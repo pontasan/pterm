@@ -12,6 +12,8 @@ import PtermCore
 final class ScrollbackBuffer {
     /// Underlying C ring buffer
     private var ringBuffer: UnsafeMutablePointer<RingBuffer>?
+    private let persistentPath: String?
+    private var unlinkOnDeinit: Bool
 
     /// Number of rows currently stored
     var rowCount: Int {
@@ -26,13 +28,36 @@ final class ScrollbackBuffer {
     /// Bytes per cell in binary format
     static let bytesPerCell = 16
 
-    init(capacity: Int = 64 * 1024 * 1024) {
-        self.ringBuffer = ring_buffer_create(capacity)
+    init(initialCapacity: Int = 64 * 1024 * 1024,
+         maxCapacity: Int = 64 * 1024 * 1024,
+         persistentPath: String? = nil) {
+        self.persistentPath = persistentPath
+        self.unlinkOnDeinit = false
+
+        if let persistentPath {
+            guard let ringBuffer = ring_buffer_create_mmap_sized(
+                persistentPath,
+                initialCapacity,
+                maxCapacity
+            ) else {
+                fatalError("Failed to create mmap-backed scrollback buffer at \(persistentPath)")
+            }
+            self.ringBuffer = ringBuffer
+        } else {
+            guard let ringBuffer = ring_buffer_create_sized(initialCapacity, maxCapacity) else {
+                fatalError("Failed to create scrollback buffer with initial capacity \(initialCapacity) and max capacity \(maxCapacity)")
+            }
+            self.ringBuffer = ringBuffer
+        }
     }
 
     deinit {
         if let rb = ringBuffer {
-            ring_buffer_destroy(rb)
+            if unlinkOnDeinit {
+                ring_buffer_destroy_and_unlink(rb)
+            } else {
+                ring_buffer_destroy(rb)
+            }
         }
         if let buf = serializeBuf {
             buf.deallocate()
@@ -108,6 +133,12 @@ final class ScrollbackBuffer {
     func clear() {
         guard let rb = ringBuffer else { return }
         ring_buffer_clear(rb)
+    }
+
+    func discardPersistentBackingStore() {
+        guard persistentPath != nil else { return }
+        clear()
+        unlinkOnDeinit = true
     }
 
     // MARK: - Cell Serialization

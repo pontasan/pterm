@@ -291,13 +291,17 @@ final class GlyphAtlas {
     }
 
     private static func makeTerminalFont(name: String? = nil, size: CGFloat) -> CTFont {
-        if let name,
-           let font = NSFont(name: name, size: size) {
+        if let name {
+            guard let font = NSFont(name: name, size: size) else {
+                fatalError("Configured font is not available: \(name)")
+            }
             return font as CTFont
         }
 
-        if let menlo = NSFont(name: "Menlo-Regular", size: size) {
-            return menlo as CTFont
+        for candidate in ["SFMono-Regular", ".SFNSMono-Regular", "Menlo-Regular"] {
+            if let font = NSFont(name: candidate, size: size) {
+                return font as CTFont
+            }
         }
 
         return NSFont.monospacedSystemFont(ofSize: size, weight: .regular) as CTFont

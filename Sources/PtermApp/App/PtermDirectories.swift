@@ -20,6 +20,7 @@ enum PtermDirectories {
 
     /// Session data: ~/.pterm/sessions/
     static var sessions: URL { base.appendingPathComponent("sessions") }
+    static var sessionScrollback: URL { sessions.appendingPathComponent("scrollback") }
 
     /// Audit logs: ~/.pterm/audit/
     static var audit: URL { base.appendingPathComponent("audit") }
@@ -30,7 +31,7 @@ enum PtermDirectories {
     /// Ensure all directories exist with correct permissions.
     static func ensureDirectories() {
         let fm = FileManager.default
-        let dirs = [base, files, sessions, audit, workspaces]
+        let dirs = [base, files, sessions, sessionScrollback, audit, workspaces]
 
         for dir in dirs {
             if !fm.fileExists(atPath: dir.path) {

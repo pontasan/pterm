@@ -1,5 +1,6 @@
 import Foundation
 import PtermCore
+import Darwin
 
 /// Error type for PTY operations.
 enum PTYError: Error {
@@ -34,6 +35,9 @@ final class PTY {
     /// Dispatch source for reading PTY output
     private var readSource: DispatchSourceRead?
 
+    /// Signals that the child process has fully exited and been reaped.
+    private let exitSemaphore = DispatchSemaphore(value: 0)
+
     /// Callback invoked when data is available from the PTY
     var onOutput: ((Data) -> Void)?
 
@@ -51,9 +55,12 @@ final class PTY {
     /// Start the PTY with the specified terminal size.
     /// Spawns zsh as the child process.
     /// Throws PTYError.forkptyFailed if forkpty() fails.
-    func start(rows: UInt16, cols: UInt16, termEnv: String = "xterm-256color") throws {
+    func start(rows: UInt16, cols: UInt16, termEnv: String = "xterm-256color",
+               initialDirectory: String? = nil) throws {
         // Validate TERM value: only allow alphanumeric and hyphens
-        let validTerm = termEnv.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
+        let validTerm = termEnv.allSatisfy {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_")
+        }
         let safeTerm = validTerm ? termEnv : "xterm-256color"
 
         termRows = rows
@@ -75,7 +82,7 @@ final class PTY {
 
         if pid == 0 {
             // Child process: exec zsh
-            setupChildEnvironment(termEnv: safeTerm)
+            setupChildEnvironment(termEnv: safeTerm, initialDirectory: initialDirectory)
             let shell = "/bin/zsh"
             let argv: [UnsafeMutablePointer<CChar>?] = [
                 strdup(shell),
@@ -115,7 +122,7 @@ final class PTY {
     }
 
     /// Stop the PTY and terminate the child process.
-    func stop() {
+    func stop(waitForExit: Bool = false) {
         // Cancel dispatch source first to prevent further read events
         readSource?.cancel()
         readSource = nil
@@ -123,6 +130,7 @@ final class PTY {
         // Close FD under lock — single close site prevents double-close
         fdLock.lock()
         let fd = masterFD
+        let pid = childPID
         masterFD = -1
         _isRunning = false
         fdLock.unlock()
@@ -131,15 +139,20 @@ final class PTY {
             close(fd)
         }
 
-        if childPID > 0 {
-            kill(childPID, SIGTERM)
-            let pid = childPID
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
-                var status: Int32 = 0
-                let result = waitpid(pid, &status, WNOHANG)
-                if result == 0 {
+        if pid > 0 {
+            kill(pid, SIGTERM)
+            if waitForExit {
+                if exitSemaphore.wait(timeout: .now() + 0.5) == .timedOut {
                     kill(pid, SIGKILL)
-                    waitpid(pid, &status, 0)
+                    _ = exitSemaphore.wait(timeout: .now() + 2.0)
+                }
+            } else {
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    guard let self else { return }
+                    if self.exitSemaphore.wait(timeout: .now()) == .success {
+                        return
+                    }
+                    kill(pid, SIGKILL)
                 }
             }
         }
@@ -174,6 +187,19 @@ final class PTY {
         write(data)
     }
 
+    /// Returns the current foreground process group leader PID for this PTY.
+    /// When the shell is waiting for input, this is typically the shell PID.
+    func foregroundProcessGroupID() -> pid_t? {
+        fdLock.lock()
+        let fd = masterFD
+        fdLock.unlock()
+
+        guard fd >= 0 else { return nil }
+        let pgid = tcgetpgrp(fd)
+        guard pgid > 0 else { return nil }
+        return pgid
+    }
+
     /// Update terminal size and notify the child process via SIGWINCH.
     func resize(rows: UInt16, cols: UInt16) {
         termRows = rows
@@ -201,17 +227,45 @@ final class PTY {
 
     // MARK: - Private
 
-    private func setupChildEnvironment(termEnv: String) {
+    private func setupChildEnvironment(termEnv: String, initialDirectory: String?) {
+        let userInfo = getpwuid(getuid())
+        let fallbackHome = FileManager.default.homeDirectoryForCurrentUser.path
+        let homeDirectory = userInfo.flatMap { String(validatingUTF8: $0.pointee.pw_dir) }
+            ?? fallbackHome
+        let userName = userInfo.flatMap { String(validatingUTF8: $0.pointee.pw_name) }
+            ?? NSUserName()
+        let userShell = userInfo.flatMap { String(validatingUTF8: $0.pointee.pw_shell) }
+            ?? "/bin/zsh"
+
+        clearInheritedEnvironment()
+
+        // Essential POSIX environment
+        setenv("HOME", homeDirectory, 1)
+        setenv("USER", userName, 1)
+        setenv("LOGNAME", userName, 1)
+        setenv("SHELL", userShell, 1)
+        setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", 1)
+        setenv("TMPDIR", NSTemporaryDirectory(), 1)
+
+        // Terminal identification
         setenv("TERM", termEnv, 1)
         setenv("COLORTERM", "truecolor", 1)
+
+        // Locale
         setenv("LANG", "en_US.UTF-8", 1)
 
-        // Remove environment variables inherited from parent process that
-        // could confuse child programs (e.g., Claude Code session detection).
-        // pterm is an independent terminal — child shells must start clean.
-        unsetenv("CLAUDECODE")
-        unsetenv("CLAUDE_CODE_ENTRYPOINT")
-        unsetenv("CLAUDE_CODE_SESSION_ACCESS_TOKEN")
+        let targetDirectory = initialDirectory
+            .flatMap { ($0 as NSString).expandingTildeInPath }
+            ?? homeDirectory
+        if chdir(targetDirectory) != 0 {
+            _exit(1)
+        }
+    }
+
+    private func clearInheritedEnvironment() {
+        for key in ProcessInfo.processInfo.environment.keys {
+            unsetenv(key)
+        }
     }
 
     private func handleReadEvent() {
@@ -241,10 +295,14 @@ final class PTY {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
             var status: Int32 = 0
-            waitpid(self.childPID, &status, 0)
+            let pid = self.childPID
+            guard pid > 0 else { return }
+            waitpid(pid, &status, 0)
             self.fdLock.lock()
             self._isRunning = false
+            self.childPID = 0
             self.fdLock.unlock()
+            self.exitSemaphore.signal()
             DispatchQueue.main.async {
                 self.onExit?()
             }

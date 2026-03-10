@@ -12,6 +12,11 @@ final class TerminalModel {
         case decSpecialGraphics
     }
 
+    private enum TitleUpdateRateLimit {
+        static let interval: TimeInterval = 1.0
+        static let maxUpdatesPerInterval = 8
+    }
+
     /// Active screen grid
     private(set) var grid: TerminalGrid
 
@@ -56,6 +61,14 @@ final class TerminalModel {
 
     /// Callback when bell is triggered
     var onBell: (() -> Void)?
+    var onClipboardWrite: ((String) -> Void)?
+    var onClipboardRead: (() -> String?)?
+    var encodeText: ((String) -> Data?)?
+    var decodeText: ((Data) -> String?)?
+    var mouseReportingPolicy: ((MouseReportingMode, Bool) -> Bool)?
+    var onWindowResizeRequest: ((_ rows: Int, _ cols: Int) -> Void)?
+    var onWindowPixelResizeRequest: ((_ width: Int, _ height: Int) -> Void)?
+    var onClearScrollback: (() -> Void)?
 
     /// OSC string accumulator
     private var oscString: String = ""
@@ -63,6 +76,9 @@ final class TerminalModel {
     /// Maximum length for OSC strings in Swift layer (4KB is sufficient for all
     /// legitimate OSC commands: titles, color definitions, etc.)
     private static let maxOSCStringLength = 4096
+
+    private var titleUpdateWindowStart: TimeInterval = ProcessInfo.processInfo.systemUptime
+    private var titleUpdateCount = 0
 
     enum MouseReportingMode {
         case none
@@ -72,6 +88,14 @@ final class TerminalModel {
         case buttonEvent // Button event tracking
         case anyEvent   // Any event tracking
     }
+
+    enum MouseProtocol {
+        case x10
+        case sgr
+    }
+
+    var mouseProtocol: MouseProtocol = .x10
+    var focusTrackingEnabled: Bool = false
 
     init(rows: Int, cols: Int) {
         self.rows = rows
@@ -381,8 +405,28 @@ final class TerminalModel {
             cursor.col = 0
             cursor.pendingWrap = false
 
+        case 0x74: // Window manipulation
+            handleWindowManipulation(parser: parser)
+
         default:
             break // Unknown CSI: silently discard
+        }
+    }
+
+    private func handleWindowManipulation(parser: UnsafePointer<VtParser>) {
+        let operation = vt_parser_param(parser, 0, 0)
+        switch operation {
+        case 8:
+            let targetRows = max(1, Int(vt_parser_param(parser, 1, Int32(rows))))
+            let targetCols = max(1, Int(vt_parser_param(parser, 2, Int32(cols))))
+            onWindowResizeRequest?(targetRows, targetCols)
+        case 4:
+            let targetHeight = max(1, Int(vt_parser_param(parser, 1, 0)))
+            let targetWidth = max(1, Int(vt_parser_param(parser, 2, 0)))
+            guard targetWidth > 0, targetHeight > 0 else { return }
+            onWindowPixelResizeRequest?(targetWidth, targetHeight)
+        default:
+            break
         }
     }
 
@@ -403,7 +447,7 @@ final class TerminalModel {
         case 2: // Erase entire display
             grid.clearAll()
         case 3: // Erase scrollback (xterm extension)
-            // TODO: clear ring buffer
+            onClearScrollback?()
             grid.clearAll()
         default:
             break
@@ -450,15 +494,15 @@ final class TerminalModel {
                 case 47, 1047: // Alternate Screen Buffer
                     switchScreen(alternate: set)
                 case 1000: // X10 mouse reporting
-                    mouseReporting = set ? .x10 : .none
+                    setMouseReporting(set ? .x10 : .none)
                 case 1002: // Button event mouse reporting
-                    mouseReporting = set ? .buttonEvent : .none
+                    setMouseReporting(set ? .buttonEvent : .none)
                 case 1003: // Any event mouse reporting
-                    mouseReporting = set ? .anyEvent : .none
+                    setMouseReporting(set ? .anyEvent : .none)
                 case 1004: // Focus tracking
-                    break // TODO
+                    focusTrackingEnabled = set
                 case 1006: // SGR mouse mode
-                    break // TODO: SGR mouse encoding
+                    mouseProtocol = set ? .sgr : .x10
                 case 1049: // Alternate Screen + save cursor
                     if set {
                         cursor.save()
@@ -494,6 +538,21 @@ final class TerminalModel {
         }
 
         isAlternateScreen = alternate
+        if !alternate {
+            mouseReporting = .none
+        }
+    }
+
+    private func setMouseReporting(_ mode: MouseReportingMode) {
+        guard mode != .none else {
+            mouseReporting = .none
+            return
+        }
+        if mouseReportingPolicy?(mode, isAlternateScreen) ?? true {
+            mouseReporting = mode
+        } else {
+            mouseReporting = .none
+        }
     }
 
     // MARK: - SGR (Select Graphic Rendition)
@@ -603,7 +662,7 @@ final class TerminalModel {
     // MARK: - DSR (Device Status Report)
 
     /// Response callback: writes response bytes to PTY
-    var onResponse: ((Data) -> Void)?
+    var onResponse: ((String) -> Void)?
 
     private func handleDSR(parser: UnsafePointer<VtParser>) {
         let param = vt_parser_param(parser, 0, 0)
@@ -621,8 +680,7 @@ final class TerminalModel {
     private func sendResponse(_ response: String) {
         // Security: sanitize response - strip any control characters from
         // dynamic content. For DSR, the row/col are integers so this is safe.
-        guard let data = response.data(using: .utf8) else { return }
-        onResponse?(data)
+        onResponse?(response)
     }
 
     // MARK: - ESC Sequences
@@ -716,26 +774,64 @@ final class TerminalModel {
 
         switch command {
         case 0: // Set icon name and window title
-            let safe = Self.sanitizeTitle(text)
-            title = safe
-            onTitleChange?(safe)
+            applyTitleUpdate(text)
 
         case 1: // Set icon name
             break
 
         case 2: // Set window title
-            let safe = Self.sanitizeTitle(text)
-            title = safe
-            onTitleChange?(safe)
+            applyTitleUpdate(text)
 
         case 52: // Clipboard access (OSC 52)
-            // Handled by security layer - not processed here
-            // Read: denied by default. Write: allowed by default.
-            break
+            handleOSC52(text)
 
         default:
             break
         }
+    }
+
+    private func applyTitleUpdate(_ rawTitle: String) {
+        guard consumeTitleUpdateBudget() else { return }
+        let safe = Self.sanitizeTitle(rawTitle)
+        title = safe
+        onTitleChange?(safe)
+    }
+
+    private func consumeTitleUpdateBudget(now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
+        if now - titleUpdateWindowStart >= TitleUpdateRateLimit.interval {
+            titleUpdateWindowStart = now
+            titleUpdateCount = 0
+        }
+
+        guard titleUpdateCount < TitleUpdateRateLimit.maxUpdatesPerInterval else {
+            return false
+        }
+
+        titleUpdateCount += 1
+        return true
+    }
+
+    private func handleOSC52(_ payload: String) {
+        let components = payload.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+        guard components.count == 2 else { return }
+        let target = String(components[0])
+        let data = String(components[1])
+
+        if data == "?" {
+            guard let clipboardText = onClipboardRead?() else { return }
+            guard let encodedData = encodeText?(clipboardText) ?? clipboardText.data(using: .utf8) else {
+                return
+            }
+            let encoded = encodedData.base64EncodedString()
+            sendResponse("\u{1B}]52;\(target);\(encoded)\u{07}")
+            return
+        }
+
+        guard let decoded = Data(base64Encoded: data),
+              let string = decodeText?(decoded) ?? String(data: decoded, encoding: .utf8) else {
+            return
+        }
+        onClipboardWrite?(string)
     }
 
     // MARK: - Reset
@@ -748,12 +844,19 @@ final class TerminalModel {
         bracketedPasteMode = false
         applicationCursorKeys = false
         mouseReporting = .none
+        mouseProtocol = .x10
+        focusTrackingEnabled = false
         isAlternateScreen = false
         alternateGrid = nil
         g0Charset = .ascii
         g1Charset = .ascii
         activeCharsetIsG1 = false
         initTabStops()
+    }
+
+    func notifyFocusChanged(_ isFocused: Bool) {
+        guard focusTrackingEnabled else { return }
+        sendResponse(isFocused ? "\u{1B}[I" : "\u{1B}[O")
     }
 
     private func designateCharacterSet(intermediate: UInt8, finalByte: UInt32) {

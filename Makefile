@@ -1,12 +1,13 @@
 # pterm - macOS Terminal Emulator
 # Build system: SPM + xcrun metal + shell scripts
 
-.PHONY: build debug test clean bundle run
+.PHONY: build debug test clean bundle run shaders
 
 # Output directories
 BUILD_DIR = .build
 APP_BUNDLE = $(BUILD_DIR)/pterm.app
 SHADER_DIR = Sources/PtermApp/Rendering/Shaders
+METAL_TOOLCHAIN = TOOLCHAINS=Metal
 
 # Build release
 build:
@@ -33,22 +34,28 @@ clean:
 
 # Assemble .app bundle
 bundle:
-	@CONFIG=$${CONFIG:-debug}; \
+	@set -e; \
+	CONFIG=$${CONFIG:-debug}; \
 	BINARY_DIR=$(BUILD_DIR)/$$CONFIG; \
 	echo "Bundling pterm.app ($$CONFIG)..."; \
 	mkdir -p $(APP_BUNDLE)/Contents/MacOS; \
 	mkdir -p $(APP_BUNDLE)/Contents/Resources; \
+	mkdir -p $(BUILD_DIR)/shaders; \
 	cp $$BINARY_DIR/PtermApp $(APP_BUNDLE)/Contents/MacOS/PtermApp; \
 	cp Resources/Info.plist $(APP_BUNDLE)/Contents/Info.plist; \
+	$(METAL_TOOLCHAIN) xcrun -sdk macosx metal -c $(SHADER_DIR)/terminal.metal \
+		-o $(BUILD_DIR)/shaders/terminal.air; \
+	$(METAL_TOOLCHAIN) xcrun -sdk macosx metallib $(BUILD_DIR)/shaders/terminal.air \
+		-o $(APP_BUNDLE)/Contents/Resources/default.metallib; \
 	echo "Bundle created at $(APP_BUNDLE)"
 
 # Compile Metal shaders (requires Xcode.app)
 shaders:
 	@echo "Compiling Metal shaders..."
 	@mkdir -p $(BUILD_DIR)/shaders
-	xcrun -sdk macosx metal -c $(SHADER_DIR)/terminal.metal \
+	$(METAL_TOOLCHAIN) xcrun -sdk macosx metal -c $(SHADER_DIR)/terminal.metal \
 		-o $(BUILD_DIR)/shaders/terminal.air
-	xcrun -sdk macosx metallib $(BUILD_DIR)/shaders/terminal.air \
+	$(METAL_TOOLCHAIN) xcrun -sdk macosx metallib $(BUILD_DIR)/shaders/terminal.air \
 		-o $(APP_BUNDLE)/Contents/Resources/default.metallib
 	@echo "Shaders compiled."
 

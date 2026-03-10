@@ -38,6 +38,7 @@ typedef struct {
 typedef struct {
     uint8_t      *data;          /* Circular data buffer */
     size_t        data_capacity; /* Total data buffer size in bytes */
+    size_t        max_data_capacity; /* Growth limit in bytes */
     size_t        write_offset;  /* Current write position in data buffer */
 
     RingRowEntry *rows;          /* Row index array (circular) */
@@ -50,6 +51,9 @@ typedef struct {
     uint32_t      flags;         /* RING_FLAG_MMAP etc. */
     int           mmap_fd;       /* File descriptor for mmap mode (-1 if heap) */
     char         *mmap_path;     /* File path for mmap mode (NULL if heap) */
+    void         *mapping_base;  /* Base address of mmap region */
+    size_t        mapping_length;/* Total length of mmap region */
+    void         *mmap_header;   /* Internal header pointer for mmap mode */
 
     /* Temporary buffer for wrap-around reads */
     uint8_t      *copy_buf;
@@ -62,6 +66,7 @@ typedef struct {
  * Returns NULL on allocation failure.
  */
 RingBuffer *ring_buffer_create(size_t capacity);
+RingBuffer *ring_buffer_create_sized(size_t initial_capacity, size_t max_capacity);
 
 /*
  * Create an mmap-backed ring buffer mapped to a file.
@@ -70,6 +75,9 @@ RingBuffer *ring_buffer_create(size_t capacity);
  * Returns NULL on failure.
  */
 RingBuffer *ring_buffer_create_mmap(const char *path, size_t capacity);
+RingBuffer *ring_buffer_create_mmap_sized(const char *path,
+                                          size_t initial_capacity,
+                                          size_t max_capacity);
 
 /*
  * Destroy a ring buffer and free all resources.

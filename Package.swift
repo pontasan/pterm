@@ -24,6 +24,9 @@ let package = Package(
             name: "PtermApp",
             dependencies: ["PtermCore"],
             path: "Sources/PtermApp",
+            exclude: [
+                "Rendering/Shaders/terminal.metal"
+            ],
             swiftSettings: [
                 .unsafeFlags(["-O"], .when(configuration: .release))
             ],
@@ -32,7 +35,10 @@ let package = Package(
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
                 .linkedFramework("CoreText"),
-                .linkedFramework("QuartzCore")
+                .linkedFramework("QuartzCore"),
+                .linkedFramework("Security"),
+                .linkedFramework("UserNotifications"),
+                .linkedFramework("AVFoundation")
             ]
         ),
         // C module tests

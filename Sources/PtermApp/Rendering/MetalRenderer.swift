@@ -121,6 +121,11 @@ final class MetalRenderer {
         glyphAtlas.updateFont(name: glyphAtlas.fontName, size: clamped)
     }
 
+    func updateFont(name: String, size: CGFloat) {
+        let clamped = min(MetalRenderer.maxFontSize, max(MetalRenderer.minFontSize, size))
+        glyphAtlas.updateFont(name: name, size: clamped)
+    }
+
     /// Load Metal shaders and create render pipelines.
     /// Must be called after the Metal library is available.
     func setupPipelines(library: MTLLibrary) {

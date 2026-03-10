@@ -132,7 +132,9 @@ struct TerminalSelection {
                     while result.hasSuffix(" ") {
                         result.removeLast()
                     }
-                    result.append("\n")
+                    if !grid.isWrapped(row + 1) {
+                        result.append("\n")
+                    }
                 }
             }
 
