@@ -277,40 +277,20 @@ final class TerminalView: MTKView, NSTextInputClient {
         guard commandHeld,
               let controller = terminalController,
               let position = gridPosition(from: event),
-              controller.detectedLink(at: position) != nil else {
+              let link = controller.detectedLink(at: position) else {
             if hoveredLinkRange != nil {
                 hoveredLinkRange = nil
                 NSCursor.arrow.set()
-                setNeedsDisplay(bounds)
             }
             return
         }
 
-        // Find the column range of the link text in this row by scanning cells
-        var bestStart = position.col
-        var bestEnd = position.col
-        controller.withViewport { model, _, _ in
-            // Scan backwards to find link start
-            for c in stride(from: position.col, through: 0, by: -1) {
-                let cell = model.grid.cell(at: position.row, col: c)
-                if cell.codepoint <= 0x20 { break }
-                bestStart = c
-            }
-            // Scan forwards to find link end
-            for c in (position.col + 1)..<model.cols {
-                let cell = model.grid.cell(at: position.row, col: c)
-                if cell.codepoint <= 0x20 { break }
-                bestEnd = c
-            }
-        }
-
-        let newRange = (row: position.row, startCol: bestStart, endCol: bestEnd)
+        let newRange = (row: position.row, startCol: link.startCol, endCol: link.endCol)
         if hoveredLinkRange?.row != newRange.row ||
            hoveredLinkRange?.startCol != newRange.startCol ||
            hoveredLinkRange?.endCol != newRange.endCol {
             hoveredLinkRange = newRange
             NSCursor.pointingHand.set()
-            setNeedsDisplay(bounds)
         }
     }
 
@@ -405,6 +385,9 @@ final class TerminalView: MTKView, NSTextInputClient {
               let detectedLink = controller.detectedLink(at: position) else {
             return false
         }
+
+        hoveredLinkRange = nil
+        NSCursor.arrow.set()
 
         let scheme = detectedLink.url.scheme?.lowercased()
         if scheme == "http" || scheme == "https" {

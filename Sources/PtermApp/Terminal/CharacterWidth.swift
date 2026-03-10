@@ -132,10 +132,10 @@ enum CharacterWidth {
         if cp >= 0x1F300 && cp <= 0x1F9FF { return true }
         if cp >= 0x1FA00 && cp <= 0x1FA6F { return true }
         if cp >= 0x1FA70 && cp <= 0x1FAFF { return true }
-        // Misc symbols and pictographs
-        if cp >= 0x2600 && cp <= 0x27BF { return true }
-        // Dingbats
-        if cp >= 0x2700 && cp <= 0x27BF { return true }
+        // Note: U+2600-U+27BF (Misc Symbols, Dingbats) are East Asian Width
+        // Neutral/Ambiguous and rendered as width 1 in standard terminals.
+        // Treating them as wide breaks CLI tools (e.g. Ink) that rely on
+        // wcwidth-compatible column counting.
 
         return false
     }

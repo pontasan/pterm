@@ -21,6 +21,8 @@ final class TerminalController {
     struct DetectedLink {
         let url: URL
         let originalText: String
+        let startCol: Int
+        let endCol: Int
     }
 
     struct SearchMatch: Equatable {
@@ -571,7 +573,16 @@ final class TerminalController {
                     continue
                 }
                 let originalText = nsText.substring(with: match.range)
-                return DetectedLink(url: url, originalText: originalText)
+
+                // Reverse-map NSRange character indices to column positions
+                let matchStart = match.range.location
+                let matchEnd = matchStart + match.range.length - 1
+                guard let startCol = projection.columnByCharacterIndex[matchStart],
+                      let endCol = projection.columnByCharacterIndex[matchEnd] else {
+                    continue
+                }
+                return DetectedLink(url: url, originalText: originalText,
+                                    startCol: startCol, endCol: endCol)
             }
             return nil
         }
@@ -702,18 +713,21 @@ final class TerminalController {
         return results
     }
 
-    private static func projectVisibleText(from cells: [Cell]) -> (text: String, characterIndexByColumn: [Int: Int]) {
+    private static func projectVisibleText(from cells: [Cell]) -> (text: String, characterIndexByColumn: [Int: Int], columnByCharacterIndex: [Int: Int]) {
         var text = ""
-        var mapping: [Int: Int] = [:]
+        var colToChar: [Int: Int] = [:]
+        var charToCol: [Int: Int] = [:]
 
         for (column, cell) in cells.enumerated() {
             if cell.isWideContinuation { continue }
             guard let scalar = Unicode.Scalar(cell.codepoint) else { continue }
-            let characterIndex = text.count
+            // Use UTF-16 offset for NSRange compatibility with NSDataDetector
+            let utf16Offset = text.utf16.count
             text.append(Character(scalar))
-            mapping[column] = characterIndex
+            colToChar[column] = utf16Offset
+            charToCol[utf16Offset] = column
         }
 
-        return (text, mapping)
+        return (text, colToChar, charToCol)
     }
 }
