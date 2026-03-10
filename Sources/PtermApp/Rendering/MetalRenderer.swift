@@ -9,8 +9,10 @@ import QuartzCore
 /// 1. Cell backgrounds as colored quads
 /// 2. Glyphs sampled from the texture atlas
 /// 3. Block cursor with smooth fade animation
+/// 4. Scrollbar overlay when scrollback is available
 ///
-/// Supports Retina (HiDPI) rendering.
+/// Supports Retina (HiDPI) rendering and virtualized scrollback
+/// (only visible rows are rendered, regardless of scrollback size).
 final class MetalRenderer {
     /// Metal device
     let device: MTLDevice
@@ -27,6 +29,9 @@ final class MetalRenderer {
     /// Render pipeline for cursor
     private var cursorPipeline: MTLRenderPipelineState?
 
+    /// Render pipeline for overlay (scrollbar, etc.)
+    private var overlayPipeline: MTLRenderPipelineState?
+
     /// Glyph atlas
     let glyphAtlas: GlyphAtlas
 
@@ -37,11 +42,13 @@ final class MetalRenderer {
     private var bgVertices: [Float] = []
     private var glyphVertices: [Float] = []
     private var cursorVertices: [Float] = []
+    private var overlayVertices: [Float] = []
 
     /// MTLBuffers for vertex data (avoids 4KB setVertexBytes limit)
     private var bgBuffer: MTLBuffer?
     private var glyphBuffer: MTLBuffer?
     private var cursorBuffer: MTLBuffer?
+    private var overlayBuffer: MTLBuffer?
 
     /// Uniform buffer
     private var uniforms = MetalUniforms()
@@ -58,8 +65,8 @@ final class MetalRenderer {
         var time: Float = 0.0
     }
 
-    /// Default font size (points)
-    static let defaultFontSize: CGFloat = 13.0
+    /// Default font size (points) — matches macOS Terminal default
+    static let defaultFontSize: CGFloat = 11.0
 
     /// Minimum font size
     static let minFontSize: CGFloat = 8.0
@@ -69,6 +76,18 @@ final class MetalRenderer {
 
     /// Font size step per Cmd+/Cmd- press
     static let fontSizeStep: CGFloat = 1.0
+
+    /// Padding around the terminal grid (in points).
+    /// 1 half-width character. Dynamic: scales with font size.
+    /// DPI is handled by the renderer (points → pixels via scaleFactor).
+    var gridPadding: CGFloat {
+        glyphAtlas.cellWidth
+    }
+
+    /// Whether render pipelines are set up
+    var hasPipelines: Bool {
+        bgPipeline != nil && glyphPipeline != nil && cursorPipeline != nil && overlayPipeline != nil
+    }
 
     /// Floats per vertex: position(2) + texCoord(2) + fgColor(4) + bgColor(4) = 12
     private let floatsPerVertex = 12
@@ -138,12 +157,30 @@ final class MetalRenderer {
             desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
             cursorPipeline = try? device.makeRenderPipelineState(descriptor: desc)
         }
+
+        // Overlay pipeline (alpha blending, pass-through fragment)
+        if let overlayVertex = library.makeFunction(name: "bg_vertex"),
+           let overlayFragment = library.makeFunction(name: "overlay_fragment") {
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction = overlayVertex
+            desc.fragmentFunction = overlayFragment
+            desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+            desc.colorAttachments[0].isBlendingEnabled = true
+            desc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            desc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            desc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            overlayPipeline = try? device.makeRenderPipelineState(descriptor: desc)
+        }
     }
 
     private func setupSampler() {
         let desc = MTLSamplerDescriptor()
-        desc.minFilter = .linear
-        desc.magFilter = .linear
+        // Use nearest-neighbor filtering for pixel-crisp text rendering.
+        // In a monospace terminal grid, glyph texels map 1:1 to screen pixels
+        // at the atlas's native scale, so linear interpolation only adds blur.
+        desc.minFilter = .nearest
+        desc.magFilter = .nearest
         desc.mipFilter = .notMipmapped
         desc.sAddressMode = .clampToEdge
         desc.tAddressMode = .clampToEdge
@@ -171,7 +208,10 @@ final class MetalRenderer {
     // MARK: - Rendering
 
     /// Build vertex data from terminal model and render.
-    func render(model: TerminalModel, in view: MTKView) {
+    /// When scrollOffset > 0, mixes scrollback rows with active grid rows
+    /// to show historical content (virtualized: only visible rows are processed).
+    func render(model: TerminalModel, scrollback: ScrollbackBuffer,
+                scrollOffset: Int, selection: TerminalSelection?, in view: MTKView) {
         guard let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor,
               let commandBuffer = commandQueue.makeCommandBuffer() else {
@@ -184,14 +224,16 @@ final class MetalRenderer {
                                      Float(drawableSize.height))
         uniforms.viewportSize = viewportSize
         uniforms.time = Float(CACurrentMediaTime() - startTime)
-        uniforms.cursorOpacity = model.cursor.visible ? 1.0 : 0.0
+        uniforms.cursorOpacity = (scrollOffset == 0 && model.cursor.visible) ? 1.0 : 0.0
 
         // Clear color: black background
         renderPassDescriptor.colorAttachments[0].clearColor =
             MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
 
-        // Build vertex data
-        buildVertexData(model: model, scaleFactor: Float(view.window?.backingScaleFactor ?? 2.0))
+        // Build vertex data using the atlas's scale factor.
+        let sf = Float(glyphAtlas.scaleFactor)
+        buildVertexData(model: model, scrollback: scrollback, scrollOffset: scrollOffset,
+                        selection: selection, scaleFactor: sf)
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(
             descriptor: renderPassDescriptor) else {
@@ -221,7 +263,7 @@ final class MetalRenderer {
                                   vertexCount: glyphVertices.count / floatsPerVertex)
         }
 
-        // 3. Draw cursor
+        // 3. Draw cursor (only when at the bottom of scrollback)
         if !cursorVertices.isEmpty, let pipeline = cursorPipeline,
            let buf = updateVertexBuffer(&cursorBuffer, vertices: cursorVertices) {
             encoder.setRenderPipelineState(pipeline)
@@ -231,6 +273,16 @@ final class MetalRenderer {
                                   vertexCount: cursorVertices.count / floatsPerVertex)
         }
 
+        // 4. Draw overlay (scrollbar)
+        if !overlayVertices.isEmpty, let pipeline = overlayPipeline,
+           let buf = updateVertexBuffer(&overlayBuffer, vertices: overlayVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                  vertexCount: overlayVertices.count / floatsPerVertex)
+        }
+
         encoder.endEncoding()
         commandBuffer.present(drawable)
         commandBuffer.commit()
@@ -238,31 +290,68 @@ final class MetalRenderer {
 
     // MARK: - Vertex Building
 
-    private func buildVertexData(model: TerminalModel, scaleFactor: Float) {
+    private func buildVertexData(model: TerminalModel, scrollback: ScrollbackBuffer,
+                                  scrollOffset: Int, selection: TerminalSelection?,
+                                  scaleFactor: Float) {
         bgVertices.removeAll(keepingCapacity: true)
         glyphVertices.removeAll(keepingCapacity: true)
         cursorVertices.removeAll(keepingCapacity: true)
+        overlayVertices.removeAll(keepingCapacity: true)
 
         let cellW = Float(glyphAtlas.cellWidth) * scaleFactor
         let cellH = Float(glyphAtlas.cellHeight) * scaleFactor
+        let padX = Float(gridPadding) * scaleFactor
+        let padY = Float(gridPadding) * scaleFactor
 
-        for row in 0..<model.rows {
-            for col in 0..<model.cols {
-                let cell = model.grid.cell(at: row, col: col)
+        let viewRows = model.rows
+        let viewCols = model.cols
+        let sbCount = scrollback.rowCount
+
+        // Pre-fetch scrollback rows that are visible in the viewport.
+        // Each row is fetched once and reused for all columns.
+        var scrollbackRowCache: [Int: [Cell]] = [:]
+        if scrollOffset > 0 {
+            let firstAbsolute = max(0, sbCount - scrollOffset)
+            for viewRow in 0..<viewRows {
+                let absRow = firstAbsolute + viewRow
+                if absRow >= 0 && absRow < sbCount {
+                    scrollbackRowCache[absRow] = scrollback.getRow(at: absRow)
+                }
+            }
+        }
+
+        let firstAbsolute = scrollOffset > 0 ? max(0, sbCount - scrollOffset) : sbCount
+
+        for row in 0..<viewRows {
+            let absoluteRow = firstAbsolute + row
+            let isScrollbackRow = absoluteRow < sbCount
+            let scrollbackRow = isScrollbackRow ? scrollbackRowCache[absoluteRow] : nil
+            let gridRow = isScrollbackRow ? -1 : absoluteRow - sbCount
+
+            for col in 0..<viewCols {
+                let cell: Cell
+                if let sbRow = scrollbackRow {
+                    cell = col < sbRow.count ? sbRow[col] : .empty
+                } else {
+                    cell = model.grid.cell(at: gridRow, col: col)
+                }
 
                 // Skip continuation cells of wide characters
                 if cell.isWideContinuation { continue }
 
-                let x = Float(col) * cellW
-                let y = Float(row) * cellH
+                let x = padX + Float(col) * cellW
+                let y = padY + Float(row) * cellH
                 let w = cellW * Float(max(1, cell.width))
                 let h = cellH
 
-                // Resolve colors (handle inverse)
+                // Resolve colors (handle inverse and selection)
                 var fgColor: (r: Float, g: Float, b: Float)
                 var bgColor: (r: Float, g: Float, b: Float)
 
-                if cell.attributes.inverse {
+                let isSelected = selection?.contains(row: row, col: col) ?? false
+
+                if cell.attributes.inverse != isSelected {
+                    // Inverse XOR selected: swap fg/bg
                     fgColor = cell.attributes.background.resolve(isForeground: false)
                     bgColor = cell.attributes.foreground.resolve(isForeground: true)
                 } else {
@@ -270,8 +359,8 @@ final class MetalRenderer {
                     bgColor = cell.attributes.background.resolve(isForeground: false)
                 }
 
-                // Background quad (skip if default black to save draw calls)
-                if bgColor.r > 0.001 || bgColor.g > 0.001 || bgColor.b > 0.001 {
+                // Background quad (skip if default black to save draw calls, but always draw for selected cells)
+                if isSelected || bgColor.r > 0.001 || bgColor.g > 0.001 || bgColor.b > 0.001 {
                     addQuad(to: &bgVertices, x: x, y: y, w: w, h: h,
                            tx: 0, ty: 0, tw: 0, th: 0,
                            fg: (bgColor.r, bgColor.g, bgColor.b, 1),
@@ -284,9 +373,10 @@ final class MetalRenderer {
                    glyph.pixelWidth > 0 {
 
                     let glyphX = x + Float(glyph.bearingX) * scaleFactor
-                    let glyphY = y + (cellH - Float(glyphAtlas.baseline) * scaleFactor
-                                      - Float(glyph.bearingY) * scaleFactor
-                                      - Float(glyph.pixelHeight))
+                    // Position glyph so its baseline (at baselineOffset pixels from
+                    // the bitmap top) aligns with the cell's baseline screen position.
+                    let baselineScreenY = y + cellH - Float(glyphAtlas.baseline) * scaleFactor
+                    let glyphY = baselineScreenY - glyph.baselineOffset
                     let glyphW = Float(glyph.pixelWidth)
                     let glyphH = Float(glyph.pixelHeight)
 
@@ -300,15 +390,61 @@ final class MetalRenderer {
             }
         }
 
-        // Cursor
-        if model.cursor.visible {
-            let cx = Float(model.cursor.col) * cellW
-            let cy = Float(model.cursor.row) * cellH
+        // Cursor (only visible when not scrolled back)
+        if scrollOffset == 0 && model.cursor.visible {
+            let cx = padX + Float(model.cursor.col) * cellW
+            let cy = padY + Float(model.cursor.row) * cellH
             addQuad(to: &cursorVertices, x: cx, y: cy, w: cellW, h: cellH,
                    tx: 0, ty: 0, tw: 0, th: 0,
                    fg: (0.8, 0.8, 0.8, 1),
                    bg: (0.8, 0.8, 0.8, 1))
         }
+
+        // Scrollbar
+        let totalRows = sbCount + viewRows
+        if sbCount > 0 {
+            buildScrollbar(totalRows: totalRows, viewRows: viewRows,
+                          scrollOffset: scrollOffset, scaleFactor: scaleFactor)
+        }
+    }
+
+    /// Build scrollbar overlay vertices.
+    private func buildScrollbar(totalRows: Int, viewRows: Int,
+                                 scrollOffset: Int, scaleFactor: Float) {
+        let scrollbarWidth: Float = 6.0 * scaleFactor  // 6pt wide
+        let scrollbarMargin: Float = 2.0 * scaleFactor // 2pt from edge
+        let scrollbarX = viewportSize.x - scrollbarWidth - scrollbarMargin
+        let viewportHeight = viewportSize.y
+
+        // Thumb size proportional to viewport/total content ratio
+        let thumbFraction = Float(viewRows) / Float(totalRows)
+        let minThumbHeight: Float = 20.0 * scaleFactor
+        let thumbHeight = max(minThumbHeight, viewportHeight * thumbFraction)
+
+        // Thumb position: 0 = bottom, maxOffset = top
+        let maxOffset = totalRows - viewRows
+        let scrollFraction: Float
+        if maxOffset > 0 {
+            scrollFraction = 1.0 - Float(scrollOffset) / Float(maxOffset)
+        } else {
+            scrollFraction = 1.0
+        }
+        let thumbY = (viewportHeight - thumbHeight) * scrollFraction
+
+        // Scrollbar track (very subtle)
+        addQuad(to: &overlayVertices,
+               x: scrollbarX, y: 0, w: scrollbarWidth, h: viewportHeight,
+               tx: 0, ty: 0, tw: 0, th: 0,
+               fg: (1.0, 1.0, 1.0, 0.05),
+               bg: (0, 0, 0, 0))
+
+        // Scrollbar thumb
+        let thumbAlpha: Float = scrollOffset > 0 ? 0.5 : 0.2
+        addQuad(to: &overlayVertices,
+               x: scrollbarX, y: thumbY, w: scrollbarWidth, h: thumbHeight,
+               tx: 0, ty: 0, tw: 0, th: 0,
+               fg: (0.7, 0.7, 0.7, thumbAlpha),
+               bg: (0, 0, 0, 0))
     }
 
     /// Add a quad (2 triangles = 6 vertices) to the vertex array.

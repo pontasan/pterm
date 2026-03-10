@@ -66,14 +66,14 @@ final class PTY {
             ws_ypixel: 0
         )
 
-        var childPid: pid_t = 0
-        let fd = forkpty(&childPid, nil, nil, &winSize)
+        var amaster: Int32 = -1
+        let pid = forkpty(&amaster, nil, nil, &winSize)
 
-        if fd < 0 {
+        if pid < 0 {
             throw PTYError.forkptyFailed(String(cString: strerror(errno)))
         }
 
-        if childPid == 0 {
+        if pid == 0 {
             // Child process: exec zsh
             setupChildEnvironment(termEnv: safeTerm)
             let shell = "/bin/zsh"
@@ -89,18 +89,18 @@ final class PTY {
 
         // Parent process
         fdLock.lock()
-        self.masterFD = fd
+        self.masterFD = amaster
         self._isRunning = true
         fdLock.unlock()
 
-        self.childPID = childPid
+        self.childPID = pid
 
         // Set non-blocking mode
-        let flags = fcntl(fd, F_GETFL)
-        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        let flags = fcntl(amaster, F_GETFL)
+        _ = fcntl(amaster, F_SETFL, flags | O_NONBLOCK)
 
         // Set up dispatch source for reading
-        let source = DispatchSource.makeReadSource(fileDescriptor: fd,
+        let source = DispatchSource.makeReadSource(fileDescriptor: amaster,
                                                     queue: .global(qos: .userInteractive))
         source.setEventHandler { [weak self] in
             self?.handleReadEvent()
@@ -205,6 +205,13 @@ final class PTY {
         setenv("TERM", termEnv, 1)
         setenv("COLORTERM", "truecolor", 1)
         setenv("LANG", "en_US.UTF-8", 1)
+
+        // Remove environment variables inherited from parent process that
+        // could confuse child programs (e.g., Claude Code session detection).
+        // pterm is an independent terminal — child shells must start clean.
+        unsetenv("CLAUDECODE")
+        unsetenv("CLAUDE_CODE_ENTRYPOINT")
+        unsetenv("CLAUDE_CODE_SESSION_ACCESS_TOKEN")
     }
 
     private func handleReadEvent() {

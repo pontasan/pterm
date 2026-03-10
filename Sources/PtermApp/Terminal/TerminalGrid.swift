@@ -2,6 +2,8 @@ import Foundation
 
 /// Terminal character grid.
 /// Stores a 2D array of cells representing the visible terminal screen.
+/// Each row has a `isWrapped` flag indicating whether it is a soft-wrapped
+/// continuation of the previous row (as opposed to a hard line break).
 final class TerminalGrid {
     /// Number of rows
     private(set) var rows: Int
@@ -11,6 +13,10 @@ final class TerminalGrid {
 
     /// Cell storage: row-major order
     private var cells: [Cell]
+
+    /// Per-row wrap flag. `true` means this row is a continuation of the
+    /// previous logical line (soft wrap), `false` means a new logical line.
+    private(set) var lineWrapped: [Bool]
 
     /// Scroll region top (inclusive, 0-based)
     var scrollTop: Int = 0
@@ -23,6 +29,7 @@ final class TerminalGrid {
         self.cols = cols
         self.scrollBottom = rows - 1
         self.cells = Array(repeating: Cell.empty, count: rows * cols)
+        self.lineWrapped = Array(repeating: false, count: rows)
     }
 
     // MARK: - Cell Access
@@ -41,6 +48,20 @@ final class TerminalGrid {
         cells[row * cols + col] = cell
     }
 
+    // MARK: - Wrap Flag
+
+    /// Mark a row as a soft-wrapped continuation of the previous row.
+    func setWrapped(_ row: Int, _ wrapped: Bool) {
+        guard row >= 0, row < rows else { return }
+        lineWrapped[row] = wrapped
+    }
+
+    /// Check if a row is soft-wrapped.
+    func isWrapped(_ row: Int) -> Bool {
+        guard row >= 0, row < rows else { return false }
+        return lineWrapped[row]
+    }
+
     // MARK: - Line Operations
 
     /// Clear a range of cells in a row to empty.
@@ -56,11 +77,15 @@ final class TerminalGrid {
     /// Clear entire row.
     func clearRow(_ row: Int) {
         clearCells(row: row, fromCol: 0, toCol: cols - 1)
+        if row >= 0 && row < rows {
+            lineWrapped[row] = false
+        }
     }
 
     /// Clear entire grid.
     func clearAll() {
         cells = Array(repeating: Cell.empty, count: rows * cols)
+        lineWrapped = Array(repeating: false, count: rows)
     }
 
     // MARK: - Scrolling
@@ -74,7 +99,6 @@ final class TerminalGrid {
         let regionHeight = bottom - top + 1
 
         if count >= regionHeight {
-            // Clear entire scroll region
             for row in top...bottom {
                 clearRow(row)
             }
@@ -87,6 +111,7 @@ final class TerminalGrid {
             let dstOffset = row * cols
             cells.replaceSubrange(dstOffset..<(dstOffset + cols),
                                   with: cells[srcOffset..<(srcOffset + cols)])
+            lineWrapped[row] = lineWrapped[row + count]
         }
 
         // Clear newly exposed lines at bottom
@@ -116,6 +141,7 @@ final class TerminalGrid {
             let dstOffset = row * cols
             cells.replaceSubrange(dstOffset..<(dstOffset + cols),
                                   with: cells[srcOffset..<(srcOffset + cols)])
+            lineWrapped[row] = lineWrapped[row - count]
         }
 
         // Clear newly exposed lines at top
@@ -124,26 +150,234 @@ final class TerminalGrid {
         }
     }
 
-    // MARK: - Resize
+    /// A row that was trimmed from the grid during resize.
+    struct TrimmedRow {
+        let cells: [Cell]
+        let isWrapped: Bool
+    }
 
-    /// Resize the grid. Preserves content where possible.
-    func resize(newRows: Int, newCols: Int) {
-        var newCells = Array(repeating: Cell.empty, count: newRows * newCols)
+    /// Result of a resize operation.
+    struct ResizeResult {
+        let cursorRow: Int
+        let cursorCol: Int
+        /// Rows that were pushed off the top of the grid.
+        /// These should be saved to scrollback to prevent data loss.
+        let trimmedRows: [TrimmedRow]
+    }
 
-        let copyRows = min(rows, newRows)
-        let copyCols = min(cols, newCols)
+    // MARK: - Resize with Re-wrap
 
-        for row in 0..<copyRows {
-            for col in 0..<copyCols {
-                newCells[row * newCols + col] = cells[row * cols + col]
+    /// Resize the grid with intelligent line re-wrapping.
+    /// Returns the new cursor position and any rows trimmed from the top
+    /// (which the caller should save to scrollback).
+    func resize(newRows: Int, newCols: Int, cursorRow: Int, cursorCol: Int) -> ResizeResult {
+        if newCols == cols {
+            // Column count unchanged — simple row adjustment
+            return resizeRowsOnly(newRows: newRows, cursorRow: cursorRow, cursorCol: cursorCol)
+        }
+
+        // 1. Collect logical lines by joining soft-wrapped rows
+        let logicalLines = collectLogicalLines()
+
+        // 2. Find cursor position in logical line space
+        let (cursorLogicalIdx, cursorLogicalCol) = mapCursorToLogical(
+            cursorRow: cursorRow, cursorCol: cursorCol)
+
+        // 3. Re-wrap logical lines at new column width
+        var newCells = [Cell]()
+        var newWrapped = [Bool]()
+        var newCursorRow = 0
+        var newCursorCol = cursorLogicalCol
+
+        for (lineIdx, logicalLine) in logicalLines.enumerated() {
+            let wrappedRows = wrapLogicalLine(logicalLine, cols: newCols)
+
+            for (rowInLine, rowCells) in wrappedRows.enumerated() {
+                // Track cursor position
+                if lineIdx == cursorLogicalIdx {
+                    let offsetInLine = rowInLine * newCols
+                    if cursorLogicalCol >= offsetInLine &&
+                       cursorLogicalCol < offsetInLine + newCols {
+                        newCursorRow = newCells.count / newCols
+                        newCursorCol = cursorLogicalCol - offsetInLine
+                    }
+                }
+
+                newCells.append(contentsOf: rowCells)
+                // Pad to full row width
+                if rowCells.count < newCols {
+                    newCells.append(contentsOf:
+                        Array(repeating: Cell.empty, count: newCols - rowCells.count))
+                }
+
+                // First row of a logical line: not wrapped. Subsequent: wrapped.
+                newWrapped.append(rowInLine > 0)
             }
+        }
+
+        // 4. Trim or pad to newRows
+        let totalRows = newCells.count / newCols
+        var trimmedRows: [TrimmedRow] = []
+
+        if totalRows > newRows {
+            // Capture excess rows from the top before discarding
+            let excessRows = totalRows - newRows
+            for i in 0..<excessRows {
+                let start = i * newCols
+                let rowCells = Array(newCells[start..<(start + newCols)])
+                trimmedRows.append(TrimmedRow(cells: rowCells, isWrapped: newWrapped[i]))
+            }
+            newCells.removeFirst(excessRows * newCols)
+            newWrapped.removeFirst(excessRows)
+            newCursorRow -= excessRows
+        } else if totalRows < newRows {
+            let padRows = newRows - totalRows
+            newCells.append(contentsOf:
+                Array(repeating: Cell.empty, count: padRows * newCols))
+            newWrapped.append(contentsOf:
+                Array(repeating: false, count: padRows))
         }
 
         self.rows = newRows
         self.cols = newCols
         self.cells = newCells
+        self.lineWrapped = newWrapped
         self.scrollTop = 0
         self.scrollBottom = newRows - 1
+
+        let clampedRow = max(0, min(newRows - 1, newCursorRow))
+        let clampedCol = max(0, min(newCols - 1, newCursorCol))
+        return ResizeResult(cursorRow: clampedRow, cursorCol: clampedCol, trimmedRows: trimmedRows)
+    }
+
+    /// Simple row-only resize (column count unchanged).
+    private func resizeRowsOnly(newRows: Int, cursorRow: Int, cursorCol: Int) -> ResizeResult {
+        var newCursorRow = cursorRow
+        var trimmedRows: [TrimmedRow] = []
+
+        if newRows < rows {
+            // Shrinking: if cursor is below new bottom, scroll content up
+            if cursorRow >= newRows {
+                let scrollAmount = cursorRow - newRows + 1
+                // Capture rows being scrolled out
+                for i in 0..<scrollAmount {
+                    let start = i * cols
+                    let rowCells = Array(cells[start..<(start + cols)])
+                    trimmedRows.append(TrimmedRow(cells: rowCells, isWrapped: lineWrapped[i]))
+                }
+                cells.removeFirst(scrollAmount * cols)
+                lineWrapped.removeFirst(scrollAmount)
+                cells.append(contentsOf:
+                    Array(repeating: Cell.empty, count: scrollAmount * cols))
+                lineWrapped.append(contentsOf:
+                    Array(repeating: false, count: scrollAmount))
+                newCursorRow -= scrollAmount
+            }
+            // Trim to newRows
+            cells = Array(cells.prefix(newRows * cols))
+            lineWrapped = Array(lineWrapped.prefix(newRows))
+        } else if newRows > rows {
+            // Growing: add empty rows at bottom
+            let padRows = newRows - rows
+            cells.append(contentsOf:
+                Array(repeating: Cell.empty, count: padRows * cols))
+            lineWrapped.append(contentsOf:
+                Array(repeating: false, count: padRows))
+        }
+
+        self.rows = newRows
+        self.scrollTop = 0
+        self.scrollBottom = newRows - 1
+
+        return ResizeResult(
+            cursorRow: max(0, min(newRows - 1, newCursorRow)),
+            cursorCol: cursorCol,
+            trimmedRows: trimmedRows
+        )
+    }
+
+    /// Collect logical lines by joining soft-wrapped rows.
+    private func collectLogicalLines() -> [[Cell]] {
+        var logicalLines = [[Cell]]()
+        var currentLine = [Cell]()
+
+        for row in 0..<rows {
+            let offset = row * cols
+            let rowCells = Array(cells[offset..<(offset + cols)])
+
+            if row == 0 || !lineWrapped[row] {
+                // Start of a new logical line
+                if row > 0 {
+                    logicalLines.append(currentLine)
+                }
+                currentLine = trimTrailingEmpty(rowCells)
+            } else {
+                // Continuation (soft wrap) — append to current logical line
+                // Restore to full width before appending
+                let fullPrev = padToWidth(currentLine, width: cols)
+                currentLine = fullPrev + trimTrailingEmpty(rowCells)
+            }
+        }
+        logicalLines.append(currentLine)
+
+        return logicalLines
+    }
+
+    /// Map cursor position (row, col) to logical line index and offset.
+    private func mapCursorToLogical(cursorRow: Int, cursorCol: Int) -> (lineIdx: Int, colInLine: Int) {
+        var logicalIdx = 0
+        var rowInLogical = 0
+
+        for row in 0..<rows {
+            if row > 0 && !lineWrapped[row] {
+                logicalIdx += 1
+                rowInLogical = 0
+            }
+            if row == cursorRow {
+                return (logicalIdx, rowInLogical * cols + cursorCol)
+            }
+            rowInLogical += 1
+        }
+        return (logicalIdx, cursorCol)
+    }
+
+    /// Wrap a logical line of cells into rows of the given width.
+    private func wrapLogicalLine(_ line: [Cell], cols newCols: Int) -> [[Cell]] {
+        if line.isEmpty {
+            return [[]]  // One empty row
+        }
+
+        var result = [[Cell]]()
+        var idx = 0
+
+        while idx < line.count {
+            let end = min(idx + newCols, line.count)
+            let row = Array(line[idx..<end])
+            result.append(row)
+            idx = end
+        }
+
+        if result.isEmpty {
+            result.append([])
+        }
+
+        return result
+    }
+
+    /// Trim trailing empty (space) cells from a row.
+    private func trimTrailingEmpty(_ rowCells: [Cell]) -> [Cell] {
+        var end = rowCells.count
+        while end > 0 && rowCells[end - 1].codepoint == 0x20
+                       && rowCells[end - 1].attributes == .default {
+            end -= 1
+        }
+        return Array(rowCells.prefix(end))
+    }
+
+    /// Pad a cell array to a given width with empty cells.
+    private func padToWidth(_ line: [Cell], width: Int) -> [Cell] {
+        if line.count >= width { return line }
+        return line + Array(repeating: Cell.empty, count: width - line.count)
     }
 
     // MARK: - Row Data

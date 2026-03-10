@@ -39,7 +39,7 @@ final class TerminalModel {
     private var tabStops: Set<Int> = []
 
     /// Callback when a line scrolls off the top of the screen (for scrollback)
-    var onScrollOut: (([Cell]) -> Void)?
+    var onScrollOut: ((_ cells: [Cell], _ isWrapped: Bool) -> Void)?
 
     /// Callback when title changes
     var onTitleChange: ((String) -> Void)?
@@ -124,6 +124,7 @@ final class TerminalModel {
         if cursor.pendingWrap {
             cursor.col = 0
             lineFeed()
+            grid.setWrapped(cursor.row, true)
             cursor.pendingWrap = false
         }
 
@@ -134,6 +135,7 @@ final class TerminalModel {
             if cursor.autoWrapMode {
                 cursor.col = 0
                 lineFeed()
+                grid.setWrapped(cursor.row, true)
             } else {
                 cursor.col = cols - charWidth
             }
@@ -214,7 +216,8 @@ final class TerminalModel {
             // At bottom of scroll region: scroll up
             // Save the line being scrolled out
             let scrolledRow = Array(grid.rowCells(grid.scrollTop))
-            onScrollOut?(scrolledRow)
+            let isWrapped = grid.isWrapped(grid.scrollTop)
+            onScrollOut?(scrolledRow, isWrapped)
             grid.scrollUp(count: 1)
         } else if cursor.row < rows - 1 {
             cursor.row += 1
@@ -742,11 +745,22 @@ final class TerminalModel {
     // MARK: - Resize
 
     func resize(newRows: Int, newCols: Int) {
-        grid.resize(newRows: newRows, newCols: newCols)
-        alternateGrid?.resize(newRows: newRows, newCols: newCols)
+        let result = grid.resize(newRows: newRows, newCols: newCols,
+                                  cursorRow: cursor.row, cursorCol: cursor.col)
+
+        // Save trimmed rows to scrollback before they are lost
+        for trimmed in result.trimmedRows {
+            onScrollOut?(trimmed.cells, trimmed.isWrapped)
+        }
+
+        // Alternate grid doesn't need cursor-aware re-wrap
+        _ = alternateGrid?.resize(newRows: newRows, newCols: newCols,
+                                   cursorRow: 0, cursorCol: 0)
         rows = newRows
         cols = newCols
-        cursor.clamp(rows: newRows, cols: newCols)
+        cursor.row = result.cursorRow
+        cursor.col = result.cursorCol
+        cursor.pendingWrap = false
         initTabStops()
     }
 }

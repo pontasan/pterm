@@ -97,3 +97,11 @@ fragment float4 cursor_fragment(
     alpha = 0.3 + alpha * 0.7;
     return float4(in.fgColor.rgb, alpha * uniforms.cursorOpacity);
 }
+
+// MARK: - Overlay
+
+/// Fragment shader for UI overlays (scrollbar, etc.).
+/// Simple pass-through of foreground color with alpha blending.
+fragment float4 overlay_fragment(VertexOut in [[stage_in]]) {
+    return in.fgColor;
+}

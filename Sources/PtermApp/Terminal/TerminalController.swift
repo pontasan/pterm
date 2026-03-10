@@ -7,15 +7,22 @@ import PtermCore
 /// The PTY read thread writes to the ring buffer and feeds the VT parser.
 /// The main thread reads the model for rendering.
 ///
-/// Thread safety: All access to model, parser, and decoder is serialized
-/// through `lock`. The PTY read thread acquires the lock for the entire
-/// decode+parse operation.
+/// Thread safety: All access to model, parser, decoder, and scrollback
+/// is serialized through `lock`. The PTY read thread acquires the lock
+/// for the entire decode+parse operation.
 final class TerminalController {
     /// Terminal model (grid + cursor + state)
     let model: TerminalModel
 
     /// PTY connection
     let pty: PTY
+
+    /// Scrollback buffer (ring buffer for terminal history)
+    let scrollback: ScrollbackBuffer
+
+    /// Scroll offset: number of lines scrolled back from the bottom.
+    /// 0 = at the bottom (normal operation), >0 = viewing history.
+    private(set) var scrollOffset: Int = 0
 
     /// VT parser (C struct)
     private var parser: VtParser = VtParser()
@@ -43,7 +50,7 @@ final class TerminalController {
     /// Whether this terminal is still alive
     var isAlive: Bool { pty.isRunning }
 
-    /// Lock for thread-safe model/parser/decoder access
+    /// Lock for thread-safe model/parser/decoder/scrollback access
     private let lock = NSLock()
 
     /// Callback when terminal needs redraw
@@ -61,6 +68,7 @@ final class TerminalController {
     init(rows: Int, cols: Int) {
         self.model = TerminalModel(rows: rows, cols: cols)
         self.pty = PTY()
+        self.scrollback = ScrollbackBuffer()
 
         setupParser()
         setupModelCallbacks()
@@ -103,6 +111,17 @@ final class TerminalController {
 
         model.onBell = {
             // TODO: handle bell (visual/audio based on config)
+        }
+
+        // Wire scrollback: when a line scrolls off the top, store it
+        model.onScrollOut = { [weak self] cells, isWrapped in
+            guard let self = self else { return }
+            self.scrollback.appendRow(ArraySlice(cells), isWrapped: isWrapped)
+
+            // If user is scrolled back, increment offset to keep viewport stable
+            if self.scrollOffset > 0 {
+                self.scrollOffset += 1
+            }
         }
     }
 
@@ -183,10 +202,54 @@ final class TerminalController {
 
     func resize(rows: Int, cols: Int) {
         lock.lock()
-        model.resize(newRows: rows, newCols: cols)
+        let oldRows = model.rows
+        let oldCols = model.cols
+        if rows != oldRows || cols != oldCols {
+            model.resize(newRows: rows, newCols: cols)
+        }
         lock.unlock()
 
-        pty.resize(rows: UInt16(rows), cols: UInt16(cols))
+        if rows != oldRows || cols != oldCols {
+            pty.resize(rows: UInt16(rows), cols: UInt16(cols))
+        }
+    }
+
+    // MARK: - Scrollback Navigation
+
+    /// Scroll up (view older content). Returns true if the offset changed.
+    @discardableResult
+    func scrollUp(lines: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let maxOffset = scrollback.rowCount
+        let newOffset = min(maxOffset, scrollOffset + lines)
+        if newOffset != scrollOffset {
+            scrollOffset = newOffset
+            return true
+        }
+        return false
+    }
+
+    /// Scroll down (view newer content). Returns true if the offset changed.
+    @discardableResult
+    func scrollDown(lines: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let newOffset = max(0, scrollOffset - lines)
+        if newOffset != scrollOffset {
+            scrollOffset = newOffset
+            return true
+        }
+        return false
+    }
+
+    /// Scroll to the very bottom (resume normal operation).
+    func scrollToBottom() {
+        lock.lock()
+        scrollOffset = 0
+        lock.unlock()
     }
 
     // MARK: - Thread-Safe Model Access
@@ -196,5 +259,12 @@ final class TerminalController {
         lock.lock()
         defer { lock.unlock() }
         return block(model)
+    }
+
+    /// Execute a block with read access to model, scrollback, and scroll state.
+    func withViewport<T>(_ block: (TerminalModel, ScrollbackBuffer, Int) -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return block(model, scrollback, scrollOffset)
     }
 }

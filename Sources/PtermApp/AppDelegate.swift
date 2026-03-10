@@ -34,32 +34,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         loadShaders()
 
         // Create window
-        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1024, height: 768)
-        let windowRect = NSRect(
-            x: screenFrame.midX - 400,
-            y: screenFrame.midY - 300,
-            width: 800,
-            height: 600
-        )
-
         window = NSWindow(
-            contentRect: windowRect,
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
+        window.center()
         window.title = "pterm"
         window.minSize = NSSize(width: 400, height: 300)
         window.delegate = self
 
-        // Dark appearance
+        // Dark appearance — standard dark mode title bar with visible title text,
+        // matching macOS Terminal.app behavior
         window.appearance = NSAppearance(named: .darkAqua)
         window.backgroundColor = .black
         window.isOpaque = true
-
-        // Title bar styling
-        window.titlebarAppearsTransparent = true
-        window.titleVisibility = .hidden
 
         // Create terminal view
         terminalView = TerminalView(frame: window.contentView!.bounds,
@@ -67,11 +57,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminalView.autoresizingMask = [.width, .height]
         window.contentView!.addSubview(terminalView)
 
-        // Create terminal controller
-        let cols = max(1, Int(terminalView.bounds.width / renderer.glyphAtlas.cellWidth))
-        let rows = max(1, Int(terminalView.bounds.height / renderer.glyphAtlas.cellHeight))
+        // Create terminal controller (account for grid padding)
+        let pad = renderer.gridPadding * 2
+        let cols = max(1, Int((terminalView.bounds.width - pad) / renderer.glyphAtlas.cellWidth))
+        let rows = max(1, Int((terminalView.bounds.height - pad) / renderer.glyphAtlas.cellHeight))
         terminalController = TerminalController(rows: rows, cols: cols)
         terminalView.terminalController = terminalController
+
+        // Update window title to match macOS Terminal format
+        updateWindowTitle()
+
+        terminalController.onTitleChange = { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.updateWindowTitle()
+            }
+        }
 
         // Handle terminal exit
         terminalController.onExit = { [weak self] in
@@ -93,6 +93,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Show window
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(terminalView)
 
@@ -214,6 +216,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alpha = 0.3 + alpha * 0.7;
             return float4(in.fgColor.rgb, alpha * uniforms.cursorOpacity);
         }
+
+        fragment float4 overlay_fragment(VertexOut in [[stage_in]]) {
+            return in.fgColor;
+        }
         """
 
         do {
@@ -299,6 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func applyFontSize(_ newSize: CGFloat) {
         renderer.updateFontSize(newSize)
         terminalView.fontSizeDidChange()
+        updateWindowTitle()
     }
 
     @objc func fontSizeIncrease(_ sender: Any?) {
@@ -315,6 +322,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyFontSize(MetalRenderer.defaultFontSize)
     }
 
+    // MARK: - Window Title
+
+    /// Update the window title to match macOS Terminal format:
+    /// `<shell/process> — <directory> — <cols>×<rows>`
+    private func updateWindowTitle() {
+        guard let controller = terminalController else { return }
+
+        var parts: [String] = []
+
+        // Shell/process name
+        let shellName = ProcessInfo.processInfo.environment["SHELL"]
+            .flatMap { URL(fileURLWithPath: $0).lastPathComponent } ?? "zsh"
+        parts.append(shellName)
+
+        // Title from OSC (typically the current directory or user-set title)
+        let oscTitle = controller.title
+        if !oscTitle.isEmpty && oscTitle != "~" {
+            parts.append(oscTitle)
+        }
+
+        // Dimensions
+        controller.withModel { model in
+            parts.append("\(model.cols)×\(model.rows)")
+        }
+
+        window.title = parts.joined(separator: " — ")
+    }
+
     // MARK: - Actions
 
     @objc func newTerminal(_ sender: Any?) {
@@ -322,7 +357,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func copy(_ sender: Any?) {
-        // TODO: implement copy
+        if let text = terminalView.selectedText() {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+            terminalView.clearSelection()
+        } else {
+            // No selection: send SIGINT (Ctrl+C)
+            terminalController.sendInput("\u{03}")
+        }
     }
 
     @objc func paste(_ sender: Any?) {
@@ -342,7 +385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func selectAll(_ sender: Any?) {
-        // TODO: implement select all
+        terminalView.selectAll()
     }
 
     @objc func performFindPanelAction(_ sender: Any?) {
@@ -354,7 +397,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension AppDelegate: NSWindowDelegate {
     func windowDidResize(_ notification: Notification) {
-        // Terminal view handles resize via autoresizing mask
+        // Terminal view handles resize via autoresizing mask.
+        // Update title to reflect new dimensions.
+        updateWindowTitle()
+    }
+
+    func windowDidChangeScreen(_ notification: Notification) {
+        // Trigger scale factor sync when window moves between displays
+        terminalView?.syncScaleFactorIfNeeded()
+    }
+
+    func windowDidChangeBackingProperties(_ notification: Notification) {
+        // Also handle backing property changes at the window level
+        terminalView?.syncScaleFactorIfNeeded()
     }
 
     func windowWillClose(_ notification: Notification) {

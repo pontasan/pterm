@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import CoreText
 import CoreGraphics
 import Metal
@@ -39,7 +39,7 @@ final class GlyphAtlas {
     private(set) var baseline: CGFloat = 0
 
     /// Scale factor for Retina
-    private let scaleFactor: CGFloat
+    private(set) var scaleFactor: CGFloat
 
     /// Metal device
     private let device: MTLDevice
@@ -49,11 +49,11 @@ final class GlyphAtlas {
         var textureY: Float     // Texture coordinate Y (0..1)
         var textureW: Float     // Texture width (0..1)
         var textureH: Float     // Texture height (0..1)
-        var bearingX: Float     // Horizontal bearing (pixels)
-        var bearingY: Float     // Vertical bearing (pixels)
+        var bearingX: Float     // Horizontal bearing (points)
+        var baselineOffset: Float // Distance from bitmap top to baseline (pixels, integer-snapped)
         var pixelWidth: Int     // Pixel width of glyph image
         var pixelHeight: Int    // Pixel height of glyph image
-        var advance: Float      // Horizontal advance (pixels)
+        var advance: Float      // Horizontal advance (points)
     }
 
     init(device: MTLDevice, fontSize: CGFloat, scaleFactor: CGFloat) {
@@ -61,18 +61,12 @@ final class GlyphAtlas {
         self.scaleFactor = scaleFactor
         self.fontSize = fontSize
 
-        // Create font - SF Mono is the default
-        let preferredName = "SFMono-Regular"
-        if let font = CTFontCreateWithName(preferredName as CFString, fontSize, nil) as CTFont? {
-            self.ctFont = font
-            self.fontName = preferredName
-        } else {
-            // Fallback to Menlo if SF Mono unavailable
-            let fallbackName = "Menlo-Regular"
-            self.ctFont = CTFontCreateWithName(fallbackName as CFString,
-                                                fontSize, nil)
-            self.fontName = fallbackName
-        }
+        // Use the system monospaced font (SF Mono on modern macOS).
+        // CTFontCreateWithName("SFMono-Regular") does NOT work — SF Mono is a
+        // system-protected font and must be accessed through the system API.
+        let systemMono = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+        self.ctFont = systemMono as CTFont
+        self.fontName = CTFontCopyPostScriptName(self.ctFont) as String
 
         calculateCellMetrics()
         createAtlasTexture()
@@ -109,7 +103,9 @@ final class GlyphAtlas {
             mipmapped: false
         )
         descriptor.usage = [.shaderRead]
-        descriptor.storageMode = .managed
+        // Use shared storage on unified memory (Apple Silicon) to avoid
+        // explicit CPU→GPU synchronization. Fall back to managed for discrete GPUs.
+        descriptor.storageMode = device.hasUnifiedMemory ? .shared : .managed
 
         texture = device.makeTexture(descriptor: descriptor)
     }
@@ -122,12 +118,8 @@ final class GlyphAtlas {
             _ = rasterizeGlyph(codepoint: cp)
         }
 
-        // Sync texture to GPU
-        if let texture = texture,
-           let blitEncoder = device.makeCommandQueue()?.makeCommandBuffer()?.makeBlitCommandEncoder() {
-            blitEncoder.synchronize(resource: texture)
-            blitEncoder.endEncoding()
-        }
+        // Sync texture to GPU (only needed for managed storage)
+        syncTextureToGPU()
     }
 
     /// Get glyph info for a codepoint, rasterizing if not cached.
@@ -174,7 +166,7 @@ final class GlyphAtlas {
             // Space or zero-width glyph
             let info = GlyphInfo(
                 textureX: 0, textureY: 0, textureW: 0, textureH: 0,
-                bearingX: 0, bearingY: 0,
+                bearingX: 0, baselineOffset: 0,
                 pixelWidth: 0, pixelHeight: 0,
                 advance: Float(advance.width)
             )
@@ -217,7 +209,10 @@ final class GlyphAtlas {
         // Draw glyph
         context.setFillColor(gray: 1, alpha: 1)
         let drawX = -boundingRect.origin.x + 1.0 / scale
-        let drawY = -boundingRect.origin.y + 1.0 / scale
+        // Snap the baseline to an integer pixel boundary within the bitmap.
+        // Without this, different glyphs have non-integer baseline offsets in
+        // the bitmap, causing ±1px visual misalignment with nearest-neighbor sampling.
+        let drawY = ceil((-boundingRect.origin.y) * scale + 1.0) / scale
 
         var position = CGPoint(x: drawX, y: drawY)
         CTFontDrawGlyphs(runFont, &glyph, &position, 1, context)
@@ -228,13 +223,19 @@ final class GlyphAtlas {
         texture?.replace(region: region, mipmapLevel: 0,
                         withBytes: data, bytesPerRow: pixelW)
 
+        // Baseline offset: distance from the top of the bitmap to the baseline (in pixels).
+        // drawY * scale is the baseline position from the bottom of the bitmap,
+        // which was snapped to an integer pixel above.
+        let baselineFromBottom = ceil((-boundingRect.origin.y) * scale + 1.0)
+        let baselineOffset = Float(pixelH) - Float(baselineFromBottom)
+
         let info = GlyphInfo(
             textureX: Float(packX) / Float(atlasPixelW),
             textureY: Float(packY) / Float(atlasPixelH),
             textureW: Float(pixelW) / Float(atlasPixelW),
             textureH: Float(pixelH) / Float(atlasPixelH),
             bearingX: Float(boundingRect.origin.x),
-            bearingY: Float(boundingRect.origin.y),
+            baselineOffset: baselineOffset,
             pixelWidth: pixelW,
             pixelHeight: pixelH,
             advance: Float(advance.width)
@@ -249,14 +250,41 @@ final class GlyphAtlas {
         return info
     }
 
+    /// Synchronize managed texture from CPU to GPU.
+    /// No-op for shared storage (Apple Silicon unified memory).
+    private func syncTextureToGPU() {
+        guard let texture = texture, texture.storageMode == .managed else { return }
+        guard let queue = device.makeCommandQueue(),
+              let cmdBuf = queue.makeCommandBuffer(),
+              let blit = cmdBuf.makeBlitCommandEncoder() else { return }
+        blit.synchronize(resource: texture)
+        blit.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+    }
+
     // MARK: - Font Change
 
     func updateFont(name: String, size: CGFloat) {
-        if let font = CTFontCreateWithName(name as CFString, size, nil) as CTFont? {
-            self.ctFont = font
-            self.fontName = name
-            self.fontSize = size
-        }
+        // Use system monospaced font API to get SF Mono
+        let font = NSFont.monospacedSystemFont(ofSize: size, weight: .regular) as CTFont
+        self.ctFont = font
+        self.fontName = CTFontCopyPostScriptName(font) as String
+        self.fontSize = size
+
+        rebuildAtlas()
+    }
+
+    /// Update the scale factor (e.g. when moving between Retina and non-Retina displays).
+    func updateScaleFactor(_ newScale: CGFloat) {
+        guard newScale != scaleFactor else { return }
+        // scaleFactor is let, so we need to recreate — use a mutable shadow
+        // Actually, let's make it var
+        self.scaleFactor = newScale
+        rebuildAtlas()
+    }
+
+    private func rebuildAtlas() {
         glyphCache.removeAll()
         packX = 0
         packY = 0

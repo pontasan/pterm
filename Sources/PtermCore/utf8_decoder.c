@@ -3,24 +3,29 @@
 /*
  * DFA-based UTF-8 decoder.
  *
- * State transition table derived from Bjoern Hoehrmann's design.
- * See: http://bjoern.hoehrmann.de/utf-8/decoder/dfa/
+ * Byte classification (12 classes for the transition table):
+ *   class 0:  0x00-0x7F  ASCII
+ *   class 1:  0x80-0x8F  continuation (low)
+ *   class 2:  0xC2-0xDF  2-byte lead
+ *   class 3:  0xE1-0xEC, 0xEE-0xEF  3-byte lead (normal)
+ *   class 5:  0xF1-0xF3  4-byte lead (normal)
+ *   class 6:  0xF4       4-byte lead (high-range constraint)
+ *   class 7:  0xA0-0xBF  continuation (high)
+ *   class 8:  0xC0-0xC1, 0xF5-0xFF  invalid
+ *   class 9:  0x90-0x9F  continuation (mid)
+ *   class 10: 0xE0       3-byte lead (overlong constraint)
+ *   class 11: 0xF0       4-byte lead (overlong constraint)
  *
- * Byte classification:
- *   0x00-0x7F: ASCII (class 0)
- *   0x80-0x8F: continuation (class 1)
- *   0x90-0x9F: continuation (class 9) - also C1 control range
- *   0xA0-0xBF: continuation (class 7)
- *   0xC0-0xC1: invalid overlong (class 8)
- *   0xC2-0xDF: 2-byte lead (class 2)
- *   0xE0:      3-byte lead, special (class 10)
- *   0xE1-0xEC: 3-byte lead (class 3)
- *   0xED:      3-byte lead, special for surrogates (class 4)
- *   0xEE-0xEF: 3-byte lead (class 3)
- *   0xF0:      4-byte lead, special (class 11)
- *   0xF1-0xF3: 4-byte lead (class 5)
- *   0xF4:      4-byte lead, special (class 6)
- *   0xF5-0xFF: invalid (class 8)
+ * DFA states:
+ *    0: ACCEPT  — start/accept state
+ *   12: REJECT  — invalid sequence detected
+ *   24: need 1 more continuation byte (any 0x80-0xBF)
+ *   36: need 2 more continuation bytes (any)
+ *   48: after E0 — need 2 more, first must be 0xA0-0xBF
+ *   60: (unused)
+ *   72: need 3 more continuation bytes (any) — after F1-F3
+ *   84: after F0 — need 3 more, first must be 0x90-0xBF
+ *   96: after F4 — need 3 more, first must be 0x80-0x8F
  */
 
 static const uint8_t utf8_class[256] = {
@@ -43,20 +48,24 @@ static const uint8_t utf8_class[256] = {
 };
 
 /*
- * State transition table.
- * States: 0=accept, 12=reject, 24/36/48/60/72/84/96 = intermediate
- * Index: state + class
+ * State transition table.  Index = state + class.
+ *
+ * Continuation classes 1/7/9 advance toward ACCEPT through the
+ * intermediate state chain; lead/invalid classes trigger REJECT.
+ * Constrained states (48, 84, 96) accept only the valid subset
+ * of continuation bytes for their respective lead bytes.
  */
 static const uint8_t utf8_transition[] = {
-     0,12,24,36,60,72,12,12,12,96,84,12, /* state  0 (accept) */
-    12, 0,12,12,12,12,12, 0,12, 0,12,12, /* state 12 (reject) */
-    12,24,12,12,12,12,12,24,12,24,12,12, /* state 24 */
-    12,36,12,12,12,12,12,36,12,36,12,12, /* state 36 */
-    12,12,12,12,12,12,12,12,12,12,12,12, /* state 48 (unused) */
-    12,36,12,12,12,12,12,36,12,36,12,12, /* state 60 */
-    12,24,12,12,12,12,12,24,12,24,12,12, /* state 72 */
-    12,12,12,12,12,12,12,24,12,24,12,12, /* state 84 */
-    12,24,12,12,12,12,12,12,12,24,12,12, /* state 96 */
+  /* class:  0  1  2  3  4  5  6  7  8  9 10 11 */
+     0,12,24,36,12,72,96,12,12,12,48,84, /* state  0: ACCEPT  */
+    12,12,12,12,12,12,12,12,12,12,12,12, /* state 12: REJECT  */
+    12, 0,12,12,12,12,12, 0,12, 0,12,12, /* state 24: need 1 cont (any 80-BF) */
+    12,24,12,12,12,12,12,24,12,24,12,12, /* state 36: need 2 cont (any) */
+    12,12,12,12,12,12,12,24,12,12,12,12, /* state 48: E0: first must be A0-BF */
+    12,12,12,12,12,12,12,12,12,12,12,12, /* state 60: (unused) */
+    12,36,12,12,12,12,12,36,12,36,12,12, /* state 72: need 3 cont (any) */
+    12,12,12,12,12,12,12,36,12,36,12,12, /* state 84: F0: first must be 90-BF */
+    12,36,12,12,12,12,12,12,12,12,12,12, /* state 96: F4: first must be 80-8F */
 };
 
 void utf8_decoder_init(Utf8Decoder *decoder, bool reject_c1) {
@@ -84,9 +93,29 @@ uint32_t utf8_decoder_feed(Utf8Decoder *decoder, uint8_t byte) {
 
     uint32_t type = utf8_class[byte];
 
+    /* Lead-byte payload mask: extracts the significant bits from the
+     * first byte of a UTF-8 sequence.  A lookup table is used instead
+     * of the (0xFF >> type) trick because class 6 (F4) and class 11 (F0)
+     * need 3 payload bits (mask 0x07) but their class numbers would
+     * produce incorrect shift amounts. */
+    static const uint8_t lead_mask[12] = {
+        0x7F, /* class 0:  ASCII — 7 bits */
+        0x3F, /* class 1:  continuation — not used as lead */
+        0x1F, /* class 2:  C2-DF — 5 bits */
+        0x0F, /* class 3:  E1-EC/EE-EF — 4 bits */
+        0x0F, /* class 4:  (unused) */
+        0x07, /* class 5:  F1-F3 — 3 bits */
+        0x07, /* class 6:  F4 — 3 bits */
+        0x3F, /* class 7:  continuation — not used as lead */
+        0x00, /* class 8:  invalid */
+        0x3F, /* class 9:  continuation — not used as lead */
+        0x0F, /* class 10: E0 — 4 bits */
+        0x07, /* class 11: F0 — 3 bits */
+    };
+
     decoder->codepoint = (decoder->state != UTF8_ACCEPT)
         ? (byte & 0x3Fu) | (decoder->codepoint << 6)
-        : (0xFFu >> type) & byte;
+        : byte & lead_mask[type];
 
     decoder->state = utf8_transition[decoder->state + type];
 
