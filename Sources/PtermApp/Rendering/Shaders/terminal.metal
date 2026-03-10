@@ -1,0 +1,99 @@
+#include <metal_stdlib>
+using namespace metal;
+
+/// Vertex data for a single glyph quad.
+struct VertexIn {
+    float2 position  [[attribute(0)]]; // Screen-space position
+    float2 texCoord  [[attribute(1)]]; // Texture coordinate in glyph atlas
+    float4 fgColor   [[attribute(2)]]; // Foreground color (RGBA)
+    float4 bgColor   [[attribute(3)]]; // Background color (RGBA)
+};
+
+struct VertexOut {
+    float4 position [[position]];
+    float2 texCoord;
+    float4 fgColor;
+    float4 bgColor;
+};
+
+/// Uniforms passed per frame.
+struct Uniforms {
+    float2 viewportSize;
+    float  cursorOpacity; // For smooth cursor fade animation
+    float  time;
+};
+
+// MARK: - Background Vertex/Fragment
+
+/// Vertex shader for cell backgrounds.
+vertex VertexOut bg_vertex(
+    uint vertexID [[vertex_id]],
+    constant VertexIn *vertices [[buffer(0)]],
+    constant Uniforms &uniforms [[buffer(1)]]
+) {
+    VertexOut out;
+    VertexIn in = vertices[vertexID];
+
+    // Convert pixel coordinates to Metal NDC (-1..1)
+    float2 ndc = (in.position / uniforms.viewportSize) * 2.0 - 1.0;
+    ndc.y = -ndc.y; // Flip Y (Metal has origin at bottom-left)
+
+    out.position = float4(ndc, 0.0, 1.0);
+    out.texCoord = in.texCoord;
+    out.fgColor = in.fgColor;
+    out.bgColor = in.bgColor;
+    return out;
+}
+
+/// Fragment shader for cell backgrounds.
+fragment float4 bg_fragment(VertexOut in [[stage_in]]) {
+    return in.bgColor;
+}
+
+// MARK: - Glyph Vertex/Fragment
+
+/// Vertex shader for glyph rendering.
+vertex VertexOut glyph_vertex(
+    uint vertexID [[vertex_id]],
+    constant VertexIn *vertices [[buffer(0)]],
+    constant Uniforms &uniforms [[buffer(1)]]
+) {
+    VertexOut out;
+    VertexIn in = vertices[vertexID];
+
+    float2 ndc = (in.position / uniforms.viewportSize) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+
+    out.position = float4(ndc, 0.0, 1.0);
+    out.texCoord = in.texCoord;
+    out.fgColor = in.fgColor;
+    out.bgColor = in.bgColor;
+    return out;
+}
+
+/// Fragment shader for glyph rendering.
+/// Samples from the glyph atlas texture and applies foreground color.
+fragment float4 glyph_fragment(
+    VertexOut in [[stage_in]],
+    texture2d<float> atlas [[texture(0)]],
+    sampler atlasSampler [[sampler(0)]]
+) {
+    float4 texColor = atlas.sample(atlasSampler, in.texCoord);
+    // The atlas stores grayscale glyphs: use alpha channel for coverage
+    float coverage = texColor.r; // Monochrome glyph
+    return float4(in.fgColor.rgb, coverage * in.fgColor.a);
+}
+
+// MARK: - Cursor
+
+/// Fragment shader for block cursor with smooth fade.
+fragment float4 cursor_fragment(
+    VertexOut in [[stage_in]],
+    constant Uniforms &uniforms [[buffer(1)]]
+) {
+    // Smooth fade using sine wave for gentle blinking
+    float alpha = 0.5 + 0.5 * sin(uniforms.time * 2.5);
+    // Clamp to never fully disappear (keep minimum visibility)
+    alpha = 0.3 + alpha * 0.7;
+    return float4(in.fgColor.rgb, alpha * uniforms.cursorOpacity);
+}

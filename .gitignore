@@ -1,0 +1,35 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# App bundle (build artifact)
+*.app
+
+# Metal compiled shaders
+*.air
+*.metallib
+
+# Distribution artifacts
+*.zip
+*.dmg
+
+# IDE
+.vscode/
+.idea/
+
+# Environment / secrets
+.env
+*.pem
+*.p12
+credentials.json
