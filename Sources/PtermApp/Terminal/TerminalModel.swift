@@ -7,6 +7,11 @@ import PtermCore
 /// to update the terminal display. This is the bridge between the C VT parser
 /// and the Swift rendering layer.
 final class TerminalModel {
+    private enum DesignatedCharacterSet {
+        case ascii
+        case decSpecialGraphics
+    }
+
     /// Active screen grid
     private(set) var grid: TerminalGrid
 
@@ -37,6 +42,11 @@ final class TerminalModel {
 
     /// Tab stops
     private var tabStops: Set<Int> = []
+
+    /// G0/G1 character set designations and the currently invoked set.
+    private var g0Charset: DesignatedCharacterSet = .ascii
+    private var g1Charset: DesignatedCharacterSet = .ascii
+    private var activeCharsetIsG1 = false
 
     /// Callback when a line scrolls off the top of the screen (for scrollback)
     var onScrollOut: ((_ cells: [Cell], _ isWrapped: Bool) -> Void)?
@@ -117,7 +127,8 @@ final class TerminalModel {
     // MARK: - Print
 
     private func handlePrint(_ codepoint: UInt32) {
-        let width = CharacterWidth.width(of: codepoint)
+        let translatedCodepoint = translateCharacterSet(codepoint)
+        let width = CharacterWidth.width(of: translatedCodepoint)
         guard width >= 0 else { return } // Non-printable
 
         // Handle pending wrap
@@ -143,7 +154,7 @@ final class TerminalModel {
 
         // Write the cell
         let cell = Cell(
-            codepoint: codepoint,
+            codepoint: translatedCodepoint,
             attributes: cursor.attributes,
             width: UInt8(charWidth),
             isWideContinuation: false
@@ -199,10 +210,10 @@ final class TerminalModel {
             cursor.pendingWrap = false
 
         case 0x0E: // SO (Shift Out) - G1 character set
-            break // TODO: character set switching
+            activeCharsetIsG1 = true
 
         case 0x0F: // SI (Shift In) - G0 character set
-            break // TODO: character set switching
+            activeCharsetIsG1 = false
 
         default:
             break
@@ -628,7 +639,7 @@ final class TerminalModel {
                intermediate == UInt8(ascii: ")") ||
                intermediate == UInt8(ascii: "*") ||
                intermediate == UInt8(ascii: "+") {
-                // TODO: G0/G1/G2/G3 character set designation
+                designateCharacterSet(intermediate: intermediate, finalByte: finalByte)
                 return
             }
 
@@ -739,7 +750,73 @@ final class TerminalModel {
         mouseReporting = .none
         isAlternateScreen = false
         alternateGrid = nil
+        g0Charset = .ascii
+        g1Charset = .ascii
+        activeCharsetIsG1 = false
         initTabStops()
+    }
+
+    private func designateCharacterSet(intermediate: UInt8, finalByte: UInt32) {
+        let charset: DesignatedCharacterSet
+        switch finalByte {
+        case 0x30: // "0" = DEC Special Graphics
+            charset = .decSpecialGraphics
+        case 0x42: // "B" = US ASCII
+            charset = .ascii
+        default:
+            return
+        }
+
+        switch intermediate {
+        case UInt8(ascii: "("):
+            g0Charset = charset
+        case UInt8(ascii: ")"):
+            g1Charset = charset
+        default:
+            return
+        }
+    }
+
+    private func translateCharacterSet(_ codepoint: UInt32) -> UInt32 {
+        let charset = activeCharsetIsG1 ? g1Charset : g0Charset
+        guard charset == .decSpecialGraphics else { return codepoint }
+
+        switch codepoint {
+        case 0x5F: return 0x00A0 // no-break space
+        case 0x60: return 0x25C6 // black diamond
+        case 0x61: return 0x2592 // medium shade
+        case 0x62: return 0x2409 // symbol for horizontal tab
+        case 0x63: return 0x240C // symbol for form feed
+        case 0x64: return 0x240D // symbol for carriage return
+        case 0x65: return 0x240A // symbol for line feed
+        case 0x66: return 0x00B0 // degree sign
+        case 0x67: return 0x00B1 // plus-minus sign
+        case 0x68: return 0x2424 // symbol for newline
+        case 0x69: return 0x240B // symbol for vertical tab
+        case 0x6A: return 0x2518 // box drawings light up and left
+        case 0x6B: return 0x2510 // box drawings light down and left
+        case 0x6C: return 0x250C // box drawings light down and right
+        case 0x6D: return 0x2514 // box drawings light up and right
+        case 0x6E: return 0x253C // box drawings light vertical and horizontal
+        case 0x6F: return 0x23BA // horizontal scan line 1
+        case 0x70: return 0x23BB // horizontal scan line 3
+        case 0x71: return 0x2500 // box drawings light horizontal
+        case 0x72: return 0x23BC // horizontal scan line 7
+        case 0x73: return 0x23BD // horizontal scan line 9
+        case 0x74: return 0x251C // box drawings light vertical and right
+        case 0x75: return 0x2524 // box drawings light vertical and left
+        case 0x76: return 0x2534 // box drawings light up and horizontal
+        case 0x77: return 0x252C // box drawings light down and horizontal
+        case 0x78: return 0x2502 // box drawings light vertical
+        case 0x79: return 0x2264 // less-than or equal to
+        case 0x7A: return 0x2265 // greater-than or equal to
+        case 0x7B: return 0x03C0 // pi
+        case 0x7C: return 0x2260 // not equal to
+        case 0x7D: return 0x00A3 // pound sign
+        case 0x7E: return 0x00B7 // middle dot
+        default:
+            return codepoint
+        }
     }
 
     // MARK: - Resize

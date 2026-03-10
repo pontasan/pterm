@@ -22,7 +22,11 @@ final class TerminalView: MTKView {
     var onBackToIntegrated: (() -> Void)?
 
     /// Current text selection (nil = no selection)
-    private(set) var selection: TerminalSelection?
+    private(set) var selection: TerminalSelection? {
+        didSet {
+            setNeedsDisplay(bounds)
+        }
+    }
 
     /// Click count tracker for double/triple click detection
     private var clickCount: Int = 0
@@ -57,6 +61,41 @@ final class TerminalView: MTKView {
     }
 
     override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.contains(.command) else {
+            return super.performKeyEquivalent(with: event)
+        }
+
+        if event.keyCode == 53 {
+            onBackToIntegrated?()
+            return true
+        }
+
+        guard let characters = event.charactersIgnoringModifiers?.lowercased() else {
+            return super.performKeyEquivalent(with: event)
+        }
+
+        let action: Selector?
+        switch characters {
+        case "c":
+            action = #selector(AppDelegate.copy(_:))
+        case "v":
+            action = #selector(AppDelegate.paste(_:))
+        case "a":
+            action = #selector(AppDelegate.selectAll(_:))
+        default:
+            action = nil
+        }
+
+        guard let action else {
+            return super.performKeyEquivalent(with: event)
+        }
+
+        return NSApp.sendAction(action, to: nil, from: self)
+    }
 
     // MARK: - Multi-Display Support
 
@@ -192,8 +231,9 @@ final class TerminalView: MTKView {
         } else {
             // Start new selection
             let mode: SelectionMode = event.modifierFlags.contains(.option) ? .rectangular : .normal
-            selection = TerminalSelection(anchor: pos, active: pos, mode: mode)
-            selection?.isDragging = true
+            var newSelection = TerminalSelection(anchor: pos, active: pos, mode: mode)
+            newSelection.isDragging = true
+            selection = newSelection
         }
     }
 
@@ -314,6 +354,13 @@ final class TerminalView: MTKView {
         let cols = max(1, Int((bounds.width - pad) / cellW))
         let rows = max(1, Int((bounds.height - pad) / cellH))
 
+        let currentSize = controller.withModel { model in
+            (rows: model.rows, cols: model.cols)
+        }
+        guard currentSize.rows != rows || currentSize.cols != cols else {
+            return
+        }
+
         controller.resize(rows: rows, cols: cols)
 
         // Clear selection on resize (grid coordinates change)
@@ -424,8 +471,11 @@ final class TerminalScrollView: NSScrollView {
     /// The MTKView must always fill exactly the viewport — it renders
     /// the virtual scroll position, not a physical offset.
     private func pinTerminalViewToViewport() {
-        terminalView.frame = NSRect(origin: contentView.bounds.origin,
-                                     size: contentView.bounds.size)
+        let targetFrame = NSRect(origin: contentView.bounds.origin,
+                                 size: contentView.bounds.size)
+        if terminalView.frame != targetFrame {
+            terminalView.frame = targetFrame
+        }
     }
 
     // MARK: - Scroller Sync
@@ -525,4 +575,36 @@ final class TerminalScrollView: NSScrollView {
 /// Flipped document view so NSScrollView's origin is at the top.
 private final class FlippedDocumentView: NSView {
     override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if let terminalView = subviews.first(where: { $0 is TerminalView }),
+           terminalView.frame.contains(point) {
+            return terminalView
+        }
+        return super.hitTest(point)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let terminalView = subviews.first(where: { $0 is TerminalView }) as? TerminalView else {
+            super.mouseDown(with: event)
+            return
+        }
+        terminalView.mouseDown(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let terminalView = subviews.first(where: { $0 is TerminalView }) as? TerminalView else {
+            super.mouseDragged(with: event)
+            return
+        }
+        terminalView.mouseDragged(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let terminalView = subviews.first(where: { $0 is TerminalView }) as? TerminalView else {
+            super.mouseUp(with: event)
+            return
+        }
+        terminalView.mouseUp(with: event)
+    }
 }

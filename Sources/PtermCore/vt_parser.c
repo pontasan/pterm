@@ -61,24 +61,30 @@ static void parser_collect(VtParser *parser, uint8_t byte) {
 static void parser_param_add(VtParser *parser, uint8_t byte) {
     if (byte == ';') {
         /* Move to next parameter */
+        if (parser->param_count == 0) {
+            parser->param_count = 1;
+        }
         if (parser->param_count < VT_PARSER_MAX_PARAMS) {
             parser->param_count++;
         }
     } else if (byte == ':') {
         /* Sub-parameter separator */
         parser->param_has_sub = true;
+        if (parser->param_count == 0) {
+            parser->param_count = 1;
+        }
         if (parser->param_count < VT_PARSER_MAX_PARAMS) {
             parser->param_count++;
         }
     } else if (byte >= '0' && byte <= '9') {
         /* Accumulate digit */
-        uint32_t idx = parser->param_count;
-        if (idx >= VT_PARSER_MAX_PARAMS) return;
-
         /* Ensure param_count reflects at least one parameter */
-        if (parser->param_count == 0 && idx == 0) {
+        if (parser->param_count == 0) {
             parser->param_count = 1;
         }
+
+        uint32_t idx = parser->param_count - 1;
+        if (idx >= VT_PARSER_MAX_PARAMS) return;
 
         int32_t val = parser->params[idx];
         /* Clamp BEFORE multiplication to prevent signed integer overflow (UB) */

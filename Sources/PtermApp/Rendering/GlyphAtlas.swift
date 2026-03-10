@@ -61,11 +61,8 @@ final class GlyphAtlas {
         self.scaleFactor = scaleFactor
         self.fontSize = fontSize
 
-        // Use the system monospaced font (SF Mono on modern macOS).
-        // CTFontCreateWithName("SFMono-Regular") does NOT work — SF Mono is a
-        // system-protected font and must be accessed through the system API.
-        let systemMono = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
-        self.ctFont = systemMono as CTFont
+        let defaultFont = Self.makeTerminalFont(size: fontSize)
+        self.ctFont = defaultFont
         self.fontName = CTFontCopyPostScriptName(self.ctFont) as String
 
         calculateCellMetrics()
@@ -266,8 +263,7 @@ final class GlyphAtlas {
     // MARK: - Font Change
 
     func updateFont(name: String, size: CGFloat) {
-        // Use system monospaced font API to get SF Mono
-        let font = NSFont.monospacedSystemFont(ofSize: size, weight: .regular) as CTFont
+        let font = Self.makeTerminalFont(name: name, size: size)
         self.ctFont = font
         self.fontName = CTFontCopyPostScriptName(font) as String
         self.fontSize = size
@@ -292,5 +288,18 @@ final class GlyphAtlas {
         calculateCellMetrics()
         createAtlasTexture()
         prerasterizeASCII()
+    }
+
+    private static func makeTerminalFont(name: String? = nil, size: CGFloat) -> CTFont {
+        if let name,
+           let font = NSFont(name: name, size: size) {
+            return font as CTFont
+        }
+
+        if let menlo = NSFont(name: "Menlo-Regular", size: size) {
+            return menlo as CTFont
+        }
+
+        return NSFont.monospacedSystemFont(ofSize: size, weight: .regular) as CTFont
     }
 }

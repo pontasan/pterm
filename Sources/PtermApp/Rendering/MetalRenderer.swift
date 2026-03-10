@@ -372,8 +372,14 @@ final class MetalRenderer {
                     fgColor = cell.attributes.background.resolve(isForeground: false)
                     bgColor = cell.attributes.foreground.resolve(isForeground: true)
                 } else {
-                    fgColor = cell.attributes.foreground.resolve(isForeground: true)
+                    fgColor = resolveForegroundColor(for: cell)
                     bgColor = cell.attributes.background.resolve(isForeground: false)
+                }
+
+                if cell.attributes.hidden {
+                    fgColor = bgColor
+                } else if cell.attributes.dim {
+                    fgColor = (fgColor.r * 0.66, fgColor.g * 0.66, fgColor.b * 0.66)
                 }
 
                 // Background quad (skip if default black to save draw calls, but always draw for selected cells)
@@ -384,12 +390,20 @@ final class MetalRenderer {
                            bg: (bgColor.r, bgColor.g, bgColor.b, 1))
                 }
 
-                // Glyph
-                if cell.codepoint > 0x20, // Skip spaces
+                // Block/quadrant elements render more faithfully as geometry.
+                if renderBlockElementIfNeeded(
+                    codepoint: cell.codepoint,
+                    x: x, y: y, w: w, h: h,
+                    color: fgColor
+                ) {
+                    // no-op
+                } else if cell.codepoint > 0x20, // Skip spaces
                    let glyph = glyphAtlas.glyphInfo(for: cell.codepoint),
                    glyph.pixelWidth > 0 {
 
-                    let glyphX = x + Float(glyph.bearingX) * scaleFactor
+                    let glyphAdvance = max(0, glyph.advance * scaleFactor)
+                    let centeredOffset = max(0, (w - glyphAdvance) * 0.5)
+                    let glyphX = x + centeredOffset + Float(glyph.bearingX) * scaleFactor
                     // Position glyph so its baseline (at baselineOffset pixels from
                     // the bitmap top) aligns with the cell's baseline screen position.
                     let baselineScreenY = y + cellH - Float(glyphAtlas.baseline) * scaleFactor
@@ -403,6 +417,34 @@ final class MetalRenderer {
                            tw: glyph.textureW, th: glyph.textureH,
                            fg: (fgColor.r, fgColor.g, fgColor.b, 1),
                            bg: (0, 0, 0, 0))
+
+                    if cell.attributes.bold {
+                        let boldOffset = max(1.0, scaleFactor) * 0.5
+                        addQuad(to: &glyphVertices,
+                               x: glyphX + boldOffset, y: glyphY, w: glyphW, h: glyphH,
+                               tx: glyph.textureX, ty: glyph.textureY,
+                               tw: glyph.textureW, th: glyph.textureH,
+                               fg: (fgColor.r, fgColor.g, fgColor.b, 1),
+                               bg: (0, 0, 0, 0))
+                    }
+                }
+
+                if cell.attributes.underline {
+                    let underlineThickness = max(1.0, scaleFactor)
+                    let underlineY = y + h - underlineThickness
+                    addQuad(to: &overlayVertices, x: x, y: underlineY, w: w, h: underlineThickness,
+                           tx: 0, ty: 0, tw: 0, th: 0,
+                           fg: (fgColor.r, fgColor.g, fgColor.b, 1),
+                           bg: (fgColor.r, fgColor.g, fgColor.b, 1))
+                }
+
+                if cell.attributes.strikethrough {
+                    let strikeThickness = max(1.0, scaleFactor)
+                    let strikeY = y + (h * 0.5) - (strikeThickness * 0.5)
+                    addQuad(to: &overlayVertices, x: x, y: strikeY, w: w, h: strikeThickness,
+                           tx: 0, ty: 0, tw: 0, th: 0,
+                           fg: (fgColor.r, fgColor.g, fgColor.b, 1),
+                           bg: (fgColor.r, fgColor.g, fgColor.b, 1))
                 }
             }
         }
@@ -418,6 +460,90 @@ final class MetalRenderer {
         }
 
         // Scrollbar is handled by NSScroller overlay in TerminalView
+    }
+
+    private func resolveForegroundColor(for cell: Cell) -> (r: Float, g: Float, b: Float) {
+        if cell.attributes.bold,
+           case .indexed(let idx) = cell.attributes.foreground,
+           idx < 8 {
+            return TerminalColor.indexed(idx + 8).resolve(isForeground: true)
+        }
+
+        return cell.attributes.foreground.resolve(isForeground: true)
+    }
+
+    @discardableResult
+    private func renderBlockElementIfNeeded(
+        codepoint: UInt32,
+        x: Float,
+        y: Float,
+        w: Float,
+        h: Float,
+        color: (r: Float, g: Float, b: Float)
+    ) -> Bool {
+        let rects = blockElementRects(for: codepoint, width: w, height: h)
+        guard !rects.isEmpty else { return false }
+
+        for rect in rects {
+            addQuad(to: &overlayVertices,
+                   x: x + rect.x, y: y + rect.y, w: rect.w, h: rect.h,
+                   tx: 0, ty: 0, tw: 0, th: 0,
+                   fg: (color.r, color.g, color.b, 1),
+                   bg: (color.r, color.g, color.b, 1))
+        }
+        return true
+    }
+
+    private func blockElementRects(
+        for codepoint: UInt32,
+        width: Float,
+        height: Float
+    ) -> [(x: Float, y: Float, w: Float, h: Float)] {
+        let halfW = width * 0.5
+        let halfH = height * 0.5
+        let quarterH = max(1.0, height * 0.25)
+        let eighthW = max(1.0, width * 0.125)
+
+        switch codepoint {
+        case 0x2580:
+            return [(0, 0, width, halfH)]
+        case 0x2581:
+            return [(0, height - quarterH, width, quarterH)]
+        case 0x2584:
+            return [(0, halfH, width, halfH)]
+        case 0x2588:
+            return [(0, 0, width, height)]
+        case 0x258C:
+            return [(0, 0, halfW, height)]
+        case 0x258F:
+            return [(0, 0, eighthW, height)]
+        case 0x2590:
+            return [(halfW, 0, halfW, height)]
+        case 0x2595:
+            return [(width - eighthW, 0, eighthW, height)]
+        case 0x2596:
+            return [(0, halfH, halfW, halfH)]
+        case 0x2597:
+            return [(halfW, halfH, halfW, halfH)]
+        case 0x2598:
+            return [(0, 0, halfW, halfH)]
+        case 0x2599:
+            return [(0, 0, halfW, halfH), (0, halfH, width, halfH)]
+        case 0x259A:
+            return [(0, 0, halfW, halfH), (halfW, halfH, halfW, halfH)]
+        case 0x259B:
+            return [(0, 0, width, halfH), (0, halfH, halfW, halfH)]
+        case 0x259C:
+            return [(0, 0, width, halfH), (halfW, halfH, halfW, halfH)]
+        case 0x259D:
+            return [(halfW, 0, halfW, halfH)]
+        case 0x259E:
+            return [(halfW, 0, halfW, halfH), (0, halfH, halfW, halfH)]
+        case 0x259F:
+            return [(halfW, 0, halfW, halfH), (0, halfH, width, halfH)]
+        default:
+            return []
+        }
     }
 
     /// Add a quad (2 triangles = 6 vertices) to the vertex array.
