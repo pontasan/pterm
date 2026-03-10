@@ -57,6 +57,9 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var markedTextSelection = NSRange(location: NSNotFound, length: 0)
     private var pendingTextInputHandled = false
 
+    /// URL hover state for Cmd+mouseover visual feedback
+    private var hoveredLinkRange: (row: Int, startCol: Int, endCol: Int)?
+
     // MARK: - Initialization
 
     init(frame: NSRect, renderer: MetalRenderer) {
@@ -260,11 +263,55 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     override func flagsChanged(with event: NSEvent) {
-        // Handle modifier key changes if needed
+        updateLinkHover(with: event)
     }
 
     override func mouseMoved(with event: NSEvent) {
-        _ = sendMouseEventIfNeeded(event, phase: .moved)
+        if !sendMouseEventIfNeeded(event, phase: .moved) {
+            updateLinkHover(with: event)
+        }
+    }
+
+    private func updateLinkHover(with event: NSEvent) {
+        let commandHeld = event.modifierFlags.contains(.command)
+        guard commandHeld,
+              let controller = terminalController,
+              let position = gridPosition(from: event),
+              controller.detectedLink(at: position) != nil else {
+            if hoveredLinkRange != nil {
+                hoveredLinkRange = nil
+                NSCursor.arrow.set()
+                setNeedsDisplay(bounds)
+            }
+            return
+        }
+
+        // Find the column range of the link text in this row by scanning cells
+        var bestStart = position.col
+        var bestEnd = position.col
+        controller.withViewport { model, _, _ in
+            // Scan backwards to find link start
+            for c in stride(from: position.col, through: 0, by: -1) {
+                let cell = model.grid.cell(at: position.row, col: c)
+                if cell.codepoint <= 0x20 { break }
+                bestStart = c
+            }
+            // Scan forwards to find link end
+            for c in (position.col + 1)..<model.cols {
+                let cell = model.grid.cell(at: position.row, col: c)
+                if cell.codepoint <= 0x20 { break }
+                bestEnd = c
+            }
+        }
+
+        let newRange = (row: position.row, startCol: bestStart, endCol: bestEnd)
+        if hoveredLinkRange?.row != newRange.row ||
+           hoveredLinkRange?.startCol != newRange.startCol ||
+           hoveredLinkRange?.endCol != newRange.endCol {
+            hoveredLinkRange = newRange
+            NSCursor.pointingHand.set()
+            setNeedsDisplay(bounds)
+        }
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -827,9 +874,16 @@ extension TerminalView: MTKViewDelegate {
         guard let renderer = renderer,
               let controller = terminalController else { return }
 
+        let highlight: MetalRenderer.SearchHighlight? = searchMatches.isEmpty ? nil :
+            MetalRenderer.SearchHighlight(matches: searchMatches, currentIndex: currentSearchIndex)
+        let linkUL: MetalRenderer.LinkUnderline? = hoveredLinkRange.map {
+            MetalRenderer.LinkUnderline(row: $0.row, startCol: $0.startCol, endCol: $0.endCol)
+        }
+
         controller.withViewport { model, scrollback, scrollOffset in
             renderer.render(model: model, scrollback: scrollback,
-                          scrollOffset: scrollOffset, selection: selection, in: view)
+                          scrollOffset: scrollOffset, selection: selection,
+                          searchHighlight: highlight, linkUnderline: linkUL, in: view)
         }
 
         // Keep the native scroller in sync every frame

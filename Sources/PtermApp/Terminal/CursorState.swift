@@ -1,5 +1,12 @@
 import Foundation
 
+/// DECSCUSR cursor shapes.
+enum CursorShape {
+    case block
+    case underline
+    case bar
+}
+
 /// Cursor position and state in the terminal.
 struct CursorState {
     /// Row position (0-based from top of active screen)
@@ -10,6 +17,12 @@ struct CursorState {
 
     /// Whether the cursor is visible
     var visible: Bool = true
+
+    /// Cursor shape (DECSCUSR)
+    var shape: CursorShape = .block
+
+    /// Whether the cursor blinks (DECSCUSR)
+    var blinking: Bool = true
 
     /// Current attributes applied to new characters
     var attributes: CellAttributes = .default
@@ -31,6 +44,8 @@ struct CursorState {
         var attributes: CellAttributes
         var originMode: Bool
         var autoWrapMode: Bool
+        var shape: CursorShape
+        var blinking: Bool
     }
 
     var savedState: SavedState?
@@ -42,7 +57,9 @@ struct CursorState {
             col: col,
             attributes: attributes,
             originMode: originMode,
-            autoWrapMode: autoWrapMode
+            autoWrapMode: autoWrapMode,
+            shape: shape,
+            blinking: blinking
         )
     }
 
@@ -54,6 +71,8 @@ struct CursorState {
         attributes = saved.attributes
         originMode = saved.originMode
         autoWrapMode = saved.autoWrapMode
+        shape = saved.shape
+        blinking = saved.blinking
         pendingWrap = false
     }
 

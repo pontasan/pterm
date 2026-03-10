@@ -20,6 +20,7 @@ struct VertexOut {
 struct Uniforms {
     float2 viewportSize;
     float  cursorOpacity; // For smooth cursor fade animation
+    float  cursorBlink;   // 1.0 = blinking, 0.0 = steady
     float  time;
 };
 
@@ -86,15 +87,20 @@ fragment float4 glyph_fragment(
 
 // MARK: - Cursor
 
-/// Fragment shader for block cursor with smooth fade.
+/// Fragment shader for cursor with optional smooth blink.
 fragment float4 cursor_fragment(
     VertexOut in [[stage_in]],
     constant Uniforms &uniforms [[buffer(1)]]
 ) {
-    // Smooth fade using sine wave for gentle blinking
-    float alpha = 0.5 + 0.5 * sin(uniforms.time * 2.5);
-    // Clamp to never fully disappear (keep minimum visibility)
-    alpha = 0.3 + alpha * 0.7;
+    float alpha;
+    if (uniforms.cursorBlink > 0.5) {
+        // Smooth fade using sine wave for gentle blinking
+        alpha = 0.5 + 0.5 * sin(uniforms.time * 2.5);
+        // Clamp to never fully disappear (keep minimum visibility)
+        alpha = 0.3 + alpha * 0.7;
+    } else {
+        alpha = 1.0;
+    }
     return float4(in.fgColor.rgb, alpha * uniforms.cursorOpacity);
 }
 

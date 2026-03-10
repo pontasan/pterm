@@ -405,6 +405,21 @@ final class TerminalModel {
             cursor.col = 0
             cursor.pendingWrap = false
 
+        case 0x71: // DECSCUSR (Set Cursor Style) — CSI Ps SP q
+            if parser.pointee.intermediate_count == 1 &&
+               parser.pointee.intermediates.0 == 0x20 {
+                let ps = Int(vt_parser_param(parser, 0, 0))
+                switch ps {
+                case 0, 1: cursor.shape = .block;     cursor.blinking = true
+                case 2:    cursor.shape = .block;     cursor.blinking = false
+                case 3:    cursor.shape = .underline;  cursor.blinking = true
+                case 4:    cursor.shape = .underline;  cursor.blinking = false
+                case 5:    cursor.shape = .bar;        cursor.blinking = true
+                case 6:    cursor.shape = .bar;        cursor.blinking = false
+                default:   break
+                }
+            }
+
         case 0x74: // Window manipulation
             handleWindowManipulation(parser: parser)
 

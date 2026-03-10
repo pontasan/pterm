@@ -68,6 +68,7 @@ final class MetalRenderer {
     struct MetalUniforms {
         var viewportSize: SIMD2<Float> = .zero
         var cursorOpacity: Float = 1.0
+        var cursorBlink: Float = 1.0
         var time: Float = 0.0
     }
 
@@ -232,8 +233,24 @@ final class MetalRenderer {
     /// Build vertex data from terminal model and render.
     /// When scrollOffset > 0, mixes scrollback rows with active grid rows
     /// to show historical content (virtualized: only visible rows are processed).
+    /// Search match info for rendering highlights.
+    struct SearchHighlight {
+        let matches: [TerminalController.SearchMatch]
+        let currentIndex: Int?
+    }
+
+    /// Link hover underline range (view-relative row, startCol, endCol).
+    struct LinkUnderline {
+        let row: Int
+        let startCol: Int
+        let endCol: Int
+    }
+
     func render(model: TerminalModel, scrollback: ScrollbackBuffer,
-                scrollOffset: Int, selection: TerminalSelection?, in view: MTKView) {
+                scrollOffset: Int, selection: TerminalSelection?,
+                searchHighlight: SearchHighlight? = nil,
+                linkUnderline: LinkUnderline? = nil,
+                in view: MTKView) {
         guard let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor,
               let commandBuffer = commandQueue.makeCommandBuffer() else {
@@ -247,6 +264,7 @@ final class MetalRenderer {
         uniforms.viewportSize = viewportSize
         uniforms.time = Float(CACurrentMediaTime() - startTime)
         uniforms.cursorOpacity = (scrollOffset == 0 && model.cursor.visible) ? 1.0 : 0.0
+        uniforms.cursorBlink = model.cursor.blinking ? 1.0 : 0.0
 
         // Clear color: black background
         renderPassDescriptor.colorAttachments[0].clearColor =
@@ -255,7 +273,8 @@ final class MetalRenderer {
         // Build vertex data using the atlas's scale factor.
         let sf = Float(glyphAtlas.scaleFactor)
         buildVertexData(model: model, scrollback: scrollback, scrollOffset: scrollOffset,
-                        selection: selection, scaleFactor: sf)
+                        selection: selection, searchHighlight: searchHighlight,
+                        linkUnderline: linkUnderline, scaleFactor: sf)
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(
             descriptor: renderPassDescriptor) else {
@@ -291,6 +310,7 @@ final class MetalRenderer {
             encoder.setRenderPipelineState(pipeline)
             encoder.setVertexBuffer(buf, offset: 0, index: 0)
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0,
                                   vertexCount: cursorVertices.count / floatsPerVertex)
         }
@@ -314,6 +334,8 @@ final class MetalRenderer {
 
     private func buildVertexData(model: TerminalModel, scrollback: ScrollbackBuffer,
                                   scrollOffset: Int, selection: TerminalSelection?,
+                                  searchHighlight: SearchHighlight? = nil,
+                                  linkUnderline: LinkUnderline? = nil,
                                   scaleFactor: Float) {
         bgVertices.removeAll(keepingCapacity: true)
         glyphVertices.removeAll(keepingCapacity: true)
@@ -344,11 +366,24 @@ final class MetalRenderer {
 
         let firstAbsolute = scrollOffset > 0 ? max(0, sbCount - scrollOffset) : sbCount
 
+        // Build search match lookup: absoluteRow -> [(startCol, endCol, isCurrent)]
+        var searchMatchesByRow: [Int: [(start: Int, end: Int, isCurrent: Bool)]] = [:]
+        if let sh = searchHighlight {
+            for (i, match) in sh.matches.enumerated() {
+                let isCurrent = sh.currentIndex == i
+                searchMatchesByRow[match.absoluteRow, default: []].append(
+                    (start: match.startCol, end: match.endCol, isCurrent: isCurrent))
+            }
+        }
+
         for row in 0..<viewRows {
             let absoluteRow = firstAbsolute + row
             let isScrollbackRow = absoluteRow < sbCount
             let scrollbackRow = isScrollbackRow ? scrollbackRowCache[absoluteRow] : nil
             let gridRow = isScrollbackRow ? -1 : absoluteRow - sbCount
+
+            // Pre-check which columns in this row have search highlights
+            let rowMatches = searchMatchesByRow[absoluteRow]
 
             for col in 0..<viewCols {
                 let cell: Cell
@@ -372,6 +407,17 @@ final class MetalRenderer {
 
                 let isSelected = selection?.contains(row: row, col: col) ?? false
 
+                // Check if this cell is in a search match
+                var searchMatchType: Int = 0 // 0=none, 1=match, 2=current match
+                if let matches = rowMatches {
+                    for m in matches {
+                        if col >= m.start && col <= m.end {
+                            searchMatchType = m.isCurrent ? 2 : 1
+                            break
+                        }
+                    }
+                }
+
                 if cell.attributes.inverse != isSelected {
                     // Inverse XOR selected: swap fg/bg
                     fgColor = cell.attributes.background.resolve(isForeground: false)
@@ -381,14 +427,25 @@ final class MetalRenderer {
                     bgColor = cell.attributes.background.resolve(isForeground: false)
                 }
 
+                // Apply search match highlight
+                if searchMatchType == 2 {
+                    // Current match: bright orange background, dark foreground
+                    bgColor = (0.90, 0.60, 0.10)
+                    fgColor = (0.0, 0.0, 0.0)
+                } else if searchMatchType == 1 {
+                    // Other matches: dim yellow background
+                    bgColor = (0.55, 0.45, 0.10)
+                    fgColor = (0.0, 0.0, 0.0)
+                }
+
                 if cell.attributes.hidden {
                     fgColor = bgColor
-                } else if cell.attributes.dim {
+                } else if cell.attributes.dim && searchMatchType == 0 {
                     fgColor = (fgColor.r * 0.66, fgColor.g * 0.66, fgColor.b * 0.66)
                 }
 
-                // Background quad (skip if default black to save draw calls, but always draw for selected cells)
-                if isSelected || bgColor.r > 0.001 || bgColor.g > 0.001 || bgColor.b > 0.001 {
+                // Background quad (skip if default black to save draw calls, but always draw for selected/highlighted cells)
+                if isSelected || searchMatchType > 0 || bgColor.r > 0.001 || bgColor.g > 0.001 || bgColor.b > 0.001 {
                     addQuad(to: &bgVertices, x: x, y: y, w: w, h: h,
                            tx: 0, ty: 0, tw: 0, th: 0,
                            fg: (bgColor.r, bgColor.g, bgColor.b, 1),
@@ -451,6 +508,18 @@ final class MetalRenderer {
                            fg: (fgColor.r, fgColor.g, fgColor.b, 1),
                            bg: (fgColor.r, fgColor.g, fgColor.b, 1))
                 }
+
+                // URL hover underline
+                if let link = linkUnderline,
+                   row == link.row && col >= link.startCol && col <= link.endCol {
+                    let underlineThickness = max(1.0, scaleFactor)
+                    let underlineY = y + h - underlineThickness
+                    // Blue underline for link hover
+                    addQuad(to: &overlayVertices, x: x, y: underlineY, w: w, h: underlineThickness,
+                           tx: 0, ty: 0, tw: 0, th: 0,
+                           fg: (0.4, 0.6, 1.0, 1.0),
+                           bg: (0.4, 0.6, 1.0, 1.0))
+                }
             }
         }
 
@@ -458,10 +527,26 @@ final class MetalRenderer {
         if scrollOffset == 0 && model.cursor.visible {
             let cx = padX + Float(model.cursor.col) * cellW
             let cy = padY + Float(model.cursor.row) * cellH
-            addQuad(to: &cursorVertices, x: cx, y: cy, w: cellW, h: cellH,
-                   tx: 0, ty: 0, tw: 0, th: 0,
-                   fg: (0.8, 0.8, 0.8, 1),
-                   bg: (0.8, 0.8, 0.8, 1))
+            let cursorColor: (Float, Float, Float, Float) = (0.8, 0.8, 0.8, 1)
+
+            switch model.cursor.shape {
+            case .block:
+                addQuad(to: &cursorVertices, x: cx, y: cy, w: cellW, h: cellH,
+                       tx: 0, ty: 0, tw: 0, th: 0,
+                       fg: cursorColor, bg: cursorColor)
+            case .underline:
+                let thickness = max(1.0, scaleFactor * 2.0)
+                addQuad(to: &cursorVertices, x: cx, y: cy + cellH - thickness,
+                       w: cellW, h: thickness,
+                       tx: 0, ty: 0, tw: 0, th: 0,
+                       fg: cursorColor, bg: cursorColor)
+            case .bar:
+                let thickness = max(1.0, scaleFactor * 2.0)
+                addQuad(to: &cursorVertices, x: cx, y: cy,
+                       w: thickness, h: cellH,
+                       tx: 0, ty: 0, tw: 0, th: 0,
+                       fg: cursorColor, bg: cursorColor)
+            }
         }
 
         // Scrollbar is handled by NSScroller overlay in TerminalView
