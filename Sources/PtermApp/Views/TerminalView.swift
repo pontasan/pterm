@@ -5,6 +5,7 @@ import MetalKit
 ///
 /// Handles keyboard input, mouse events (text selection), scroll wheel
 /// for scrollback navigation, and delegates rendering to the MetalRenderer.
+/// Wrapped inside a TerminalScrollView for native macOS scrollbar behavior.
 final class TerminalView: MTKView {
     /// Terminal controller for this view
     var terminalController: TerminalController? {
@@ -16,6 +17,9 @@ final class TerminalView: MTKView {
 
     /// Keyboard handler
     private var keyboardHandler: KeyboardHandler?
+
+    /// Callback when user requests to go back to integrated view (Cmd+Escape)
+    var onBackToIntegrated: (() -> Void)?
 
     /// Current text selection (nil = no selection)
     private(set) var selection: TerminalSelection?
@@ -119,6 +123,12 @@ final class TerminalView: MTKView {
     // MARK: - Keyboard Input
 
     override func keyDown(with event: NSEvent) {
+        // Cmd+Escape: back to integrated view
+        if event.modifierFlags.contains(.command) && event.keyCode == 53 {
+            onBackToIntegrated?()
+            return
+        }
+
         if event.modifierFlags.contains(.command) {
             super.keyDown(with: event)
             return
@@ -214,6 +224,15 @@ final class TerminalView: MTKView {
     }
 
     override func scrollWheel(with event: NSEvent) {
+        // When inside a TerminalScrollView, forward to NSScrollView
+        // so it handles scrolling natively (shows overlay scroller, momentum, etc.).
+        // The scrollViewDidScroll notification translates clip position → scrollOffset.
+        if enclosingScrollView is TerminalScrollView {
+            super.scrollWheel(with: event)
+            return
+        }
+
+        // Direct handling when not inside a scroll view (standalone mode)
         guard let controller = terminalController,
               let renderer = renderer else { return }
 
@@ -221,8 +240,6 @@ final class TerminalView: MTKView {
         guard cellH > 0 else { return }
 
         if event.hasPreciseScrollingDeltas {
-            // Trackpad: smooth scrolling with pixel-level deltas.
-            // Positive deltaY = scroll up (view older content).
             scrollAccumulator += event.scrollingDeltaY
 
             let lines = Int(scrollAccumulator / cellH)
@@ -235,7 +252,6 @@ final class TerminalView: MTKView {
                 }
             }
         } else {
-            // Mouse wheel: discrete steps. Each notch scrolls 3 lines.
             let lines = 3
             if event.scrollingDeltaY > 0 {
                 controller.scrollUp(lines: lines)
@@ -325,5 +341,188 @@ extension TerminalView: MTKViewDelegate {
             renderer.render(model: model, scrollback: scrollback,
                           scrollOffset: scrollOffset, selection: selection, in: view)
         }
+
+        // Keep the native scroller in sync every frame
+        (enclosingScrollView as? TerminalScrollView)?.syncScroller()
     }
+}
+
+// MARK: - TerminalScrollView
+
+/// NSScrollView wrapper that provides native macOS scrollbar behavior
+/// for the terminal's virtual scrollback.
+///
+/// The scroll view doesn't actually scroll the MTKView — instead it
+/// syncs the native NSScroller position with TerminalController's
+/// scrollOffset, giving the user standard macOS scrollbar interaction
+/// (drag, hover-expand, click-in-track) over virtual content.
+///
+/// IMPORTANT: The terminal view's frame is managed explicitly (no
+/// autoresizingMask) to prevent deadlocks. Changing the document view's
+/// frame height (to reflect scrollback size) must not trigger a resize
+/// cascade that tries to re-acquire the TerminalController lock.
+final class TerminalScrollView: NSScrollView {
+    /// The terminal view inside this scroll view.
+    private(set) var terminalView: TerminalView!
+
+    /// Guard against feedback loops during programmatic scroller updates.
+    private var isSyncing = false
+
+    init(frame: NSRect, renderer: MetalRenderer) {
+        super.init(frame: frame)
+
+        // Configure scroll view for overlay-style scrollbar
+        self.hasVerticalScroller = true
+        self.hasHorizontalScroller = false
+        self.autohidesScrollers = true
+        self.scrollerStyle = .overlay
+        self.verticalScroller?.knobStyle = .light
+        self.drawsBackground = false
+        self.borderType = .noBorder
+        self.scrollerInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+
+        // Create the flipped container (NSScrollView needs a flipped documentView)
+        let container = FlippedDocumentView(frame: NSRect(origin: .zero, size: frame.size))
+        self.documentView = container
+
+        // Create the terminal MTKView.
+        // NO autoresizingMask — we manage its frame explicitly to prevent
+        // resize cascades when the document view height changes for scrollbar sync.
+        terminalView = TerminalView(frame: NSRect(origin: .zero, size: frame.size),
+                                     renderer: renderer)
+        container.addSubview(terminalView)
+
+        // Observe scroll events from the native scroller (for knob drag)
+        self.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(scrollViewDidScroll(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: self.contentView
+        )
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) not implemented")
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    // MARK: - Layout
+
+    override func resizeSubviews(withOldSize oldSize: NSSize) {
+        super.resizeSubviews(withOldSize: oldSize)
+        // Update document view width to match, keep height as-is (managed by syncScroller)
+        documentView?.frame.size.width = bounds.width
+        pinTerminalViewToViewport()
+    }
+
+    /// Keep the terminal MTKView pinned to the visible area.
+    /// The MTKView must always fill exactly the viewport — it renders
+    /// the virtual scroll position, not a physical offset.
+    private func pinTerminalViewToViewport() {
+        terminalView.frame = NSRect(origin: contentView.bounds.origin,
+                                     size: contentView.bounds.size)
+    }
+
+    // MARK: - Scroller Sync
+
+    /// Sync the native scroller position with the terminal's virtual scroll state.
+    /// Called every frame from TerminalView's draw(in:).
+    ///
+    /// Handles two directions:
+    /// 1. Programmatic → UI: when scrollOffset changes (auto-scroll on output,
+    ///    keyboard scrollToBottom), update the clip view position.
+    /// 2. Document height: when scrollback grows, update document view height
+    ///    so the scroller knob proportion reflects total content.
+    ///
+    /// CRITICAL: All reads from TerminalController happen first (under lock),
+    /// then the lock is released BEFORE any UI mutation. This prevents deadlocks
+    /// caused by layout cascades (docView resize → terminalView resize →
+    /// updateTerminalSize → controller.resize → lock).
+    func syncScroller() {
+        guard let controller = terminalView.terminalController,
+              let renderer = terminalView.renderer else { return }
+
+        let cellH = renderer.glyphAtlas.cellHeight
+        guard cellH > 0 else { return }
+
+        // Step 1: Read scroll state under lock — NO UI mutation here.
+        let (sbCount, viewRows, scrollOffset) = controller.withViewport { model, scrollback, offset in
+            (scrollback.rowCount, model.rows, offset)
+        }
+        // Lock is now released.
+
+        let totalRows = sbCount + viewRows
+        let viewportHeight = self.bounds.height
+        let documentHeight = max(viewportHeight, CGFloat(totalRows) * cellH)
+
+        // Step 2: All UI mutations under isSyncing to block re-entrant notifications.
+        isSyncing = true
+        defer { isSyncing = false }
+
+        let docView = self.documentView!
+        if abs(docView.frame.height - documentHeight) > 1 {
+            docView.frame = NSRect(x: 0, y: 0, width: self.bounds.width, height: documentHeight)
+            self.reflectScrolledClipView(self.contentView)
+        }
+
+        // Map scrollOffset to clipView position.
+        // scrollOffset 0 = bottom → clipView origin.y = maxY
+        // scrollOffset == sbCount = top → clipView origin.y = 0
+        let maxY = documentHeight - viewportHeight
+        let targetY: CGFloat
+        if sbCount > 0 {
+            targetY = maxY * CGFloat(sbCount - scrollOffset) / CGFloat(sbCount)
+        } else {
+            targetY = maxY
+        }
+
+        // Use cellH tolerance to avoid fighting with NSScrollView's native
+        // scroll positioning (which differs by sub-line pixel amounts).
+        let currentY = self.contentView.bounds.origin.y
+        if abs(currentY - targetY) > cellH {
+            self.contentView.setBoundsOrigin(NSPoint(x: 0, y: targetY))
+            self.reflectScrolledClipView(self.contentView)
+        }
+
+        pinTerminalViewToViewport()
+    }
+
+    /// Handle user-initiated scrolling (scroll wheel, trackpad, knob drag).
+    /// NSScrollView moves the clip view natively; we translate that position
+    /// back to a scrollOffset for the terminal's virtual scrollback.
+    @objc private func scrollViewDidScroll(_ notification: Notification) {
+        guard !isSyncing else { return }
+        guard let controller = terminalView.terminalController else { return }
+
+        let viewportHeight = bounds.height
+        let documentHeight = documentView?.frame.height ?? viewportHeight
+        let maxY = documentHeight - viewportHeight
+        guard maxY > 0 else { return }
+
+        let currentY = contentView.bounds.origin.y
+        let fraction = currentY / maxY  // 0 = top, 1 = bottom
+
+        let sbCount = controller.withViewport { _, scrollback, _ in scrollback.rowCount }
+        let newOffset = sbCount - Int(fraction * CGFloat(sbCount))
+        controller.setScrollOffset(newOffset)
+
+        pinTerminalViewToViewport()
+    }
+
+    // MARK: - First Responder
+
+    override var acceptsFirstResponder: Bool { true }
+    override func becomeFirstResponder() -> Bool {
+        return window?.makeFirstResponder(terminalView) ?? false
+    }
+}
+
+/// Flipped document view so NSScrollView's origin is at the top.
+private final class FlippedDocumentView: NSView {
+    override var isFlipped: Bool { true }
 }

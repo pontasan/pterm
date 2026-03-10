@@ -245,6 +245,14 @@ final class TerminalController {
         return false
     }
 
+    /// Set the scroll offset to an absolute value (used by NSScroller drag).
+    func setScrollOffset(_ offset: Int) {
+        lock.lock()
+        let maxOffset = scrollback.rowCount
+        scrollOffset = max(0, min(maxOffset, offset))
+        lock.unlock()
+    }
+
     /// Scroll to the very bottom (resume normal operation).
     func scrollToBottom() {
         lock.lock()

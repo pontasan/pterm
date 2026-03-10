@@ -4,19 +4,37 @@ import MetalKit
 /// Application delegate for pterm.
 ///
 /// Manages the single application window, terminal lifecycle,
+/// view switching between integrated view and focused view,
 /// and top-level keyboard shortcuts.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The single application window
     private var window: NSWindow!
 
-    /// Metal renderer
+    /// Metal renderer (shared by all views)
     private var renderer: MetalRenderer!
 
-    /// Terminal view
-    private var terminalView: TerminalView!
+    /// Terminal manager (manages all terminal sessions)
+    private var manager: TerminalManager!
 
-    /// Active terminal controller
-    private var terminalController: TerminalController!
+    /// Integrated view (grid of terminal thumbnails)
+    private var integratedView: IntegratedView?
+
+    /// Focused terminal scroll view (wraps TerminalView with native scrollbar)
+    private var terminalScrollView: TerminalScrollView?
+
+    /// Focused terminal view (single terminal occupying the window)
+    private var terminalView: TerminalView?
+
+    /// Currently focused terminal controller (nil = integrated view mode)
+    private var focusedController: TerminalController?
+
+    /// View mode
+    private enum ViewMode {
+        case integrated
+        case focused(TerminalController)
+    }
+
+    private var viewMode: ViewMode = .integrated
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Ensure ~/.pterm/ directories exist
@@ -44,6 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.title = "pterm"
         window.minSize = NSSize(width: 400, height: 300)
         window.delegate = self
+        window.isRestorable = false // Disable macOS state restoration
 
         // Dark appearance — standard dark mode title bar with visible title text,
         // matching macOS Terminal.app behavior
@@ -51,52 +70,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.backgroundColor = .black
         window.isOpaque = true
 
-        // Create terminal view
-        terminalView = TerminalView(frame: window.contentView!.bounds,
-                                     renderer: renderer)
-        terminalView.autoresizingMask = [.width, .height]
-        window.contentView!.addSubview(terminalView)
-
-        // Create terminal controller (account for grid padding)
+        // Create terminal manager with initial grid size
         let pad = renderer.gridPadding * 2
-        let cols = max(1, Int((terminalView.bounds.width - pad) / renderer.glyphAtlas.cellWidth))
-        let rows = max(1, Int((terminalView.bounds.height - pad) / renderer.glyphAtlas.cellHeight))
-        terminalController = TerminalController(rows: rows, cols: cols)
-        terminalView.terminalController = terminalController
+        let contentBounds = window.contentView!.bounds
+        let cols = max(1, Int((contentBounds.width - pad) / renderer.glyphAtlas.cellWidth))
+        let rows = max(1, Int((contentBounds.height - pad) / renderer.glyphAtlas.cellHeight))
+        manager = TerminalManager(rows: rows, cols: cols)
 
-        // Update window title to match macOS Terminal format
-        updateWindowTitle()
-
-        terminalController.onTitleChange = { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.updateWindowTitle()
+        // Create integrated view
+        let iv = IntegratedView(frame: contentBounds, renderer: renderer, manager: manager)
+        iv.autoresizingMask = [.width, .height]
+        iv.onSelectTerminal = { [weak self] controller in
+            self?.switchToFocused(controller)
+        }
+        iv.onAddTerminal = { [weak self] in
+            self?.addNewTerminal()
+        }
+        iv.onMultiSelect = { [weak self] controllers in
+            // TODO: split view for multi-select
+            // For now, focus the first selected terminal
+            if let first = controllers.first {
+                self?.switchToFocused(first)
             }
         }
+        integratedView = iv
+        window.contentView!.addSubview(iv)
 
-        // Handle terminal exit
-        terminalController.onExit = { [weak self] in
-            // For now, close the app when the single terminal exits
-            NSApplication.shared.terminate(nil)
+        // React to terminal list changes
+        manager.onListChanged = { [weak self] in
+            self?.handleTerminalListChanged()
         }
 
-        // Start the terminal
-        do {
-            try terminalController.start()
-        } catch {
-            let alert = NSAlert()
-            alert.messageText = "ターミナルの起動に失敗しました"
-            alert.informativeText = "\(error)"
-            alert.alertStyle = .critical
-            alert.runModal()
-            NSApplication.shared.terminate(nil)
-            return
-        }
+        // Create the first terminal
+        addNewTerminal()
 
         // Show window
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
-        window.makeFirstResponder(terminalView)
+        window.makeFirstResponder(integratedView)
 
         // Setup menu
         setupMenu()
@@ -107,11 +119,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        // Confirm exit if terminals are running
-        if terminalController?.isAlive == true {
+        let aliveCount = manager.terminals.filter { $0.isAlive }.count
+        if aliveCount > 0 {
             let alert = NSAlert()
             alert.messageText = "ptermを終了しますか？"
-            alert.informativeText = "動作中のターミナルが1つあります。"
+            alert.informativeText = "動作中のターミナルが\(aliveCount)つあります。"
             alert.alertStyle = .warning
             alert.addButton(withTitle: "終了")
             alert.addButton(withTitle: "キャンセル")
@@ -122,8 +134,110 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        terminalController?.stop()
+        manager.stopAll()
         return .terminateNow
+    }
+
+    // MARK: - Terminal Management
+
+    @discardableResult
+    private func addNewTerminal() -> TerminalController? {
+        do {
+            let controller = try manager.addTerminal()
+
+            controller.onTitleChange = { [weak self] _ in
+                DispatchQueue.main.async {
+                    self?.updateWindowTitle()
+                }
+            }
+
+            return controller
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "ターミナルの起動に失敗しました"
+            alert.informativeText = "\(error)"
+            alert.alertStyle = .critical
+            alert.runModal()
+            return nil
+        }
+    }
+
+    private func handleTerminalListChanged() {
+        // If all terminals are gone, close the app
+        if manager.count == 0 {
+            NSApplication.shared.terminate(nil)
+            return
+        }
+
+        // If the focused terminal was removed, switch back to integrated view
+        if case .focused(let controller) = viewMode {
+            if !manager.terminals.contains(where: { $0 === controller }) {
+                switchToIntegrated()
+            }
+        }
+
+        updateWindowTitle()
+    }
+
+    // MARK: - View Switching
+
+    private func switchToFocused(_ controller: TerminalController) {
+        // Remove integrated view
+        integratedView?.removeFromSuperview()
+
+        // Create focused terminal view wrapped in scroll view
+        let sv = TerminalScrollView(frame: window.contentView!.bounds, renderer: renderer)
+        sv.autoresizingMask = [.width, .height]
+        sv.terminalView.terminalController = controller
+        sv.terminalView.onBackToIntegrated = { [weak self] in
+            self?.switchToIntegrated()
+        }
+        window.contentView!.addSubview(sv)
+        terminalScrollView = sv
+        terminalView = sv.terminalView
+        focusedController = controller
+
+        viewMode = .focused(controller)
+        window.makeFirstResponder(sv.terminalView)
+
+        updateWindowTitle()
+    }
+
+    private func switchToIntegrated() {
+        // Remove focused terminal scroll view
+        terminalScrollView?.removeFromSuperview()
+        terminalScrollView = nil
+        terminalView = nil
+        focusedController = nil
+
+        // Show integrated view
+        let iv: IntegratedView
+        if let existing = integratedView {
+            iv = existing
+        } else {
+            iv = IntegratedView(frame: window.contentView!.bounds,
+                                renderer: renderer, manager: manager)
+            iv.autoresizingMask = [.width, .height]
+            iv.onSelectTerminal = { [weak self] controller in
+                self?.switchToFocused(controller)
+            }
+            iv.onAddTerminal = { [weak self] in
+                self?.addNewTerminal()
+            }
+            iv.onMultiSelect = { [weak self] controllers in
+                if let first = controllers.first {
+                    self?.switchToFocused(first)
+                }
+            }
+            integratedView = iv
+        }
+
+        iv.frame = window.contentView!.bounds
+        window.contentView!.addSubview(iv)
+        viewMode = .integrated
+        window.makeFirstResponder(iv)
+
+        updateWindowTitle()
     }
 
     // MARK: - Metal Shaders
@@ -263,7 +377,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         keyEquivalent: "f")
         editMenuItem.submenu = editMenu
 
-        // View menu (font size control)
+        // View menu (font size control + view switching)
         let viewMenuItem = NSMenuItem()
         mainMenu.addItem(viewMenuItem)
         let viewMenu = NSMenu(title: "表示")
@@ -287,6 +401,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         action: #selector(fontSizeReset(_:)),
                         keyEquivalent: "0")
 
+        viewMenu.addItem(NSMenuItem.separator())
+
+        // Cmd+Escape: back to integrated view
+        let backItem = NSMenuItem(title: "統合ビューに戻る",
+                                   action: #selector(backToIntegratedView(_:)),
+                                   keyEquivalent: "\u{1B}") // Escape
+        backItem.keyEquivalentModifierMask = .command
+        viewMenu.addItem(backItem)
+
         viewMenuItem.submenu = viewMenu
 
         // Shell menu
@@ -304,7 +427,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func applyFontSize(_ newSize: CGFloat) {
         renderer.updateFontSize(newSize)
-        terminalView.fontSizeDidChange()
+        terminalView?.fontSizeDidChange()
         updateWindowTitle()
     }
 
@@ -324,68 +447,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Window Title
 
-    /// Update the window title to match macOS Terminal format:
-    /// `<shell/process> — <directory> — <cols>×<rows>`
+    /// Update the window title based on current view mode.
     private func updateWindowTitle() {
-        guard let controller = terminalController else { return }
+        switch viewMode {
+        case .integrated:
+            let count = manager.count
+            window.title = "pterm — \(count)個のターミナル"
 
-        var parts: [String] = []
+        case .focused(let controller):
+            var parts: [String] = []
 
-        // Shell/process name
-        let shellName = ProcessInfo.processInfo.environment["SHELL"]
-            .flatMap { URL(fileURLWithPath: $0).lastPathComponent } ?? "zsh"
-        parts.append(shellName)
+            let shellName = ProcessInfo.processInfo.environment["SHELL"]
+                .flatMap { URL(fileURLWithPath: $0).lastPathComponent } ?? "zsh"
+            parts.append(shellName)
 
-        // Title from OSC (typically the current directory or user-set title)
-        let oscTitle = controller.title
-        if !oscTitle.isEmpty && oscTitle != "~" {
-            parts.append(oscTitle)
+            let oscTitle = controller.title
+            if !oscTitle.isEmpty && oscTitle != "~" {
+                parts.append(oscTitle)
+            }
+
+            controller.withModel { model in
+                parts.append("\(model.cols)×\(model.rows)")
+            }
+
+            window.title = parts.joined(separator: " — ")
         }
-
-        // Dimensions
-        controller.withModel { model in
-            parts.append("\(model.cols)×\(model.rows)")
-        }
-
-        window.title = parts.joined(separator: " — ")
     }
 
     // MARK: - Actions
 
     @objc func newTerminal(_ sender: Any?) {
-        // TODO: implement multi-terminal in Phase 4
+        addNewTerminal()
+        // If in focused mode, switch to integrated to see the new terminal
+        if case .focused = viewMode {
+            switchToIntegrated()
+        }
+    }
+
+    @objc func backToIntegratedView(_ sender: Any?) {
+        if case .focused = viewMode {
+            switchToIntegrated()
+        }
     }
 
     @objc func copy(_ sender: Any?) {
-        if let text = terminalView.selectedText() {
+        guard case .focused(let controller) = viewMode else { return }
+
+        if let text = terminalView?.selectedText() {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.setString(text, forType: .string)
-            terminalView.clearSelection()
+            terminalView?.clearSelection()
         } else {
             // No selection: send SIGINT (Ctrl+C)
-            terminalController.sendInput("\u{03}")
+            controller.sendInput("\u{03}")
         }
     }
 
     @objc func paste(_ sender: Any?) {
+        guard case .focused(let controller) = viewMode else { return }
+
         let pasteboard = NSPasteboard.general
         guard let text = pasteboard.string(forType: .string) else { return }
 
-        if terminalController.model.bracketedPasteMode {
-            // Sanitize: strip the bracketed paste end sequence from pasted content
-            // to prevent premature termination and command injection
+        if controller.model.bracketedPasteMode {
             let sanitized = text.replacingOccurrences(of: "\u{1B}[201~", with: "")
-            terminalController.sendInput("\u{1B}[200~")
-            terminalController.sendInput(sanitized)
-            terminalController.sendInput("\u{1B}[201~")
+            controller.sendInput("\u{1B}[200~")
+            controller.sendInput(sanitized)
+            controller.sendInput("\u{1B}[201~")
         } else {
-            terminalController.sendInput(text)
+            controller.sendInput(text)
         }
     }
 
     @objc func selectAll(_ sender: Any?) {
-        terminalView.selectAll()
+        terminalView?.selectAll()
     }
 
     @objc func performFindPanelAction(_ sender: Any?) {
@@ -397,22 +533,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension AppDelegate: NSWindowDelegate {
     func windowDidResize(_ notification: Notification) {
-        // Terminal view handles resize via autoresizing mask.
-        // Update title to reflect new dimensions.
+        // Update full-size grid dimensions for all terminals
+        let pad = renderer.gridPadding * 2
+        let contentBounds = window.contentView!.bounds
+        let cols = max(1, Int((contentBounds.width - pad) / renderer.glyphAtlas.cellWidth))
+        let rows = max(1, Int((contentBounds.height - pad) / renderer.glyphAtlas.cellHeight))
+        manager.updateFullSize(rows: rows, cols: cols)
         updateWindowTitle()
     }
 
     func windowDidChangeScreen(_ notification: Notification) {
-        // Trigger scale factor sync when window moves between displays
         terminalView?.syncScaleFactorIfNeeded()
     }
 
     func windowDidChangeBackingProperties(_ notification: Notification) {
-        // Also handle backing property changes at the window level
         terminalView?.syncScaleFactorIfNeeded()
     }
 
     func windowWillClose(_ notification: Notification) {
-        terminalController?.stop()
+        manager?.stopAll()
     }
 }

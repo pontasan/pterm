@@ -17,26 +17,32 @@ final class MetalRenderer {
     /// Metal device
     let device: MTLDevice
 
-    /// Command queue
-    private let commandQueue: MTLCommandQueue
+    /// Command queue (accessible for IntegratedView)
+    let commandQueue: MTLCommandQueue
 
     /// Render pipeline for cell backgrounds
-    private var bgPipeline: MTLRenderPipelineState?
+    private(set) var bgPipeline: MTLRenderPipelineState?
 
     /// Render pipeline for glyphs
-    private var glyphPipeline: MTLRenderPipelineState?
+    private(set) var glyphPipeline: MTLRenderPipelineState?
 
     /// Render pipeline for cursor
-    private var cursorPipeline: MTLRenderPipelineState?
+    private(set) var cursorPipeline: MTLRenderPipelineState?
 
     /// Render pipeline for overlay (scrollbar, etc.)
-    private var overlayPipeline: MTLRenderPipelineState?
+    private(set) var overlayPipeline: MTLRenderPipelineState?
 
     /// Glyph atlas
     let glyphAtlas: GlyphAtlas
 
-    /// Sampler state for glyph texture
+    /// Sampler state for glyph texture (nearest-neighbor for full-size)
     private var sampler: MTLSamplerState?
+
+    /// Sampler state for thumbnails (linear filtering for scaled-down rendering)
+    private var thumbnailSampler: MTLSamplerState?
+
+    /// Public accessor for sampler (used by IntegratedView)
+    var samplerState: MTLSamplerState? { sampler }
 
     /// Vertex data for current frame
     private var bgVertices: [Float] = []
@@ -185,6 +191,17 @@ final class MetalRenderer {
         desc.sAddressMode = .clampToEdge
         desc.tAddressMode = .clampToEdge
         sampler = device.makeSamplerState(descriptor: desc)
+
+        // Linear filtering for thumbnail rendering where glyphs are
+        // scaled down by the GPU. Bilinear interpolation produces
+        // smoother, more readable text at reduced sizes.
+        let thumbDesc = MTLSamplerDescriptor()
+        thumbDesc.minFilter = .linear
+        thumbDesc.magFilter = .linear
+        thumbDesc.mipFilter = .notMipmapped
+        thumbDesc.sAddressMode = .clampToEdge
+        thumbDesc.tAddressMode = .clampToEdge
+        thumbnailSampler = device.makeSamplerState(descriptor: thumbDesc)
     }
 
     // MARK: - Vertex Buffer Management
@@ -400,51 +417,7 @@ final class MetalRenderer {
                    bg: (0.8, 0.8, 0.8, 1))
         }
 
-        // Scrollbar
-        let totalRows = sbCount + viewRows
-        if sbCount > 0 {
-            buildScrollbar(totalRows: totalRows, viewRows: viewRows,
-                          scrollOffset: scrollOffset, scaleFactor: scaleFactor)
-        }
-    }
-
-    /// Build scrollbar overlay vertices.
-    private func buildScrollbar(totalRows: Int, viewRows: Int,
-                                 scrollOffset: Int, scaleFactor: Float) {
-        let scrollbarWidth: Float = 6.0 * scaleFactor  // 6pt wide
-        let scrollbarMargin: Float = 2.0 * scaleFactor // 2pt from edge
-        let scrollbarX = viewportSize.x - scrollbarWidth - scrollbarMargin
-        let viewportHeight = viewportSize.y
-
-        // Thumb size proportional to viewport/total content ratio
-        let thumbFraction = Float(viewRows) / Float(totalRows)
-        let minThumbHeight: Float = 20.0 * scaleFactor
-        let thumbHeight = max(minThumbHeight, viewportHeight * thumbFraction)
-
-        // Thumb position: 0 = bottom, maxOffset = top
-        let maxOffset = totalRows - viewRows
-        let scrollFraction: Float
-        if maxOffset > 0 {
-            scrollFraction = 1.0 - Float(scrollOffset) / Float(maxOffset)
-        } else {
-            scrollFraction = 1.0
-        }
-        let thumbY = (viewportHeight - thumbHeight) * scrollFraction
-
-        // Scrollbar track (very subtle)
-        addQuad(to: &overlayVertices,
-               x: scrollbarX, y: 0, w: scrollbarWidth, h: viewportHeight,
-               tx: 0, ty: 0, tw: 0, th: 0,
-               fg: (1.0, 1.0, 1.0, 0.05),
-               bg: (0, 0, 0, 0))
-
-        // Scrollbar thumb
-        let thumbAlpha: Float = scrollOffset > 0 ? 0.5 : 0.2
-        addQuad(to: &overlayVertices,
-               x: scrollbarX, y: thumbY, w: scrollbarWidth, h: thumbHeight,
-               tx: 0, ty: 0, tw: 0, th: 0,
-               fg: (0.7, 0.7, 0.7, thumbAlpha),
-               bg: (0, 0, 0, 0))
+        // Scrollbar is handled by NSScroller overlay in TerminalView
     }
 
     /// Add a quad (2 triangles = 6 vertices) to the vertex array.
@@ -461,5 +434,194 @@ final class MetalRenderer {
         vertices.append(contentsOf: [x + w, y,     tx + tw, ty,      fg.r, fg.g, fg.b, fg.a, bg.r, bg.g, bg.b, bg.a])
         vertices.append(contentsOf: [x + w, y + h, tx + tw, ty + th, fg.r, fg.g, fg.b, fg.a, bg.r, bg.g, bg.b, bg.a])
         vertices.append(contentsOf: [x,     y + h, tx,      ty + th, fg.r, fg.g, fg.b, fg.a, bg.r, bg.g, bg.b, bg.a])
+    }
+
+    // MARK: - Public API for IntegratedView
+
+    /// Public quad builder (same as addQuad, accessible by IntegratedView).
+    func addQuadPublic(to vertices: inout [Float],
+                       x: Float, y: Float, w: Float, h: Float,
+                       tx: Float, ty: Float, tw: Float, th: Float,
+                       fg: (r: Float, g: Float, b: Float, a: Float),
+                       bg: (r: Float, g: Float, b: Float, a: Float)) {
+        addQuad(to: &vertices, x: x, y: y, w: w, h: h,
+                tx: tx, ty: ty, tw: tw, th: th, fg: fg, bg: bg)
+    }
+
+    /// Create a one-shot MTLBuffer from vertex data.
+    func makeTemporaryBuffer(vertices: [Float]) -> MTLBuffer? {
+        let byteCount = vertices.count * MemoryLayout<Float>.size
+        guard byteCount > 0 else { return nil }
+        let buffer = device.makeBuffer(bytes: vertices, length: byteCount, options: .storageModeShared)
+        return buffer
+    }
+
+    // MARK: - Thumbnail Rendering
+
+    /// Render terminal content scaled down into a thumbnail rectangle.
+    ///
+    /// Builds vertex data for the terminal grid at full resolution, then
+    /// applies a linear transform to map all positions into `thumbnailRect`
+    /// within the drawable. This is the GPU-scaled rendering path used by
+    /// the integrated view.
+    ///
+    /// - Parameters:
+    ///   - model: Terminal model with grid data.
+    ///   - scrollback: Scrollback buffer.
+    ///   - scrollOffset: Current scroll offset.
+    ///   - encoder: Active render command encoder to draw into.
+    ///   - viewportSize: Size of the drawable in pixels.
+    ///   - thumbnailRect: Destination rectangle in points (flipped Y: origin = top-left).
+    ///   - scaleFactor: Display scale factor.
+    func renderThumbnail(model: TerminalModel, scrollback: ScrollbackBuffer,
+                         scrollOffset: Int, encoder: MTLRenderCommandEncoder,
+                         viewportSize: SIMD2<Float>, thumbnailRect: NSRect,
+                         scaleFactor: Float) {
+        var thumbBgVertices: [Float] = []
+        var thumbGlyphVertices: [Float] = []
+
+        let cellW = Float(glyphAtlas.cellWidth) * scaleFactor
+        let cellH = Float(glyphAtlas.cellHeight) * scaleFactor
+        let padX = Float(gridPadding) * scaleFactor
+        let padY = Float(gridPadding) * scaleFactor
+
+        let viewRows = model.rows
+        let viewCols = model.cols
+
+        // Compute the full terminal size in pixels (as if rendering at full size)
+        let termW = padX * 2 + Float(viewCols) * cellW
+        let termH = padY * 2 + Float(viewRows) * cellH
+
+        // Thumbnail destination in pixels
+        let thumbX = Float(thumbnailRect.origin.x) * scaleFactor
+        let thumbY = Float(thumbnailRect.origin.y) * scaleFactor
+        let thumbW = Float(thumbnailRect.width) * scaleFactor
+        let thumbH = Float(thumbnailRect.height) * scaleFactor
+
+        // Scale to map terminal pixels → thumbnail pixels
+        let scaleX = thumbW / termW
+        let scaleY = thumbH / termH
+        // Use uniform scale to maintain aspect ratio
+        let thumbScale = min(scaleX, scaleY)
+
+        // Center within thumbnail rect
+        let scaledW = termW * thumbScale
+        let scaledH = termH * thumbScale
+        let offsetX = thumbX + (thumbW - scaledW) / 2
+        let offsetY = thumbY + (thumbH - scaledH) / 2
+
+        let sbCount = scrollback.rowCount
+        var scrollbackRowCache: [Int: [Cell]] = [:]
+        if scrollOffset > 0 {
+            let firstAbsolute = max(0, sbCount - scrollOffset)
+            for viewRow in 0..<viewRows {
+                let absRow = firstAbsolute + viewRow
+                if absRow >= 0 && absRow < sbCount {
+                    scrollbackRowCache[absRow] = scrollback.getRow(at: absRow)
+                }
+            }
+        }
+
+        let firstAbsolute = scrollOffset > 0 ? max(0, sbCount - scrollOffset) : sbCount
+
+        for row in 0..<viewRows {
+            let absoluteRow = firstAbsolute + row
+            let isScrollbackRow = absoluteRow < sbCount
+            let scrollbackRow = isScrollbackRow ? scrollbackRowCache[absoluteRow] : nil
+            let gridRow = isScrollbackRow ? -1 : absoluteRow - sbCount
+
+            for col in 0..<viewCols {
+                let cell: Cell
+                if let sbRow = scrollbackRow {
+                    cell = col < sbRow.count ? sbRow[col] : .empty
+                } else {
+                    cell = model.grid.cell(at: gridRow, col: col)
+                }
+
+                if cell.isWideContinuation { continue }
+
+                // Full-size position
+                let fullX = padX + Float(col) * cellW
+                let fullY = padY + Float(row) * cellH
+                let fullW = cellW * Float(max(1, cell.width))
+                let fullH = cellH
+
+                // Transform to thumbnail space
+                let x = offsetX + fullX * thumbScale
+                let y = offsetY + fullY * thumbScale
+                let w = fullW * thumbScale
+                let h = fullH * thumbScale
+
+                // Resolve colors
+                var fgColor: (r: Float, g: Float, b: Float)
+                var bgColor: (r: Float, g: Float, b: Float)
+
+                if cell.attributes.inverse {
+                    fgColor = cell.attributes.background.resolve(isForeground: false)
+                    bgColor = cell.attributes.foreground.resolve(isForeground: true)
+                } else {
+                    fgColor = cell.attributes.foreground.resolve(isForeground: true)
+                    bgColor = cell.attributes.background.resolve(isForeground: false)
+                }
+
+                // Background
+                if bgColor.r > 0.001 || bgColor.g > 0.001 || bgColor.b > 0.001 {
+                    addQuad(to: &thumbBgVertices, x: x, y: y, w: w, h: h,
+                           tx: 0, ty: 0, tw: 0, th: 0,
+                           fg: (bgColor.r, bgColor.g, bgColor.b, 1),
+                           bg: (bgColor.r, bgColor.g, bgColor.b, 1))
+                }
+
+                // Glyph
+                if cell.codepoint > 0x20,
+                   let glyph = glyphAtlas.glyphInfo(for: cell.codepoint),
+                   glyph.pixelWidth > 0 {
+
+                    let glyphFullX = fullX + Float(glyph.bearingX) * scaleFactor
+                    let baselineScreenY = fullY + fullH - Float(glyphAtlas.baseline) * scaleFactor
+                    let glyphFullY = baselineScreenY - glyph.baselineOffset
+                    let glyphFullW = Float(glyph.pixelWidth)
+                    let glyphFullH = Float(glyph.pixelHeight)
+
+                    // Transform glyph to thumbnail space
+                    let gx = offsetX + glyphFullX * thumbScale
+                    let gy = offsetY + glyphFullY * thumbScale
+                    let gw = glyphFullW * thumbScale
+                    let gh = glyphFullH * thumbScale
+
+                    addQuad(to: &thumbGlyphVertices,
+                           x: gx, y: gy, w: gw, h: gh,
+                           tx: glyph.textureX, ty: glyph.textureY,
+                           tw: glyph.textureW, th: glyph.textureH,
+                           fg: (fgColor.r, fgColor.g, fgColor.b, 1),
+                           bg: (0, 0, 0, 0))
+                }
+            }
+        }
+
+        // Draw thumbnail backgrounds
+        var thumbUniforms = MetalUniforms(viewportSize: viewportSize, cursorOpacity: 0, time: 0)
+
+        if !thumbBgVertices.isEmpty, let pipeline = bgPipeline,
+           let buf = makeTemporaryBuffer(vertices: thumbBgVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&thumbUniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                  vertexCount: thumbBgVertices.count / floatsPerVertex)
+        }
+
+        // Draw thumbnail glyphs (linear filtering for scaled-down text)
+        if !thumbGlyphVertices.isEmpty, let pipeline = glyphPipeline,
+           let atlas = glyphAtlas.texture,
+           let buf = makeTemporaryBuffer(vertices: thumbGlyphVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&thumbUniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.setFragmentTexture(atlas, index: 0)
+            encoder.setFragmentSamplerState(thumbnailSampler, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                  vertexCount: thumbGlyphVertices.count / floatsPerVertex)
+        }
     }
 }
