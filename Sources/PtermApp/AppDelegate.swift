@@ -51,7 +51,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var titlebarBackButton: NSButton?
 
     private var metricsMonitor: ProcessMetricsMonitor?
-    private var controlReturnMonitor: ControlReturnMonitor?
+    /// Tracks last output time per terminal for active-output indicator.
+    private var lastOutputTimes: [UUID: Date] = [:]
+    private var outputIdleTimer: Timer?
+    /// Suppresses active-output indicator briefly after resize or terminal creation.
+    private var lastResizeTime: Date = .distantPast
+    private var terminalCreationTimes: [UUID: Date] = [:]
     private let clipboardFileStore = ClipboardFileStore()
     private var clipboardCleanupService: ClipboardCleanupService?
     private let sessionStore = SessionStore()
@@ -262,7 +267,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let cleanupService = ClipboardCleanupService(fileStore: clipboardFileStore)
         cleanupService.start()
         clipboardCleanupService = cleanupService
-        startControlReturnMonitor()
         installBackShortcutMonitor()
 
         // Setup menu
@@ -292,7 +296,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isTerminating = true
         persistSession()
         clipboardCleanupService?.stop()
-        controlReturnMonitor?.stop()
         manager.stopAll(
             preserveScrollback: config.sessionScrollBufferPersistence,
             waitForExit: true
@@ -1047,14 +1050,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.persistSession()
             }
         }
+        terminalCreationTimes[controller.id] = Date()
         controller.onOutputActivity = { [weak self, weak controller] in
             guard let self, let controller else { return }
-            guard let foregroundPID = controller.foregroundProcessID else { return }
-            self.controlReturnMonitor?.noteOutput(for: controller.id,
-                                                  pid: foregroundPID,
-                                                  displayName: controller.title)
+            let now = Date()
+            // Suppress briefly after window resize (SIGWINCH) or terminal creation
+            if now.timeIntervalSince(self.lastResizeTime) < 1.0 { return }
+            if let created = self.terminalCreationTimes[controller.id],
+               now.timeIntervalSince(created) < 2.0 { return }
+            self.lastOutputTimes[controller.id] = now
+            self.integratedView?.activeOutputTerminals.insert(controller.id)
+            self.ensureOutputIdleTimer()
         }
-
         if config.audit.enabled {
             let logger = TerminalAuditLogger(
                 sessionID: controller.id,
@@ -1072,26 +1079,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func startControlReturnMonitor() {
-        let monitor = ControlReturnMonitor(modeProvider: { [weak self] in
-            self?.config.notification ?? .default
-        })
-        monitor.onStateChange = { [weak self] highlighted in
-            self?.integratedView?.controlReturnedTerminals = highlighted
-            self?.integratedView?.setNeedsDisplay(self?.integratedView?.bounds ?? .zero)
-        }
-        monitor.start { [weak self] in
-            guard let self else { return [] }
-            return self.manager.terminals.compactMap {
-                guard let foregroundPID = $0.foregroundProcessID else { return nil }
-                return ControlReturnMonitor.TerminalSnapshot(
-                    id: $0.id,
-                    pid: foregroundPID,
-                    displayName: $0.title
-                )
+    private func ensureOutputIdleTimer() {
+        guard outputIdleTimer == nil else { return }
+        outputIdleTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            let now = Date()
+            let idleThreshold: TimeInterval = 1.5
+            var changed = false
+            for (id, lastTime) in self.lastOutputTimes {
+                if now.timeIntervalSince(lastTime) >= idleThreshold {
+                    if self.integratedView?.activeOutputTerminals.remove(id) != nil {
+                        changed = true
+                    }
+                    self.lastOutputTimes.removeValue(forKey: id)
+                }
+            }
+            if self.lastOutputTimes.isEmpty {
+                timer.invalidate()
+                self.outputIdleTimer = nil
+            }
+            if changed {
+                self.integratedView?.setNeedsDisplay(self.integratedView?.bounds ?? .zero)
             }
         }
-        controlReturnMonitor = monitor
     }
 
     private func persistSession() {
@@ -1691,6 +1701,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension AppDelegate: NSWindowDelegate {
     func windowDidResize(_ notification: Notification) {
+        lastResizeTime = Date()
         synchronizeWindowLayout(shouldPersistSession: true)
     }
 
@@ -1736,7 +1747,6 @@ extension AppDelegate: NSWindowDelegate {
         stopConfigWatcher()
         metricsMonitor?.stop()
         clipboardCleanupService?.stop()
-        controlReturnMonitor?.stop()
         manager?.stopAll(preserveScrollback: config.sessionScrollBufferPersistence)
         try? sessionStore.markCleanShutdown()
         singleInstanceLock.release()

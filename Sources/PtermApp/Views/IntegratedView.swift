@@ -58,7 +58,9 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     /// CPU usage provider for status labels.
     var cpuUsageProvider: ((pid_t) -> Double?)?
-    var controlReturnedTerminals: Set<UUID> = []
+
+    /// Terminals that are actively producing output (border pulses red).
+    var activeOutputTerminals: Set<UUID> = []
     var shortcutConfiguration: ShortcutConfiguration = .default
     var explicitWorkspaceNames: [String] = [] {
         didSet { setNeedsDisplay(bounds) }
@@ -591,6 +593,7 @@ extension IntegratedView: MTKViewDelegate {
         }
 
         let sf = Float(renderer.glyphAtlas.scaleFactor)
+        let time = Float(CACurrentMediaTime())
         let terminals = manager.terminals
         let count = terminals.count
         cachedWorkspaceLayouts = workspaceLayouts()
@@ -630,15 +633,15 @@ extension IntegratedView: MTKViewDelegate {
                 // Draw thumbnail border/background
                 let isHovered = hoveredIndex == i
                 let isSelected = selectedTerminals.contains(controller.id)
-                let isControlReturned = controlReturnedTerminals.contains(controller.id)
-
+                let isActiveOutput = activeOutputTerminals.contains(controller.id)
                 drawThumbnailBackground(
                     encoder: encoder,
                     frame: frame.thumbnail,
                     titleFrame: frame.title,
                     isHovered: isHovered,
                     isSelected: isSelected,
-                    isControlReturned: isControlReturned,
+                    isActiveOutput: isActiveOutput,
+                    time: time,
                     scaleFactor: sf,
                     viewportSize: viewportSize
                 )
@@ -696,7 +699,8 @@ extension IntegratedView: MTKViewDelegate {
         titleFrame: NSRect,
         isHovered: Bool,
         isSelected: Bool,
-        isControlReturned: Bool,
+        isActiveOutput: Bool,
+        time: Float,
         scaleFactor: Float,
         viewportSize: SIMD2<Float>
     ) {
@@ -735,13 +739,21 @@ extension IntegratedView: MTKViewDelegate {
         )
 
         // Border
-        let borderAlpha: Float = isControlReturned ? 0.95 : (isSelected ? 0.9 : (isHovered ? 0.6 : 0.3))
+        let borderAlpha: Float
         let borderColor: (Float, Float, Float)
-        if isControlReturned {
-            borderColor = (0.95, 0.72, 0.18)
+        if isActiveOutput {
+            // Gentle red pulse: fades between 0.15 and 0.8
+            let pulse = 0.475 + 0.325 * sin(time * 3.0)
+            borderAlpha = pulse
+            borderColor = (0.9, 0.2, 0.15)
         } else if isSelected {
+            borderAlpha = 0.9
             borderColor = (0.3, 0.6, 1.0)
+        } else if isHovered {
+            borderAlpha = 0.6
+            borderColor = (0.4, 0.4, 0.4)
         } else {
+            borderAlpha = 0.3
             borderColor = (0.4, 0.4, 0.4)
         }
         let bw: Float = Float(Layout.borderWidth) * scaleFactor

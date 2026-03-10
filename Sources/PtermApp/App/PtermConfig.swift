@@ -30,7 +30,6 @@ struct PtermConfig {
     let sessionScrollBufferPersistence: Bool
     let audit: AuditConfiguration
     let security: SecurityConfiguration
-    let notification: NotificationConfiguration
     let shortcuts: ShortcutConfiguration
     let workspaces: [ConfiguredWorkspace]
 
@@ -44,7 +43,6 @@ struct PtermConfig {
         sessionScrollBufferPersistence: false,
         audit: .disabled,
         security: .default,
-        notification: .default,
         shortcuts: .default,
         workspaces: []
     )
@@ -73,7 +71,6 @@ enum PtermConfigStore {
         let session: SessionSection?
         let audit: AuditSection?
         let security: SecuritySection?
-        let notification: NotificationSection?
         let shortcuts: ShortcutSection?
 
         enum CodingKeys: String, CodingKey {
@@ -84,7 +81,6 @@ enum PtermConfigStore {
             case session
             case audit
             case security
-            case notification
             case shortcuts
         }
     }
@@ -132,16 +128,6 @@ enum PtermConfigStore {
         }
     }
 
-    private struct NotificationSection: Decodable {
-        let controlReturn: String?
-        let customSound: String?
-
-        enum CodingKeys: String, CodingKey {
-            case controlReturn = "control_return"
-            case customSound = "custom_sound"
-        }
-    }
-
     static func load() -> PtermConfig {
         let defaults = PtermConfig.default
         guard let data = try? Data(contentsOf: PtermDirectories.config),
@@ -159,7 +145,6 @@ enum PtermConfigStore {
         let session = dictionaryValue(root["session"])
         let audit = dictionaryValue(root["audit"])
         let security = dictionaryValue(root["security"])
-        let notification = dictionaryValue(root["notification"])
         let shortcuts = dictionaryValue(root["shortcuts"])
         let workspaces = workspaceList(root["workspaces"])
 
@@ -181,10 +166,6 @@ enum PtermConfigStore {
                 pasteConfirmation: boolValue(security?["paste_confirmation"]) ?? defaults.security.pasteConfirmation,
                 mouseReportRestrictAlternateScreen: boolValue(security?["mouse_report_restrict_alternate_screen"]) ?? defaults.security.mouseReportRestrictAlternateScreen,
                 allowWindowResizeSequence: boolValue(security?["allow_window_resize_sequence"]) ?? defaults.security.allowWindowResizeSequence
-            ),
-            notification: NotificationConfiguration(
-                controlReturn: stringValue(notification?["control_return"]).flatMap(ControlReturnMode.init(rawValue:)) ?? defaults.notification.controlReturn,
-                customSound: stringValue(notification?["custom_sound"])
             ),
             shortcuts: ShortcutParser.parseMap(shortcuts?.compactMapValues(stringValue)),
             workspaces: workspaces
