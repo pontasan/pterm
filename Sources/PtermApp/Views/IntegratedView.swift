@@ -72,8 +72,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
     /// Index of the thumbnail currently under the mouse (for hover effects)
     private var hoveredIndex: Int?
 
-    /// Index of the thumbnail whose close button is hovered
-    private var hoveredCloseIndex: Int?
+    /// ID of the terminal whose close button is hovered
+    private var hoveredCloseID: UUID?
 
     /// Stored frame for the add button (updated each draw)
     private var addButtonFrame: NSRect = .zero
@@ -325,14 +325,13 @@ final class IntegratedView: MTKView, NSDraggingSource {
         return nil
     }
 
-    /// Check if a point hits a close button.
-    private func closeButtonIndex(at point: NSPoint) -> Int? {
+    /// Check if a point hits a close button, returning the associated controller.
+    private func closeButtonController(at point: NSPoint) -> TerminalController? {
         let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
-        for (i, f) in flattened.enumerated() {
-            // Slightly larger hit area for the close button
+        for f in flattened {
             let hitRect = f.close.insetBy(dx: -4, dy: -4)
             if hitRect.contains(point) {
-                return i
+                return f.controller
             }
         }
         return nil
@@ -426,21 +425,17 @@ final class IntegratedView: MTKView, NSDraggingSource {
         }
 
         // Check close button first
-        if let closeIdx = closeButtonIndex(at: point),
-           closeIdx < manager.terminals.count {
-            let controller = manager.terminals[closeIdx]
+        if let controller = closeButtonController(at: point) {
             manager.removeTerminal(controller)
             return
         }
 
         // Check thumbnail click
+        let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
         guard let idx = thumbnailIndex(at: point),
-              idx < manager.terminals.count else {
+              idx < flattened.count else {
             return
         }
-
-        let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
-        guard idx < flattened.count else { return }
         let controller = flattened[idx].controller
         mouseDownTerminal = controller
 
@@ -492,12 +487,12 @@ final class IntegratedView: MTKView, NSDraggingSource {
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         hoveredIndex = thumbnailIndex(at: point)
-        hoveredCloseIndex = closeButtonIndex(at: point)
+        hoveredCloseID = closeButtonController(at: point)?.id
     }
 
     override func mouseExited(with event: NSEvent) {
         hoveredIndex = nil
-        hoveredCloseIndex = nil
+        hoveredCloseID = nil
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -670,7 +665,7 @@ extension IntegratedView: MTKViewDelegate {
                 )
 
                 // Draw close button
-                let isCloseHovered = hoveredCloseIndex == i
+                let isCloseHovered = hoveredCloseID == controller.id
                 drawCloseButton(
                     encoder: encoder,
                     frame: frame.close,
