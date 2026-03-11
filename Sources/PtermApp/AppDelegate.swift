@@ -54,10 +54,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Tracks last output time per terminal for active-output indicator.
     private var lastOutputTimes: [UUID: Date] = [:]
     private var outputIdleTimer: Timer?
-    /// Suppresses active-output indicator briefly after resize, terminal creation, or app launch.
+    /// Suppresses active-output indicator briefly after resize.
     private var lastResizeTime: Date = .distantPast
-    private var terminalCreationTimes: [UUID: Date] = [:]
-    private let appLaunchTime: Date = Date()
+    /// Tracks terminals that have been idle at least once (initial output burst is over).
+    private var terminalsEverIdle: Set<UUID> = []
     private let clipboardFileStore = ClipboardFileStore()
     private var clipboardCleanupService: ClipboardCleanupService?
     private let sessionStore = SessionStore()
@@ -1133,18 +1133,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.persistSession()
             }
         }
-        terminalCreationTimes[controller.id] = Date()
         controller.onOutputActivity = { [weak self, weak controller] in
             guard let self, let controller else { return }
             let now = Date()
-            // Suppress briefly after app launch, window resize (SIGWINCH), or terminal creation
-            if now.timeIntervalSince(self.appLaunchTime) < 3.0 { return }
-            if now.timeIntervalSince(self.lastResizeTime) < 1.0 { return }
-            if let created = self.terminalCreationTimes[controller.id],
-               now.timeIntervalSince(created) < 2.0 { return }
+            // Always track last output time (needed to detect when terminal becomes idle)
             self.lastOutputTimes[controller.id] = now
-            self.integratedView?.activeOutputTerminals.insert(controller.id)
             self.ensureOutputIdleTimer()
+            // Suppress indicator briefly after window resize (SIGWINCH)
+            if now.timeIntervalSince(self.lastResizeTime) < 1.0 { return }
+            // Only show indicator for terminals that have been idle at least once.
+            // This prevents the initial shell startup output from triggering the indicator.
+            guard self.terminalsEverIdle.contains(controller.id) else { return }
+            self.integratedView?.activeOutputTerminals.insert(controller.id)
         }
         if config.audit.enabled {
             let logger = TerminalAuditLogger(
@@ -1176,6 +1176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         changed = true
                     }
                     self.lastOutputTimes.removeValue(forKey: id)
+                    self.terminalsEverIdle.insert(id)
                 }
             }
             if self.lastOutputTimes.isEmpty {
