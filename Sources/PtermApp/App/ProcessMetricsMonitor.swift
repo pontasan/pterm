@@ -6,6 +6,8 @@ final class ProcessMetricsMonitor {
         let cpuUsageByPID: [pid_t: Double]
         let appMemoryBytes: UInt64
         let currentDirectoryByPID: [pid_t: String]
+        /// Resident memory per monitored PID including all descendant processes.
+        let memoryByPID: [pid_t: UInt64]
     }
 
     private struct CPUSample {
@@ -45,6 +47,7 @@ final class ProcessMetricsMonitor {
         var usage: [pid_t: Double] = [:]
         var nextSamples: [pid_t: CPUSample] = [:]
         var currentDirectoryByPID: [pid_t: String] = [:]
+        var memoryByPID: [pid_t: UInt64] = [:]
 
         for pid in Set(pids) {
             guard let totalTime = processCPUTime(pid: pid) else { continue }
@@ -64,13 +67,38 @@ final class ProcessMetricsMonitor {
             } else {
                 usage[pid] = 0
             }
+
+            // Collect memory for this PID and all its descendants
+            let descendants = collectDescendants(of: pid)
+            var totalMemory: UInt64 = processResidentMemory(pid: pid)
+            for child in descendants {
+                totalMemory += processResidentMemory(pid: child)
+                // Also track CPU for descendant processes
+                if nextSamples[child] == nil,
+                   let childTime = processCPUTime(pid: child) {
+                    let childSample = CPUSample(totalTime: childTime, timestamp: now)
+                    nextSamples[child] = childSample
+                    if let prev = lastSamples[child], childSample.timestamp > prev.timestamp {
+                        let dt = Double(childSample.totalTime &- prev.totalTime) / 1_000_000.0
+                        let elapsed = childSample.timestamp - prev.timestamp
+                        if elapsed > 0 {
+                            let pct = min(999.0, max(0, (dt / elapsed) * 100.0 / cpuCount))
+                            usage[child] = pct
+                        }
+                    } else {
+                        usage[child] = 0
+                    }
+                }
+            }
+            memoryByPID[pid] = totalMemory
         }
 
         lastSamples = nextSamples
         onUpdate?(Snapshot(
             cpuUsageByPID: usage,
             appMemoryBytes: currentProcessResidentMemory(),
-            currentDirectoryByPID: currentDirectoryByPID
+            currentDirectoryByPID: currentDirectoryByPID,
+            memoryByPID: memoryByPID
         ))
     }
 
@@ -91,6 +119,34 @@ final class ProcessMetricsMonitor {
         }
         guard result == KERN_SUCCESS else { return 0 }
         return UInt64(info.resident_size)
+    }
+
+    private func processResidentMemory(pid: pid_t) -> UInt64 {
+        var info = proc_taskinfo()
+        let size = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, Int32(MemoryLayout<proc_taskinfo>.stride))
+        guard size == Int32(MemoryLayout<proc_taskinfo>.stride) else { return 0 }
+        return UInt64(info.pti_resident_size)
+    }
+
+    private func collectDescendants(of rootPID: pid_t) -> [pid_t] {
+        var result: [pid_t] = []
+        var queue: [pid_t] = [rootPID]
+        while !queue.isEmpty {
+            let parent = queue.removeFirst()
+            let count = proc_listchildpids(parent, nil, 0)
+            guard count > 0 else { continue }
+            var childPIDs = [pid_t](repeating: 0, count: Int(count))
+            let actual = proc_listchildpids(parent, &childPIDs, count * Int32(MemoryLayout<pid_t>.stride))
+            let childCount = Int(actual) / MemoryLayout<pid_t>.stride
+            for i in 0..<childCount {
+                let child = childPIDs[i]
+                if child > 0 {
+                    result.append(child)
+                    queue.append(child)
+                }
+            }
+        }
+        return result
     }
 
     private func processCurrentDirectory(pid: pid_t) -> String? {

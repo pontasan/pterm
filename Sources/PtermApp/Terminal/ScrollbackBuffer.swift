@@ -21,6 +21,12 @@ final class ScrollbackBuffer {
         return Int(ring_buffer_row_count(rb))
     }
 
+    /// Total allocated capacity in bytes
+    var capacity: Int {
+        guard let rb = ringBuffer else { return 0 }
+        return ring_buffer_capacity(rb)
+    }
+
     /// Reusable serialization buffer (avoids per-call allocation)
     private var serializeBuf: UnsafeMutablePointer<UInt8>?
     private var serializeBufCapacity: Int = 0

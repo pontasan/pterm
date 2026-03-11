@@ -951,10 +951,11 @@ extension IntegratedView: MTKViewDelegate {
         viewportSize: SIMD2<Float>
     ) {
         let textX = frame.minX + Layout.closeButtonSize + 8
+        let halfGlyph = renderer.glyphAtlas.cellHeight * 0.5
         drawRightAlignedTitleText(
             encoder: encoder,
             text: text,
-            frame: NSRect(x: textX, y: frame.minY, width: frame.width - Layout.closeButtonSize - 8, height: frame.height),
+            frame: NSRect(x: textX, y: frame.minY + halfGlyph - 4, width: frame.width - Layout.closeButtonSize - 8, height: frame.height),
             scaleFactor: scaleFactor,
             viewportSize: viewportSize,
             color: (0.9, 0.9, 0.9, 1.0),

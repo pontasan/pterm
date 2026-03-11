@@ -78,6 +78,11 @@ final class TerminalController {
     var processID: pid_t { pty.childPID }
     var foregroundProcessID: pid_t? { pty.foregroundProcessGroupID() }
 
+    /// Allocated scrollback buffer capacity in bytes
+    var scrollbackCapacity: UInt64 {
+        lock.withReadLock { UInt64(scrollback.capacity) }
+    }
+
     /// Lock for thread-safe model/parser/decoder/scrollback access
     private let lock = ReadWriteLock()
 
