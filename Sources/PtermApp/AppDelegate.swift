@@ -1,6 +1,19 @@
 import AppKit
 import MetalKit
-import ObjectiveC
+
+private extension String {
+    func appendLine(to url: URL) throws {
+        let data = Data(utf8)
+        if FileManager.default.fileExists(atPath: url.path) {
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+        } else {
+            try data.write(to: url, options: .atomic)
+        }
+    }
+}
 
 private final class PtermWindow: NSWindow {
     var onBackToIntegratedShortcut: (() -> Void)?
@@ -87,6 +100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var terminalView: TerminalView?
     private var searchBarView: SearchBarView?
     private var splitContainerView: SplitTerminalContainerView?
+    private var workspaceNoteEditors: [String: MarkdownEditorWindowController] = [:]
 
     /// Currently focused terminal controller (nil = integrated view mode)
     private var focusedController: TerminalController?
@@ -103,19 +117,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let size: CGFloat
     }
 
-    private final class WorkspaceNoteAutosaveDelegate: NSObject, NSTextViewDelegate {
-        let onChange: (String) -> Void
-
-        init(onChange: @escaping (String) -> Void) {
-            self.onChange = onChange
-        }
-
-        func textDidChange(_ notification: Notification) {
-            guard let textView = notification.object as? NSTextView else { return }
-            onChange(textView.string)
-        }
-    }
-
     private enum WorkspaceNaming {
         static let uncategorized = "Uncategorized"
     }
@@ -124,15 +125,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isTerminating = false
     private var isWindowLayoutReady = false
     private var workspaceNames: [String] = []
+    private lazy var isNoteEditorSelfTestEnabled: Bool = {
+        let arguments = ProcessInfo.processInfo.arguments
+        let environment = ProcessInfo.processInfo.environment
+        return arguments.contains("--note-editor-selftest") ||
+            environment["PTERM_NOTE_EDITOR_SELFTEST"] == "1"
+    }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        do {
-            if try !singleInstanceLock.acquireOrActivateExisting() {
-                NSApp.terminate(nil)
-                return
+        if !isNoteEditorSelfTestEnabled {
+            do {
+                if try !singleInstanceLock.acquireOrActivateExisting() {
+                    NSApp.terminate(nil)
+                    return
+                }
+            } catch {
+                fatalError("Failed to acquire single-instance lock: \(error)")
             }
-        } catch {
-            fatalError("Failed to acquire single-instance lock: \(error)")
         }
 
         DistributedNotificationCenter.default().addObserver(
@@ -198,6 +207,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusBarView.autoresizingMask = [.width, .maxYMargin]
         statusBarView.onBackToIntegrated = { [weak self] in
             self?.backToIntegratedView(nil)
+        }
+        statusBarView.onOpenWorkspaceNote = { [weak self] in
+            self?.editWorkspaceNote(nil)
         }
         window.contentView!.addSubview(statusBarView)
 
@@ -275,6 +287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if case .integrated = viewMode {
             window.makeFirstResponder(integratedView)
         }
+        runNoteEditorSelfTestIfRequested()
         startMetricsMonitor()
         let cleanupService = ClipboardCleanupService(fileStore: clipboardFileStore)
         cleanupService.start()
@@ -283,6 +296,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Setup menu
         setupMenu()
+    }
+
+    private func runNoteEditorSelfTestIfRequested() {
+        guard isNoteEditorSelfTestEnabled else {
+            return
+        }
+        let diagnosticsRoot = URL(fileURLWithPath: "/Users/umedatomohiro/Developments/workspace/pterm-ai/.tmp/note-editor-selftest",
+                                  isDirectory: true)
+        try? FileManager.default.createDirectory(at: diagnosticsRoot, withIntermediateDirectories: true)
+        let logURL = diagnosticsRoot.appendingPathComponent("selftest.log")
+        try? "start\n".write(to: logURL, atomically: true, encoding: .utf8)
+
+        let controller = MarkdownEditorWindowController(
+            workspaceName: "SelfTest",
+            initialText: "abc\n日本語\n- item",
+            onSave: { _ in }
+        )
+        controller.showEditorWindow()
+        try? "window-shown\n".appendLine(to: logURL)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            try? "selftest-done\n".appendLine(to: logURL)
+            NSApp.terminate(nil)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -1524,25 +1560,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func editWorkspaceNote(for workspaceName: String) {
-        let alert = NSAlert()
-        alert.messageText = "Note — \(workspaceName)"
-        alert.informativeText = "Changes are saved automatically."
-        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 420, height: 220))
-        let textView = NSTextView(frame: scrollView.bounds)
-        scrollView.documentView = textView
-        scrollView.hasVerticalScroller = true
-        scrollView.borderType = .bezelBorder
-        if let existing = ((try? workspaceNoteStore.loadNote(for: workspaceName)) ?? nil) {
-            textView.string = existing
+        if let existing = workspaceNoteEditors[workspaceName] {
+            existing.showEditorWindow()
+            return
         }
-        let autosaveDelegate = WorkspaceNoteAutosaveDelegate { [workspaceNoteStore] text in
-            try? workspaceNoteStore.saveNote(text, for: workspaceName)
+
+        let initialText = ((try? workspaceNoteStore.loadNote(for: workspaceName)) ?? nil) ?? ""
+        let editorController = MarkdownEditorWindowController(
+            workspaceName: workspaceName,
+            initialText: initialText,
+            onSave: { [workspaceNoteStore] text in
+                try? workspaceNoteStore.saveNote(text, for: workspaceName)
+            }
+        )
+        editorController.onClose = { [weak self] in
+            self?.workspaceNoteEditors.removeValue(forKey: workspaceName)
         }
-        textView.delegate = autosaveDelegate
-        objc_setAssociatedObject(alert, Unmanaged.passUnretained(alert).toOpaque(), autosaveDelegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-        alert.accessoryView = scrollView
-        alert.addButton(withTitle: "Close")
-        alert.runModal()
+        workspaceNoteEditors[workspaceName] = editorController
+        editorController.showEditorWindow()
     }
 
     @objc func performFindPanelAction(_ sender: Any?) {

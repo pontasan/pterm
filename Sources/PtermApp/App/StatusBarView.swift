@@ -5,13 +5,20 @@ final class StatusBarView: NSView {
     private var currentCpu: Double = 0
     private var currentMemBytes: UInt64 = 0
     private let backButton: NSButton
+    private let separatorLabel: NSTextField
+    private let noteButton: NSButton
     var onBackToIntegrated: (() -> Void)?
+    var onOpenWorkspaceNote: (() -> Void)?
 
     override init(frame frameRect: NSRect) {
         backButton = NSButton(title: "◀ Overview", target: nil, action: nil)
+        separatorLabel = NSTextField(labelWithString: "|")
+        noteButton = NSButton(title: "📝 Notes", target: nil, action: nil)
         super.init(frame: frameRect)
         backButton.target = self
         backButton.action = #selector(backButtonClicked)
+        noteButton.target = self
+        noteButton.action = #selector(noteButtonClicked)
 
         wantsLayer = true
         layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1).cgColor
@@ -31,6 +38,19 @@ final class StatusBarView: NSView {
         backButton.toolTip = "Back to Overview (Cmd+`)"
         backButton.isHidden = true
         addSubview(backButton)
+
+        separatorLabel.textColor = NSColor(calibratedWhite: 0.4, alpha: 1)
+        separatorLabel.font = font
+        separatorLabel.isHidden = true
+        addSubview(separatorLabel)
+
+        noteButton.bezelStyle = .recessed
+        noteButton.isBordered = false
+        noteButton.contentTintColor = textColor
+        noteButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        noteButton.toolTip = "Workspace Notes"
+        noteButton.isHidden = true
+        addSubview(noteButton)
     }
 
     @available(*, unavailable)
@@ -43,10 +63,23 @@ final class StatusBarView: NSView {
         let inset: CGFloat = 12
         let vertInset: CGFloat = 4
         let height = bounds.height - vertInset * 2
+        let spacing: CGFloat = 6
 
         backButton.sizeToFit()
         if !backButton.isHidden {
             backButton.frame = NSRect(x: inset, y: vertInset, width: backButton.frame.width, height: height)
+        }
+
+        separatorLabel.sizeToFit()
+        if !separatorLabel.isHidden {
+            let sepX = backButton.frame.maxX + spacing
+            separatorLabel.frame = NSRect(x: sepX, y: vertInset, width: separatorLabel.frame.width, height: height)
+        }
+
+        noteButton.sizeToFit()
+        if !noteButton.isHidden {
+            let noteX = separatorLabel.frame.maxX + spacing
+            noteButton.frame = NSRect(x: noteX, y: vertInset, width: noteButton.frame.width, height: height)
         }
 
         metricsLabel.sizeToFit()
@@ -72,10 +105,16 @@ final class StatusBarView: NSView {
 
     func setBackButtonVisible(_ visible: Bool) {
         backButton.isHidden = !visible
+        separatorLabel.isHidden = !visible
+        noteButton.isHidden = !visible
         needsLayout = true
     }
 
     @objc private func backButtonClicked() {
         onBackToIntegrated?()
+    }
+
+    @objc private func noteButtonClicked() {
+        onOpenWorkspaceNote?()
     }
 }
