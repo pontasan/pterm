@@ -123,6 +123,21 @@ final class PTY {
 
     /// Stop the PTY and terminate the child process.
     func stop(waitForExit: Bool = false) {
+        initiateShutdown()
+        if waitForExit {
+            awaitExit()
+        } else {
+            // Escalate to SIGKILL asynchronously if SIGTERM is not honoured.
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self else { return }
+                self.awaitExit()
+            }
+        }
+    }
+
+    /// Phase 1: Send SIGTERM and close the PTY file descriptor.
+    /// Safe to call multiple times. Does not block.
+    func initiateShutdown() {
         // Cancel dispatch source first to prevent further read events
         readSource?.cancel()
         readSource = nil
@@ -141,20 +156,21 @@ final class PTY {
 
         if pid > 0 {
             kill(pid, SIGTERM)
-            if waitForExit {
-                if exitSemaphore.wait(timeout: .now() + 0.5) == .timedOut {
-                    kill(pid, SIGKILL)
-                    _ = exitSemaphore.wait(timeout: .now() + 2.0)
-                }
-            } else {
-                DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                    guard let self else { return }
-                    if self.exitSemaphore.wait(timeout: .now()) == .success {
-                        return
-                    }
-                    kill(pid, SIGKILL)
-                }
-            }
+        }
+    }
+
+    /// Phase 2: Wait for the child process to exit.
+    /// If SIGTERM is not honoured within 0.5s, escalates to SIGKILL.
+    func awaitExit() {
+        fdLock.lock()
+        let pid = childPID
+        fdLock.unlock()
+
+        guard pid > 0 else { return }
+
+        if exitSemaphore.wait(timeout: .now() + 0.5) == .timedOut {
+            kill(pid, SIGKILL)
+            _ = exitSemaphore.wait(timeout: .now() + 2.0)
         }
     }
 

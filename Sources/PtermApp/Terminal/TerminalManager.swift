@@ -104,8 +104,30 @@ final class TerminalManager {
                 t.discardPersistentScrollback()
             }
             t.onExit = nil
-            t.stop(waitForExit: waitForExit)
         }
+
+        if waitForExit {
+            // Phase 1: Send SIGTERM to all processes simultaneously.
+            for t in terminals {
+                t.initiateShutdown()
+            }
+            // Phase 2: Wait for all exits in parallel.
+            // Total wait time = max(per-process time) instead of sum.
+            let group = DispatchGroup()
+            for t in terminals {
+                group.enter()
+                DispatchQueue.global().async {
+                    t.awaitExit()
+                    group.leave()
+                }
+            }
+            group.wait()
+        } else {
+            for t in terminals {
+                t.stop(waitForExit: false)
+            }
+        }
+
         terminals.removeAll()
     }
 

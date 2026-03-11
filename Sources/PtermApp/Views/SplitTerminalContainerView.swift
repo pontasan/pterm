@@ -169,9 +169,11 @@ final class SplitTerminalContainerView: NSView {
         for (index, scrollView) in scrollViews.enumerated() {
             let col = index % cols
             let row = index / cols
+            // Flip y so row 0 is at the top and remainder cells land at bottom-right.
+            let flippedRow = rows - 1 - row
             scrollView.frame = NSRect(
                 x: CGFloat(col) * (cellWidth + gap),
-                y: CGFloat(row) * (cellHeight + gap),
+                y: CGFloat(flippedRow) * (cellHeight + gap),
                 width: cellWidth,
                 height: cellHeight
             )

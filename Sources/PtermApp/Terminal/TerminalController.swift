@@ -244,6 +244,16 @@ final class TerminalController {
         pty.stop(waitForExit: waitForExit)
     }
 
+    /// Send SIGTERM and close PTY without blocking. Call awaitExit() later.
+    func initiateShutdown() {
+        pty.initiateShutdown()
+    }
+
+    /// Block until the child process exits (with SIGKILL escalation).
+    func awaitExit() {
+        pty.awaitExit()
+    }
+
     func discardPersistentScrollback() {
         lock.withWriteLock {
             scrollback.discardPersistentBackingStore()
