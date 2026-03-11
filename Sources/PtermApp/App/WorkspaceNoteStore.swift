@@ -21,12 +21,6 @@ final class WorkspaceNoteStore {
         self.fileManager = fileManager
     }
 
-    /// Pre-load the encryption key so that Keychain prompts happen once at
-    /// startup rather than on each note open/save.
-    func warmUpKey() {
-        cachedKey = try? loadOrCreateKey()
-    }
-
     func loadNote(for workspaceName: String) throws -> String? {
         let url = noteURL(for: workspaceName)
         guard fileManager.fileExists(atPath: url.path) else {
