@@ -75,8 +75,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var clipboardCleanupService: ClipboardCleanupService?
     private let sessionStore = SessionStore()
     private let singleInstanceLock = SingleInstanceLock()
-    private let workspaceNoteStore = WorkspaceNoteStore()
-    private lazy var exportImportManager = PtermExportImportManager(noteStore: workspaceNoteStore)
+    private let appNoteStore = AppNoteStore()
+    private lazy var exportImportManager = PtermExportImportManager(noteStore: appNoteStore)
 
     private var cpuUsageByPID: [pid_t: Double] = [:]
     private var lastMemoryByPID: [pid_t: UInt64] = [:]
@@ -100,7 +100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var terminalView: TerminalView?
     private var searchBarView: SearchBarView?
     private var splitContainerView: SplitTerminalContainerView?
-    private var workspaceNoteEditors: [String: MarkdownEditorWindowController] = [:]
+    private var appNoteEditor: MarkdownEditorWindowController?
 
     /// Currently focused terminal controller (nil = integrated view mode)
     private var focusedController: TerminalController?
@@ -211,8 +211,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusBarView.onBackToIntegrated = { [weak self] in
             self?.backToIntegratedView(nil)
         }
-        statusBarView.onOpenWorkspaceNote = { [weak self] in
-            self?.editWorkspaceNote(nil)
+        statusBarView.onOpenNote = { [weak self] in
+            self?.editAppNote()
         }
         window.contentView!.addSubview(statusBarView)
 
@@ -247,9 +247,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         iv.onRenameTerminalTitle = { [weak self] controller, title in
             self?.renameTerminalTitle(controller, title: title)
-        }
-        iv.onEditWorkspaceNote = { [weak self] workspace in
-            self?.editWorkspaceNote(for: workspace)
         }
         iv.onMultiSelect = { [weak self] controllers in
             self?.switchToSplit(controllers)
@@ -312,7 +309,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? "start\n".write(to: logURL, atomically: true, encoding: .utf8)
 
         let controller = MarkdownEditorWindowController(
-            workspaceName: "SelfTest",
             initialText: "abc\n日本語\n- item",
             onSave: { _ in }
         )
@@ -455,6 +451,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.splitOriginControllers = nil
             self.switchToSplit(controllers)
         }
+        if splitOriginControllers != nil {
+            sv.terminalView.cmdClickTooltip = "⌘+Click to return to split view"
+        }
         window.contentView!.addSubview(sv)
         terminalScrollView = sv
         terminalView = sv.terminalView
@@ -563,9 +562,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             iv.onRenameTerminalTitle = { [weak self] controller, title in
                 self?.renameTerminalTitle(controller, title: title)
-            }
-            iv.onEditWorkspaceNote = { [weak self] workspace in
-                self?.editWorkspaceNote(for: workspace)
             }
             iv.onMultiSelect = { [weak self] controllers in
                 self?.switchToSplit(controllers)
@@ -773,14 +769,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let shellMenu = NSMenu(title: "Shell")
         shellMenu.addItem(makeMenuItem(title: "New Terminal", shortcut: .newTerminal))
         shellMenu.addItem(makeMenuItem(title: "Close Terminal", shortcut: .closeTerminal))
+        shellMenu.addItem(NSMenuItem.separator())
+        shellMenu.addItem(withTitle: "Edit Note", action: #selector(editAppNote(_:)),
+                          keyEquivalent: "")
         shellMenuItem.submenu = shellMenu
-
-        let workspaceMenuItem = NSMenuItem()
-        mainMenu.addItem(workspaceMenuItem)
-        let workspaceMenu = NSMenu(title: "Workspace")
-        workspaceMenu.addItem(withTitle: "Edit Note", action: #selector(editWorkspaceNote(_:)),
-                              keyEquivalent: "")
-        workspaceMenuItem.submenu = workspaceMenu
 
         NSApplication.shared.mainMenu = mainMenu
     }
@@ -1378,7 +1370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func exportData(_ sender: Any?) {
         let password = promptPassword(title: "Export Password",
-                                      message: "This password protects the encryption key for workspace notes.")
+                                      message: "This password protects the encryption key for notes.")
         guard let password else { return }
         let panel = NSSavePanel()
         panel.nameFieldStringValue = exportImportManager.defaultExportURL().lastPathComponent
@@ -1561,37 +1553,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc func editWorkspaceNote(_ sender: Any?) {
-        let workspaceName: String
-        switch viewMode {
-        case .focused(let controller):
-            workspaceName = controller.sessionSnapshot.workspaceName
-        case .split(let controllers):
-            workspaceName = controllers.first?.sessionSnapshot.workspaceName ?? "Uncategorized"
-        case .integrated:
-            workspaceName = "Uncategorized"
-        }
-        editWorkspaceNote(for: workspaceName)
-    }
+    private var isOpeningNote = false
 
-    private func editWorkspaceNote(for workspaceName: String) {
-        if let existing = workspaceNoteEditors[workspaceName] {
+    @objc func editAppNote(_ sender: Any? = nil) {
+        let debugLog = "/tmp/pterm_note_debug.log"
+        func log(_ msg: String) {
+            let line = "\(Date()): \(msg)\n"
+            if let fh = FileHandle(forWritingAtPath: debugLog) {
+                fh.seekToEndOfFile()
+                fh.write(Data(line.utf8))
+                fh.closeFile()
+            } else {
+                FileManager.default.createFile(atPath: debugLog, contents: Data(line.utf8))
+            }
+        }
+        log("editAppNote called, sender=\(String(describing: sender)), isOpeningNote=\(isOpeningNote), hasEditor=\(appNoteEditor != nil)")
+
+        if let existing = appNoteEditor {
+            log("reusing existing editor")
             existing.showEditorWindow()
             return
         }
+        // Guard against re-entrant calls (e.g., Keychain dialog dispatching events).
+        guard !isOpeningNote else {
+            log("blocked by isOpeningNote guard")
+            return
+        }
+        isOpeningNote = true
+        defer { isOpeningNote = false }
 
-        let initialText = ((try? workspaceNoteStore.loadNote(for: workspaceName)) ?? nil) ?? ""
+        log("loading note...")
+        let initialText = ((try? appNoteStore.loadNote()) ?? nil) ?? ""
+        log("note loaded, length=\(initialText.count)")
         let editorController = MarkdownEditorWindowController(
-            workspaceName: workspaceName,
             initialText: initialText,
-            onSave: { [workspaceNoteStore] text in
-                try? workspaceNoteStore.saveNote(text, for: workspaceName)
+            onSave: { [appNoteStore] text in
+                try? appNoteStore.saveNote(text)
             }
         )
         editorController.onClose = { [weak self] in
-            self?.workspaceNoteEditors.removeValue(forKey: workspaceName)
+            self?.appNoteEditor = nil
         }
-        workspaceNoteEditors[workspaceName] = editorController
+        appNoteEditor = editorController
         editorController.showEditorWindow()
     }
 
@@ -1672,7 +1675,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         workspaceNames.removeAll { $0 == normalized }
         syncIntegratedWorkspaceNames()
-        try? workspaceNoteStore.removeWorkspaceData(for: normalized)
         persistSession()
     }
 
@@ -1689,7 +1691,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         workspaceNames = deduplicatedWorkspaceNamesPreservingOrder(workspaceNames)
         syncIntegratedWorkspaceNames()
-        try? workspaceNoteStore.renameWorkspaceData(from: source, to: target)
         persistSession()
     }
 

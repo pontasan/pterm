@@ -327,9 +327,9 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
     private var saveFn: (String) -> Void
     var onClose: (() -> Void)?
 
-    init(workspaceName: String, initialText: String, onSave: @escaping (String) -> Void) {
+    init(initialText: String, onSave: @escaping (String) -> Void) {
         self.saveFn = onSave
-        self.baseTitle = "Notes — \(workspaceName)"
+        self.baseTitle = "Notes"
         let contentRect = NSRect(x: 0, y: 0, width: 720, height: 560)
         let styleMask: NSWindow.StyleMask = [.titled, .closable, .resizable, .miniaturizable]
         let window = NSWindow(contentRect: contentRect, styleMask: styleMask, backing: .buffered, defer: false)

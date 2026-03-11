@@ -126,6 +126,7 @@ final class SplitTerminalContainerView: NSView {
                 guard let self, let controller else { return }
                 self.onMaximizeTerminal?(controller)
             }
+            scrollView.toolTip = "⌘+Click to maximize this terminal"
         }
 
         // Phase 4: Create single-MTKView overlay on top of all scroll views.

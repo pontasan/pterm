@@ -23,14 +23,14 @@ final class PtermExportImportManager {
         static let rounds: UInt32 = 100_000
     }
 
-    private let noteStore: WorkspaceNoteStore
+    private let noteStore: AppNoteStore
     private let fileManager: FileManager
     private let configURL: URL
     private let sessionsURL: URL
     private let workspacesURL: URL
     private let auditURL: URL
 
-    init(noteStore: WorkspaceNoteStore,
+    init(noteStore: AppNoteStore,
          fileManager: FileManager = .default,
          configURL: URL = PtermDirectories.config,
          sessionsURL: URL = PtermDirectories.sessions,

@@ -8,12 +8,12 @@ final class StatusBarView: NSView {
     private let separatorLabel: NSTextField
     private let noteButton: NSButton
     var onBackToIntegrated: (() -> Void)?
-    var onOpenWorkspaceNote: (() -> Void)?
+    var onOpenNote: (() -> Void)?
 
     override init(frame frameRect: NSRect) {
         backButton = NSButton(title: "◀ Overview", target: nil, action: nil)
         separatorLabel = NSTextField(labelWithString: "|")
-        noteButton = NSButton(title: "📝 Notes", target: nil, action: nil)
+        noteButton = NSButton(title: "Edit Notes", target: nil, action: nil)
         super.init(frame: frameRect)
         backButton.target = self
         backButton.action = #selector(backButtonClicked)
@@ -48,8 +48,7 @@ final class StatusBarView: NSView {
         noteButton.isBordered = false
         noteButton.contentTintColor = textColor
         noteButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        noteButton.toolTip = "Workspace Notes"
-        noteButton.isHidden = true
+        noteButton.toolTip = "Notes"
         addSubview(noteButton)
     }
 
@@ -65,23 +64,24 @@ final class StatusBarView: NSView {
         let height = bounds.height - vertInset * 2
         let spacing: CGFloat = 6
 
-        backButton.sizeToFit()
-        if !backButton.isHidden {
-            backButton.frame = NSRect(x: inset, y: vertInset, width: backButton.frame.width, height: height)
-        }
+        // Left side: [backButton] [separator] [noteButton] when back is visible
+        //            [noteButton] when back is hidden
+        var x = inset
 
-        separatorLabel.sizeToFit()
-        if !separatorLabel.isHidden {
-            let sepX = backButton.frame.maxX + spacing
-            separatorLabel.frame = NSRect(x: sepX, y: vertInset, width: separatorLabel.frame.width, height: height)
+        if !backButton.isHidden {
+            backButton.sizeToFit()
+            backButton.frame = NSRect(x: x, y: vertInset, width: backButton.frame.width, height: height)
+            x = backButton.frame.maxX + spacing
+
+            separatorLabel.sizeToFit()
+            separatorLabel.frame = NSRect(x: x, y: vertInset, width: separatorLabel.frame.width, height: height)
+            x = separatorLabel.frame.maxX + spacing
         }
 
         noteButton.sizeToFit()
-        if !noteButton.isHidden {
-            let noteX = separatorLabel.frame.maxX + spacing
-            noteButton.frame = NSRect(x: noteX, y: vertInset, width: noteButton.frame.width, height: height)
-        }
+        noteButton.frame = NSRect(x: x, y: vertInset, width: noteButton.frame.width, height: height)
 
+        // Right side: metrics
         metricsLabel.sizeToFit()
         let metricsX = bounds.width - inset - metricsLabel.frame.width
         metricsLabel.frame = NSRect(x: metricsX, y: vertInset, width: metricsLabel.frame.width, height: height)
@@ -106,7 +106,6 @@ final class StatusBarView: NSView {
     func setBackButtonVisible(_ visible: Bool) {
         backButton.isHidden = !visible
         separatorLabel.isHidden = !visible
-        noteButton.isHidden = !visible
         needsLayout = true
     }
 
@@ -115,6 +114,6 @@ final class StatusBarView: NSView {
     }
 
     @objc private func noteButtonClicked() {
-        onOpenWorkspaceNote?()
+        onOpenNote?()
     }
 }

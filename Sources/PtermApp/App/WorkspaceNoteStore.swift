@@ -2,7 +2,8 @@ import CommonCrypto
 import Foundation
 import Security
 
-final class WorkspaceNoteStore {
+/// Stores a single encrypted app-level note in ~/.pterm/note.enc.
+final class AppNoteStore {
     private enum Constants {
         static let service = "com.pterm.workspace-notes"
         static let account = "encryption-key"
@@ -10,19 +11,20 @@ final class WorkspaceNoteStore {
         static let ivLength = kCCBlockSizeAES128
         static let saltLength = 16
         static let magic = "PTN1".data(using: .utf8)!
+        static let noteFileName = "note.enc"
     }
 
     private let rootDirectory: URL
     private let fileManager: FileManager
     private var cachedKey: Data?
 
-    init(rootDirectory: URL = PtermDirectories.workspaces, fileManager: FileManager = .default) {
+    init(rootDirectory: URL = PtermDirectories.base, fileManager: FileManager = .default) {
         self.rootDirectory = rootDirectory
         self.fileManager = fileManager
     }
 
-    func loadNote(for workspaceName: String) throws -> String? {
-        let url = noteURL(for: workspaceName)
+    func loadNote() throws -> String? {
+        let url = noteURL
         guard fileManager.fileExists(atPath: url.path) else {
             return nil
         }
@@ -33,50 +35,12 @@ final class WorkspaceNoteStore {
         return String(data: plaintext, encoding: .utf8)
     }
 
-    func saveNote(_ note: String, for workspaceName: String) throws {
-        let directory = workspaceDirectory(for: workspaceName)
-        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true,
+    func saveNote(_ note: String) throws {
+        try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true,
                                         attributes: [.posixPermissions: 0o700])
         let key = try loadOrCreateKey()
         let ciphertext = try encrypt(Data(note.utf8), using: key)
-        try AtomicFileWriter.write(ciphertext, to: noteURL(for: workspaceName), permissions: 0o600)
-    }
-
-    func renameWorkspaceData(from oldName: String, to newName: String) throws {
-        let source = workspaceDirectory(for: oldName)
-        let destination = workspaceDirectory(for: newName)
-        guard source.path != destination.path,
-              fileManager.fileExists(atPath: source.path) else {
-            return
-        }
-
-        try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true,
-                                        attributes: [.posixPermissions: 0o700])
-
-        if fileManager.fileExists(atPath: destination.path) {
-            let sourceNote = noteURL(for: oldName)
-            if fileManager.fileExists(atPath: sourceNote.path) {
-                let note = try loadNote(for: oldName) ?? ""
-                try saveNote(note, for: newName)
-            }
-            try removeWorkspaceData(for: oldName)
-            return
-        }
-
-        try fileManager.moveItem(at: source, to: destination)
-        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: destination.path)
-        let note = destination.appendingPathComponent("notes.enc")
-        if fileManager.fileExists(atPath: note.path) {
-            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: note.path)
-        }
-    }
-
-    func removeWorkspaceData(for workspaceName: String) throws {
-        let directory = workspaceDirectory(for: workspaceName)
-        guard fileManager.fileExists(atPath: directory.path) else {
-            return
-        }
-        try fileManager.removeItem(at: directory)
+        try AtomicFileWriter.write(ciphertext, to: noteURL, permissions: 0o600)
     }
 
     func exportEncryptionKey() throws -> Data {
@@ -85,7 +49,7 @@ final class WorkspaceNoteStore {
 
     func importEncryptionKey(_ key: Data) throws {
         guard key.count == Constants.keyLength else {
-            throw WorkspaceNoteError.invalidKeyLength
+            throw AppNoteError.invalidKeyLength
         }
         let deleteQuery: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
@@ -103,22 +67,33 @@ final class WorkspaceNoteStore {
         ]
         let status = SecItemAdd(add as CFDictionary, nil)
         guard status == errSecSuccess else {
-            throw WorkspaceNoteError.keychain(status)
+            throw AppNoteError.keychain(status)
         }
     }
 
-    private func workspaceDirectory(for name: String) -> URL {
-        let sanitized = FileNameSanitizer.sanitize(name, fallback: "Uncategorized")
-        return rootDirectory.appendingPathComponent(sanitized)
+    private var noteURL: URL {
+        rootDirectory.appendingPathComponent(Constants.noteFileName)
     }
 
-    private func noteURL(for workspaceName: String) -> URL {
-        workspaceDirectory(for: workspaceName).appendingPathComponent("notes.enc")
+    private func debugLog(_ msg: String) {
+        let line = "\(Date()): [AppNoteStore] \(msg)\n"
+        let path = "/tmp/pterm_note_debug.log"
+        if let fh = FileHandle(forWritingAtPath: path) {
+            fh.seekToEndOfFile()
+            fh.write(Data(line.utf8))
+            fh.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
+        }
     }
 
     private func loadOrCreateKey() throws -> Data {
-        if let cachedKey { return cachedKey }
+        if let cachedKey {
+            debugLog("using cachedKey")
+            return cachedKey
+        }
 
+        debugLog("calling SecItemCopyMatching...")
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: Constants.service,
@@ -128,15 +103,16 @@ final class WorkspaceNoteStore {
         ]
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
+        debugLog("SecItemCopyMatching returned status=\(status)")
         if status == errSecSuccess, let data = item as? Data {
             guard data.count == Constants.keyLength else {
-                throw WorkspaceNoteError.invalidKeyLength
+                throw AppNoteError.invalidKeyLength
             }
             cachedKey = data
             return data
         }
         if status != errSecItemNotFound {
-            throw WorkspaceNoteError.keychain(status)
+            throw AppNoteError.keychain(status)
         }
 
         var key = Data(count: Constants.keyLength)
@@ -144,7 +120,7 @@ final class WorkspaceNoteStore {
             SecRandomCopyBytes(kSecRandomDefault, Constants.keyLength, bytes.baseAddress!)
         }
         guard result == errSecSuccess else {
-            throw WorkspaceNoteError.randomFailure
+            throw AppNoteError.randomFailure
         }
 
         let add: [CFString: Any] = [
@@ -156,7 +132,7 @@ final class WorkspaceNoteStore {
         ]
         let addStatus = SecItemAdd(add as CFDictionary, nil)
         guard addStatus == errSecSuccess else {
-            throw WorkspaceNoteError.keychain(addStatus)
+            throw AppNoteError.keychain(addStatus)
         }
         cachedKey = key
         return key
@@ -172,7 +148,7 @@ final class WorkspaceNoteStore {
             SecRandomCopyBytes(kSecRandomDefault, Constants.ivLength, bytes.baseAddress!)
         }
         guard saltStatus == errSecSuccess, ivStatus == errSecSuccess else {
-            throw WorkspaceNoteError.randomFailure
+            throw AppNoteError.randomFailure
         }
 
         let crypt = try crypt(operation: CCOperation(kCCEncrypt),
@@ -184,7 +160,7 @@ final class WorkspaceNoteStore {
         let prefixLength = Constants.magic.count + Constants.saltLength + Constants.ivLength
         guard ciphertext.count >= prefixLength,
               ciphertext.prefix(Constants.magic.count) == Constants.magic else {
-            throw WorkspaceNoteError.invalidFormat
+            throw AppNoteError.invalidFormat
         }
         let ivRange = (Constants.magic.count + Constants.saltLength)..<(Constants.magic.count + Constants.saltLength + Constants.ivLength)
         let bodyRange = (Constants.magic.count + Constants.saltLength + Constants.ivLength)..<ciphertext.count
@@ -219,14 +195,14 @@ final class WorkspaceNoteStore {
         }
 
         guard status == kCCSuccess else {
-            throw WorkspaceNoteError.crypto(status)
+            throw AppNoteError.crypto(status)
         }
         output.removeSubrange(outLength..<output.count)
         return output
     }
 }
 
-enum WorkspaceNoteError: Error {
+enum AppNoteError: Error {
     case keychain(OSStatus)
     case crypto(CCCryptorStatus)
     case invalidFormat

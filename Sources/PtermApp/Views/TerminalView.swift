@@ -31,6 +31,10 @@ final class TerminalView: MTKView, NSTextInputClient {
     var onBecameFirstResponder: (() -> Void)?
     /// Callback when user Cmd+clicks (maximize/restore in split view)
     var onCmdClick: (() -> Void)?
+    /// Tooltip shown when hovering over this terminal (e.g., Cmd+click hint).
+    var cmdClickTooltip: String? {
+        didSet { toolTip = cmdClickTooltip }
+    }
 
     /// When true, rendering is demand-driven (only on model changes) instead of 60fps continuous.
     /// Used in split view to avoid overwhelming GPU with many independent display links.

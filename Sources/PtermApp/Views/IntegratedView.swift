@@ -45,7 +45,6 @@ final class IntegratedView: MTKView, NSDraggingSource {
         let name: String
         let frame: NSRect
         let headerFrame: NSRect
-        let noteFrame: NSRect
         let addFrame: NSRect
         let closeFrame: NSRect
         let selectAllFrame: NSRect
@@ -68,7 +67,6 @@ final class IntegratedView: MTKView, NSDraggingSource {
     var onRenameWorkspace: ((String, String) -> Void)?
     var onMoveTerminalToWorkspace: ((TerminalController, String) -> Void)?
     var onRenameTerminalTitle: ((TerminalController, String?) -> Void)?
-    var onEditWorkspaceNote: ((String) -> Void)?
 
     /// Set of currently selected terminals (for multi-select with Shift)
     private(set) var selectedTerminals: Set<UUID> = []
@@ -402,11 +400,6 @@ final class IntegratedView: MTKView, NSDraggingSource {
                                       y: headerFrame.minY + (headerFrame.height - Layout.closeButtonSize) / 2,
                                       width: Layout.closeButtonSize,
                                       height: Layout.closeButtonSize)
-                let noteFrame = NSRect(x: addFrame.minX - Layout.closeButtonSize - 6,
-                                       y: addFrame.minY,
-                                       width: Layout.closeButtonSize,
-                                       height: Layout.closeButtonSize)
-
                 // Compute grid and thumbnail size based on actual workspace width
                 let termCount = max(section.terminals.count, 1)
                 let g = actualGrid(terminalCount: termCount, wsWidth: wsWidth)
@@ -455,7 +448,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
                                            y: selectBtnY, width: deselectW, height: selectBtnH)
 
                 layouts.append(WorkspaceLayout(name: section.name, frame: frame, headerFrame: headerFrame,
-                                               noteFrame: noteFrame, addFrame: addFrame, closeFrame: closeFrame,
+                                               addFrame: addFrame, closeFrame: closeFrame,
                                                selectAllFrame: selectAllFrame, deselectFrame: deselectFrame,
                                                terminals: thumbnailLayouts))
                 currentX += wsWidth + outerPad
@@ -509,13 +502,6 @@ final class IntegratedView: MTKView, NSDraggingSource {
         return nil
     }
 
-    private func workspaceNoteTarget(at point: NSPoint) -> String? {
-        for layout in cachedWorkspaceLayouts where layout.noteFrame.insetBy(dx: -4, dy: -4).contains(point) {
-            return layout.name
-        }
-        return nil
-    }
-
     private func workspaceRemoveTarget(at point: NSPoint) -> String? {
         for layout in cachedWorkspaceLayouts where layout.closeFrame.insetBy(dx: -4, dy: -4).contains(point) {
             return layout.name
@@ -557,11 +543,6 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
         if let workspace = workspaceAddTarget(at: point) {
             onAddTerminalToWorkspace?(workspace)
-            return
-        }
-
-        if let workspace = workspaceNoteTarget(at: point) {
-            onEditWorkspaceNote?(workspace)
             return
         }
 
@@ -634,8 +615,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         // Workspace header click: prepare for workspace drag
         if let workspace = workspaceHeaderTarget(at: point),
            workspaceAddTarget(at: point) == nil,
-           workspaceRemoveTarget(at: point) == nil,
-           workspaceNoteTarget(at: point) == nil {
+           workspaceRemoveTarget(at: point) == nil {
             mouseDownWorkspace = workspace
             mouseDownPoint = point
         }
@@ -771,14 +751,11 @@ final class IntegratedView: MTKView, NSDraggingSource {
             text = "Delete Workspace"
         } else if workspaceAddTarget(at: point) != nil {
             text = "Add Terminal"
-        } else if workspaceNoteTarget(at: point) != nil {
-            text = "Edit Note"
         } else if addWorkspaceButtonFrame.contains(point) {
             text = "Add Workspace"
         } else if let workspace = workspaceHeaderTarget(at: point),
                   workspaceAddTarget(at: point) == nil,
-                  workspaceRemoveTarget(at: point) == nil,
-                  workspaceNoteTarget(at: point) == nil {
+                  workspaceRemoveTarget(at: point) == nil {
             text = "Double-click to rename \"\(workspace)\""
         } else if let controller = terminalTitleTarget(at: point) {
             text = "Double-click to rename \"\(controller.title)\""
@@ -1244,6 +1221,7 @@ extension IntegratedView: MTKViewDelegate {
                 encoder: encoder,
                 title: controller.title,
                 pid: controller.foregroundProcessID ?? controller.processID,
+                shellPID: controller.processID,
                 frame: frame.title,
                 scaleFactor: sf,
                 viewportSize: viewportSize
@@ -1448,12 +1426,6 @@ extension IntegratedView: MTKViewDelegate {
             scaleFactor: scaleFactor,
             viewportSize: viewportSize
         )
-        drawWorkspaceNoteButton(
-            encoder: encoder,
-            frame: workspace.noteFrame,
-            scaleFactor: scaleFactor,
-            viewportSize: viewportSize
-        )
         drawWorkspaceCloseButton(
             encoder: encoder,
             frame: workspace.closeFrame,
@@ -1487,6 +1459,7 @@ extension IntegratedView: MTKViewDelegate {
         encoder: MTLRenderCommandEncoder,
         title: String,
         pid: pid_t,
+        shellPID: pid_t,
         frame: NSRect,
         scaleFactor: Float,
         viewportSize: SIMD2<Float>
@@ -1556,6 +1529,15 @@ extension IntegratedView: MTKViewDelegate {
             drawRightAlignedTitleText(
                 encoder: encoder,
                 text: String(format: "CPU: %.0f%%", usage),
+                frame: frame,
+                scaleFactor: scaleFactor,
+                viewportSize: viewportSize
+            )
+        } else if pid != shellPID {
+            // Foreground process (e.g., setuid binary) is not accessible via proc_pidinfo.
+            drawRightAlignedTitleText(
+                encoder: encoder,
+                text: "CPU: N/A",
                 frame: frame,
                 scaleFactor: scaleFactor,
                 viewportSize: viewportSize
@@ -1723,38 +1705,6 @@ extension IntegratedView: MTKViewDelegate {
         }
     }
 
-    private func drawWorkspaceNoteButton(
-        encoder: MTLRenderCommandEncoder,
-        frame: NSRect,
-        scaleFactor: Float,
-        viewportSize: SIMD2<Float>
-    ) {
-        guard let pipeline = renderer.overlayPipeline else { return }
-        var vertices: [Float] = []
-        let x = Float(frame.origin.x) * scaleFactor
-        let y = Float(frame.origin.y) * scaleFactor
-        let size = Float(frame.width) * scaleFactor
-        renderer.addQuadPublic(to: &vertices, x: x, y: y, w: size, h: size,
-                               tx: 0, ty: 0, tw: 0, th: 0,
-                               fg: (0.18, 0.22, 0.28, 0.95), bg: (0, 0, 0, 0))
-        let inset = size * 0.22
-        let paperW = size - inset * 2
-        let paperH = size - inset * 2
-        renderer.addQuadPublic(to: &vertices, x: x + inset, y: y + inset, w: paperW, h: paperH,
-                               tx: 0, ty: 0, tw: 0, th: 0,
-                               fg: (0.9, 0.9, 0.88, 1.0), bg: (0, 0, 0, 0))
-        let lineInset = inset * 1.35
-        let lineW = paperW - lineInset
-        let lineH: Float = max(1, scaleFactor)
-        for row in 0..<3 {
-            let lineY = y + inset + size * 0.18 + Float(row) * size * 0.16
-            renderer.addQuadPublic(to: &vertices, x: x + lineInset, y: lineY, w: lineW, h: lineH,
-                                   tx: 0, ty: 0, tw: 0, th: 0,
-                                   fg: (0.28, 0.34, 0.42, 1.0), bg: (0, 0, 0, 0))
-        }
-        drawVertices(vertices, encoder: encoder, pipeline: pipeline, viewportSize: viewportSize)
-    }
-
     private func drawWorkspaceCloseButton(
         encoder: MTLRenderCommandEncoder,
         frame: NSRect,
@@ -1915,23 +1865,25 @@ extension IntegratedView: MTKViewDelegate {
         let size = Float(btnSize) * scaleFactor
         var vertices: [Float] = []
 
+        // Background
         renderer.addQuadPublic(
             to: &vertices, x: x, y: y, w: size, h: size,
             tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (0.18, 0.22, 0.18, 0.75),
+            fg: (0.20, 0.24, 0.20, 0.80),
             bg: (0, 0, 0, 0)
         )
 
-        let lineW: Float = 3.0 * scaleFactor
-        let lineLen: Float = size * 0.42
+        // Plus sign
         let cx = x + size / 2
         let cy = y + size / 2
+        let lineW: Float = 2.5 * scaleFactor
+        let lineLen: Float = size * 0.4
         renderer.addQuadPublic(
             to: &vertices,
             x: cx - lineLen / 2, y: cy - lineW / 2,
             w: lineLen, h: lineW,
             tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (0.82, 0.9, 0.82, 1.0),
+            fg: (0.85, 0.92, 0.85, 1.0),
             bg: (0, 0, 0, 0)
         )
         renderer.addQuadPublic(
@@ -1939,16 +1891,7 @@ extension IntegratedView: MTKViewDelegate {
             x: cx - lineW / 2, y: cy - lineLen / 2,
             w: lineW, h: lineLen,
             tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (0.82, 0.9, 0.82, 1.0),
-            bg: (0, 0, 0, 0)
-        )
-        let folderY = y + size * 0.22
-        renderer.addQuadPublic(
-            to: &vertices,
-            x: x + size * 0.18, y: folderY,
-            w: size * 0.64, h: size * 0.36,
-            tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (0.36, 0.48, 0.36, 0.95),
+            fg: (0.85, 0.92, 0.85, 1.0),
             bg: (0, 0, 0, 0)
         )
         drawVertices(vertices, encoder: encoder, pipeline: pipeline, viewportSize: viewportSize)
