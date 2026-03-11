@@ -884,14 +884,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         splitContainerView?.shortcutConfiguration = config.shortcuts
         integratedView?.shortcutConfiguration = config.shortcuts
 
-        if manager.count == 0 {
-            let fontName = config.fontName ?? renderer.glyphAtlas.fontName
-            let fontSize = CGFloat(config.fontSize ?? Double(renderer.glyphAtlas.fontSize))
-            renderer.updateFont(name: fontName, size: fontSize)
-            terminalView?.fontSizeDidChange()
-            splitContainerView?.fontSizeDidChange()
-            integratedView?.setNeedsDisplay(integratedView?.bounds ?? .zero)
-        }
+        let fontName = config.fontName ?? renderer.glyphAtlas.fontName
+        let fontSize = CGFloat(config.fontSize ?? Double(renderer.glyphAtlas.fontSize))
+
+        // Apply the new font to the renderer and propagate to all terminals.
+        // Without synchronizeControllerFontSettings(), per-terminal persisted
+        // font settings would override the global config on the next view switch.
+        let currentRows = manager.fullRows
+        let currentCols = manager.fullCols
+        renderer.updateFont(name: fontName, size: fontSize)
+        synchronizeControllerFontSettings()
+        resizeWindowForFontChange(rows: currentRows, cols: currentCols)
+
+        terminalView?.fontSizeDidChange()
+        terminalView?.updateMarkedTextOverlayPublic()
+        splitContainerView?.fontSizeDidChange()
+        splitContainerView?.updateMarkedTextForFontChange()
+        integratedView?.setNeedsDisplay(integratedView?.bounds ?? .zero)
+        synchronizeWindowLayout(shouldPersistSession: false)
 
         updateWindowTitle()
     }
