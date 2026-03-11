@@ -29,6 +29,25 @@ final class TerminalView: MTKView, NSTextInputClient {
     /// Callback when user requests to go back to integrated view
     var onBackToIntegrated: (() -> Void)?
     var onBecameFirstResponder: (() -> Void)?
+    /// Callback when user Cmd+clicks (maximize/restore in split view)
+    var onCmdClick: (() -> Void)?
+
+    /// When true, rendering is demand-driven (only on model changes) instead of 60fps continuous.
+    /// Used in split view to avoid overwhelming GPU with many independent display links.
+    var demandDrivenRendering: Bool = false {
+        didSet {
+            isPaused = demandDrivenRendering
+            enableSetNeedsDisplay = demandDrivenRendering
+            if demandDrivenRendering {
+                setNeedsDisplay(bounds)
+            }
+        }
+    }
+
+    /// When true, this view's own draw() does nothing. An external SplitRenderView
+    /// handles all rendering into a single MTKView to avoid macOS CAMetalLayer
+    /// compositing issues with multiple Metal layers in one window.
+    var renderingSuppressed: Bool = false
 
     /// Border configuration for split-view focus indication (drawn within Metal pipeline).
     var borderConfig: MetalRenderer.BorderConfig?
@@ -172,10 +191,15 @@ final class TerminalView: MTKView, NSTextInputClient {
             self?.updateMarkedTextOverlay()
         }
         controller.notifyFocusChanged(window?.isKeyWindow == true)
+        updateTerminalSize()
+        // When a controller is assigned to a new view (e.g., returning to split view),
+        // ensure we show the latest output, not stale scrollback position.
+        controller.scrollToBottom()
     }
 
     deinit {
         removeWindowObservers()
+        renderer?.removeBuffers(for: self)
     }
 
     private func updateWindowObservers() {
@@ -325,9 +349,14 @@ final class TerminalView: MTKView, NSTextInputClient {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
 
-        if event.modifierFlags.contains(.command),
-           handleDetectedLinkClick(event) {
-            return
+        if event.modifierFlags.contains(.command) {
+            if handleDetectedLinkClick(event) {
+                return
+            }
+            if let onCmdClick {
+                onCmdClick()
+                return
+            }
         }
 
         if sendMouseEventIfNeeded(event, phase: .down, buttonOverride: 0) {
@@ -862,7 +891,8 @@ extension TerminalView: MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
-        guard let renderer = renderer,
+        guard !renderingSuppressed,
+              let renderer = renderer,
               let controller = terminalController else { return }
 
         let highlight: MetalRenderer.SearchHighlight? = searchMatches.isEmpty ? nil :
@@ -1163,6 +1193,9 @@ final class TerminalScrollView: NSScrollView {
     /// back to a scrollOffset for the terminal's virtual scrollback.
     @objc private func scrollViewDidScroll(_ notification: Notification) {
         guard !isSyncing else { return }
+        // When rendering is suppressed (split view), SplitRenderView owns the render loop.
+        // The clip view position is stale and must not feed back into scrollOffset.
+        guard !terminalView.renderingSuppressed else { return }
         guard let controller = terminalView.terminalController else { return }
 
         let viewportHeight = bounds.height

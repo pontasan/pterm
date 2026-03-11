@@ -12,6 +12,9 @@ final class SplitTerminalContainerView: NSView {
     private let renderer: MetalRenderer
     private(set) var controllers: [TerminalController]
     private var scrollViews: [TerminalScrollView] = []
+    /// Single MTKView overlay that renders all terminal cells.
+    /// Avoids macOS CAMetalLayer compositing issues with multiple Metal layers.
+    private var splitRenderView: SplitRenderView?
     private let backButton = NSButton(title: "▦", target: nil, action: nil)
     var shortcutConfiguration: ShortcutConfiguration = .default {
         didSet {
@@ -21,6 +24,7 @@ final class SplitTerminalContainerView: NSView {
 
     var onBackToIntegrated: (() -> Void)?
     var onActiveControllerChange: ((TerminalController) -> Void)?
+    var onMaximizeTerminal: ((TerminalController) -> Void)?
 
     init(frame: NSRect, renderer: MetalRenderer, controllers: [TerminalController]) {
         self.renderer = renderer
@@ -72,40 +76,84 @@ final class SplitTerminalContainerView: NSView {
         layoutGrid()
     }
 
-    /// Set borderConfig on each TerminalView: white for unfocused, blue for focused.
-    private func updateFocusBorders() {
-        guard scrollViews.count > 1 else {
-            scrollViews.first?.terminalView?.borderConfig = nil
-            return
-        }
+    /// Compute border config for each cell: white for unfocused, blue for focused.
+    private func borderConfig(for terminalView: TerminalView) -> MetalRenderer.BorderConfig? {
+        guard scrollViews.count > 1 else { return nil }
         let firstResponder = window?.firstResponder
-        for scrollView in scrollViews {
-            guard let tv = scrollView.terminalView else { continue }
-            tv.borderConfig = (firstResponder === tv) ? Self.blueBorder : Self.whiteBorder
-        }
+        return (firstResponder === terminalView) ? Self.blueBorder : Self.whiteBorder
     }
 
     private func rebuildSubviews() {
+        // Remove old overlay and scroll views
+        splitRenderView?.removeFromSuperview()
+        splitRenderView = nil
         scrollViews.forEach { $0.removeFromSuperview() }
         scrollViews.removeAll()
 
-        for controller in controllers {
+        // Phase 1: Create scroll views WITHOUT assigning controllers.
+        // This avoids premature terminal resizes with incorrect (full-window) bounds.
+        for _ in controllers {
             let scrollView = TerminalScrollView(frame: bounds, renderer: renderer)
             scrollView.autoresizingMask = [.width, .height]
+            addSubview(scrollView)
+            scrollViews.append(scrollView)
+        }
+
+        // Phase 2: Set correct cell-sized frames before controllers are assigned.
+        layoutGrid()
+
+        // Phase 3: Assign controllers now that frames are correct.
+        for (index, controller) in controllers.enumerated() {
+            let scrollView = scrollViews[index]
             scrollView.terminalView.shortcutConfiguration = shortcutConfiguration
+            // Suppress individual rendering — SplitRenderView handles it.
+            // Also make the CAMetalLayer invisible so it doesn't interfere
+            // with Window Server compositing of the overlay SplitRenderView.
+            scrollView.terminalView.renderingSuppressed = true
+            scrollView.terminalView.isPaused = true
+            scrollView.terminalView.enableSetNeedsDisplay = false
+            scrollView.terminalView.alphaValue = 0
             scrollView.terminalView.terminalController = controller
             scrollView.terminalView.onBecameFirstResponder = { [weak self, weak controller] in
                 guard let self, let controller else { return }
                 self.onActiveControllerChange?(controller)
-                self.updateFocusBorders()
+                self.syncRenderCells()
             }
             scrollView.terminalView.onBackToIntegrated = { [weak self] in
                 self?.onBackToIntegrated?()
             }
-            addSubview(scrollView)
-            scrollViews.append(scrollView)
+            scrollView.terminalView.onCmdClick = { [weak self, weak controller] in
+                guard let self, let controller else { return }
+                self.onMaximizeTerminal?(controller)
+            }
         }
-        layoutGrid()
+
+        // Phase 4: Create single-MTKView overlay on top of all scroll views.
+        let overlay = SplitRenderView(frame: bounds, renderer: renderer)
+        overlay.autoresizingMask = [.width, .height]
+        overlay.delegate = overlay
+        overlay.borderConfigProvider = { [weak self] tv in
+            self?.borderConfig(for: tv)
+        }
+        addSubview(overlay)
+        splitRenderView = overlay
+        syncRenderCells()
+    }
+
+    /// Sync the SplitRenderView's cell references from current scroll view layout.
+    private func syncRenderCells() {
+        guard let overlay = splitRenderView else { return }
+        var refs: [SplitRenderView.CellRef] = []
+        for scrollView in scrollViews {
+            guard let tv = scrollView.terminalView,
+                  let controller = tv.terminalController else { continue }
+            refs.append(SplitRenderView.CellRef(
+                terminalView: tv,
+                controller: controller,
+                frame: scrollView.frame
+            ))
+        }
+        overlay.cellRefs = refs
     }
 
     private func layoutGrid() {
@@ -128,13 +176,14 @@ final class SplitTerminalContainerView: NSView {
                 height: cellHeight
             )
         }
-        updateFocusBorders()
+
+        splitRenderView?.frame = bounds
+        syncRenderCells()
     }
 
     func fontSizeDidChange() {
         for scrollView in scrollViews {
             scrollView.terminalView.fontSizeDidChange()
-            scrollView.terminalView.setNeedsDisplay(scrollView.terminalView.bounds)
         }
         needsLayout = true
     }

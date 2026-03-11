@@ -105,6 +105,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Currently focused terminal controller (nil = integrated view mode)
     private var focusedController: TerminalController?
 
+    /// Controllers saved when maximizing a terminal from split view (for restore)
+    private var splitOriginControllers: [TerminalController]?
+
     /// View mode
     private enum ViewMode {
         case integrated
@@ -447,6 +450,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sv.terminalView.onBackToIntegrated = { [weak self] in
             self?.switchToIntegrated()
         }
+        sv.terminalView.onCmdClick = { [weak self] in
+            guard let self, let controllers = self.splitOriginControllers else { return }
+            self.splitOriginControllers = nil
+            self.switchToSplit(controllers)
+        }
         window.contentView!.addSubview(sv)
         terminalScrollView = sv
         terminalView = sv.terminalView
@@ -492,8 +500,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         splitView.onBackToIntegrated = { [weak self] in
             self?.switchToIntegrated()
         }
+        splitView.onMaximizeTerminal = { [weak self] controller in
+            guard let self else { return }
+            self.splitOriginControllers = controllers
+            self.switchToFocused(controller)
+        }
         window.contentView!.addSubview(splitView)
         splitContainerView = splitView
+        splitOriginControllers = nil
         viewMode = .split(controllers)
         updateTitlebarBackButtonVisibility()
         refreshStatusBarMetrics()
@@ -517,6 +531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scrollbarOverlay = nil
         terminalView = nil
         focusedController = nil
+        splitOriginControllers = nil
         hideSearchBar()
 
         // Show integrated view

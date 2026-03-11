@@ -1,0 +1,133 @@
+import AppKit
+import MetalKit
+
+/// A single MTKView overlay that renders all split-view terminals in one render pass.
+///
+/// macOS Window Server does not reliably composite multiple CAMetalLayers in a single
+/// window — only the first/focused layer renders correctly. This view solves that by
+/// rendering all terminal cells into a single Metal drawable using vertex offsets and
+/// scissor rects, the same proven approach used by IntegratedView for thumbnails.
+///
+/// Event handling (keyboard, mouse, IME) remains on the individual TerminalViews
+/// underneath. This view passes all hit-test events through (hitTest returns nil).
+final class SplitRenderView: MTKView {
+    /// Reference to a terminal cell in the split grid.
+    /// Holds a weak reference to TerminalView so live state (selection, border) is read each frame.
+    struct CellRef {
+        weak var terminalView: TerminalView?
+        let controller: TerminalController
+        let frame: NSRect
+    }
+
+    private let renderer: MetalRenderer
+    var cellRefs: [CellRef] = []
+    /// Closure to compute border config for a TerminalView each frame.
+    var borderConfigProvider: ((TerminalView) -> MetalRenderer.BorderConfig?)?
+
+    init(frame: NSRect, renderer: MetalRenderer) {
+        self.renderer = renderer
+        super.init(frame: frame, device: renderer.device)
+
+        self.colorPixelFormat = .bgra8Unorm
+        self.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        self.isPaused = false
+        self.enableSetNeedsDisplay = false
+        self.preferredFramesPerSecond = 60
+        self.wantsLayer = true
+    }
+
+    @available(*, unavailable)
+    required init(coder: NSCoder) {
+        fatalError("init(coder:) not implemented")
+    }
+
+    deinit {
+        renderer.removeBuffers(for: self)
+    }
+
+    /// Pass all events through to the TerminalViews underneath.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    override var acceptsFirstResponder: Bool { false }
+
+    /// Detect backing scale factor changes (moving between Retina/non-Retina displays).
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        if let sf = window?.backingScaleFactor {
+            layer?.contentsScale = sf
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let sf = window?.backingScaleFactor {
+            layer?.contentsScale = sf
+        }
+    }
+}
+
+// MARK: - MTKViewDelegate
+
+extension SplitRenderView: MTKViewDelegate {
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        // No-op: terminal sizes are managed by the TerminalViews.
+    }
+
+    func draw(in view: MTKView) {
+        guard !cellRefs.isEmpty,
+              let drawable = view.currentDrawable,
+              let renderPassDescriptor = view.currentRenderPassDescriptor,
+              let commandBuffer = renderer.commandQueue.makeCommandBuffer() else {
+            return
+        }
+
+        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].clearColor =
+            MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(
+            descriptor: renderPassDescriptor) else {
+            return
+        }
+
+        let drawableSize = view.drawableSize
+        let viewportSize = SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height))
+        let sf = Float(renderer.glyphAtlas.scaleFactor)
+
+        let viewHeight = bounds.height
+
+        for ref in cellRefs {
+            // Read live state from TerminalView each frame
+            let selection = ref.terminalView?.selection
+            let border = ref.terminalView.flatMap { borderConfigProvider?($0) }
+
+            // Convert from NSView coordinates (y=0 at bottom) to Metal coordinates (y=0 at top)
+            let flippedRect = NSRect(
+                x: ref.frame.origin.x,
+                y: viewHeight - ref.frame.origin.y - ref.frame.height,
+                width: ref.frame.width,
+                height: ref.frame.height
+            )
+
+            ref.controller.withViewport { model, scrollback, scrollOffset in
+                renderer.renderSplitCell(
+                    model: model,
+                    scrollback: scrollback,
+                    scrollOffset: scrollOffset,
+                    selection: selection,
+                    borderConfig: border,
+                    encoder: encoder,
+                    viewportSize: viewportSize,
+                    cellRect: flippedRect,
+                    scaleFactor: sf
+                )
+            }
+        }
+
+        encoder.endEncoding()
+        commandBuffer.present(drawable)
+        commandBuffer.commit()
+    }
+}

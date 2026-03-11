@@ -894,4 +894,139 @@ final class MetalRenderer {
                                   vertexCount: thumbGlyphVertices.count / floatsPerVertex)
         }
     }
+
+    // MARK: - Split Cell Rendering
+
+    /// Render a terminal at full (1:1) size into a specific rectangle within a shared render pass.
+    /// Used by SplitRenderView to render all split terminals into a single MTKView,
+    /// avoiding macOS CAMetalLayer compositing issues with multiple Metal layers.
+    ///
+    /// Vertex positions from buildVertexData are offset by cellRect's origin.
+    /// A scissor rect clips rendering to the cell bounds.
+    func renderSplitCell(model: TerminalModel, scrollback: ScrollbackBuffer,
+                         scrollOffset: Int, selection: TerminalSelection?,
+                         searchHighlight: SearchHighlight? = nil,
+                         linkUnderline: LinkUnderline? = nil,
+                         borderConfig: BorderConfig? = nil,
+                         encoder: MTLRenderCommandEncoder,
+                         viewportSize: SIMD2<Float>,
+                         cellRect: NSRect,
+                         scaleFactor: Float) {
+        // Build vertex data at full size (positions relative to (0,0))
+        let vd = buildVertexData(model: model, scrollback: scrollback, scrollOffset: scrollOffset,
+                                 selection: selection, searchHighlight: searchHighlight,
+                                 linkUnderline: linkUnderline, scaleFactor: scaleFactor)
+
+        // Pixel offset for this cell
+        let offsetX = Float(cellRect.origin.x) * scaleFactor
+        let offsetY = Float(cellRect.origin.y) * scaleFactor
+        let cellPixelW = Float(cellRect.width) * scaleFactor
+        let cellPixelH = Float(cellRect.height) * scaleFactor
+
+        // Scissor rect must be wholly contained within the drawable.
+        // Clamp to drawable bounds to avoid Metal validation errors.
+        let drawableW = Int(viewportSize.x)
+        let drawableH = Int(viewportSize.y)
+        let sx = max(0, min(Int(offsetX), drawableW - 1))
+        let sy = max(0, min(Int(offsetY), drawableH - 1))
+        let sw = max(1, min(Int(cellPixelW), drawableW - sx))
+        let sh = max(1, min(Int(cellPixelH), drawableH - sy))
+        let scissor = MTLScissorRect(x: sx, y: sy, width: sw, height: sh)
+        encoder.setScissorRect(scissor)
+
+        var uniforms = MetalUniforms(
+            viewportSize: viewportSize,
+            cursorOpacity: (scrollOffset == 0 && model.cursor.visible) ? 1.0 : 0.0,
+            cursorBlink: model.cursor.blinking ? 1.0 : 0.0,
+            time: Float(CACurrentMediaTime() - startTime)
+        )
+
+        // Offset all vertex positions by the cell origin
+        func offsetVertices(_ vertices: [Float]) -> [Float] {
+            guard !vertices.isEmpty else { return vertices }
+            var result = vertices
+            let vertexStride = floatsPerVertex
+            var i = 0
+            while i < result.count {
+                result[i] += offsetX      // x position
+                result[i + 1] += offsetY  // y position
+                i += vertexStride
+            }
+            return result
+        }
+
+        // 1. Backgrounds
+        let bgOffset = offsetVertices(vd.bgVertices)
+        if !bgOffset.isEmpty, let pipeline = bgPipeline,
+           let buf = makeTemporaryBuffer(vertices: bgOffset) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                  vertexCount: bgOffset.count / floatsPerVertex)
+        }
+
+        // 2. Glyphs
+        let glyphOffset = offsetVertices(vd.glyphVertices)
+        if !glyphOffset.isEmpty, let pipeline = glyphPipeline,
+           let atlas = glyphAtlas.texture,
+           let buf = makeTemporaryBuffer(vertices: glyphOffset) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.setFragmentTexture(atlas, index: 0)
+            encoder.setFragmentSamplerState(sampler, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                  vertexCount: glyphOffset.count / floatsPerVertex)
+        }
+
+        // 3. Cursor
+        let cursorOffset = offsetVertices(vd.cursorVertices)
+        if !cursorOffset.isEmpty, let pipeline = cursorPipeline,
+           let buf = makeTemporaryBuffer(vertices: cursorOffset) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                  vertexCount: cursorOffset.count / floatsPerVertex)
+        }
+
+        // 4. Overlay (underline, strikethrough, block elements)
+        let overlayOffset = offsetVertices(vd.overlayVertices)
+        if !overlayOffset.isEmpty, let pipeline = overlayPipeline,
+           let buf = makeTemporaryBuffer(vertices: overlayOffset) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                  vertexCount: overlayOffset.count / floatsPerVertex)
+        }
+
+        // 5. Border (focus indicator)
+        if let border = borderConfig, let pipeline = overlayPipeline {
+            var bv: [Float] = []
+            let bw = border.width * scaleFactor
+            let c = border.color
+            // Top
+            addQuad(to: &bv, x: offsetX, y: offsetY, w: cellPixelW, h: bw,
+                   tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            // Bottom
+            addQuad(to: &bv, x: offsetX, y: offsetY + cellPixelH - bw, w: cellPixelW, h: bw,
+                   tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            // Left
+            addQuad(to: &bv, x: offsetX, y: offsetY + bw, w: bw, h: cellPixelH - 2 * bw,
+                   tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            // Right
+            addQuad(to: &bv, x: offsetX + cellPixelW - bw, y: offsetY + bw, w: bw, h: cellPixelH - 2 * bw,
+                   tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            if let buf = makeTemporaryBuffer(vertices: bv) {
+                encoder.setRenderPipelineState(pipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                      vertexCount: bv.count / floatsPerVertex)
+            }
+        }
+    }
 }

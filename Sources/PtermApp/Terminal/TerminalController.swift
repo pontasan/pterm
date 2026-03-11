@@ -404,6 +404,9 @@ final class TerminalController {
             let oldCols = model.cols
             if rows != oldRows || cols != oldCols {
                 model.resize(newRows: rows, newCols: cols)
+                // After resize, snap to the latest content so the user sees
+                // the current terminal output, not stale scrollback.
+                scrollOffset = 0
             }
             return (oldRows, oldCols)
         }
