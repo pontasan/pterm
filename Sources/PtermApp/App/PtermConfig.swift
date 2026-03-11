@@ -39,7 +39,7 @@ struct PtermConfig {
         fontName: nil,
         fontSize: nil,
         memoryMax: 64 * 1024 * 1024,
-        memoryInitial: 64 * 1024 * 1024,
+        memoryInitial: 2 * 1024 * 1024,
         sessionScrollBufferPersistence: false,
         audit: .disabled,
         security: .default,

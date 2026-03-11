@@ -65,6 +65,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var exportImportManager = PtermExportImportManager(noteStore: workspaceNoteStore)
 
     private var cpuUsageByPID: [pid_t: Double] = [:]
+    private var lastMemoryByPID: [pid_t: UInt64] = [:]
+    private var lastAppMemoryBytes: UInt64 = 0
 
     /// Metal renderer (shared by all views)
     private var renderer: MetalRenderer!
@@ -404,6 +406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         viewMode = .focused(controller)
         updateTitlebarBackButtonVisibility()
+        refreshStatusBarMetrics()
         window.makeFirstResponder(sv.terminalView)
         sv.terminalView.syncScaleFactorIfNeeded()
 
@@ -443,6 +446,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         splitContainerView = splitView
         viewMode = .split(controllers)
         updateTitlebarBackButtonVisibility()
+        refreshStatusBarMetrics()
         if let activeController = splitView.activeController {
             applyRendererSettings(for: activeController)
         }
@@ -511,6 +515,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         iv.syncScaleFactorIfNeeded()
         viewMode = .integrated
         updateTitlebarBackButtonVisibility()
+        refreshStatusBarMetrics()
         window.makeFirstResponder(iv)
 
         updateWindowTitle()
@@ -541,43 +546,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return pids
     }
 
+    private func refreshStatusBarMetrics() {
+        switch viewMode {
+        case .integrated:
+            statusBarView.updateMemoryUsage(bytes: lastAppMemoryBytes)
+            let appCpu = cpuUsageByPID[getpid()] ?? 0
+            statusBarView.updateCpuUsage(percent: appCpu)
+        case .focused(let controller):
+            let pids = terminalPIDs(for: controller)
+            let cpu = pids.compactMap { cpuUsageByPID[$0] }.reduce(0, +)
+            let processMem = lastMemoryByPID[controller.processID] ?? 0
+            let mem = processMem + controller.scrollbackCapacity
+            statusBarView.updateCpuUsage(percent: cpu)
+            statusBarView.updateMemoryUsage(bytes: mem)
+        case .split(let controllers):
+            var totalCpu: Double = 0
+            var totalMem: UInt64 = 0
+            for c in controllers {
+                let pids = terminalPIDs(for: c)
+                totalCpu += pids.compactMap { cpuUsageByPID[$0] }.reduce(0, +)
+                totalMem += (lastMemoryByPID[c.processID] ?? 0) + c.scrollbackCapacity
+            }
+            statusBarView.updateCpuUsage(percent: totalCpu)
+            statusBarView.updateMemoryUsage(bytes: totalMem)
+        }
+    }
+
     private func startMetricsMonitor() {
         let monitor = ProcessMetricsMonitor(interval: 3.0)
         monitor.onUpdate = { [weak self] snapshot in
             guard let self else { return }
             self.cpuUsageByPID = snapshot.cpuUsageByPID
+            self.lastMemoryByPID = snapshot.memoryByPID
+            self.lastAppMemoryBytes = snapshot.appMemoryBytes
             self.manager.terminals.forEach { terminal in
                 if let cwd = snapshot.currentDirectoryByPID[terminal.processID] {
                     terminal.updateCurrentDirectory(path: cwd)
                 }
             }
-
-            // Update status bar metrics based on current view mode
-            switch self.viewMode {
-            case .integrated:
-                // App-level metrics
-                self.statusBarView.updateMemoryUsage(bytes: snapshot.appMemoryBytes)
-                let appPID = getpid()
-                let appCpu = snapshot.cpuUsageByPID[appPID] ?? 0
-                self.statusBarView.updateCpuUsage(percent: appCpu)
-            case .focused(let controller):
-                let pids = self.terminalPIDs(for: controller)
-                let cpu = pids.compactMap { snapshot.cpuUsageByPID[$0] }.reduce(0, +)
-                let processMem = snapshot.memoryByPID[controller.processID] ?? 0
-                let mem = processMem + controller.scrollbackCapacity
-                self.statusBarView.updateCpuUsage(percent: cpu)
-                self.statusBarView.updateMemoryUsage(bytes: mem)
-            case .split(let controllers):
-                var totalCpu: Double = 0
-                var totalMem: UInt64 = 0
-                for c in controllers {
-                    let pids = self.terminalPIDs(for: c)
-                    totalCpu += pids.compactMap { snapshot.cpuUsageByPID[$0] }.reduce(0, +)
-                    totalMem += (snapshot.memoryByPID[c.processID] ?? 0) + c.scrollbackCapacity
-                }
-                self.statusBarView.updateCpuUsage(percent: totalCpu)
-                self.statusBarView.updateMemoryUsage(bytes: totalMem)
-            }
+            self.refreshStatusBarMetrics()
         }
         monitor.start { [weak self] in
             guard let self else { return [] }
