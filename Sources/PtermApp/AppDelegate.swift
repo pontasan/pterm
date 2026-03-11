@@ -191,6 +191,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusBarView = StatusBarView(frame: statusBarFrame())
         statusBarView.autoresizingMask = [.width, .maxYMargin]
+        statusBarView.onBackToIntegrated = { [weak self] in
+            self?.backToIntegratedView(nil)
+        }
         window.contentView!.addSubview(statusBarView)
 
         // Create terminal manager with initial grid size
@@ -292,8 +295,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        isTerminating = true
-        persistSession()
+        if !isTerminating {
+            isTerminating = true
+            persistSession()
+        }
         clipboardCleanupService?.stop()
         manager.stopAll(
             preserveScrollback: config.sessionScrollBufferPersistence,
@@ -344,18 +349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Keep the app alive if there are persisted workspaces to manage.
-        if manager.count == 0 {
-            if !workspaceNames.isEmpty {
-                if case .focused = viewMode {
-                    switchToIntegrated()
-                } else if case .split = viewMode {
-                    switchToIntegrated()
-                }
-                updateWindowTitle()
-                persistSession()
-                return
-            }
+        if manager.count == 0 && workspaceNames.isEmpty {
             NSApplication.shared.terminate(nil)
             return
         }
@@ -544,6 +538,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         monitor.onUpdate = { [weak self] snapshot in
             self?.cpuUsageByPID = snapshot.cpuUsageByPID
             self?.statusBarView.updateMemoryUsage(bytes: snapshot.appMemoryBytes)
+            let totalCpu = snapshot.cpuUsageByPID.values.reduce(0, +)
+            self?.statusBarView.updateCpuUsage(percent: totalCpu)
             self?.manager.terminals.forEach { terminal in
                 if let cwd = snapshot.currentDirectoryByPID[terminal.processID] {
                     terminal.updateCurrentDirectory(path: cwd)
@@ -749,6 +745,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             shouldShow = false
         }
         titlebarBackButton?.isHidden = !shouldShow
+        statusBarView?.setBackButtonVisible(shouldShow)
         layoutTitlebarBackButton()
     }
 
@@ -901,8 +898,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if case .split(let controllers) = viewMode,
                   let first = controllers.first {
             addNewTerminal(workspaceName: first.sessionSnapshot.workspaceName)
-        } else {
-            addNewTerminal()
         }
     }
 

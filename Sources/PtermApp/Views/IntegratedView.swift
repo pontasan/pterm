@@ -69,6 +69,11 @@ final class IntegratedView: MTKView, NSDraggingSource {
     /// Size in pixels of the cached icon texture
     private static let closeIconTextureSize: Int = 64
 
+    /// Custom tooltip window for instant display
+    private var tooltipWindow: NSWindow?
+    private var tooltipLabel: NSTextField?
+    private var currentTooltipText: String?
+
     /// Tracking area for mouse hover (close buttons, etc.)
     private var trackingArea: NSTrackingArea?
 
@@ -487,12 +492,120 @@ final class IntegratedView: MTKView, NSDraggingSource {
         hoveredIndex = thumbnailIndex(at: point)
         hoveredCloseID = closeButtonController(at: point)?.id
         hoveredWorkspaceClose = workspaceRemoveTarget(at: point)
+        updateTooltip(at: point)
     }
 
     override func mouseExited(with event: NSEvent) {
         hoveredIndex = nil
         hoveredCloseID = nil
         hoveredWorkspaceClose = nil
+        hideTooltip()
+    }
+
+    private func updateTooltip(at point: NSPoint) {
+        let text: String?
+        if closeButtonController(at: point) != nil {
+            text = "ターミナルを閉じる"
+        } else if workspaceRemoveTarget(at: point) != nil {
+            text = "ワークスペースを削除"
+        } else if workspaceAddTarget(at: point) != nil {
+            text = "ターミナルを追加"
+        } else if workspaceNoteTarget(at: point) != nil {
+            text = "メモを編集"
+        } else if addWorkspaceButtonFrame.contains(point) {
+            text = "ワークスペースを追加"
+        } else if let workspace = workspaceHeaderTarget(at: point),
+                  workspaceAddTarget(at: point) == nil,
+                  workspaceRemoveTarget(at: point) == nil,
+                  workspaceNoteTarget(at: point) == nil {
+            text = "ダブルクリックで「\(workspace)」の名前を変更"
+        } else if let controller = terminalTitleTarget(at: point) {
+            text = "ダブルクリックで「\(controller.title)」のタイトルを変更"
+        } else {
+            text = nil
+        }
+
+        if text == currentTooltipText { return }
+        currentTooltipText = text
+
+        guard let text else {
+            hideTooltip()
+            return
+        }
+        showTooltip(text, at: point)
+    }
+
+    private func showTooltip(_ text: String, at point: NSPoint) {
+        guard let window else { hideTooltip(); return }
+
+        let label: NSTextField
+        let tipWindow: NSWindow
+        if let existing = tooltipWindow, let existingLabel = tooltipLabel {
+            tipWindow = existing
+            label = existingLabel
+        } else {
+            label = NSTextField(labelWithString: "")
+            label.font = NSFont.systemFont(ofSize: 11)
+            label.textColor = NSColor.white
+            label.isBezeled = false
+            label.isEditable = false
+            label.drawsBackground = false
+
+            let container = NSView()
+            container.wantsLayer = true
+            container.addSubview(label)
+
+            tipWindow = NSWindow(
+                contentRect: .zero,
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: true
+            )
+            tipWindow.isOpaque = false
+            tipWindow.backgroundColor = NSColor(calibratedWhite: 0.15, alpha: 0.95)
+            tipWindow.level = .floating
+            tipWindow.hasShadow = true
+            tipWindow.contentView = container
+            tooltipWindow = tipWindow
+            tooltipLabel = label
+        }
+
+        label.stringValue = text
+        label.sizeToFit()
+        let paddingH: CGFloat = 10
+        let paddingV: CGFloat = 6
+        let labelSize = label.frame.size
+        let winSize = NSSize(width: labelSize.width + paddingH * 2, height: labelSize.height + paddingV * 2)
+        label.frame = NSRect(x: paddingH, y: paddingV, width: labelSize.width, height: labelSize.height)
+        tipWindow.contentView?.frame = NSRect(origin: .zero, size: winSize)
+
+        let screenPoint = window.convertPoint(toScreen: convert(point, to: nil))
+        var origin = NSPoint(x: screenPoint.x + 12, y: screenPoint.y + 16)
+
+        // Keep within screen bounds
+        if let screen = window.screen ?? NSScreen.main {
+            let visibleFrame = screen.visibleFrame
+            if origin.x + winSize.width > visibleFrame.maxX {
+                origin.x = visibleFrame.maxX - winSize.width
+            }
+            if origin.y + winSize.height > visibleFrame.maxY {
+                origin.y = screenPoint.y - winSize.height - 4
+            }
+            if origin.x < visibleFrame.minX {
+                origin.x = visibleFrame.minX
+            }
+            if origin.y < visibleFrame.minY {
+                origin.y = visibleFrame.minY
+            }
+        }
+
+        tipWindow.setFrame(NSRect(origin: origin, size: winSize), display: true)
+        tipWindow.orderFront(nil)
+    }
+
+    private func hideTooltip() {
+        tooltipWindow?.orderOut(nil)
+        currentTooltipText = nil
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -589,8 +702,6 @@ extension IntegratedView: MTKViewDelegate {
 
         let sf = Float(renderer.glyphAtlas.scaleFactor)
         let time = Float(CACurrentMediaTime())
-        let terminals = manager.terminals
-        let count = terminals.count
         cachedWorkspaceLayouts = workspaceLayouts()
 
         renderPassDescriptor.colorAttachments[0].clearColor =
@@ -604,76 +715,74 @@ extension IntegratedView: MTKViewDelegate {
         let drawableSize = view.drawableSize
         let viewportSize = SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height))
 
-        // Render each terminal thumbnail
-        if count > 0 {
-            let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
+        // Render workspace backgrounds (even when empty)
+        for workspace in cachedWorkspaceLayouts {
+            drawWorkspaceBackground(
+                encoder: encoder,
+                workspace: workspace,
+                scaleFactor: sf,
+                viewportSize: viewportSize
+            )
+        }
 
-            for workspace in cachedWorkspaceLayouts {
-                drawWorkspaceBackground(
+        // Render terminal thumbnails
+        let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
+        for (i, frame) in flattened.enumerated() {
+            let controller = frame.controller
+            let fontSettings = controller.persistedFontSettings
+            if renderer.glyphAtlas.fontName != fontSettings.name ||
+                abs(Double(renderer.glyphAtlas.fontSize) - fontSettings.size) > 0.001 {
+                renderer.updateFont(name: fontSettings.name, size: CGFloat(fontSettings.size))
+            }
+
+            // Draw thumbnail border/background
+            let isHovered = hoveredIndex == i
+            let isSelected = selectedTerminals.contains(controller.id)
+            let isActiveOutput = activeOutputTerminals.contains(controller.id)
+            drawThumbnailBackground(
+                encoder: encoder,
+                frame: frame.thumbnail,
+                titleFrame: frame.title,
+                isHovered: isHovered,
+                isSelected: isSelected,
+                isActiveOutput: isActiveOutput,
+                time: time,
+                scaleFactor: sf,
+                viewportSize: viewportSize
+            )
+
+            // Draw terminal content scaled to thumbnail size
+            controller.withViewport { model, scrollback, scrollOffset in
+                renderer.renderThumbnail(
+                    model: model,
+                    scrollback: scrollback,
+                    scrollOffset: scrollOffset,
                     encoder: encoder,
-                    workspace: workspace,
-                    scaleFactor: sf,
-                    viewportSize: viewportSize
+                    viewportSize: viewportSize,
+                    thumbnailRect: frame.thumbnail,
+                    scaleFactor: sf
                 )
             }
 
-            for (i, frame) in flattened.enumerated() {
-                let controller = frame.controller
-                let fontSettings = controller.persistedFontSettings
-                if renderer.glyphAtlas.fontName != fontSettings.name ||
-                    abs(Double(renderer.glyphAtlas.fontSize) - fontSettings.size) > 0.001 {
-                    renderer.updateFont(name: fontSettings.name, size: CGFloat(fontSettings.size))
-                }
+            // Draw title text
+            drawTitle(
+                encoder: encoder,
+                title: controller.title,
+                pid: controller.foregroundProcessID ?? controller.processID,
+                frame: frame.title,
+                scaleFactor: sf,
+                viewportSize: viewportSize
+            )
 
-                // Draw thumbnail border/background
-                let isHovered = hoveredIndex == i
-                let isSelected = selectedTerminals.contains(controller.id)
-                let isActiveOutput = activeOutputTerminals.contains(controller.id)
-                drawThumbnailBackground(
-                    encoder: encoder,
-                    frame: frame.thumbnail,
-                    titleFrame: frame.title,
-                    isHovered: isHovered,
-                    isSelected: isSelected,
-                    isActiveOutput: isActiveOutput,
-                    time: time,
-                    scaleFactor: sf,
-                    viewportSize: viewportSize
-                )
-
-                // Draw terminal content scaled to thumbnail size
-                controller.withViewport { model, scrollback, scrollOffset in
-                    renderer.renderThumbnail(
-                        model: model,
-                        scrollback: scrollback,
-                        scrollOffset: scrollOffset,
-                        encoder: encoder,
-                        viewportSize: viewportSize,
-                        thumbnailRect: frame.thumbnail,
-                        scaleFactor: sf
-                    )
-                }
-
-                // Draw title text
-                drawTitle(
-                    encoder: encoder,
-                    title: controller.title,
-                    pid: controller.foregroundProcessID ?? controller.processID,
-                    frame: frame.title,
-                    scaleFactor: sf,
-                    viewportSize: viewportSize
-                )
-
-                // Draw close button
-                let isCloseHovered = hoveredCloseID == controller.id
-                drawCloseButton(
-                    encoder: encoder,
-                    frame: frame.close,
-                    isHovered: isCloseHovered,
-                    scaleFactor: sf,
-                    viewportSize: viewportSize
-                )
-            }
+            // Draw close button
+            let isCloseHovered = hoveredCloseID == controller.id
+            drawCloseButton(
+                encoder: encoder,
+                frame: frame.close,
+                isHovered: isCloseHovered,
+                scaleFactor: sf,
+                viewportSize: viewportSize
+            )
         }
 
         // Draw "+" button for adding new workspace
@@ -841,10 +950,11 @@ extension IntegratedView: MTKViewDelegate {
         scaleFactor: Float,
         viewportSize: SIMD2<Float>
     ) {
+        let textX = frame.minX + Layout.closeButtonSize + 8
         drawRightAlignedTitleText(
             encoder: encoder,
             text: text,
-            frame: NSRect(x: frame.minX - frame.width + 120 + Layout.closeButtonSize + 8, y: frame.minY, width: frame.width, height: frame.height),
+            frame: NSRect(x: textX, y: frame.minY, width: frame.width - Layout.closeButtonSize - 8, height: frame.height),
             scaleFactor: scaleFactor,
             viewportSize: viewportSize,
             color: (0.9, 0.9, 0.9, 1.0),
@@ -924,7 +1034,7 @@ extension IntegratedView: MTKViewDelegate {
            usage >= 0 {
             drawRightAlignedTitleText(
                 encoder: encoder,
-                text: String(format: "%.1f%%", usage),
+                text: String(format: "CPU: %.0f%%", usage),
                 frame: frame,
                 scaleFactor: scaleFactor,
                 viewportSize: viewportSize
