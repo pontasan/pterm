@@ -133,6 +133,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        workspaceNoteStore.warmUpKey()
+
         if !isNoteEditorSelfTestEnabled {
             do {
                 if try !singleInstanceLock.acquireOrActivateExisting() {

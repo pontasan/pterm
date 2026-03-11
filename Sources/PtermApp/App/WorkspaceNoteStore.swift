@@ -14,10 +14,17 @@ final class WorkspaceNoteStore {
 
     private let rootDirectory: URL
     private let fileManager: FileManager
+    private var cachedKey: Data?
 
     init(rootDirectory: URL = PtermDirectories.workspaces, fileManager: FileManager = .default) {
         self.rootDirectory = rootDirectory
         self.fileManager = fileManager
+    }
+
+    /// Pre-load the encryption key so that Keychain prompts happen once at
+    /// startup rather than on each note open/save.
+    func warmUpKey() {
+        cachedKey = try? loadOrCreateKey()
     }
 
     func loadNote(for workspaceName: String) throws -> String? {
@@ -116,6 +123,8 @@ final class WorkspaceNoteStore {
     }
 
     private func loadOrCreateKey() throws -> Data {
+        if let cachedKey { return cachedKey }
+
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: Constants.service,
@@ -129,6 +138,7 @@ final class WorkspaceNoteStore {
             guard data.count == Constants.keyLength else {
                 throw WorkspaceNoteError.invalidKeyLength
             }
+            cachedKey = data
             return data
         }
         if status != errSecItemNotFound {
@@ -154,6 +164,7 @@ final class WorkspaceNoteStore {
         guard addStatus == errSecSuccess else {
             throw WorkspaceNoteError.keychain(addStatus)
         }
+        cachedKey = key
         return key
     }
 

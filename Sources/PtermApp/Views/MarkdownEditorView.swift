@@ -322,13 +322,18 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
     private var highlighter: MarkdownHighlighter!
     private weak var scrollView: NSScrollView?
     private var keyMonitor: Any?
+    private var isDirty = false
+    private var baseTitle: String
+    private var saveFn: (String) -> Void
     var onClose: (() -> Void)?
 
     init(workspaceName: String, initialText: String, onSave: @escaping (String) -> Void) {
+        self.saveFn = onSave
+        self.baseTitle = "Notes — \(workspaceName)"
         let contentRect = NSRect(x: 0, y: 0, width: 720, height: 560)
         let styleMask: NSWindow.StyleMask = [.titled, .closable, .resizable, .miniaturizable]
         let window = NSWindow(contentRect: contentRect, styleMask: styleMask, backing: .buffered, defer: false)
-        window.title = "Notes — \(workspaceName)"
+        window.title = baseTitle
         window.backgroundColor = NSColor(calibratedRed: 0.118, green: 0.118, blue: 0.118, alpha: 1)
         window.appearance = NSAppearance(named: .darkAqua)
         window.minSize = NSSize(width: 400, height: 300)
@@ -419,9 +424,9 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         // Auto-format delegate
         let fmtDelegate = MarkdownAutoFormatDelegate()
         fmtDelegate.highlighter = syntaxHighlighter
-        fmtDelegate.onTextChange = { [weak gutter] text in
-            onSave(text)
+        fmtDelegate.onTextChange = { [weak self, weak gutter] _ in
             gutter?.needsDisplay = true
+            self?.markDirty()
         }
         tv.delegate = fmtDelegate
         autoFormatDelegate = fmtDelegate
@@ -445,6 +450,11 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
             let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
             guard let chars = event.charactersIgnoringModifiers else { return event }
 
+            // Cmd+S → Save
+            if flags == [.command], chars == "s" {
+                self.save()
+                return nil
+            }
             // Cmd+F → Find
             if flags == [.command], chars == "f" {
                 let findItem = NSMenuItem()
@@ -475,6 +485,19 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         gutterView.needsDisplay = true
     }
 
+    private func markDirty() {
+        guard !isDirty else { return }
+        isDirty = true
+        window?.title = "* \(baseTitle)"
+    }
+
+    private func save() {
+        guard isDirty else { return }
+        saveFn(textView.string)
+        isDirty = false
+        window?.title = baseTitle
+    }
+
     func showEditorWindow() {
         guard let window else { return }
         window.makeKeyAndOrderFront(nil)
@@ -491,7 +514,24 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        return true
+        guard isDirty else { return true }
+        let alert = NSAlert()
+        alert.messageText = "Unsaved Changes"
+        alert.informativeText = "Do you want to save your changes before closing?"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Don't Save")
+        alert.addButton(withTitle: "Cancel")
+        let response = alert.runModal()
+        switch response {
+        case .alertFirstButtonReturn:
+            save()
+            return true
+        case .alertSecondButtonReturn:
+            return true
+        default:
+            return false
+        }
     }
 
     func windowWillClose(_ notification: Notification) {
