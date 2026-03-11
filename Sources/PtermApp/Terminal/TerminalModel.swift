@@ -958,4 +958,6 @@ final class TerminalModel {
         cursor.pendingWrap = false
         initTabStops()
     }
+
+
 }

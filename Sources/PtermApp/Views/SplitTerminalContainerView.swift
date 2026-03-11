@@ -118,6 +118,13 @@ final class SplitTerminalContainerView: NSView {
         needsLayout = true
     }
 
+    /// Update only the IME overlay without triggering terminal resizes.
+    func updateMarkedTextForFontChange() {
+        for scrollView in scrollViews {
+            scrollView.terminalView.updateMarkedTextOverlayPublic()
+        }
+    }
+
     @objc private func backButtonPressed(_ sender: Any?) {
         onBackToIntegrated?()
     }

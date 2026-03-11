@@ -16,8 +16,8 @@ final class TerminalManager {
     /// Default terminal grid dimensions (full-size, used for PTY).
     /// These remain constant regardless of whether the terminal is
     /// displayed as a thumbnail or occupying the full window.
-    private var fullRows: Int
-    private var fullCols: Int
+    private(set) var fullRows: Int
+    private(set) var fullCols: Int
 
     init(rows: Int, cols: Int, config: PtermConfig) {
         self.fullRows = rows

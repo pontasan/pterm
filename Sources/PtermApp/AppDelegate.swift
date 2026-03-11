@@ -811,17 +811,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Font Size
 
     private func applyFontSize(_ newSize: CGFloat) {
+        // Capture current grid dimensions BEFORE changing font metrics.
+        let currentRows = manager.fullRows
+        let currentCols = manager.fullCols
+
         renderer.updateFontSize(newSize)
         synchronizeControllerFontSettings()
-        let pad = renderer.gridPadding * 2
-        let contentBounds = availableContentFrame()
-        let cols = max(1, Int((contentBounds.width - pad) / renderer.glyphAtlas.cellWidth))
-        let rows = max(1, Int((contentBounds.height - pad) / renderer.glyphAtlas.cellHeight))
-        manager.updateFullSize(rows: rows, cols: cols)
-        terminalView?.fontSizeDidChange()
-        splitContainerView?.fontSizeDidChange()
+
+        // Resize the window to preserve current rows/cols with the new cell
+        // metrics. This avoids changing the grid dimensions, so no SIGWINCH
+        // is sent and the shell does not redraw (preventing prompt duplication).
+        resizeWindowForFontChange(rows: currentRows, cols: currentCols)
+
+        terminalView?.updateMarkedTextOverlayPublic()
+        splitContainerView?.updateMarkedTextForFontChange()
         integratedView?.setNeedsDisplay(integratedView?.bounds ?? .zero)
         updateWindowTitle()
+    }
+
+    /// Resize the window so that the given rows/cols fit with the current cell
+    /// metrics. The window may extend beyond the visible screen area — this
+    /// matches macOS Terminal.app behaviour and ensures rows/cols are preserved
+    /// so that no SIGWINCH is sent to the shell.
+    private func resizeWindowForFontChange(rows: Int, cols: Int) {
+        guard rows > 0, cols > 0 else { return }
+        let pad = renderer.gridPadding * 2
+        let searchInset = searchBarView == nil ? 0 : Layout.searchBarHeight
+        let contentWidth = pad + CGFloat(cols) * renderer.glyphAtlas.cellWidth
+        let contentHeight = pad + CGFloat(rows) * renderer.glyphAtlas.cellHeight
+            + Layout.statusBarHeight + searchInset
+        let contentRect = NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight)
+        var newFrame = window.frameRect(forContentRect: contentRect)
+
+        // Preserve the top-left corner position (macOS coordinates: origin is
+        // bottom-left, so we fix maxY and adjust origin.y).
+        let oldFrame = window.frame
+        newFrame.origin.x = oldFrame.origin.x
+        newFrame.origin.y = oldFrame.maxY - newFrame.height
+
+        window.setFrame(newFrame, display: true, animate: false)
     }
 
     @objc func fontSizeIncrease(_ sender: Any?) {

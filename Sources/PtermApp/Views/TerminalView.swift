@@ -801,6 +801,11 @@ final class TerminalView: MTKView, NSTextInputClient {
         updateMarkedTextOverlay()
     }
 
+    /// Update only the IME overlay without triggering a terminal resize.
+    func updateMarkedTextOverlayPublic() {
+        updateMarkedTextOverlay()
+    }
+
     private func currentCursorRect() -> NSRect {
         guard let controller = terminalController,
               let renderer = renderer else {
