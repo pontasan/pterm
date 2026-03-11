@@ -2,8 +2,12 @@ import AppKit
 
 final class SplitTerminalContainerView: NSView {
     private enum Layout {
-        static let outerPadding: CGFloat = 8
+        /// Gap between terminal cells.
+        static let gap: CGFloat = 1
     }
+
+    private static let whiteBorder = MetalRenderer.BorderConfig(color: (1, 1, 1, 1), width: 1)
+    private static let blueBorder = MetalRenderer.BorderConfig(color: (0.2, 0.5, 1.0, 1), width: 2)
 
     private let renderer: MetalRenderer
     private(set) var controllers: [TerminalController]
@@ -68,6 +72,19 @@ final class SplitTerminalContainerView: NSView {
         layoutGrid()
     }
 
+    /// Set borderConfig on each TerminalView: white for unfocused, blue for focused.
+    private func updateFocusBorders() {
+        guard scrollViews.count > 1 else {
+            scrollViews.first?.terminalView?.borderConfig = nil
+            return
+        }
+        let firstResponder = window?.firstResponder
+        for scrollView in scrollViews {
+            guard let tv = scrollView.terminalView else { continue }
+            tv.borderConfig = (firstResponder === tv) ? Self.blueBorder : Self.whiteBorder
+        }
+    }
+
     private func rebuildSubviews() {
         scrollViews.forEach { $0.removeFromSuperview() }
         scrollViews.removeAll()
@@ -80,6 +97,7 @@ final class SplitTerminalContainerView: NSView {
             scrollView.terminalView.onBecameFirstResponder = { [weak self, weak controller] in
                 guard let self, let controller else { return }
                 self.onActiveControllerChange?(controller)
+                self.updateFocusBorders()
             }
             scrollView.terminalView.onBackToIntegrated = { [weak self] in
                 self?.onBackToIntegrated?()
@@ -92,22 +110,25 @@ final class SplitTerminalContainerView: NSView {
 
     private func layoutGrid() {
         guard !scrollViews.isEmpty else { return }
-        let pad: CGFloat = Layout.outerPadding
+        let gap = Layout.gap
         let (cols, rows) = TerminalManager.gridLayout(for: scrollViews.count)
-        let usableHeight = max(0, bounds.height)
-        let cellWidth = max(0, (bounds.width - pad * CGFloat(cols + 1)) / CGFloat(cols))
-        let cellHeight = max(0, (usableHeight - pad * CGFloat(rows + 1)) / CGFloat(rows))
+
+        let totalGapW = gap * CGFloat(cols - 1)
+        let totalGapH = gap * CGFloat(rows - 1)
+        let cellWidth = max(0, (bounds.width - totalGapW) / CGFloat(cols))
+        let cellHeight = max(0, (bounds.height - totalGapH) / CGFloat(rows))
 
         for (index, scrollView) in scrollViews.enumerated() {
             let col = index % cols
             let row = index / cols
             scrollView.frame = NSRect(
-                x: pad + CGFloat(col) * (cellWidth + pad),
-                y: pad + CGFloat(row) * (cellHeight + pad),
+                x: CGFloat(col) * (cellWidth + gap),
+                y: CGFloat(row) * (cellHeight + gap),
                 width: cellWidth,
                 height: cellHeight
             )
         }
+        updateFocusBorders()
     }
 
     func fontSizeDidChange() {

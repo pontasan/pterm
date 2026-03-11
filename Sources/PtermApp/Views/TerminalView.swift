@@ -30,6 +30,9 @@ final class TerminalView: MTKView, NSTextInputClient {
     var onBackToIntegrated: (() -> Void)?
     var onBecameFirstResponder: (() -> Void)?
 
+    /// Border configuration for split-view focus indication (drawn within Metal pipeline).
+    var borderConfig: MetalRenderer.BorderConfig?
+
     /// Current text selection (nil = no selection)
     private(set) var selection: TerminalSelection? {
         didSet {
@@ -868,10 +871,12 @@ extension TerminalView: MTKViewDelegate {
             MetalRenderer.LinkUnderline(row: $0.row, startCol: $0.startCol, endCol: $0.endCol)
         }
 
+        let border = borderConfig
         controller.withViewport { model, scrollback, scrollOffset in
             renderer.render(model: model, scrollback: scrollback,
                           scrollOffset: scrollOffset, selection: selection,
-                          searchHighlight: highlight, linkUnderline: linkUL, in: view)
+                          searchHighlight: highlight, linkUnderline: linkUL,
+                          borderConfig: border, in: view)
         }
 
         // Keep the native scroller in sync every frame

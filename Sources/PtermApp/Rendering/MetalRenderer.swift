@@ -44,20 +44,36 @@ final class MetalRenderer {
     /// Public accessor for sampler (used by IntegratedView)
     var samplerState: MTLSamplerState? { sampler }
 
-    /// Vertex data for current frame
-    private var bgVertices: [Float] = []
-    private var glyphVertices: [Float] = []
-    private var cursorVertices: [Float] = []
-    private var overlayVertices: [Float] = []
+    /// Per-view buffer set to avoid conflicts when multiple MTKViews share this renderer.
+    final class ViewBufferSet {
+        var bgBuffer: MTLBuffer?
+        var glyphBuffer: MTLBuffer?
+        var cursorBuffer: MTLBuffer?
+        var overlayBuffer: MTLBuffer?
+        var borderBuffer: MTLBuffer?
+    }
 
-    /// MTLBuffers for vertex data (avoids 4KB setVertexBytes limit)
-    private var bgBuffer: MTLBuffer?
-    private var glyphBuffer: MTLBuffer?
-    private var cursorBuffer: MTLBuffer?
-    private var overlayBuffer: MTLBuffer?
+    /// Border configuration for split-view rendering.
+    struct BorderConfig {
+        let color: (Float, Float, Float, Float)
+        let width: Float
+    }
 
-    /// Uniform buffer
-    private var uniforms = MetalUniforms()
+    /// Keyed by view's ObjectIdentifier to give each MTKView its own buffers.
+    private var viewBuffers: [ObjectIdentifier: ViewBufferSet] = [:]
+
+    private func bufferSet(for view: MTKView) -> ViewBufferSet {
+        let key = ObjectIdentifier(view)
+        if let existing = viewBuffers[key] { return existing }
+        let bs = ViewBufferSet()
+        viewBuffers[key] = bs
+        return bs
+    }
+
+    /// Remove buffer set when a view is deallocated.
+    func removeBuffers(for view: MTKView) {
+        viewBuffers.removeValue(forKey: ObjectIdentifier(view))
+    }
 
     /// Animation start time
     private let startTime: CFTimeInterval = CACurrentMediaTime()
@@ -250,6 +266,7 @@ final class MetalRenderer {
                 scrollOffset: Int, selection: TerminalSelection?,
                 searchHighlight: SearchHighlight? = nil,
                 linkUnderline: LinkUnderline? = nil,
+                borderConfig: BorderConfig? = nil,
                 in view: MTKView) {
         guard let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor,
@@ -257,14 +274,15 @@ final class MetalRenderer {
             return
         }
 
-        // Update uniforms
+        // Build local uniforms (avoid shared mutable state across concurrent renders)
         let drawableSize = view.drawableSize
-        viewportSize = SIMD2<Float>(Float(drawableSize.width),
-                                     Float(drawableSize.height))
-        uniforms.viewportSize = viewportSize
-        uniforms.time = Float(CACurrentMediaTime() - startTime)
-        uniforms.cursorOpacity = (scrollOffset == 0 && model.cursor.visible) ? 1.0 : 0.0
-        uniforms.cursorBlink = model.cursor.blinking ? 1.0 : 0.0
+        let vp = SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height))
+        var uniforms = MetalUniforms(
+            viewportSize: vp,
+            cursorOpacity: (scrollOffset == 0 && model.cursor.visible) ? 1.0 : 0.0,
+            cursorBlink: model.cursor.blinking ? 1.0 : 0.0,
+            time: Float(CACurrentMediaTime() - startTime)
+        )
 
         // Clear color: black background
         renderPassDescriptor.colorAttachments[0].loadAction = .clear
@@ -273,57 +291,84 @@ final class MetalRenderer {
 
         // Build vertex data using the atlas's scale factor.
         let sf = Float(glyphAtlas.scaleFactor)
-        buildVertexData(model: model, scrollback: scrollback, scrollOffset: scrollOffset,
-                        selection: selection, searchHighlight: searchHighlight,
-                        linkUnderline: linkUnderline, scaleFactor: sf)
+        let vd = buildVertexData(model: model, scrollback: scrollback, scrollOffset: scrollOffset,
+                                 selection: selection, searchHighlight: searchHighlight,
+                                 linkUnderline: linkUnderline, scaleFactor: sf)
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(
             descriptor: renderPassDescriptor) else {
             return
         }
 
+        // Use per-view buffer set to avoid conflicts when multiple MTKViews share this renderer.
+        let bs = bufferSet(for: view)
+
         // 1. Draw backgrounds
-        if !bgVertices.isEmpty, let pipeline = bgPipeline,
-           let buf = updateVertexBuffer(&bgBuffer, vertices: bgVertices) {
+        if !vd.bgVertices.isEmpty, let pipeline = bgPipeline,
+           let buf = updateVertexBuffer(&bs.bgBuffer, vertices: vd.bgVertices) {
             encoder.setRenderPipelineState(pipeline)
             encoder.setVertexBuffer(buf, offset: 0, index: 0)
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0,
-                                  vertexCount: bgVertices.count / floatsPerVertex)
+                                  vertexCount: vd.bgVertices.count / floatsPerVertex)
         }
 
         // 2. Draw glyphs
-        if !glyphVertices.isEmpty, let pipeline = glyphPipeline,
+        if !vd.glyphVertices.isEmpty, let pipeline = glyphPipeline,
            let atlas = glyphAtlas.texture,
-           let buf = updateVertexBuffer(&glyphBuffer, vertices: glyphVertices) {
+           let buf = updateVertexBuffer(&bs.glyphBuffer, vertices: vd.glyphVertices) {
             encoder.setRenderPipelineState(pipeline)
             encoder.setVertexBuffer(buf, offset: 0, index: 0)
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
             encoder.setFragmentTexture(atlas, index: 0)
             encoder.setFragmentSamplerState(sampler, index: 0)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0,
-                                  vertexCount: glyphVertices.count / floatsPerVertex)
+                                  vertexCount: vd.glyphVertices.count / floatsPerVertex)
         }
 
         // 3. Draw cursor (only when at the bottom of scrollback)
-        if !cursorVertices.isEmpty, let pipeline = cursorPipeline,
-           let buf = updateVertexBuffer(&cursorBuffer, vertices: cursorVertices) {
+        if !vd.cursorVertices.isEmpty, let pipeline = cursorPipeline,
+           let buf = updateVertexBuffer(&bs.cursorBuffer, vertices: vd.cursorVertices) {
             encoder.setRenderPipelineState(pipeline)
             encoder.setVertexBuffer(buf, offset: 0, index: 0)
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
             encoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0,
-                                  vertexCount: cursorVertices.count / floatsPerVertex)
+                                  vertexCount: vd.cursorVertices.count / floatsPerVertex)
         }
 
-        // 4. Draw overlay (scrollbar)
-        if !overlayVertices.isEmpty, let pipeline = overlayPipeline,
-           let buf = updateVertexBuffer(&overlayBuffer, vertices: overlayVertices) {
+        // 4. Draw overlay (underline, strikethrough, block elements)
+        if !vd.overlayVertices.isEmpty, let pipeline = overlayPipeline,
+           let buf = updateVertexBuffer(&bs.overlayBuffer, vertices: vd.overlayVertices) {
             encoder.setRenderPipelineState(pipeline)
             encoder.setVertexBuffer(buf, offset: 0, index: 0)
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0,
-                                  vertexCount: overlayVertices.count / floatsPerVertex)
+                                  vertexCount: vd.overlayVertices.count / floatsPerVertex)
+        }
+
+        // 5. Draw border (for split view focus indication)
+        if let border = borderConfig, let pipeline = overlayPipeline {
+            var bv: [Float] = []
+            let vw = vp.x
+            let vh = vp.y
+            let bw = border.width * Float(glyphAtlas.scaleFactor)
+            let c = border.color
+            // Top
+            addQuad(to: &bv, x: 0, y: 0, w: vw, h: bw, tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            // Bottom
+            addQuad(to: &bv, x: 0, y: vh - bw, w: vw, h: bw, tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            // Left
+            addQuad(to: &bv, x: 0, y: bw, w: bw, h: vh - 2 * bw, tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            // Right
+            addQuad(to: &bv, x: vw - bw, y: bw, w: bw, h: vh - 2 * bw, tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            if let buf = updateVertexBuffer(&bs.borderBuffer, vertices: bv) {
+                encoder.setRenderPipelineState(pipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                      vertexCount: bv.count / floatsPerVertex)
+            }
         }
 
         encoder.endEncoding()
@@ -333,15 +378,20 @@ final class MetalRenderer {
 
     // MARK: - Vertex Building
 
+    /// Result of building vertex data for a single frame.
+    struct VertexData {
+        var bgVertices: [Float] = []
+        var glyphVertices: [Float] = []
+        var cursorVertices: [Float] = []
+        var overlayVertices: [Float] = []
+    }
+
     private func buildVertexData(model: TerminalModel, scrollback: ScrollbackBuffer,
                                   scrollOffset: Int, selection: TerminalSelection?,
                                   searchHighlight: SearchHighlight? = nil,
                                   linkUnderline: LinkUnderline? = nil,
-                                  scaleFactor: Float) {
-        bgVertices.removeAll(keepingCapacity: true)
-        glyphVertices.removeAll(keepingCapacity: true)
-        cursorVertices.removeAll(keepingCapacity: true)
-        overlayVertices.removeAll(keepingCapacity: true)
+                                  scaleFactor: Float) -> VertexData {
+        var vd = VertexData()
 
         let cellW = Float(glyphAtlas.cellWidth) * scaleFactor
         let cellH = Float(glyphAtlas.cellHeight) * scaleFactor
@@ -447,7 +497,7 @@ final class MetalRenderer {
 
                 // Background quad (skip if default black to save draw calls, but always draw for selected/highlighted cells)
                 if isSelected || searchMatchType > 0 || bgColor.r > 0.001 || bgColor.g > 0.001 || bgColor.b > 0.001 {
-                    addQuad(to: &bgVertices, x: x, y: y, w: w, h: h,
+                    addQuad(to: &vd.bgVertices, x: x, y: y, w: w, h: h,
                            tx: 0, ty: 0, tw: 0, th: 0,
                            fg: (bgColor.r, bgColor.g, bgColor.b, 1),
                            bg: (bgColor.r, bgColor.g, bgColor.b, 1))
@@ -457,7 +507,8 @@ final class MetalRenderer {
                 if renderBlockElementIfNeeded(
                     codepoint: cell.codepoint,
                     x: x, y: y, w: w, h: h,
-                    color: fgColor
+                    color: fgColor,
+                    vertices: &vd.overlayVertices
                 ) {
                     // no-op
                 } else if cell.codepoint > 0x20, // Skip spaces
@@ -474,7 +525,7 @@ final class MetalRenderer {
                     let glyphW = Float(glyph.pixelWidth)
                     let glyphH = Float(glyph.pixelHeight)
 
-                    addQuad(to: &glyphVertices,
+                    addQuad(to: &vd.glyphVertices,
                            x: glyphX, y: glyphY, w: glyphW, h: glyphH,
                            tx: glyph.textureX, ty: glyph.textureY,
                            tw: glyph.textureW, th: glyph.textureH,
@@ -483,7 +534,7 @@ final class MetalRenderer {
 
                     if cell.attributes.bold {
                         let boldOffset = max(1.0, scaleFactor) * 0.5
-                        addQuad(to: &glyphVertices,
+                        addQuad(to: &vd.glyphVertices,
                                x: glyphX + boldOffset, y: glyphY, w: glyphW, h: glyphH,
                                tx: glyph.textureX, ty: glyph.textureY,
                                tw: glyph.textureW, th: glyph.textureH,
@@ -495,7 +546,7 @@ final class MetalRenderer {
                 if cell.attributes.underline {
                     let underlineThickness = max(1.0, scaleFactor)
                     let underlineY = y + h - underlineThickness
-                    addQuad(to: &overlayVertices, x: x, y: underlineY, w: w, h: underlineThickness,
+                    addQuad(to: &vd.overlayVertices, x: x, y: underlineY, w: w, h: underlineThickness,
                            tx: 0, ty: 0, tw: 0, th: 0,
                            fg: (fgColor.r, fgColor.g, fgColor.b, 1),
                            bg: (fgColor.r, fgColor.g, fgColor.b, 1))
@@ -504,7 +555,7 @@ final class MetalRenderer {
                 if cell.attributes.strikethrough {
                     let strikeThickness = max(1.0, scaleFactor)
                     let strikeY = y + (h * 0.5) - (strikeThickness * 0.5)
-                    addQuad(to: &overlayVertices, x: x, y: strikeY, w: w, h: strikeThickness,
+                    addQuad(to: &vd.overlayVertices, x: x, y: strikeY, w: w, h: strikeThickness,
                            tx: 0, ty: 0, tw: 0, th: 0,
                            fg: (fgColor.r, fgColor.g, fgColor.b, 1),
                            bg: (fgColor.r, fgColor.g, fgColor.b, 1))
@@ -516,7 +567,7 @@ final class MetalRenderer {
                     let underlineThickness = max(1.0, scaleFactor)
                     let underlineY = y + h - underlineThickness
                     // Blue underline for link hover
-                    addQuad(to: &overlayVertices, x: x, y: underlineY, w: w, h: underlineThickness,
+                    addQuad(to: &vd.overlayVertices, x: x, y: underlineY, w: w, h: underlineThickness,
                            tx: 0, ty: 0, tw: 0, th: 0,
                            fg: (0.4, 0.6, 1.0, 1.0),
                            bg: (0.4, 0.6, 1.0, 1.0))
@@ -532,18 +583,18 @@ final class MetalRenderer {
 
             switch model.cursor.shape {
             case .block:
-                addQuad(to: &cursorVertices, x: cx, y: cy, w: cellW, h: cellH,
+                addQuad(to: &vd.cursorVertices, x: cx, y: cy, w: cellW, h: cellH,
                        tx: 0, ty: 0, tw: 0, th: 0,
                        fg: cursorColor, bg: cursorColor)
             case .underline:
                 let thickness = max(1.0, scaleFactor * 2.0)
-                addQuad(to: &cursorVertices, x: cx, y: cy + cellH - thickness,
+                addQuad(to: &vd.cursorVertices, x: cx, y: cy + cellH - thickness,
                        w: cellW, h: thickness,
                        tx: 0, ty: 0, tw: 0, th: 0,
                        fg: cursorColor, bg: cursorColor)
             case .bar:
                 let thickness = max(1.0, scaleFactor * 2.0)
-                addQuad(to: &cursorVertices, x: cx, y: cy,
+                addQuad(to: &vd.cursorVertices, x: cx, y: cy,
                        w: thickness, h: cellH,
                        tx: 0, ty: 0, tw: 0, th: 0,
                        fg: cursorColor, bg: cursorColor)
@@ -551,6 +602,7 @@ final class MetalRenderer {
         }
 
         // Scrollbar is handled by NSScroller overlay in TerminalView
+        return vd
     }
 
     private func resolveForegroundColor(for cell: Cell) -> (r: Float, g: Float, b: Float) {
@@ -570,13 +622,14 @@ final class MetalRenderer {
         y: Float,
         w: Float,
         h: Float,
-        color: (r: Float, g: Float, b: Float)
+        color: (r: Float, g: Float, b: Float),
+        vertices: inout [Float]
     ) -> Bool {
         let rects = blockElementRects(for: codepoint, width: w, height: h)
         guard !rects.isEmpty else { return false }
 
         for rect in rects {
-            addQuad(to: &overlayVertices,
+            addQuad(to: &vertices,
                    x: x + rect.x, y: y + rect.y, w: rect.w, h: rect.h,
                    tx: 0, ty: 0, tw: 0, th: 0,
                    fg: (color.r, color.g, color.b, 1),
