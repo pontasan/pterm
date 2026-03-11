@@ -40,8 +40,6 @@ final class IntegratedView: MTKView, NSDraggingSource {
     /// Callback: user clicked a terminal thumbnail (single select).
     var onSelectTerminal: ((TerminalController) -> Void)?
 
-    /// Callback: user wants to add a new terminal.
-    var onAddTerminal: (() -> Void)?
     var onAddWorkspace: (() -> Void)?
     var onAddTerminalToWorkspace: ((String) -> Void)?
     var onRemoveWorkspace: ((String) -> Void)?
@@ -66,6 +64,11 @@ final class IntegratedView: MTKView, NSDraggingSource {
         didSet { setNeedsDisplay(bounds) }
     }
 
+    /// Cached × icon texture for close buttons (r8Unorm, same as glyph atlas)
+    private var closeIconTexture: MTLTexture?
+    /// Size in pixels of the cached icon texture
+    private static let closeIconTextureSize: Int = 64
+
     /// Tracking area for mouse hover (close buttons, etc.)
     private var trackingArea: NSTrackingArea?
 
@@ -74,9 +77,10 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     /// ID of the terminal whose close button is hovered
     private var hoveredCloseID: UUID?
+    /// Name of the workspace whose close button is hovered
+    private var hoveredWorkspaceClose: String?
 
     /// Stored frame for the add button (updated each draw)
-    private var addButtonFrame: NSRect = .zero
     private var addWorkspaceButtonFrame: NSRect = .zero
     private var cachedWorkspaceLayouts: [WorkspaceLayout] = []
     private var mouseDownPoint: NSPoint?
@@ -222,15 +226,15 @@ final class IntegratedView: MTKView, NSDraggingSource {
                                      y: frame.minY + innerPad / 2,
                                      width: frame.width - innerPad * 2,
                                      height: Layout.workspaceHeaderHeight)
+            let closeFrame = NSRect(x: headerFrame.minX + 4,
+                                    y: headerFrame.minY + (headerFrame.height - Layout.closeButtonSize) / 2,
+                                    width: Layout.closeButtonSize,
+                                    height: Layout.closeButtonSize)
             let addFrame = NSRect(x: headerFrame.maxX - Layout.closeButtonSize - 6,
                                   y: headerFrame.minY + (headerFrame.height - Layout.closeButtonSize) / 2,
                                   width: Layout.closeButtonSize,
                                   height: Layout.closeButtonSize)
-            let closeFrame = NSRect(x: addFrame.minX - Layout.closeButtonSize - 6,
-                                    y: addFrame.minY,
-                                    width: Layout.closeButtonSize,
-                                    height: Layout.closeButtonSize)
-            let noteFrame = NSRect(x: closeFrame.minX - Layout.closeButtonSize - 6,
+            let noteFrame = NSRect(x: addFrame.minX - Layout.closeButtonSize - 6,
                                    y: addFrame.minY,
                                    width: Layout.closeButtonSize,
                                    height: Layout.closeButtonSize)
@@ -384,12 +388,6 @@ final class IntegratedView: MTKView, NSDraggingSource {
         mouseDownPoint = point
         mouseDownTerminal = nil
 
-        // Check add button
-        if addButtonFrame.contains(point) {
-            onAddTerminal?()
-            return
-        }
-
         if addWorkspaceButtonFrame.contains(point) {
             onAddWorkspace?()
             return
@@ -488,11 +486,13 @@ final class IntegratedView: MTKView, NSDraggingSource {
         let point = convert(event.locationInWindow, from: nil)
         hoveredIndex = thumbnailIndex(at: point)
         hoveredCloseID = closeButtonController(at: point)?.id
+        hoveredWorkspaceClose = workspaceRemoveTarget(at: point)
     }
 
     override func mouseExited(with event: NSEvent) {
         hoveredIndex = nil
         hoveredCloseID = nil
+        hoveredWorkspaceClose = nil
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -676,9 +676,7 @@ extension IntegratedView: MTKViewDelegate {
             }
         }
 
-        // Draw "+" button for adding new terminal
-        drawAddButton(encoder: encoder, scaleFactor: sf, viewportSize: viewportSize,
-                      terminalCount: count)
+        // Draw "+" button for adding new workspace
         drawAddWorkspaceButton(encoder: encoder, scaleFactor: sf, viewportSize: viewportSize)
 
         encoder.endEncoding()
@@ -830,6 +828,7 @@ extension IntegratedView: MTKViewDelegate {
         drawWorkspaceCloseButton(
             encoder: encoder,
             frame: workspace.closeFrame,
+            isHovered: hoveredWorkspaceClose == workspace.name,
             scaleFactor: scaleFactor,
             viewportSize: viewportSize
         )
@@ -845,7 +844,7 @@ extension IntegratedView: MTKViewDelegate {
         drawRightAlignedTitleText(
             encoder: encoder,
             text: text,
-            frame: NSRect(x: frame.minX - frame.width + 120, y: frame.minY, width: frame.width, height: frame.height),
+            frame: NSRect(x: frame.minX - frame.width + 120 + Layout.closeButtonSize + 8, y: frame.minY, width: frame.width, height: frame.height),
             scaleFactor: scaleFactor,
             viewportSize: viewportSize,
             color: (0.9, 0.9, 0.9, 1.0),
@@ -1057,22 +1056,123 @@ extension IntegratedView: MTKViewDelegate {
     private func drawWorkspaceCloseButton(
         encoder: MTLRenderCommandEncoder,
         frame: NSRect,
+        isHovered: Bool,
         scaleFactor: Float,
         viewportSize: SIMD2<Float>
     ) {
-        guard let pipeline = renderer.overlayPipeline else { return }
-        var vertices: [Float] = []
+        let alpha: Float = isHovered ? 0.9 : 0.7
+        let bgColor: (Float, Float, Float) = isHovered ? (0.8, 0.15, 0.15) : (0.6, 0.15, 0.15)
+        drawXCloseButton(
+            encoder: encoder,
+            frame: frame,
+            bgColor: bgColor,
+            bgAlpha: alpha,
+            fgColor: (1, 1, 1, alpha),
+            scaleFactor: scaleFactor,
+            viewportSize: viewportSize
+        )
+    }
+
+    /// Creates and caches an r8Unorm texture with a × icon drawn using Core Graphics.
+    private func ensureCloseIconTexture() -> MTLTexture? {
+        if let existing = closeIconTexture { return existing }
+        let size = Self.closeIconTextureSize
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        guard let ctx = CGContext(
+            data: nil,
+            width: size,
+            height: size,
+            bitsPerComponent: 8,
+            bytesPerRow: size,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else { return nil }
+
+        // Clear to black (transparent in r8Unorm usage)
+        ctx.setFillColor(gray: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+
+        // Draw × with rounded line caps
+        let margin = CGFloat(size) * 0.22
+        ctx.setStrokeColor(gray: 1, alpha: 1)
+        ctx.setLineWidth(CGFloat(size) * 0.12)
+        ctx.setLineCap(.round)
+        ctx.move(to: CGPoint(x: margin, y: margin))
+        ctx.addLine(to: CGPoint(x: CGFloat(size) - margin, y: CGFloat(size) - margin))
+        ctx.move(to: CGPoint(x: CGFloat(size) - margin, y: margin))
+        ctx.addLine(to: CGPoint(x: margin, y: CGFloat(size) - margin))
+        ctx.strokePath()
+
+        guard let data = ctx.data else { return nil }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r8Unorm,
+            width: size,
+            height: size,
+            mipmapped: false
+        )
+        descriptor.usage = [.shaderRead]
+        descriptor.storageMode = renderer.device.hasUnifiedMemory ? .shared : .managed
+        guard let texture = renderer.device.makeTexture(descriptor: descriptor) else { return nil }
+        texture.replace(
+            region: MTLRegionMake2D(0, 0, size, size),
+            mipmapLevel: 0,
+            withBytes: data,
+            bytesPerRow: size
+        )
+        closeIconTexture = texture
+        return texture
+    }
+
+    /// Draws a × close button using a textured icon for both terminal and workspace close buttons.
+    private func drawXCloseButton(
+        encoder: MTLRenderCommandEncoder,
+        frame: NSRect,
+        bgColor: (Float, Float, Float),
+        bgAlpha: Float,
+        fgColor: (Float, Float, Float, Float),
+        scaleFactor: Float,
+        viewportSize: SIMD2<Float>
+    ) {
+        guard let overlayPipeline = renderer.overlayPipeline else { return }
         let x = Float(frame.origin.x) * scaleFactor
         let y = Float(frame.origin.y) * scaleFactor
         let size = Float(frame.width) * scaleFactor
-        renderer.addQuadPublic(to: &vertices, x: x, y: y, w: size, h: size,
-                               tx: 0, ty: 0, tw: 0, th: 0,
-                               fg: (0.35, 0.18, 0.18, 0.9), bg: (0, 0, 0, 0))
-        let lineW: Float = 2.0 * scaleFactor
-        renderer.addQuadPublic(to: &vertices, x: x + size * 0.25, y: y + size * 0.5 - lineW / 2,
-                               w: size * 0.5, h: lineW, tx: 0, ty: 0, tw: 0, th: 0,
-                               fg: (1, 1, 1, 1), bg: (0, 0, 0, 0))
-        drawVertices(vertices, encoder: encoder, pipeline: pipeline, viewportSize: viewportSize)
+
+        // Draw background quad
+        var bgVertices: [Float] = []
+        renderer.addQuadPublic(
+            to: &bgVertices, x: x, y: y, w: size, h: size,
+            tx: 0, ty: 0, tw: 0, th: 0,
+            fg: (bgColor.0, bgColor.1, bgColor.2, bgAlpha),
+            bg: (0, 0, 0, 0)
+        )
+        drawVertices(bgVertices, encoder: encoder, pipeline: overlayPipeline, viewportSize: viewportSize)
+
+        // Draw × icon from texture
+        guard let glyphPipeline = renderer.glyphPipeline,
+              let iconTexture = ensureCloseIconTexture() else { return }
+        var iconVertices: [Float] = []
+        // Full UV (0,0)-(1,1), icon fills the entire texture. Y is flipped for Metal.
+        renderer.addQuadPublic(
+            to: &iconVertices, x: x, y: y, w: size, h: size,
+            tx: 0, ty: 1, tw: 1, th: -1,
+            fg: (fgColor.0, fgColor.1, fgColor.2, fgColor.3),
+            bg: (0, 0, 0, 0)
+        )
+        if let buf = renderer.makeTemporaryBuffer(vertices: iconVertices) {
+            var uniforms = MetalRenderer.MetalUniforms(
+                viewportSize: viewportSize,
+                cursorOpacity: 0,
+                time: 0
+            )
+            encoder.setRenderPipelineState(glyphPipeline)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalRenderer.MetalUniforms>.size, index: 1)
+            encoder.setFragmentTexture(iconTexture, index: 0)
+            encoder.setFragmentSamplerState(renderer.samplerState, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                  vertexCount: iconVertices.count / 12)
+        }
     }
 
     private func drawCloseButton(
@@ -1082,109 +1182,17 @@ extension IntegratedView: MTKViewDelegate {
         scaleFactor: Float,
         viewportSize: SIMD2<Float>
     ) {
-        guard let pipeline = renderer.overlayPipeline else { return }
-
-        var vertices: [Float] = []
-        let x = Float(frame.origin.x) * scaleFactor
-        let y = Float(frame.origin.y) * scaleFactor
-        let size = Float(frame.width) * scaleFactor
-
-        // Circle background (approximate with a filled square for now)
-        let alpha: Float = isHovered ? 0.8 : 0.3
-        let bgColor: (Float, Float, Float) = isHovered ? (0.8, 0.2, 0.2) : (0.4, 0.4, 0.4)
-        renderer.addQuadPublic(
-            to: &vertices, x: x, y: y, w: size, h: size,
-            tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (bgColor.0, bgColor.1, bgColor.2, alpha),
-            bg: (0, 0, 0, 0)
+        let alpha: Float = isHovered ? 0.9 : 0.7
+        let bgColor: (Float, Float, Float) = isHovered ? (0.8, 0.15, 0.15) : (0.6, 0.15, 0.15)
+        drawXCloseButton(
+            encoder: encoder,
+            frame: frame,
+            bgColor: bgColor,
+            bgAlpha: alpha,
+            fgColor: (1, 1, 1, alpha),
+            scaleFactor: scaleFactor,
+            viewportSize: viewportSize
         )
-
-        // X mark (two thin lines)
-        let lineW: Float = 2.0 * scaleFactor
-        let margin: Float = size * 0.25
-        let cx = x + size / 2
-        let cy = y + size / 2
-        let halfLen = (size - margin * 2) / 2
-
-        // Diagonal line 1 (approximate with a thin rectangle)
-        renderer.addQuadPublic(
-            to: &vertices,
-            x: cx - halfLen, y: cy - lineW / 2,
-            w: halfLen * 2, h: lineW,
-            tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (1, 1, 1, alpha),
-            bg: (0, 0, 0, 0)
-        )
-        // Diagonal line 2
-        renderer.addQuadPublic(
-            to: &vertices,
-            x: cx - lineW / 2, y: cy - halfLen,
-            w: lineW, h: halfLen * 2,
-            tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (1, 1, 1, alpha),
-            bg: (0, 0, 0, 0)
-        )
-
-        drawVertices(vertices, encoder: encoder, pipeline: pipeline, viewportSize: viewportSize)
-    }
-
-    private func drawAddButton(
-        encoder: MTLRenderCommandEncoder,
-        scaleFactor: Float,
-        viewportSize: SIMD2<Float>,
-        terminalCount: Int
-    ) {
-        guard let pipeline = renderer.overlayPipeline else { return }
-
-        // Position: bottom-right corner
-        let btnSize = Layout.addButtonSize
-        let margin: CGFloat = 20
-        let bx = bounds.width - btnSize - margin
-        let by = bounds.height - btnSize - margin
-
-        let x = Float(bx) * scaleFactor
-        let y = Float(by) * scaleFactor
-        let size = Float(btnSize) * scaleFactor
-
-        var vertices: [Float] = []
-
-        // Button background
-        renderer.addQuadPublic(
-            to: &vertices, x: x, y: y, w: size, h: size,
-            tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (0.3, 0.3, 0.3, 0.6),
-            bg: (0, 0, 0, 0)
-        )
-
-        // Plus sign
-        let lineW: Float = 3.0 * scaleFactor
-        let lineLen: Float = size * 0.5
-        let cx = x + size / 2
-        let cy = y + size / 2
-
-        // Horizontal
-        renderer.addQuadPublic(
-            to: &vertices,
-            x: cx - lineLen / 2, y: cy - lineW / 2,
-            w: lineLen, h: lineW,
-            tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (0.8, 0.8, 0.8, 0.9),
-            bg: (0, 0, 0, 0)
-        )
-        // Vertical
-        renderer.addQuadPublic(
-            to: &vertices,
-            x: cx - lineW / 2, y: cy - lineLen / 2,
-            w: lineW, h: lineLen,
-            tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (0.8, 0.8, 0.8, 0.9),
-            bg: (0, 0, 0, 0)
-        )
-
-        drawVertices(vertices, encoder: encoder, pipeline: pipeline, viewportSize: viewportSize)
-
-        // Store the add button frame for hit testing
-        addButtonFrame = NSRect(x: bx, y: by, width: btnSize, height: btnSize)
     }
 
     private func drawAddWorkspaceButton(
@@ -1196,8 +1204,7 @@ extension IntegratedView: MTKViewDelegate {
 
         let btnSize = Layout.addButtonSize
         let margin: CGFloat = 20
-        let spacing: CGFloat = 12
-        let bx = bounds.width - btnSize * 2 - margin - spacing
+        let bx = bounds.width - btnSize - margin
         let by = bounds.height - btnSize - margin
 
         let x = Float(bx) * scaleFactor
@@ -1243,11 +1250,6 @@ extension IntegratedView: MTKViewDelegate {
         )
         drawVertices(vertices, encoder: encoder, pipeline: pipeline, viewportSize: viewportSize)
         addWorkspaceButtonFrame = NSRect(x: bx, y: by, width: btnSize, height: btnSize)
-    }
-
-    /// Check if the add button was clicked
-    func checkAddButtonClick(at point: NSPoint) -> Bool {
-        return addButtonFrame.contains(point)
     }
 
     private func drawVertices(

@@ -207,9 +207,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         iv.onSelectTerminal = { [weak self] controller in
             self?.switchToFocused(controller)
         }
-        iv.onAddTerminal = { [weak self] in
-            self?.addNewTerminal()
-        }
         iv.onAddWorkspace = { [weak self] in
             self?.promptCreateWorkspace()
         }
@@ -278,18 +275,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let aliveCount = manager.terminals.filter { $0.isAlive }.count
-        if aliveCount > 0 {
-            let alert = NSAlert()
-            alert.messageText = "ptermを終了しますか？"
-            alert.informativeText = "動作中のターミナルが\(aliveCount)つあります。"
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "終了")
-            alert.addButton(withTitle: "キャンセル")
+        if !isTerminating {
+            let aliveCount = manager.terminals.filter { $0.isAlive }.count
+            if aliveCount > 0 {
+                let alert = NSAlert()
+                alert.messageText = "ptermを終了しますか？"
+                alert.informativeText = "動作中のターミナルが\(aliveCount)つあります。"
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "終了")
+                alert.addButton(withTitle: "キャンセル")
 
-            let response = alert.runModal()
-            if response == .alertSecondButtonReturn {
-                return .terminateCancel
+                let response = alert.runModal()
+                if response == .alertSecondButtonReturn {
+                    return .terminateCancel
+                }
             }
         }
 
@@ -481,9 +480,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             iv.shortcutConfiguration = config.shortcuts
             iv.onSelectTerminal = { [weak self] controller in
                 self?.switchToFocused(controller)
-            }
-            iv.onAddTerminal = { [weak self] in
-                self?.addNewTerminal()
             }
             iv.onAddWorkspace = { [weak self] in
                 self?.promptCreateWorkspace()
@@ -1768,6 +1764,25 @@ extension AppDelegate: NSWindowDelegate {
         layoutTitlebarBackButton()
         integratedView?.syncScaleFactorIfNeeded()
         terminalView?.syncScaleFactorIfNeeded()
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        let aliveCount = manager.terminals.filter { $0.isAlive }.count
+        if aliveCount > 0 {
+            let alert = NSAlert()
+            alert.messageText = "ptermを終了しますか？"
+            alert.informativeText = "動作中のターミナルが\(aliveCount)つあります。"
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "終了")
+            alert.addButton(withTitle: "キャンセル")
+
+            if alert.runModal() == .alertSecondButtonReturn {
+                return false
+            }
+        }
+        isTerminating = true
+        persistSession()
+        return true
     }
 
     func windowWillClose(_ notification: Notification) {
