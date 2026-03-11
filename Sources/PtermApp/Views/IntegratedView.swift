@@ -156,8 +156,11 @@ final class IntegratedView: MTKView, NSDraggingSource {
         static let borderWidth: CGFloat = 1.5
         static let selectedBorderWidth: CGFloat = 3.0
         static let workspaceBorderWidth: CGFloat = 1.0
-        /// Maximum width for a single terminal thumbnail (points).
-        static let maxThumbnailWidth: CGFloat = 320
+        /// Thumbnail aspect ratio (4:3).
+        static let thumbnailAspectRatio: CGFloat = 320.0 / 240.0
+        /// Thumbnail width bounds (points).
+        static let thumbnailMinWidth: CGFloat = 80
+        static let thumbnailMaxWidth: CGFloat = 320
     }
 
     // MARK: - Initialization
@@ -274,33 +277,90 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
         let outerPad = Layout.workspacePadding
         let innerPad = Layout.thumbnailPadding
-        let availableWidth = bounds.width - outerPad * 2
+        let viewWidth = bounds.width
+        let aspect = Layout.thumbnailAspectRatio
+        let maxW = Layout.thumbnailMaxWidth
+        let minW = Layout.thumbnailMinWidth
 
-        // Phase 1: compute natural section heights
-        var sectionHeights: [CGFloat] = []
-        var sectionGridDims: [(cols: Int, rows: Int)] = []
-        for section in sections {
+        // Compute global thumbnail size (used as the upper bound for per-workspace sizing):
+        // Determine column count so that thumbnails are ≤ maxWidth, then compute exact width.
+        let fullContentWidth = viewWidth - outerPad * 2 - innerPad * 2
+        let maxCellWidth = maxW + innerPad
+        let fitCols = max(1, Int(ceil(fullContentWidth / maxCellWidth)))
+        let thumbWidth = max(minW, min(maxW, (fullContentWidth - innerPad * CGFloat(fitCols)) / CGFloat(fitCols)))
+        let thumbHeight = thumbWidth / aspect
+        let cellWidth = thumbWidth + innerPad
+        let cellHeight = thumbHeight + Layout.titleBarHeight + innerPad
+
+        // Phase 1: group workspaces into rows that fit within window width
+        struct RowItem {
+            let sectionIndex: Int
+            let gridCols: Int
+            let gridRows: Int
+            let naturalWidth: CGFloat
+        }
+        var rows: [[RowItem]] = []
+        var currentRow: [RowItem] = []
+        var currentRowWidth: CGFloat = outerPad
+
+        for (i, section) in sections.enumerated() {
             let terminalCount = max(section.terminals.count, 1)
-            let contentAreaWidth = availableWidth - innerPad * 2
-            // Minimum columns to keep thumbnails within max width
-            let minColsForMaxWidth = max(1, Int(ceil(contentAreaWidth / (Layout.maxThumbnailWidth + innerPad))))
-            let (sqrtCols, _) = TerminalManager.gridLayout(for: terminalCount)
-            let gridCols = max(sqrtCols, minColsForMaxWidth)
+            let gridCols = Int(ceil(sqrt(Double(terminalCount))))
             let gridRows = Int(ceil(Double(terminalCount) / Double(gridCols)))
+            let naturalWidth = CGFloat(gridCols) * cellWidth + innerPad * 2
 
-            let cellWidth = contentAreaWidth / CGFloat(max(gridCols, 1))
-            let avgAspect: CGFloat = 1.6
-            let thumbnailWidth = max(0, cellWidth - innerPad)
-            let thumbnailHeight = thumbnailWidth / avgAspect
-            let cellHeight = thumbnailHeight + Layout.titleBarHeight + innerPad
-            let gridContentHeight = CGFloat(gridRows) * cellHeight
-            let sectionHeight = max(Layout.workspaceHeaderHeight + innerPad * 1.5 + gridContentHeight + innerPad, 140)
-            sectionHeights.append(sectionHeight)
-            sectionGridDims.append((gridCols, gridRows))
+            let neededWidth = currentRowWidth + naturalWidth + outerPad
+            if !currentRow.isEmpty && neededWidth > viewWidth {
+                rows.append(currentRow)
+                currentRow = []
+                currentRowWidth = outerPad
+            }
+            currentRow.append(RowItem(sectionIndex: i, gridCols: gridCols, gridRows: gridRows, naturalWidth: naturalWidth))
+            currentRowWidth += naturalWidth + outerPad
+        }
+        if !currentRow.isEmpty {
+            rows.append(currentRow)
         }
 
-        // Compute total content height (before scroll)
-        let rawContentHeight = outerPad + sectionHeights.reduce(0, +) + CGFloat(sections.count - 1) * outerPad + outerPad + Layout.addButtonSize + outerPad
+        // Helper: compute actual grid dimensions for a workspace given its allocated width.
+        // Maximizes columns (up to terminal count) while keeping thumbnail width within [minW, maxW].
+        // More terminals → more columns → narrower thumbnails.
+        func actualGrid(terminalCount: Int, wsWidth: CGFloat) -> (cols: Int, rows: Int, thumbW: CGFloat, thumbH: CGFloat) {
+            let wsContentW = wsWidth - innerPad * 2
+            let minCellWidth = minW + innerPad
+            // Maximum columns that fit at minimum thumbnail width
+            let maxFitCols = max(1, Int(floor(wsContentW / minCellWidth)))
+            // Use at most the terminal count
+            let cols = max(1, min(terminalCount, maxFitCols))
+            let tw = max(minW, min(maxW, (wsContentW - innerPad * CGFloat(cols)) / CGFloat(cols)))
+            let th = tw / aspect
+            let rows = Int(ceil(Double(terminalCount) / Double(cols)))
+            return (cols, rows, tw, th)
+        }
+
+        // Phase 2: compute total content height (using actual workspace widths)
+        var rowHeights: [CGFloat] = []
+        for row in rows {
+            let totalNatural = row.map(\.naturalWidth).reduce(0, +)
+            let totalPad = outerPad * CGFloat(row.count + 1)
+            let availableW = viewWidth - totalPad
+
+            var maxContentHeight: CGFloat = 0
+            for item in row {
+                let wsW = totalNatural > 0
+                    ? availableW * (item.naturalWidth / totalNatural)
+                    : availableW / CGFloat(row.count)
+                let termCount = max(sections[item.sectionIndex].terminals.count, 1)
+                let g = actualGrid(terminalCount: termCount, wsWidth: wsW)
+                let wsCellH = g.thumbH + Layout.titleBarHeight + innerPad
+                let h = CGFloat(g.rows) * wsCellH
+                if h > maxContentHeight { maxContentHeight = h }
+            }
+            let rowHeight = max(Layout.workspaceHeaderHeight + innerPad * 1.5 + maxContentHeight + innerPad, 140)
+            rowHeights.append(rowHeight)
+        }
+
+        let rawContentHeight = outerPad + rowHeights.reduce(0, +) + CGFloat(rows.count - 1) * outerPad + outerPad + Layout.addButtonSize + outerPad
         totalContentHeight = rawContentHeight
 
         // Clamp scroll offset
@@ -308,109 +368,85 @@ final class IntegratedView: MTKView, NSDraggingSource {
         if scrollOffset > maxScroll { scrollOffset = maxScroll }
         if scrollOffset < 0 { scrollOffset = 0 }
 
-        // Phase 2: compute layouts with scroll offset applied
+        // Phase 3: compute layouts with scroll offset applied
         var layouts: [WorkspaceLayout] = []
         var currentY = outerPad - scrollOffset
 
-        for (sectionIndex, section) in sections.enumerated() {
-            let sectionHeight = sectionHeights[sectionIndex]
-            let (gridCols, gridRows) = sectionGridDims[sectionIndex]
+        for (rowIndex, row) in rows.enumerated() {
+            let rowHeight = rowHeights[rowIndex]
+            let totalNaturalWidth = row.map(\.naturalWidth).reduce(0, +)
+            let totalPadding = outerPad * CGFloat(row.count + 1)
+            let availableForWorkspaces = viewWidth - totalPadding
 
-            let frame = NSRect(x: outerPad, y: currentY, width: availableWidth, height: sectionHeight)
-            let headerFrame = NSRect(x: frame.minX + innerPad,
-                                     y: frame.minY + innerPad / 2,
-                                     width: frame.width - innerPad * 2,
-                                     height: Layout.workspaceHeaderHeight)
-            let closeFrame = NSRect(x: headerFrame.minX + 4,
-                                    y: headerFrame.minY + (headerFrame.height - Layout.closeButtonSize) / 2,
-                                    width: Layout.closeButtonSize,
-                                    height: Layout.closeButtonSize)
-            let addFrame = NSRect(x: headerFrame.maxX - Layout.closeButtonSize - 6,
-                                  y: headerFrame.minY + (headerFrame.height - Layout.closeButtonSize) / 2,
-                                  width: Layout.closeButtonSize,
-                                  height: Layout.closeButtonSize)
-            let noteFrame = NSRect(x: addFrame.minX - Layout.closeButtonSize - 6,
-                                   y: addFrame.minY,
-                                   width: Layout.closeButtonSize,
-                                   height: Layout.closeButtonSize)
+            var currentX = outerPad
+            for item in row {
+                let section = sections[item.sectionIndex]
+                let wsWidth = totalNaturalWidth > 0
+                    ? availableForWorkspaces * (item.naturalWidth / totalNaturalWidth)
+                    : availableForWorkspaces / CGFloat(row.count)
+                let frame = NSRect(x: currentX, y: currentY, width: wsWidth, height: rowHeight)
+                let headerFrame = NSRect(x: frame.minX + innerPad,
+                                         y: frame.minY + innerPad / 2,
+                                         width: frame.width - innerPad * 2,
+                                         height: Layout.workspaceHeaderHeight)
+                let closeFrame = NSRect(x: headerFrame.minX + 4,
+                                        y: headerFrame.minY + (headerFrame.height - Layout.closeButtonSize) / 2,
+                                        width: Layout.closeButtonSize,
+                                        height: Layout.closeButtonSize)
+                let addFrame = NSRect(x: headerFrame.maxX - Layout.closeButtonSize - 6,
+                                      y: headerFrame.minY + (headerFrame.height - Layout.closeButtonSize) / 2,
+                                      width: Layout.closeButtonSize,
+                                      height: Layout.closeButtonSize)
+                let noteFrame = NSRect(x: addFrame.minX - Layout.closeButtonSize - 6,
+                                       y: addFrame.minY,
+                                       width: Layout.closeButtonSize,
+                                       height: Layout.closeButtonSize)
 
-            let contentFrame = NSRect(x: frame.minX + innerPad,
-                                      y: headerFrame.maxY + innerPad / 2,
-                                      width: frame.width - innerPad * 2,
-                                      height: max(0, frame.height - Layout.workspaceHeaderHeight - innerPad * 2))
-            let cellW = contentFrame.width / CGFloat(max(gridCols, 1))
-            let cellH = contentFrame.height / CGFloat(max(gridRows, 1))
+                // Compute grid and thumbnail size based on actual workspace width
+                let termCount = max(section.terminals.count, 1)
+                let g = actualGrid(terminalCount: termCount, wsWidth: wsWidth)
+                let wsCellWidth = g.thumbW + innerPad
+                let wsCellHeight = g.thumbH + Layout.titleBarHeight + innerPad
 
-            var thumbnailLayouts: [ThumbnailLayout] = []
-            for (index, controller) in section.terminals.enumerated() {
-                let gridCol = index % gridCols
-                let gridRow = index / gridCols
-                let cellX = contentFrame.minX + CGFloat(gridCol) * cellW
-                let cellY = contentFrame.minY + CGFloat(gridRow) * cellH
-                let previewFrames = centeredPreviewFrames(
-                    for: controller,
-                    cellFrame: NSRect(x: cellX, y: cellY, width: cellW, height: cellH),
-                    innerPadding: innerPad
-                )
-                let titleFrame = previewFrames.title
-                let thumbFrame = previewFrames.thumbnail
-                let closeFrame = NSRect(
-                    x: titleFrame.origin.x + 4,
-                    y: titleFrame.origin.y + (Layout.titleBarHeight - Layout.closeButtonSize) / 2,
-                    width: Layout.closeButtonSize,
-                    height: Layout.closeButtonSize
-                )
-                thumbnailLayouts.append(ThumbnailLayout(
-                    controller: controller,
-                    thumbnail: thumbFrame,
-                    title: titleFrame,
-                    close: closeFrame,
-                    workspace: section.name
-                ))
+                let contentHeight = max(0, CGFloat(g.rows) * wsCellHeight)
+                let contentFrame = NSRect(x: frame.minX + innerPad,
+                                          y: headerFrame.maxY + innerPad / 2,
+                                          width: frame.width - innerPad * 2,
+                                          height: contentHeight)
+
+                var thumbnailLayouts: [ThumbnailLayout] = []
+                for (index, controller) in section.terminals.enumerated() {
+                    let gridCol = index % g.cols
+                    let gridRow = index / g.cols
+                    let thumbX = contentFrame.minX + CGFloat(gridCol) * wsCellWidth + innerPad / 2
+                    let thumbY = contentFrame.minY + CGFloat(gridRow) * wsCellHeight + innerPad / 2
+                    let titleFrame = NSRect(x: thumbX, y: thumbY,
+                                            width: g.thumbW, height: Layout.titleBarHeight)
+                    let thumbFrame = NSRect(x: thumbX, y: titleFrame.maxY,
+                                            width: g.thumbW, height: g.thumbH)
+                    let closeBtn = NSRect(
+                        x: titleFrame.origin.x + 4,
+                        y: titleFrame.origin.y + (Layout.titleBarHeight - Layout.closeButtonSize) / 2,
+                        width: Layout.closeButtonSize,
+                        height: Layout.closeButtonSize
+                    )
+                    thumbnailLayouts.append(ThumbnailLayout(
+                        controller: controller,
+                        thumbnail: thumbFrame,
+                        title: titleFrame,
+                        close: closeBtn,
+                        workspace: section.name
+                    ))
+                }
+
+                layouts.append(WorkspaceLayout(name: section.name, frame: frame, headerFrame: headerFrame,
+                                               noteFrame: noteFrame, addFrame: addFrame, closeFrame: closeFrame, terminals: thumbnailLayouts))
+                currentX += wsWidth + outerPad
             }
-
-            layouts.append(WorkspaceLayout(name: section.name, frame: frame, headerFrame: headerFrame,
-                                           noteFrame: noteFrame, addFrame: addFrame, closeFrame: closeFrame, terminals: thumbnailLayouts))
-            currentY += sectionHeight + outerPad
+            currentY += rowHeight + outerPad
         }
 
         return layouts
-    }
-
-    private func centeredPreviewFrames(
-        for controller: TerminalController,
-        cellFrame: NSRect,
-        innerPadding: CGFloat
-    ) -> (title: NSRect, thumbnail: NSRect) {
-        let maxBoxWidth = max(0, cellFrame.width - innerPadding)
-        let maxBoxHeight = max(0, cellFrame.height - innerPadding)
-        let maxContentHeight = max(0, maxBoxHeight - Layout.titleBarHeight)
-        let contentAspect = thumbnailAspectRatio(for: controller)
-
-        var contentWidth = min(maxBoxWidth, maxContentHeight * contentAspect)
-        var contentHeight = contentAspect > 0 ? contentWidth / contentAspect : 0
-        if contentHeight > maxContentHeight {
-            contentHeight = maxContentHeight
-            contentWidth = contentHeight * contentAspect
-        }
-
-        let totalHeight = Layout.titleBarHeight + contentHeight
-        let originX = cellFrame.minX + (cellFrame.width - contentWidth) / 2
-        let originY = cellFrame.minY + (cellFrame.height - totalHeight) / 2
-
-        let title = NSRect(x: originX, y: originY, width: contentWidth, height: Layout.titleBarHeight)
-        let thumbnail = NSRect(x: originX, y: title.maxY, width: contentWidth, height: contentHeight)
-        return (title, thumbnail)
-    }
-
-    private func thumbnailAspectRatio(for controller: TerminalController) -> CGFloat {
-        let gridSize = controller.withModel { (rows: $0.rows, cols: $0.cols) }
-        let cellWidth = max(renderer.glyphAtlas.cellWidth, 1)
-        let cellHeight = max(renderer.glyphAtlas.cellHeight, 1)
-        let contentWidth = CGFloat(max(gridSize.cols, 1)) * cellWidth
-        let contentHeight = CGFloat(max(gridSize.rows, 1)) * cellHeight
-        guard contentHeight > 0 else { return 1.6 }
-        return max(0.8, min(3.0, contentWidth / contentHeight))
     }
 
     /// Return the index of the thumbnail at the given view-coordinates point.

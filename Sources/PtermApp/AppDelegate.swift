@@ -54,9 +54,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Tracks last output time per terminal for active-output indicator.
     private var lastOutputTimes: [UUID: Date] = [:]
     private var outputIdleTimer: Timer?
-    /// Suppresses active-output indicator briefly after resize or terminal creation.
+    /// Suppresses active-output indicator briefly after resize, terminal creation, or app launch.
     private var lastResizeTime: Date = .distantPast
     private var terminalCreationTimes: [UUID: Date] = [:]
+    private let appLaunchTime: Date = Date()
     private let clipboardFileStore = ClipboardFileStore()
     private var clipboardCleanupService: ClipboardCleanupService?
     private let sessionStore = SessionStore()
@@ -1137,7 +1138,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onOutputActivity = { [weak self, weak controller] in
             guard let self, let controller else { return }
             let now = Date()
-            // Suppress briefly after window resize (SIGWINCH) or terminal creation
+            // Suppress briefly after app launch, window resize (SIGWINCH), or terminal creation
+            if now.timeIntervalSince(self.appLaunchTime) < 3.0 { return }
             if now.timeIntervalSince(self.lastResizeTime) < 1.0 { return }
             if let created = self.terminalCreationTimes[controller.id],
                now.timeIntervalSince(created) < 2.0 { return }
@@ -1862,6 +1864,17 @@ extension AppDelegate: NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // In focused/split view, return to integrated view instead of closing
+        if case .focused = viewMode {
+            switchToIntegrated()
+            return false
+        }
+        if case .split = viewMode {
+            switchToIntegrated()
+            return false
+        }
+
+        // In integrated view, proceed with close/quit
         let aliveCount = manager.terminals.filter { $0.isAlive }.count
         if aliveCount > 0 {
             let alert = NSAlert()
