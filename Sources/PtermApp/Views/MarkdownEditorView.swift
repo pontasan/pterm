@@ -515,7 +515,7 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard isDirty else { return true }
-        let alert = NSAlert()
+        let alert = NSAlert.pterm()
         alert.messageText = "Unsaved Changes"
         alert.informativeText = "Do you want to save your changes before closing?"
         alert.alertStyle = .warning

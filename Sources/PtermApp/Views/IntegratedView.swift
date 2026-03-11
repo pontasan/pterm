@@ -1076,7 +1076,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
 
     private func promptRenameWorkspace(_ workspace: String) {
-        let alert = NSAlert()
+        let alert = NSAlert.pterm()
         alert.messageText = "Rename Workspace"
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
         field.stringValue = workspace
@@ -1090,7 +1090,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
 
     private func promptRenameTerminalTitle(_ controller: TerminalController) {
-        let alert = NSAlert()
+        let alert = NSAlert.pterm()
         alert.messageText = "Rename Terminal"
         alert.informativeText = "Leave empty to use the current directory name."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))

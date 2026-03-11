@@ -43,6 +43,7 @@ bundle:
 	mkdir -p $(BUILD_DIR)/shaders; \
 	cp $$BINARY_DIR/PtermApp $(APP_BUNDLE)/Contents/MacOS/PtermApp; \
 	cp Resources/Info.plist $(APP_BUNDLE)/Contents/Info.plist; \
+	cp Resources/AppIcon.icns $(APP_BUNDLE)/Contents/Resources/AppIcon.icns; \
 	$(METAL_TOOLCHAIN) xcrun -sdk macosx metal -c $(SHADER_DIR)/terminal.metal \
 		-o $(BUILD_DIR)/shaders/terminal.air; \
 	$(METAL_TOOLCHAIN) xcrun -sdk macosx metallib $(BUILD_DIR)/shaders/terminal.air \

@@ -431,7 +431,7 @@ final class TerminalView: MTKView, NSTextInputClient {
             return true
         }
 
-        let alert = NSAlert()
+        let alert = NSAlert.pterm()
         alert.messageText = "Open this URL?"
         alert.informativeText = detectedLink.originalText
         alert.alertStyle = .warning

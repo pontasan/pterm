@@ -75,25 +75,11 @@ final class AppNoteStore {
         rootDirectory.appendingPathComponent(Constants.noteFileName)
     }
 
-    private func debugLog(_ msg: String) {
-        let line = "\(Date()): [AppNoteStore] \(msg)\n"
-        let path = "/tmp/pterm_note_debug.log"
-        if let fh = FileHandle(forWritingAtPath: path) {
-            fh.seekToEndOfFile()
-            fh.write(Data(line.utf8))
-            fh.closeFile()
-        } else {
-            FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
-        }
-    }
-
     private func loadOrCreateKey() throws -> Data {
         if let cachedKey {
-            debugLog("using cachedKey")
             return cachedKey
         }
 
-        debugLog("calling SecItemCopyMatching...")
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: Constants.service,
@@ -103,7 +89,6 @@ final class AppNoteStore {
         ]
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
-        debugLog("SecItemCopyMatching returned status=\(status)")
         if status == errSecSuccess, let data = item as? Data {
             guard data.count == Constants.keyLength else {
                 throw AppNoteError.invalidKeyLength

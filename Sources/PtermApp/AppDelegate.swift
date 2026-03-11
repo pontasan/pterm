@@ -328,7 +328,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !isTerminating {
             let aliveCount = manager.terminals.filter { $0.isAlive }.count
             if aliveCount > 0 {
-                let alert = NSAlert()
+                let alert = NSAlert.pterm()
                 alert.messageText = "Quit pterm?"
                 alert.informativeText = "\(aliveCount) terminal(s) are still running."
                 alert.alertStyle = .warning
@@ -382,7 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             return controller
         } catch {
-            let alert = NSAlert()
+            let alert = NSAlert.pterm()
             alert.messageText = "Failed to start terminal"
             alert.informativeText = "\(error)"
             alert.alertStyle = .critical
@@ -718,7 +718,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "About pterm",
-                       action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+                       action: #selector(showAboutPanel),
                        keyEquivalent: "")
         appMenu.addItem(makeMenuItem(title: "Open Settings", shortcut: .openSettings))
         appMenu.addItem(NSMenuItem.separator())
@@ -1123,7 +1123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return true
         }
 
-        let alert = NSAlert()
+        let alert = NSAlert.pterm()
         alert.messageText = "Paste multi-line text?"
         alert.informativeText = "The text you are pasting contains newlines."
         alert.alertStyle = .warning
@@ -1273,7 +1273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case .restore(let session):
                 return session
             case .requireUserConfirmation(let session):
-                let alert = NSAlert()
+                let alert = NSAlert.pterm()
                 alert.messageText = "Restore previous session?"
                 alert.informativeText = "The previous session did not exit cleanly. Restoring may cause the same issue again."
                 alert.alertStyle = .warning
@@ -1404,7 +1404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let confirm = NSAlert()
+        let confirm = NSAlert.pterm()
         confirm.messageText = "Proceed with import?"
         let included = preview.includedItems.joined(separator: ", ")
         let overwritten = preview.overwrittenItems.isEmpty
@@ -1496,7 +1496,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func promptPassword(title: String, message: String) -> String? {
-        let alert = NSAlert()
+        let alert = NSAlert.pterm()
         alert.messageText = title
         alert.informativeText = message
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
@@ -1511,7 +1511,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func clearClipboardFiles(_ sender: Any?) {
-        let alert = NSAlert()
+        let alert = NSAlert.pterm()
         alert.messageText = "Delete clipboard files?"
         alert.informativeText = "All saved files under \(PtermDirectories.files.path) will be deleted."
         alert.addButton(withTitle: "Delete")
@@ -1525,7 +1525,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showInfoAlert(title: String, message: String) {
-        let alert = NSAlert()
+        let alert = NSAlert.pterm()
         alert.messageText = title
         alert.informativeText = message
         alert.runModal()
@@ -1555,36 +1555,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var isOpeningNote = false
 
-    @objc func editAppNote(_ sender: Any? = nil) {
-        let debugLog = "/tmp/pterm_note_debug.log"
-        func log(_ msg: String) {
-            let line = "\(Date()): \(msg)\n"
-            if let fh = FileHandle(forWritingAtPath: debugLog) {
-                fh.seekToEndOfFile()
-                fh.write(Data(line.utf8))
-                fh.closeFile()
-            } else {
-                FileManager.default.createFile(atPath: debugLog, contents: Data(line.utf8))
-            }
+    @objc func showAboutPanel() {
+        var options: [NSApplication.AboutPanelOptionKey: Any] = [:]
+        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let icon = NSImage(contentsOf: iconURL) {
+            options[.applicationIcon] = icon
         }
-        log("editAppNote called, sender=\(String(describing: sender)), isOpeningNote=\(isOpeningNote), hasEditor=\(appNoteEditor != nil)")
+        NSApp.orderFrontStandardAboutPanel(options: options)
+    }
 
+    @objc func editAppNote(_ sender: Any? = nil) {
         if let existing = appNoteEditor {
-            log("reusing existing editor")
             existing.showEditorWindow()
             return
         }
         // Guard against re-entrant calls (e.g., Keychain dialog dispatching events).
-        guard !isOpeningNote else {
-            log("blocked by isOpeningNote guard")
-            return
-        }
+        guard !isOpeningNote else { return }
         isOpeningNote = true
         defer { isOpeningNote = false }
 
-        log("loading note...")
         let initialText = ((try? appNoteStore.loadNote()) ?? nil) ?? ""
-        log("note loaded, length=\(initialText.count)")
         let editorController = MarkdownEditorWindowController(
             initialText: initialText,
             onSave: { [appNoteStore] text in
@@ -1798,7 +1788,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func promptCreateWorkspace() {
-        let alert = NSAlert()
+        let alert = NSAlert.pterm()
         alert.messageText = "Add Workspace"
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
         field.placeholderString = "Workspace name"
@@ -1811,7 +1801,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard alert.runModal() == .alertFirstButtonReturn else { return }
             let trimmed = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
-                let warn = NSAlert()
+                let warn = NSAlert.pterm()
                 warn.messageText = "Workspace name cannot be empty."
                 warn.alertStyle = .warning
                 warn.addButton(withTitle: "OK")
@@ -1942,7 +1932,7 @@ extension AppDelegate: NSWindowDelegate {
         // In integrated view, proceed with close/quit
         let aliveCount = manager.terminals.filter { $0.isAlive }.count
         if aliveCount > 0 {
-            let alert = NSAlert()
+            let alert = NSAlert.pterm()
             alert.messageText = "Quit pterm?"
             alert.informativeText = "\(aliveCount) terminal(s) are still running."
             alert.alertStyle = .warning
