@@ -14,7 +14,7 @@ final class SearchBarView: NSView, NSSearchFieldDelegate {
         layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 0.95).cgColor
         layer?.cornerRadius = 8
 
-        searchField.placeholderString = "検索"
+        searchField.placeholderString = "Search"
         searchField.delegate = self
         searchField.target = self
         searchField.action = #selector(submitSearch(_:))

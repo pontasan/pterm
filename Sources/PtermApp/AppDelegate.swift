@@ -294,11 +294,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let aliveCount = manager.terminals.filter { $0.isAlive }.count
             if aliveCount > 0 {
                 let alert = NSAlert()
-                alert.messageText = "ptermを終了しますか？"
-                alert.informativeText = "動作中のターミナルが\(aliveCount)つあります。"
+                alert.messageText = "Quit pterm?"
+                alert.informativeText = "\(aliveCount) terminal(s) are still running."
                 alert.alertStyle = .warning
-                alert.addButton(withTitle: "終了")
-                alert.addButton(withTitle: "キャンセル")
+                alert.addButton(withTitle: "Quit")
+                alert.addButton(withTitle: "Cancel")
 
                 let response = alert.runModal()
                 if response == .alertSecondButtonReturn {
@@ -348,7 +348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return controller
         } catch {
             let alert = NSAlert()
-            alert.messageText = "ターミナルの起動に失敗しました"
+            alert.messageText = "Failed to start terminal"
             alert.informativeText = "\(error)"
             alert.alertStyle = .critical
             alert.runModal()
@@ -670,65 +670,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenuItem = NSMenuItem()
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "ptermについて",
+        appMenu.addItem(withTitle: "About pterm",
                        action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                        keyEquivalent: "")
-        appMenu.addItem(makeMenuItem(title: "設定を開く", shortcut: .openSettings))
+        appMenu.addItem(makeMenuItem(title: "Open Settings", shortcut: .openSettings))
         appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(withTitle: "エクスポート", action: #selector(exportData(_:)),
+        appMenu.addItem(withTitle: "Export", action: #selector(exportData(_:)),
                         keyEquivalent: "")
-        appMenu.addItem(withTitle: "インポート", action: #selector(importData(_:)),
-                        keyEquivalent: "")
-        appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(withTitle: "クリップボードファイルを開く", action: #selector(openClipboardFilesFolder(_:)),
-                        keyEquivalent: "")
-        appMenu.addItem(withTitle: "クリップボードファイルを削除", action: #selector(clearClipboardFiles(_:)),
+        appMenu.addItem(withTitle: "Import", action: #selector(importData(_:)),
                         keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(makeMenuItem(title: "ptermを終了", shortcut: .quit))
+        appMenu.addItem(withTitle: "Open Clipboard Files", action: #selector(openClipboardFilesFolder(_:)),
+                        keyEquivalent: "")
+        appMenu.addItem(withTitle: "Delete Clipboard Files", action: #selector(clearClipboardFiles(_:)),
+                        keyEquivalent: "")
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(makeMenuItem(title: "Quit pterm", shortcut: .quit))
         appMenuItem.submenu = appMenu
 
         // Edit menu (for standard key bindings)
         let editMenuItem = NSMenuItem()
         mainMenu.addItem(editMenuItem)
-        let editMenu = NSMenu(title: "編集")
-        editMenu.addItem(makeMenuItem(title: "コピー", shortcut: .copy))
-        editMenu.addItem(makeMenuItem(title: "切り取り", shortcut: .cut))
-        editMenu.addItem(makeMenuItem(title: "ペースト", shortcut: .paste))
-        editMenu.addItem(makeMenuItem(title: "すべてを選択", shortcut: .selectAll))
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(makeMenuItem(title: "Copy", shortcut: .copy))
+        editMenu.addItem(makeMenuItem(title: "Cut", shortcut: .cut))
+        editMenu.addItem(makeMenuItem(title: "Paste", shortcut: .paste))
+        editMenu.addItem(makeMenuItem(title: "Select All", shortcut: .selectAll))
         editMenu.addItem(NSMenuItem.separator())
-        editMenu.addItem(makeMenuItem(title: "取り消し", shortcut: .undo))
-        editMenu.addItem(makeMenuItem(title: "検索...", shortcut: .find))
+        editMenu.addItem(makeMenuItem(title: "Undo", shortcut: .undo))
+        editMenu.addItem(makeMenuItem(title: "Find...", shortcut: .find))
         editMenuItem.submenu = editMenu
 
         // View menu (font size control + view switching)
         let viewMenuItem = NSMenuItem()
         mainMenu.addItem(viewMenuItem)
-        let viewMenu = NSMenu(title: "表示")
+        let viewMenu = NSMenu(title: "View")
 
-        viewMenu.addItem(makeMenuItem(title: "フォントを拡大", shortcut: .zoomIn))
-        viewMenu.addItem(makeMenuItem(title: "フォントを縮小", shortcut: .zoomOut))
-        viewMenu.addItem(makeMenuItem(title: "デフォルトサイズに戻す", shortcut: .zoomReset))
+        viewMenu.addItem(makeMenuItem(title: "Zoom In", shortcut: .zoomIn))
+        viewMenu.addItem(makeMenuItem(title: "Zoom Out", shortcut: .zoomOut))
+        viewMenu.addItem(makeMenuItem(title: "Reset to Default Size", shortcut: .zoomReset))
 
         viewMenu.addItem(NSMenuItem.separator())
 
-        // Cmd+Escape: back to integrated view
-        viewMenu.addItem(makeMenuItem(title: "統合ビューに戻る", shortcut: .backToIntegrated))
+        viewMenu.addItem(makeMenuItem(title: "Back to Overview", shortcut: .backToIntegrated))
 
         viewMenuItem.submenu = viewMenu
 
         // Shell menu
         let shellMenuItem = NSMenuItem()
         mainMenu.addItem(shellMenuItem)
-        let shellMenu = NSMenu(title: "シェル")
-        shellMenu.addItem(makeMenuItem(title: "新規ターミナル", shortcut: .newTerminal))
-        shellMenu.addItem(makeMenuItem(title: "現在のターミナルを閉じる", shortcut: .closeTerminal))
+        let shellMenu = NSMenu(title: "Shell")
+        shellMenu.addItem(makeMenuItem(title: "New Terminal", shortcut: .newTerminal))
+        shellMenu.addItem(makeMenuItem(title: "Close Terminal", shortcut: .closeTerminal))
         shellMenuItem.submenu = shellMenu
 
         let workspaceMenuItem = NSMenuItem()
         mainMenu.addItem(workspaceMenuItem)
-        let workspaceMenu = NSMenu(title: "ワークスペース")
-        workspaceMenu.addItem(withTitle: "メモを編集", action: #selector(editWorkspaceNote(_:)),
+        let workspaceMenu = NSMenu(title: "Workspace")
+        workspaceMenu.addItem(withTitle: "Edit Note", action: #selector(editWorkspaceNote(_:)),
                               keyEquivalent: "")
         workspaceMenuItem.submenu = workspaceMenu
 
@@ -931,7 +930,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch viewMode {
         case .integrated:
             let count = manager.count
-            window.title = "pterm — \(count)個のターミナル"
+            window.title = "pterm — \(count) terminal(s)"
 
         case .focused(let controller):
             var parts: [String] = []
@@ -1082,11 +1081,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let alert = NSAlert()
-        alert.messageText = "複数行のテキストを貼り付けますか？"
-        alert.informativeText = "改行を含むテキストを貼り付けようとしています。"
+        alert.messageText = "Paste multi-line text?"
+        alert.informativeText = "The text you are pasting contains newlines."
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "貼り付け")
-        alert.addButton(withTitle: "キャンセル")
+        alert.addButton(withTitle: "Paste")
+        alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
     }
 
@@ -1231,11 +1230,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return session
             case .requireUserConfirmation(let session):
                 let alert = NSAlert()
-                alert.messageText = "前回のセッションを復元しますか？"
-                alert.informativeText = "前回の終了が正常ではありませんでした。復元すると再び問題が起きる可能性があります。"
+                alert.messageText = "Restore previous session?"
+                alert.informativeText = "The previous session did not exit cleanly. Restoring may cause the same issue again."
                 alert.alertStyle = .warning
-                alert.addButton(withTitle: "復元")
-                alert.addButton(withTitle: "復元しない")
+                alert.addButton(withTitle: "Restore")
+                alert.addButton(withTitle: "Don't Restore")
                 if alert.runModal() == .alertFirstButtonReturn {
                     return session
                 }
@@ -1326,8 +1325,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func exportData(_ sender: Any?) {
-        let password = promptPassword(title: "エクスポート用パスワード",
-                                      message: "ワークスペースメモの暗号鍵を保護します。")
+        let password = promptPassword(title: "Export Password",
+                                      message: "This password protects the encryption key for workspace notes.")
         guard let password else { return }
         let panel = NSSavePanel()
         panel.nameFieldStringValue = exportImportManager.defaultExportURL().lastPathComponent
@@ -1336,7 +1335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             try exportImportManager.exportArchive(to: url, password: password)
-            showInfoAlert(title: "エクスポート完了", message: url.path)
+            showInfoAlert(title: "Export Complete", message: url.path)
         } catch {
             NSAlert(error: error).runModal()
         }
@@ -1348,8 +1347,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openPanel.canChooseDirectories = false
         guard openPanel.runModal() == .OK, let url = openPanel.url else { return }
 
-        var password = promptPassword(title: "インポート用パスワード",
-                                      message: "エクスポート時に設定したパスワードを入力してください。")
+        var password = promptPassword(title: "Import Password",
+                                      message: "Enter the password used during export.")
         guard let initialPassword = password else { return }
         password = initialPassword
 
@@ -1362,14 +1361,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let confirm = NSAlert()
-        confirm.messageText = "インポートを実行しますか？"
+        confirm.messageText = "Proceed with import?"
         let included = preview.includedItems.joined(separator: ", ")
         let overwritten = preview.overwrittenItems.isEmpty
-            ? "上書き対象なし"
-            : "上書き: " + preview.overwrittenItems.joined(separator: ", ")
-        confirm.informativeText = "内容: \(included)\n\(overwritten)"
-        confirm.addButton(withTitle: "実行")
-        confirm.addButton(withTitle: "キャンセル")
+            ? "No items to overwrite"
+            : "Overwrite: " + preview.overwrittenItems.joined(separator: ", ")
+        confirm.informativeText = "Contents: \(included)\n\(overwritten)"
+        confirm.addButton(withTitle: "Import")
+        confirm.addButton(withTitle: "Cancel")
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
 
         while let currentPassword = password {
@@ -1378,8 +1377,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 relaunchApplication()
                 return
             } catch PtermExportImportError.invalidKeyEnvelope {
-                password = promptPassword(title: "パスワードが正しくありません",
-                                          message: "インポート用パスワードを再入力してください。")
+                password = promptPassword(title: "Incorrect Password",
+                                          message: "Please re-enter the import password.")
             } catch {
                 NSAlert(error: error).runModal()
                 return
@@ -1459,7 +1458,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
         alert.accessoryView = field
         alert.addButton(withTitle: "OK")
-        alert.addButton(withTitle: "キャンセル")
+        alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
     }
 
@@ -1469,10 +1468,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func clearClipboardFiles(_ sender: Any?) {
         let alert = NSAlert()
-        alert.messageText = "クリップボード保存ファイルを削除しますか？"
-        alert.informativeText = "\(PtermDirectories.files.path) 配下の保存ファイルを全て削除します。"
-        alert.addButton(withTitle: "削除")
-        alert.addButton(withTitle: "キャンセル")
+        alert.messageText = "Delete clipboard files?"
+        alert.informativeText = "All saved files under \(PtermDirectories.files.path) will be deleted."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         do {
             try clipboardFileStore.deleteAllStoredFiles()
@@ -1525,8 +1524,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func editWorkspaceNote(for workspaceName: String) {
         let alert = NSAlert()
-        alert.messageText = "\(workspaceName) のメモ"
-        alert.informativeText = "編集内容は即時保存されます。"
+        alert.messageText = "Note — \(workspaceName)"
+        alert.informativeText = "Changes are saved automatically."
         let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 420, height: 220))
         let textView = NSTextView(frame: scrollView.bounds)
         scrollView.documentView = textView
@@ -1541,7 +1540,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         textView.delegate = autosaveDelegate
         objc_setAssociatedObject(alert, Unmanaged.passUnretained(alert).toOpaque(), autosaveDelegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         alert.accessoryView = scrollView
-        alert.addButton(withTitle: "閉じる")
+        alert.addButton(withTitle: "Close")
         alert.runModal()
     }
 
@@ -1748,12 +1747,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func promptCreateWorkspace() {
         let alert = NSAlert()
-        alert.messageText = "ワークスペースを追加"
+        alert.messageText = "Add Workspace"
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
         field.stringValue = ""
         alert.accessoryView = field
-        alert.addButton(withTitle: "追加")
-        alert.addButton(withTitle: "キャンセル")
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let normalized = normalizedWorkspaceName(field.stringValue)
         guard normalized != WorkspaceNaming.uncategorized else { return }
@@ -1878,11 +1877,11 @@ extension AppDelegate: NSWindowDelegate {
         let aliveCount = manager.terminals.filter { $0.isAlive }.count
         if aliveCount > 0 {
             let alert = NSAlert()
-            alert.messageText = "ptermを終了しますか？"
-            alert.informativeText = "動作中のターミナルが\(aliveCount)つあります。"
+            alert.messageText = "Quit pterm?"
+            alert.informativeText = "\(aliveCount) terminal(s) are still running."
             alert.alertStyle = .warning
-            alert.addButton(withTitle: "終了")
-            alert.addButton(withTitle: "キャンセル")
+            alert.addButton(withTitle: "Quit")
+            alert.addButton(withTitle: "Cancel")
 
             if alert.runModal() == .alertSecondButtonReturn {
                 return false

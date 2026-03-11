@@ -396,11 +396,11 @@ final class TerminalView: MTKView, NSTextInputClient {
         }
 
         let alert = NSAlert()
-        alert.messageText = "このURLを開きますか？"
+        alert.messageText = "Open this URL?"
         alert.informativeText = detectedLink.originalText
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "開く")
-        alert.addButton(withTitle: "キャンセル")
+        alert.addButton(withTitle: "Open")
+        alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else {
             return true
         }

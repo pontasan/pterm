@@ -722,22 +722,22 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private func updateTooltip(at point: NSPoint) {
         let text: String?
         if closeButtonController(at: point) != nil {
-            text = "ターミナルを閉じる"
+            text = "Close Terminal"
         } else if workspaceRemoveTarget(at: point) != nil {
-            text = "ワークスペースを削除"
+            text = "Delete Workspace"
         } else if workspaceAddTarget(at: point) != nil {
-            text = "ターミナルを追加"
+            text = "Add Terminal"
         } else if workspaceNoteTarget(at: point) != nil {
-            text = "メモを編集"
+            text = "Edit Note"
         } else if addWorkspaceButtonFrame.contains(point) {
-            text = "ワークスペースを追加"
+            text = "Add Workspace"
         } else if let workspace = workspaceHeaderTarget(at: point),
                   workspaceAddTarget(at: point) == nil,
                   workspaceRemoveTarget(at: point) == nil,
                   workspaceNoteTarget(at: point) == nil {
-            text = "ダブルクリックで「\(workspace)」の名前を変更"
+            text = "Double-click to rename \"\(workspace)\""
         } else if let controller = terminalTitleTarget(at: point) {
-            text = "ダブルクリックで「\(controller.title)」のタイトルを変更"
+            text = "Double-click to rename \"\(controller.title)\""
         } else {
             text = nil
         }
@@ -1056,12 +1056,12 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     private func promptRenameWorkspace(_ workspace: String) {
         let alert = NSAlert()
-        alert.messageText = "ワークスペース名を変更"
+        alert.messageText = "Rename Workspace"
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
         field.stringValue = workspace
         alert.accessoryView = field
-        alert.addButton(withTitle: "変更")
-        alert.addButton(withTitle: "キャンセル")
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let newName = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !newName.isEmpty, newName != workspace else { return }
@@ -1070,13 +1070,13 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     private func promptRenameTerminalTitle(_ controller: TerminalController) {
         let alert = NSAlert()
-        alert.messageText = "ターミナルタイトルを変更"
-        alert.informativeText = "空欄にするとカレントディレクトリ名に戻ります。"
+        alert.messageText = "Rename Terminal"
+        alert.informativeText = "Leave empty to use the current directory name."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
         field.stringValue = controller.customTitle ?? ""
         alert.accessoryView = field
-        alert.addButton(withTitle: "保存")
-        alert.addButton(withTitle: "キャンセル")
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         onRenameTerminalTitle?(controller, value.isEmpty ? nil : value)

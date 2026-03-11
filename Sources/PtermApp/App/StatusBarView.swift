@@ -8,7 +8,7 @@ final class StatusBarView: NSView {
     var onBackToIntegrated: (() -> Void)?
 
     override init(frame frameRect: NSRect) {
-        backButton = NSButton(title: "◀ 統合ビュー", target: nil, action: nil)
+        backButton = NSButton(title: "◀ Overview", target: nil, action: nil)
         super.init(frame: frameRect)
         backButton.target = self
         backButton.action = #selector(backButtonClicked)
@@ -28,7 +28,7 @@ final class StatusBarView: NSView {
         backButton.isBordered = false
         backButton.contentTintColor = textColor
         backButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        backButton.toolTip = "統合ビューに戻る (Cmd+`)"
+        backButton.toolTip = "Back to Overview (Cmd+`)"
         backButton.isHidden = true
         addSubview(backButton)
     }
