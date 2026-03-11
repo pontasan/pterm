@@ -1787,15 +1787,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = "Add Workspace"
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.placeholderString = "Workspace name"
         field.stringValue = ""
         alert.accessoryView = field
         alert.addButton(withTitle: "Add")
         alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let normalized = normalizedWorkspaceName(field.stringValue)
-        guard normalized != WorkspaceNaming.uncategorized else { return }
-        ensureWorkspaceExists(named: normalized)
-        persistSession()
+
+        while true {
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            let trimmed = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                let warn = NSAlert()
+                warn.messageText = "Workspace name cannot be empty."
+                warn.alertStyle = .warning
+                warn.addButton(withTitle: "OK")
+                warn.runModal()
+                continue
+            }
+            let normalized = normalizedWorkspaceName(trimmed)
+            guard normalized != WorkspaceNaming.uncategorized else { return }
+            ensureWorkspaceExists(named: normalized)
+            persistSession()
+            return
+        }
     }
 
     private func cleanupOrphanedScrollbackFiles(retaining ids: Set<UUID>) {
