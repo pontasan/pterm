@@ -109,6 +109,44 @@ final class TerminalManager {
         terminals.removeAll()
     }
 
+    /// Reorder a terminal within the global terminals array.
+    func moveTerminal(_ controller: TerminalController, toIndex: Int) {
+        guard let fromIndex = terminals.firstIndex(where: { $0 === controller }),
+              toIndex != fromIndex else { return }
+        terminals.remove(at: fromIndex)
+        let clampedIndex = min(toIndex, terminals.count)
+        terminals.insert(controller, at: clampedIndex)
+        onListChanged?()
+    }
+
+    /// Reorder a terminal to a specific position within a workspace.
+    /// The `wsIndex` is the desired position among terminals of the target workspace.
+    func reorderTerminal(_ controller: TerminalController, toWorkspace workspace: String, atIndex wsIndex: Int) {
+        guard let fromIndex = terminals.firstIndex(where: { $0 === controller }) else { return }
+        terminals.remove(at: fromIndex)
+
+        // Find terminals in the target workspace (after removal)
+        let wsTerminals = terminals.filter { $0.sessionSnapshot.workspaceName == workspace }
+
+        let globalIndex: Int
+        if wsIndex >= wsTerminals.count {
+            // Insert after the last terminal of the workspace
+            if let last = wsTerminals.last, let lastIdx = terminals.firstIndex(where: { $0 === last }) {
+                globalIndex = lastIdx + 1
+            } else {
+                // Workspace is empty; find insertion point based on workspace ordering
+                globalIndex = terminals.count
+            }
+        } else {
+            // Insert before the terminal at wsIndex
+            let anchor = wsTerminals[wsIndex]
+            globalIndex = terminals.firstIndex(where: { $0 === anchor }) ?? terminals.count
+        }
+
+        terminals.insert(controller, at: min(globalIndex, terminals.count))
+        onListChanged?()
+    }
+
     /// Number of active terminals.
     var count: Int { terminals.count }
 

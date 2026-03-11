@@ -1,6 +1,26 @@
 import AppKit
 import MetalKit
 
+/// Transparent NSScrollView overlay that provides native macOS scrollbar behavior.
+/// Only intercepts events targeting the scrollers; all other events pass through
+/// to the view below (IntegratedView).
+final class ScrollbarOverlayView: NSScrollView {
+    override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // Let scrollers handle their own events (hover expand, knob drag, etc.)
+        let hit = super.hitTest(point)
+        if hit is NSScroller { return hit }
+        // Pass through everything else to views below
+        return nil
+    }
+}
+
+/// Flipped NSView used as the documentView inside the scroll overlay.
+final class ScrollDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 /// Displays all terminal sessions as a grid of live thumbnails.
 ///
 /// Each thumbnail renders its terminal content at full PTY grid resolution,
@@ -95,6 +115,33 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private var cachedWorkspaceLayouts: [WorkspaceLayout] = []
     private var mouseDownPoint: NSPoint?
     private var mouseDownTerminal: TerminalController?
+    private var mouseDownWorkspace: String?
+
+    /// Vertical scroll state
+    private var scrollOffset: CGFloat = 0
+    private var totalContentHeight: CGFloat = 0
+
+    /// Drag reorder callbacks
+    var onReorderTerminal: ((TerminalController, String, Int) -> Void)?
+    var onReorderWorkspace: ((String, Int) -> Void)?
+
+    /// Drag reorder visual indicators
+    private var dragInsertionIndicator: NSRect?
+    private var dragWorkspaceIndicator: NSRect?
+
+    /// Pasteboard types for drag
+    private static let terminalPasteboardType = NSPasteboard.PasteboardType("com.pterm.terminal-id")
+    private static let workspacePasteboardType = NSPasteboard.PasteboardType("com.pterm.workspace-name")
+
+    /// Companion NSScrollView overlay for native macOS scrollbar behavior.
+    /// The scroll view is placed on top of this view and passes through
+    /// all events except those targeting its scrollers.
+    weak var companionScrollView: NSScrollView?
+
+    /// Auto-scroll during drag near edges
+    private var dragAutoScrollTimer: Timer?
+    private static let dragAutoScrollEdge: CGFloat = 60
+    private static let dragAutoScrollSpeed: CGFloat = 24
 
     /// Layout constants
     private struct Layout {
@@ -109,6 +156,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
         static let borderWidth: CGFloat = 1.5
         static let selectedBorderWidth: CGFloat = 3.0
         static let workspaceBorderWidth: CGFloat = 1.0
+        /// Maximum width for a single terminal thumbnail (points).
+        static let maxThumbnailWidth: CGFloat = 320
     }
 
     // MARK: - Initialization
@@ -125,7 +174,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         self.clearColor = MTLClearColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1)
         self.isPaused = false
         self.enableSetNeedsDisplay = false
-        self.registerForDraggedTypes([.string])
+        self.registerForDraggedTypes([.string, Self.terminalPasteboardType, Self.workspacePasteboardType])
 
         updateTrackingArea()
     }
@@ -218,20 +267,55 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     private func workspaceLayouts() -> [WorkspaceLayout] {
         let sections = workspaceSections()
-        guard !sections.isEmpty else { return [] }
+        guard !sections.isEmpty else {
+            totalContentHeight = 0
+            return []
+        }
 
         let outerPad = Layout.workspacePadding
         let innerPad = Layout.thumbnailPadding
         let availableWidth = bounds.width - outerPad * 2
-        let totalHeight = max(bounds.height - outerPad * 2 - CGFloat(sections.count - 1) * outerPad, 0)
-        let baseSectionHeight = sections.isEmpty ? 0 : totalHeight / CGFloat(sections.count)
-        var layouts: [WorkspaceLayout] = []
-        var currentY = outerPad
 
+        // Phase 1: compute natural section heights
+        var sectionHeights: [CGFloat] = []
+        var sectionGridDims: [(cols: Int, rows: Int)] = []
         for section in sections {
             let terminalCount = max(section.terminals.count, 1)
-            let (gridCols, gridRows) = TerminalManager.gridLayout(for: terminalCount)
-            let sectionHeight = max(baseSectionHeight, 180)
+            let contentAreaWidth = availableWidth - innerPad * 2
+            // Minimum columns to keep thumbnails within max width
+            let minColsForMaxWidth = max(1, Int(ceil(contentAreaWidth / (Layout.maxThumbnailWidth + innerPad))))
+            let (sqrtCols, _) = TerminalManager.gridLayout(for: terminalCount)
+            let gridCols = max(sqrtCols, minColsForMaxWidth)
+            let gridRows = Int(ceil(Double(terminalCount) / Double(gridCols)))
+
+            let cellWidth = contentAreaWidth / CGFloat(max(gridCols, 1))
+            let avgAspect: CGFloat = 1.6
+            let thumbnailWidth = max(0, cellWidth - innerPad)
+            let thumbnailHeight = thumbnailWidth / avgAspect
+            let cellHeight = thumbnailHeight + Layout.titleBarHeight + innerPad
+            let gridContentHeight = CGFloat(gridRows) * cellHeight
+            let sectionHeight = max(Layout.workspaceHeaderHeight + innerPad * 1.5 + gridContentHeight + innerPad, 140)
+            sectionHeights.append(sectionHeight)
+            sectionGridDims.append((gridCols, gridRows))
+        }
+
+        // Compute total content height (before scroll)
+        let rawContentHeight = outerPad + sectionHeights.reduce(0, +) + CGFloat(sections.count - 1) * outerPad + outerPad + Layout.addButtonSize + outerPad
+        totalContentHeight = rawContentHeight
+
+        // Clamp scroll offset
+        let maxScroll = max(0, totalContentHeight - bounds.height)
+        if scrollOffset > maxScroll { scrollOffset = maxScroll }
+        if scrollOffset < 0 { scrollOffset = 0 }
+
+        // Phase 2: compute layouts with scroll offset applied
+        var layouts: [WorkspaceLayout] = []
+        var currentY = outerPad - scrollOffset
+
+        for (sectionIndex, section) in sections.enumerated() {
+            let sectionHeight = sectionHeights[sectionIndex]
+            let (gridCols, gridRows) = sectionGridDims[sectionIndex]
+
             let frame = NSRect(x: outerPad, y: currentY, width: availableWidth, height: sectionHeight)
             let headerFrame = NSRect(x: frame.minX + innerPad,
                                      y: frame.minY + innerPad / 2,
@@ -253,7 +337,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
             let contentFrame = NSRect(x: frame.minX + innerPad,
                                       y: headerFrame.maxY + innerPad / 2,
                                       width: frame.width - innerPad * 2,
-                                      height: max(0, frame.height - headerFrame.height - innerPad * 2))
+                                      height: max(0, frame.height - Layout.workspaceHeaderHeight - innerPad * 2))
             let cellW = contentFrame.width / CGFloat(max(gridCols, 1))
             let cellH = contentFrame.height / CGFloat(max(gridRows, 1))
 
@@ -330,7 +414,20 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
 
     /// Return the index of the thumbnail at the given view-coordinates point.
+    /// Only matches the thumbnail content area, NOT the title bar.
     private func thumbnailIndex(at point: NSPoint) -> Int? {
+        let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
+        for (index, layout) in flattened.enumerated() {
+            if layout.thumbnail.contains(point) {
+                return index
+            }
+        }
+        return nil
+    }
+
+    /// Return the index of the thumbnail whose title OR thumbnail area contains the point.
+    /// Used for hover effects and drag initiation (but NOT for navigation).
+    private func thumbnailOrTitleIndex(at point: NSPoint) -> Int? {
         let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
         for (index, layout) in flattened.enumerated() {
             if layout.title.union(layout.thumbnail).contains(point) {
@@ -398,6 +495,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         let point = convert(event.locationInWindow, from: nil)
         mouseDownPoint = point
         mouseDownTerminal = nil
+        mouseDownWorkspace = nil
 
         if addWorkspaceButtonFrame.contains(point) {
             onAddWorkspace?()
@@ -439,27 +537,51 @@ final class IntegratedView: MTKView, NSDraggingSource {
             return
         }
 
-        // Check thumbnail click
+        // Check thumbnail or title click: record for drag or click-up navigation
         let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
-        guard let idx = thumbnailIndex(at: point),
-              idx < flattened.count else {
+        if let idx = thumbnailOrTitleIndex(at: point), idx < flattened.count {
+            let controller = flattened[idx].controller
+            mouseDownTerminal = controller
+
+            if event.modifierFlags.contains(.shift) {
+                // Multi-select with Shift: toggle selection (immediate)
+                if selectedTerminals.contains(controller.id) {
+                    selectedTerminals.remove(controller.id)
+                } else {
+                    selectedTerminals.insert(controller.id)
+                }
+                setNeedsDisplay(bounds)
+                mouseDownTerminal = nil  // Don't navigate on mouse up
+            }
+            // Non-shift click: navigation deferred to mouseUp
             return
         }
-        let controller = flattened[idx].controller
-        mouseDownTerminal = controller
 
-        if event.modifierFlags.contains(.shift) {
-            // Multi-select with Shift: toggle selection
-            if selectedTerminals.contains(controller.id) {
-                selectedTerminals.remove(controller.id)
-            } else {
-                selectedTerminals.insert(controller.id)
+        // Workspace header click: prepare for workspace drag
+        if let workspace = workspaceHeaderTarget(at: point),
+           workspaceAddTarget(at: point) == nil,
+           workspaceRemoveTarget(at: point) == nil,
+           workspaceNoteTarget(at: point) == nil {
+            mouseDownWorkspace = workspace
+            mouseDownPoint = point
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer {
+            mouseDownTerminal = nil
+            mouseDownPoint = nil
+        }
+        guard let controller = mouseDownTerminal else { return }
+
+        // Navigate only if the click lands on the thumbnail content area (not the title bar)
+        let point = convert(event.locationInWindow, from: nil)
+        if let idx = thumbnailIndex(at: point) {
+            let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
+            if idx < flattened.count && flattened[idx].controller === controller {
+                selectedTerminals.removeAll()
+                onSelectTerminal?(controller)
             }
-            setNeedsDisplay(bounds)
-        } else {
-            // Click without Shift: clear selection and focus this terminal
-            selectedTerminals.removeAll()
-            onSelectTerminal?(controller)
         }
     }
 
@@ -477,14 +599,59 @@ final class IntegratedView: MTKView, NSDraggingSource {
         super.flagsChanged(with: event)
     }
 
+    override func scrollWheel(with event: NSEvent) {
+        // Forward scroll events to the companion NSScrollView for native scrollbar behavior
+        companionScrollView?.scrollWheel(with: event)
+    }
+
+    /// Read scroll offset from the companion NSScrollView and update document view height.
+    private func syncWithCompanionScrollView() {
+        guard let scrollView = companionScrollView else { return }
+        // Read scroll position from the clip view
+        scrollOffset = scrollView.contentView.bounds.origin.y
+        // Update document view height to match total content
+        if let documentView = scrollView.documentView {
+            let targetHeight = max(totalContentHeight, scrollView.contentView.bounds.height)
+            if abs(documentView.frame.height - targetHeight) > 1 {
+                documentView.frame.size.height = targetHeight
+            }
+            if abs(documentView.frame.width - scrollView.contentView.bounds.width) > 1 {
+                documentView.frame.size.width = scrollView.contentView.bounds.width
+            }
+        }
+    }
+
     override func mouseDragged(with event: NSEvent) {
-        guard let origin = mouseDownPoint,
-              let controller = mouseDownTerminal else { return }
+        guard let origin = mouseDownPoint else { return }
         let point = convert(event.locationInWindow, from: nil)
         guard hypot(point.x - origin.x, point.y - origin.y) > 6 else { return }
 
+        // Workspace header drag
+        if let workspace = mouseDownWorkspace {
+            let item = NSPasteboardItem()
+            item.setString(workspace, forType: Self.workspacePasteboardType)
+            let draggingItem = NSDraggingItem(pasteboardWriter: item)
+            let image = NSImage(size: NSSize(width: 160, height: 24))
+            image.lockFocus()
+            NSColor(calibratedWhite: 0.12, alpha: 0.95).setFill()
+            NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: 160, height: 24), xRadius: 6, yRadius: 6).fill()
+            let attrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: NSColor(calibratedWhite: 0.9, alpha: 1),
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold)
+            ]
+            NSString(string: workspace).draw(in: NSRect(x: 8, y: 4, width: 144, height: 16), withAttributes: attrs)
+            image.unlockFocus()
+            draggingItem.setDraggingFrame(NSRect(origin: point, size: image.size), contents: image)
+            beginDraggingSession(with: [draggingItem], event: event, source: self)
+            mouseDownWorkspace = nil
+            return
+        }
+
+        // Terminal drag
+        guard let controller = mouseDownTerminal else { return }
         let item = NSPasteboardItem()
         item.setString(controller.id.uuidString, forType: .string)
+        item.setString(controller.id.uuidString, forType: Self.terminalPasteboardType)
         let draggingItem = NSDraggingItem(pasteboardWriter: item)
         let image = NSImage(size: NSSize(width: 140, height: 24))
         image.lockFocus()
@@ -503,7 +670,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        hoveredIndex = thumbnailIndex(at: point)
+        hoveredIndex = thumbnailOrTitleIndex(at: point)
         hoveredCloseID = closeButtonController(at: point)?.id
         hoveredWorkspaceClose = workspaceRemoveTarget(at: point)
         updateTooltip(at: point)
@@ -623,31 +790,232 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard sender.draggingPasteboard.string(forType: .string) != nil else { return [] }
-        return .move
+        let pb = sender.draggingPasteboard
+        if pb.string(forType: Self.workspacePasteboardType) != nil || pb.string(forType: .string) != nil {
+            return .move
+        }
+        return []
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard sender.draggingPasteboard.string(forType: .string) != nil else { return [] }
-        return .move
+        let pb = sender.draggingPasteboard
+        let point = convert(sender.draggingLocation, from: nil)
+
+        // Auto-scroll when dragging near top/bottom edges
+        startDragAutoScroll(at: point)
+
+        if pb.string(forType: Self.workspacePasteboardType) != nil {
+            // Workspace drag: show indicator between workspace sections
+            dragInsertionIndicator = nil
+            dragWorkspaceIndicator = computeWorkspaceDropIndicator(at: point)
+            return .move
+        }
+
+        if pb.string(forType: .string) != nil {
+            // Terminal drag: show indicator at insertion position
+            dragWorkspaceIndicator = nil
+            dragInsertionIndicator = computeTerminalDropIndicator(at: point)
+
+            // Accept drop on workspace header or terminal grid
+            if workspaceHeaderTarget(at: point) != nil || dragInsertionIndicator != nil {
+                return .move
+            }
+            // Also accept if over any workspace content area
+            for layout in cachedWorkspaceLayouts {
+                if layout.frame.contains(point) { return .move }
+            }
+        }
+        dragInsertionIndicator = nil
+        dragWorkspaceIndicator = nil
+        return []
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        dragInsertionIndicator = nil
+        dragWorkspaceIndicator = nil
+        stopDragAutoScroll()
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        guard let idString = sender.draggingPasteboard.string(forType: .string),
-              let id = UUID(uuidString: idString) else {
+        let pb = sender.draggingPasteboard
+        let point = convert(sender.draggingLocation, from: nil)
+        dragInsertionIndicator = nil
+        dragWorkspaceIndicator = nil
+        stopDragAutoScroll()
+
+        // Workspace reorder
+        if let workspaceName = pb.string(forType: Self.workspacePasteboardType) {
+            if let targetIndex = computeWorkspaceDropIndex(at: point) {
+                onReorderWorkspace?(workspaceName, targetIndex)
+                return true
+            }
             return false
         }
-        let point = convert(sender.draggingLocation, from: nil)
-        guard let workspace = workspaceHeaderTarget(at: point),
+
+        // Terminal drag
+        guard let idString = pb.string(forType: .string),
+              let id = UUID(uuidString: idString),
               let controller = manager.terminals.first(where: { $0.id == id }) else {
             return false
         }
-        onMoveTerminalToWorkspace?(controller, workspace)
-        return true
+
+        // Drop on workspace header: move to that workspace
+        if let workspace = workspaceHeaderTarget(at: point) {
+            onMoveTerminalToWorkspace?(controller, workspace)
+            return true
+        }
+
+        // Drop on terminal grid: reorder
+        if let (workspace, index) = computeTerminalDropPosition(at: point) {
+            onReorderTerminal?(controller, workspace, index)
+            return true
+        }
+
+        return false
     }
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
         .move
+    }
+
+    // MARK: - Drag Auto-Scroll
+
+    private func startDragAutoScroll(at point: NSPoint) {
+        let edge = Self.dragAutoScrollEdge
+        let maxScroll = max(0, totalContentHeight - bounds.height)
+        guard maxScroll > 0 else {
+            stopDragAutoScroll()
+            return
+        }
+
+        let scrollDelta: CGFloat
+        if point.y < edge {
+            // Near top edge: scroll up (negative offset)
+            let proximity = 1.0 - (point.y / edge)
+            scrollDelta = -Self.dragAutoScrollSpeed * proximity
+        } else if point.y > bounds.height - edge {
+            // Near bottom edge: scroll down (positive offset)
+            let proximity = 1.0 - ((bounds.height - point.y) / edge)
+            scrollDelta = Self.dragAutoScrollSpeed * proximity
+        } else {
+            stopDragAutoScroll()
+            return
+        }
+
+        // Start or continue timer
+        if dragAutoScrollTimer == nil {
+            dragAutoScrollTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+                self?.performDragAutoScroll()
+            }
+        }
+        // Store the delta for the timer callback
+        dragAutoScrollDelta = scrollDelta
+    }
+
+    private var dragAutoScrollDelta: CGFloat = 0
+
+    private func performDragAutoScroll() {
+        guard let scrollView = companionScrollView else { return }
+        let maxScroll = max(0, totalContentHeight - bounds.height)
+        guard maxScroll > 0 else { return }
+
+        var clipBounds = scrollView.contentView.bounds
+        clipBounds.origin.y = min(max(clipBounds.origin.y + dragAutoScrollDelta, 0), maxScroll)
+        scrollView.contentView.setBoundsOrigin(clipBounds.origin)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    private func stopDragAutoScroll() {
+        dragAutoScrollTimer?.invalidate()
+        dragAutoScrollTimer = nil
+        dragAutoScrollDelta = 0
+    }
+
+    // MARK: - Drop Position Calculation
+
+    private func computeTerminalDropPosition(at point: NSPoint) -> (workspace: String, index: Int)? {
+        for layout in cachedWorkspaceLayouts {
+            guard layout.frame.contains(point) else { continue }
+
+            if layout.terminals.isEmpty {
+                return (layout.name, 0)
+            }
+
+            // Find closest insertion point
+            for (i, thumb) in layout.terminals.enumerated() {
+                let fullFrame = thumb.title.union(thumb.thumbnail)
+                if point.x < fullFrame.midX && point.y < fullFrame.maxY && point.y >= fullFrame.minY {
+                    return (layout.name, i)
+                }
+                // Check if we're at the end of a row
+                let isLastInRow = (i + 1 >= layout.terminals.count) ||
+                    layout.terminals[i + 1].title.origin.y > thumb.title.origin.y + 1
+                if isLastInRow && point.y >= fullFrame.minY && point.y < fullFrame.maxY && point.x >= fullFrame.midX {
+                    return (layout.name, i + 1)
+                }
+            }
+
+            // Below all terminals
+            return (layout.name, layout.terminals.count)
+        }
+        return nil
+    }
+
+    private func computeTerminalDropIndicator(at point: NSPoint) -> NSRect? {
+        guard let (workspace, index) = computeTerminalDropPosition(at: point) else { return nil }
+        guard let wsLayout = cachedWorkspaceLayouts.first(where: { $0.name == workspace }) else { return nil }
+
+        let lineWidth: CGFloat = 3
+        if wsLayout.terminals.isEmpty {
+            // Show indicator at start of content area
+            let contentY = wsLayout.headerFrame.maxY + Layout.thumbnailPadding / 2
+            return NSRect(x: wsLayout.frame.minX + Layout.thumbnailPadding,
+                          y: contentY, width: lineWidth, height: 60)
+        }
+
+        if index < wsLayout.terminals.count {
+            let thumb = wsLayout.terminals[index]
+            let fullFrame = thumb.title.union(thumb.thumbnail)
+            return NSRect(x: fullFrame.minX - lineWidth / 2 - 2, y: fullFrame.minY,
+                          width: lineWidth, height: fullFrame.height)
+        } else {
+            let thumb = wsLayout.terminals[wsLayout.terminals.count - 1]
+            let fullFrame = thumb.title.union(thumb.thumbnail)
+            return NSRect(x: fullFrame.maxX + 2, y: fullFrame.minY,
+                          width: lineWidth, height: fullFrame.height)
+        }
+    }
+
+    private func computeWorkspaceDropIndex(at point: NSPoint) -> Int? {
+        let layouts = cachedWorkspaceLayouts
+        guard !layouts.isEmpty else { return nil }
+
+        for (i, layout) in layouts.enumerated() {
+            if point.y < layout.frame.midY {
+                return i
+            }
+        }
+        return layouts.count
+    }
+
+    private func computeWorkspaceDropIndicator(at point: NSPoint) -> NSRect? {
+        let layouts = cachedWorkspaceLayouts
+        guard !layouts.isEmpty else { return nil }
+
+        let lineHeight: CGFloat = 3
+        let outerPad = Layout.workspacePadding
+        let availableWidth = bounds.width - outerPad * 2
+
+        for layout in layouts {
+            if point.y < layout.frame.midY {
+                let y = layout.frame.minY - outerPad / 2
+                return NSRect(x: outerPad, y: y - lineHeight / 2, width: availableWidth, height: lineHeight)
+            }
+        }
+        // After last workspace
+        let lastFrame = layouts[layouts.count - 1].frame
+        let y = lastFrame.maxY + outerPad / 2
+        return NSRect(x: outerPad, y: y - lineHeight / 2, width: availableWidth, height: lineHeight)
     }
 
     private func promptRenameWorkspace(_ workspace: String) {
@@ -716,6 +1084,7 @@ extension IntegratedView: MTKViewDelegate {
 
         let sf = Float(renderer.glyphAtlas.scaleFactor)
         let time = Float(CACurrentMediaTime())
+        syncWithCompanionScrollView()
         cachedWorkspaceLayouts = workspaceLayouts()
 
         renderPassDescriptor.colorAttachments[0].clearColor =
@@ -801,6 +1170,9 @@ extension IntegratedView: MTKViewDelegate {
 
         // Draw "+" button for adding new workspace
         drawAddWorkspaceButton(encoder: encoder, scaleFactor: sf, viewportSize: viewportSize)
+
+        // Draw drag drop indicators
+        drawDropIndicators(encoder: encoder, scaleFactor: sf, viewportSize: viewportSize)
 
         encoder.endEncoding()
         commandBuffer.present(drawable)
@@ -1344,6 +1716,7 @@ extension IntegratedView: MTKViewDelegate {
 
         let btnSize = Layout.addButtonSize
         let margin: CGFloat = 20
+        // Always fixed at bottom-right of the visible area
         let bx = bounds.width - btnSize - margin
         let by = bounds.height - btnSize - margin
 
@@ -1414,4 +1787,38 @@ extension IntegratedView: MTKViewDelegate {
                                   vertexCount: vertices.count / 12)
         }
     }
+
+    private func drawDropIndicators(
+        encoder: MTLRenderCommandEncoder,
+        scaleFactor: Float,
+        viewportSize: SIMD2<Float>
+    ) {
+        guard let pipeline = renderer.overlayPipeline else { return }
+        var vertices: [Float] = []
+
+        // Terminal insertion indicator (vertical blue line)
+        if let rect = dragInsertionIndicator {
+            let x = Float(rect.origin.x) * scaleFactor
+            let y = Float(rect.origin.y) * scaleFactor
+            let w = Float(rect.width) * scaleFactor
+            let h = Float(rect.height) * scaleFactor
+            renderer.addQuadPublic(to: &vertices, x: x, y: y, w: w, h: h,
+                                   tx: 0, ty: 0, tw: 0, th: 0,
+                                   fg: (0.3, 0.6, 1.0, 0.9), bg: (0, 0, 0, 0))
+        }
+
+        // Workspace reorder indicator (horizontal blue line)
+        if let rect = dragWorkspaceIndicator {
+            let x = Float(rect.origin.x) * scaleFactor
+            let y = Float(rect.origin.y) * scaleFactor
+            let w = Float(rect.width) * scaleFactor
+            let h = Float(rect.height) * scaleFactor
+            renderer.addQuadPublic(to: &vertices, x: x, y: y, w: w, h: h,
+                                   tx: 0, ty: 0, tw: 0, th: 0,
+                                   fg: (0.3, 0.6, 1.0, 0.9), bg: (0, 0, 0, 0))
+        }
+
+        drawVertices(vertices, encoder: encoder, pipeline: pipeline, viewportSize: viewportSize)
+    }
+
 }

@@ -76,6 +76,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Integrated view (grid of terminal thumbnails)
     private var integratedView: IntegratedView?
+    /// Scrollbar overlay for integrated view (native macOS scrollbar)
+    private var scrollbarOverlay: ScrollbarOverlayView?
 
     /// Focused terminal scroll view (wraps TerminalView with native scrollbar)
     private var terminalScrollView: TerminalScrollView?
@@ -236,12 +238,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         iv.onMultiSelect = { [weak self] controllers in
             self?.switchToSplit(controllers)
         }
+        iv.onReorderTerminal = { [weak self] controller, workspace, index in
+            self?.reorderTerminal(controller, toWorkspace: workspace, atIndex: index)
+        }
+        iv.onReorderWorkspace = { [weak self] name, index in
+            self?.reorderWorkspace(name, toIndex: index)
+        }
         iv.cpuUsageProvider = { [weak self] pid in
             self?.cpuUsageByPID[pid]
         }
         integratedView = iv
         syncIntegratedWorkspaceNames()
         window.contentView!.addSubview(iv)
+        setupScrollbarOverlay(for: iv)
         isWindowLayoutReady = true
         synchronizeWindowLayout(shouldPersistSession: false)
 
@@ -388,6 +397,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Remove integrated view
         integratedView?.removeFromSuperview()
+        scrollbarOverlay?.removeFromSuperview()
+        scrollbarOverlay = nil
         splitContainerView?.removeFromSuperview()
         splitContainerView = nil
 
@@ -425,6 +436,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         integratedView?.removeFromSuperview()
+        scrollbarOverlay?.removeFromSuperview()
+        scrollbarOverlay = nil
         terminalScrollView?.removeFromSuperview()
         terminalScrollView = nil
         terminalView = nil
@@ -463,6 +476,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminalScrollView = nil
         splitContainerView?.removeFromSuperview()
         splitContainerView = nil
+        scrollbarOverlay?.removeFromSuperview()
+        scrollbarOverlay = nil
         terminalView = nil
         focusedController = nil
         hideSearchBar()
@@ -503,6 +518,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             iv.onMultiSelect = { [weak self] controllers in
                 self?.switchToSplit(controllers)
             }
+            iv.onReorderTerminal = { [weak self] controller, workspace, index in
+                self?.reorderTerminal(controller, toWorkspace: workspace, atIndex: index)
+            }
+            iv.onReorderWorkspace = { [weak self] name, index in
+                self?.reorderWorkspace(name, toIndex: index)
+            }
             iv.cpuUsageProvider = { [weak self] pid in
                 self?.cpuUsageByPID[pid]
             }
@@ -513,6 +534,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         iv.clearSelection()
         syncIntegratedWorkspaceNames()
         window.contentView!.addSubview(iv)
+        setupScrollbarOverlay(for: iv)
         iv.syncScaleFactorIfNeeded()
         viewMode = .integrated
         updateTitlebarBackButtonVisibility()
@@ -1626,6 +1648,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         persistSession()
     }
 
+    private func reorderTerminal(_ controller: TerminalController, toWorkspace workspace: String, atIndex index: Int) {
+        let normalized = normalizedWorkspaceName(workspace)
+        controller.setWorkspaceName(normalized)
+        ensureWorkspaceExists(named: normalized)
+        manager.reorderTerminal(controller, toWorkspace: normalized, atIndex: index)
+        persistSession()
+    }
+
+    private func reorderWorkspace(_ name: String, toIndex index: Int) {
+        let normalized = normalizedWorkspaceName(name)
+        guard let fromIndex = workspaceNames.firstIndex(of: normalized) else { return }
+        workspaceNames.remove(at: fromIndex)
+        let adjustedIndex = min(index > fromIndex ? index - 1 : index, workspaceNames.count)
+        workspaceNames.insert(normalized, at: adjustedIndex)
+        syncIntegratedWorkspaceNames()
+        persistSession()
+    }
+
     private func renameTerminalTitle(_ controller: TerminalController, title: String?) {
         controller.setCustomTitle(title)
         persistSession()
@@ -1656,6 +1696,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             controller.updateFontSettings(name: fontName, size: fontSize, notify: false)
         }
         persistSession()
+    }
+
+    private func setupScrollbarOverlay(for iv: IntegratedView) {
+        scrollbarOverlay?.removeFromSuperview()
+        let overlay = ScrollbarOverlayView(frame: iv.frame)
+        overlay.autoresizingMask = [.width, .height]
+        overlay.drawsBackground = false
+        overlay.backgroundColor = .clear
+        overlay.hasVerticalScroller = true
+        overlay.hasHorizontalScroller = false
+        overlay.autohidesScrollers = true
+        // Flipped document view so scroll starts from the top
+        let docView = ScrollDocumentView(frame: NSRect(x: 0, y: 0, width: iv.bounds.width, height: iv.bounds.height))
+        overlay.documentView = docView
+        overlay.contentView.postsBoundsChangedNotifications = true
+        window.contentView!.addSubview(overlay)
+        iv.companionScrollView = overlay
+        scrollbarOverlay = overlay
     }
 
     private func normalizedWorkspaceName(_ raw: String) -> String {
