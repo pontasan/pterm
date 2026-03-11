@@ -101,6 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var searchBarView: SearchBarView?
     private var splitContainerView: SplitTerminalContainerView?
     private var appNoteEditor: MarkdownEditorWindowController?
+    private var settingsController: SettingsWindowController?
 
     /// Currently focused terminal controller (nil = integrated view mode)
     private var focusedController: TerminalController?
@@ -126,6 +127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var viewMode: ViewMode = .integrated
     private var isTerminating = false
+    private var isRestoringSession = false
     private var isWindowLayoutReady = false
     private var workspaceNames: [String] = []
     private lazy var isNoteEditorSelfTestEnabled: Bool = {
@@ -720,7 +722,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(withTitle: "About pterm",
                        action: #selector(showAboutPanel),
                        keyEquivalent: "")
-        appMenu.addItem(makeMenuItem(title: "Open Settings", shortcut: .openSettings))
+        appMenu.addItem(makeMenuItem(title: "Settings\u{2026}", shortcut: .openSettings))
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Export", action: #selector(exportData(_:)),
                         keyEquivalent: "")
@@ -1262,7 +1264,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             terminals: manager.terminals.map(\.sessionSnapshot)
         )
         try? sessionStore.save(state)
-        cleanupOrphanedScrollbackFiles(retaining: Set(state.terminals.map(\.id)))
+        if !isRestoringSession {
+            cleanupOrphanedScrollbackFiles(retaining: Set(state.terminals.map(\.id)))
+        }
     }
 
     private func loadRestorableSession() -> PersistedSessionState? {
@@ -1294,6 +1298,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func restoreSession(_ state: PersistedSessionState) {
+        isRestoringSession = true
+        defer { isRestoringSession = false }
         workspaceNames = state.workspaceNames.map(normalizedWorkspaceName).filter { $0 != WorkspaceNaming.uncategorized }
         syncIntegratedWorkspaceNames()
         var restoredControllers: [UUID: TerminalController] = [:]
@@ -1431,11 +1437,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openSettings(_ sender: Any?) {
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: PtermDirectories.config.path) {
-            try? AtomicFileWriter.write(Data("{}".utf8), to: PtermDirectories.config, permissions: 0o600)
+        if let existing = settingsController {
+            existing.showWindow()
+            return
         }
-        NSWorkspace.shared.open(PtermDirectories.config)
+        let controller = SettingsWindowController()
+        controller.onClose = { [weak self] in
+            self?.settingsController = nil
+        }
+        settingsController = controller
+        controller.showWindow()
     }
 
     @objc func cut(_ sender: Any?) {

@@ -107,6 +107,8 @@ final class TerminalController {
     private let initialDirectory: String
     private let scrollbackPersistenceEnabled: Bool
     private var parserRequestedScrollbackClear = false
+    private var suppressScrollbackClear = false
+    private var isShuttingDown = false
     var auditLogger: TerminalAuditLogger?
 
     var persistedSettings: PersistedTerminalSettings {
@@ -151,6 +153,14 @@ final class TerminalController {
         self.id = id
         self.currentDirectoryPath = self.initialDirectory
         self.currentDirectory = Self.displayDirectoryName(for: self.initialDirectory)
+
+        // If mmap-backed scrollback already contains data from a previous session,
+        // protect it from shell startup clear sequences (e.g. zsh sends \e[3J).
+        // This must be set before start() is called so the PTY output handler
+        // respects the flag from the very first byte.
+        if scrollbackPersistenceEnabled && scrollback.rowCount > 0 {
+            suppressScrollbackClear = true
+        }
 
         setupParser()
         setupModelCallbacks()
@@ -241,11 +251,13 @@ final class TerminalController {
     }
 
     func stop(waitForExit: Bool = false) {
+        lock.withWriteLock { isShuttingDown = true }
         pty.stop(waitForExit: waitForExit)
     }
 
     /// Send SIGTERM and close PTY without blocking. Call awaitExit() later.
     func initiateShutdown() {
+        lock.withWriteLock { isShuttingDown = true }
         pty.initiateShutdown()
     }
 
@@ -350,6 +362,7 @@ final class TerminalController {
 
     /// Send user keyboard input to the PTY.
     func sendInput(_ data: Data) {
+        suppressScrollbackClear = false
         auditLogger?.recordInput(data)
         pty.write(data)
     }
@@ -357,6 +370,7 @@ final class TerminalController {
     /// Send a string as input to the PTY.
     func sendInput(_ string: String) {
         guard let data = textEncoding.encode(string) else { return }
+        suppressScrollbackClear = false
         auditLogger?.recordInput(data)
         pty.write(data)
     }
@@ -388,10 +402,15 @@ final class TerminalController {
                 }
 
                 if parserRequestedScrollbackClear {
-                    scrollback.clear()
-                    scrollOffset = 0
-                    parserRequestedScrollbackClear = false
-                    clearedScrollback = true
+                    if suppressScrollbackClear ||
+                       (scrollbackPersistenceEnabled && isShuttingDown) {
+                        parserRequestedScrollbackClear = false
+                    } else {
+                        scrollback.clear()
+                        scrollOffset = 0
+                        parserRequestedScrollbackClear = false
+                        clearedScrollback = true
+                    }
                 }
             }
         }
