@@ -510,6 +510,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         iv.frame = availableContentFrame()
+        iv.clearSelection()
         syncIntegratedWorkspaceNames()
         window.contentView!.addSubview(iv)
         iv.syncScaleFactorIfNeeded()

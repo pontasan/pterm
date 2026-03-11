@@ -51,6 +51,11 @@ final class IntegratedView: MTKView, NSDraggingSource {
     /// Set of currently selected terminals (for multi-select with Shift)
     private(set) var selectedTerminals: Set<UUID> = []
 
+    /// Resets multi-select state (e.g. when returning to integrated view).
+    func clearSelection() {
+        selectedTerminals.removeAll()
+    }
+
     /// Callback: user shift-clicked multiple terminals for split view.
     var onMultiSelect: (([TerminalController]) -> Void)?
 
@@ -102,6 +107,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         static let cornerRadius: CGFloat = 6
         static let titleFontSize: CGFloat = 11
         static let borderWidth: CGFloat = 1.5
+        static let selectedBorderWidth: CGFloat = 3.0
         static let workspaceBorderWidth: CGFloat = 1.0
     }
 
@@ -443,24 +449,32 @@ final class IntegratedView: MTKView, NSDraggingSource {
         mouseDownTerminal = controller
 
         if event.modifierFlags.contains(.shift) {
-            // Multi-select with Shift
+            // Multi-select with Shift: toggle selection
             if selectedTerminals.contains(controller.id) {
                 selectedTerminals.remove(controller.id)
             } else {
                 selectedTerminals.insert(controller.id)
             }
-
-            // If multiple terminals selected, trigger split view
-            let selected = manager.terminals.filter { selectedTerminals.contains($0.id) }
-            if selected.count >= 2 {
-                onMultiSelect?(selected)
-                selectedTerminals.removeAll()
-            }
+            setNeedsDisplay(bounds)
         } else {
-            // Single click: focus this terminal
+            // Click without Shift: clear selection and focus this terminal
             selectedTerminals.removeAll()
             onSelectTerminal?(controller)
         }
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        // Detect Shift key release: commit multi-selection
+        if !event.modifierFlags.contains(.shift) && !selectedTerminals.isEmpty {
+            let selected = manager.terminals.filter { selectedTerminals.contains($0.id) }
+            selectedTerminals.removeAll()
+            if selected.count >= 2 {
+                onMultiSelect?(selected)
+            } else if let single = selected.first {
+                onSelectTerminal?(single)
+            }
+        }
+        super.flagsChanged(with: event)
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -843,22 +857,37 @@ extension IntegratedView: MTKViewDelegate {
         // Border
         let borderAlpha: Float
         let borderColor: (Float, Float, Float)
+        let borderWidth: Float
         if isActiveOutput {
             // Gentle red pulse: fades between 0.15 and 0.8
             let pulse = 0.475 + 0.325 * sin(time * 3.0)
             borderAlpha = pulse
             borderColor = (0.9, 0.2, 0.15)
+            borderWidth = Float(Layout.borderWidth)
         } else if isSelected {
-            borderAlpha = 0.9
+            borderAlpha = 1.0
             borderColor = (0.3, 0.6, 1.0)
+            borderWidth = Float(Layout.selectedBorderWidth)
         } else if isHovered {
             borderAlpha = 0.6
             borderColor = (0.4, 0.4, 0.4)
+            borderWidth = Float(Layout.borderWidth)
         } else {
             borderAlpha = 0.3
             borderColor = (0.4, 0.4, 0.4)
+            borderWidth = Float(Layout.borderWidth)
         }
-        let bw: Float = Float(Layout.borderWidth) * scaleFactor
+        let bw: Float = borderWidth * scaleFactor
+
+        // Selection overlay tint (subtle blue highlight on content area)
+        if isSelected {
+            renderer.addQuadPublic(
+                to: &vertices, x: contentX, y: contentY, w: contentW, h: contentH,
+                tx: 0, ty: 0, tw: 0, th: 0,
+                fg: (0.15, 0.3, 0.6, 0.15),
+                bg: (0, 0, 0, 0)
+            )
+        }
         // Top
         renderer.addQuadPublic(to: &vertices, x: x, y: y, w: w, h: bw,
                                tx: 0, ty: 0, tw: 0, th: 0,
