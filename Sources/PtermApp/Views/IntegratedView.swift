@@ -48,6 +48,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
         let noteFrame: NSRect
         let addFrame: NSRect
         let closeFrame: NSRect
+        let selectAllFrame: NSRect
+        let deselectFrame: NSRect
         let terminals: [ThumbnailLayout]
     }
 
@@ -70,6 +72,9 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     /// Set of currently selected terminals (for multi-select with Shift)
     private(set) var selectedTerminals: Set<UUID> = []
+
+    /// Whether the Shift key is currently held (for showing select/deselect buttons)
+    private var isShiftDown = false
 
     /// Resets multi-select state (e.g. when returning to integrated view).
     func clearSelection() {
@@ -439,8 +444,20 @@ final class IntegratedView: MTKView, NSDraggingSource {
                     ))
                 }
 
+                // "Select All" / "Deselect" buttons at bottom-right of workspace
+                let selectBtnH: CGFloat = Layout.titleBarHeight
+                let selectAllW: CGFloat = 70
+                let deselectW: CGFloat = 60
+                let selectBtnY = frame.maxY - innerPad - selectBtnH
+                let selectAllFrame = NSRect(x: frame.maxX - innerPad - selectAllW,
+                                            y: selectBtnY, width: selectAllW, height: selectBtnH)
+                let deselectFrame = NSRect(x: selectAllFrame.minX - 4 - deselectW,
+                                           y: selectBtnY, width: deselectW, height: selectBtnH)
+
                 layouts.append(WorkspaceLayout(name: section.name, frame: frame, headerFrame: headerFrame,
-                                               noteFrame: noteFrame, addFrame: addFrame, closeFrame: closeFrame, terminals: thumbnailLayouts))
+                                               noteFrame: noteFrame, addFrame: addFrame, closeFrame: closeFrame,
+                                               selectAllFrame: selectAllFrame, deselectFrame: deselectFrame,
+                                               terminals: thumbnailLayouts))
                 currentX += wsWidth + outerPad
             }
             currentY += rowHeight + outerPad
@@ -573,6 +590,27 @@ final class IntegratedView: MTKView, NSDraggingSource {
             return
         }
 
+        // Check "Select All" / "Deselect" buttons (only visible when Shift is held)
+        if isShiftDown {
+            for workspace in cachedWorkspaceLayouts {
+                if workspace.selectAllFrame.contains(point) {
+                    for tl in workspace.terminals {
+                        selectedTerminals.insert(tl.controller.id)
+                    }
+                    setNeedsDisplay(bounds)
+                    return
+                }
+                let hasSelection = workspace.terminals.contains { selectedTerminals.contains($0.controller.id) }
+                if hasSelection && workspace.deselectFrame.contains(point) {
+                    for tl in workspace.terminals {
+                        selectedTerminals.remove(tl.controller.id)
+                    }
+                    setNeedsDisplay(bounds)
+                    return
+                }
+            }
+        }
+
         // Check thumbnail or title click: record for drag or click-up navigation
         let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
         if let idx = thumbnailOrTitleIndex(at: point), idx < flattened.count {
@@ -622,8 +660,14 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
 
     override func flagsChanged(with event: NSEvent) {
+        let shiftNow = event.modifierFlags.contains(.shift)
+        if shiftNow != isShiftDown {
+            isShiftDown = shiftNow
+            setNeedsDisplay(bounds)
+        }
+
         // Detect Shift key release: commit multi-selection
-        if !event.modifierFlags.contains(.shift) && !selectedTerminals.isEmpty {
+        if !shiftNow && !selectedTerminals.isEmpty {
             let selected = manager.terminals.filter { selectedTerminals.contains($0.id) }
             selectedTerminals.removeAll()
             if selected.count >= 2 {
@@ -1093,6 +1137,18 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Cmd+A: select all terminals and enter split view
+        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "a" {
+            let allTerminals = manager.terminals
+            guard !allTerminals.isEmpty else { return true }
+            if allTerminals.count >= 2 {
+                onMultiSelect?(allTerminals)
+            } else if let single = allTerminals.first {
+                onSelectTerminal?(single)
+            }
+            return true
+        }
+
         for action in ShortcutAction.allCases {
             guard shortcutConfiguration.matches(action, event: event),
                   let selector = action.appDelegateSelector else {
@@ -1202,6 +1258,33 @@ extension IntegratedView: MTKViewDelegate {
                 scaleFactor: sf,
                 viewportSize: viewportSize
             )
+        }
+
+        // Draw "Select All" / "Deselect" buttons (on top of thumbnails, only when Shift is held)
+        if isShiftDown {
+            for workspace in cachedWorkspaceLayouts where !workspace.terminals.isEmpty {
+                drawTextButton(
+                    encoder: encoder,
+                    text: "Select All",
+                    frame: workspace.selectAllFrame,
+                    scaleFactor: sf,
+                    viewportSize: viewportSize,
+                    bgColor: (0.15, 0.30, 0.55, 0.9),
+                    fgColor: (0.9, 0.9, 0.9, 1.0)
+                )
+                let hasSelection = workspace.terminals.contains { selectedTerminals.contains($0.controller.id) }
+                if hasSelection {
+                    drawTextButton(
+                        encoder: encoder,
+                        text: "Deselect",
+                        frame: workspace.deselectFrame,
+                        scaleFactor: sf,
+                        viewportSize: viewportSize,
+                        bgColor: (0.35, 0.20, 0.15, 0.9),
+                        fgColor: (0.9, 0.9, 0.9, 1.0)
+                    )
+                }
+            }
         }
 
         // Draw "+" button for adding new workspace
@@ -1567,6 +1650,77 @@ extension IntegratedView: MTKViewDelegate {
                                w: lineW, h: lineLen, tx: 0, ty: 0, tw: 0, th: 0,
                                fg: (0.85, 0.85, 0.85, 1.0), bg: (0, 0, 0, 0))
         drawVertices(vertices, encoder: encoder, pipeline: pipeline, viewportSize: viewportSize)
+    }
+
+    private func drawTextButton(
+        encoder: MTLRenderCommandEncoder,
+        text: String,
+        frame: NSRect,
+        scaleFactor: Float,
+        viewportSize: SIMD2<Float>,
+        bgColor: (Float, Float, Float, Float),
+        fgColor: (Float, Float, Float, Float)
+    ) {
+        guard let overlayPipeline = renderer.overlayPipeline,
+              let glyphPipeline = renderer.glyphPipeline,
+              let atlas = renderer.glyphAtlas.texture else { return }
+
+        // Draw background
+        let x = Float(frame.origin.x) * scaleFactor
+        let y = Float(frame.origin.y) * scaleFactor
+        let w = Float(frame.width) * scaleFactor
+        let h = Float(frame.height) * scaleFactor
+        var bgVertices: [Float] = []
+        renderer.addQuadPublic(to: &bgVertices, x: x, y: y, w: w, h: h,
+                               tx: 0, ty: 0, tw: 0, th: 0,
+                               fg: bgColor, bg: (0, 0, 0, 0))
+        drawVertices(bgVertices, encoder: encoder, pipeline: overlayPipeline, viewportSize: viewportSize)
+
+        // Draw horizontally and vertically centered text
+        let chars = Array(text.unicodeScalars)
+        let thumbGlyphScale: Float = 0.8
+        let cellW = Float(renderer.glyphAtlas.cellWidth) * scaleFactor * thumbGlyphScale
+        let cellH = Float(renderer.glyphAtlas.cellHeight) * scaleFactor * thumbGlyphScale
+        let textWidth = Float(chars.count) * cellW
+        let startX = x + (w - textWidth) / 2
+        let startY = y + (h - cellH) / 2
+
+        var vertices: [Float] = []
+        for (index, scalar) in chars.enumerated() {
+            let cp = scalar.value
+            guard cp > 0x20,
+                  let glyph = renderer.glyphAtlas.glyphInfo(for: cp),
+                  glyph.pixelWidth > 0 else {
+                continue
+            }
+
+            let cx = startX + Float(index) * cellW
+            let glyphX = cx + Float(glyph.bearingX) * scaleFactor * thumbGlyphScale
+            let baselineScreenY = startY + cellH - Float(renderer.glyphAtlas.baseline) * scaleFactor * thumbGlyphScale
+            let glyphY = baselineScreenY - glyph.baselineOffset * thumbGlyphScale
+            let glyphW = Float(glyph.pixelWidth) * thumbGlyphScale
+            let glyphH = Float(glyph.pixelHeight) * thumbGlyphScale
+
+            renderer.addQuadPublic(
+                to: &vertices,
+                x: glyphX, y: glyphY, w: glyphW, h: glyphH,
+                tx: glyph.textureX, ty: glyph.textureY,
+                tw: glyph.textureW, th: glyph.textureH,
+                fg: fgColor,
+                bg: (0, 0, 0, 0)
+            )
+        }
+
+        guard !vertices.isEmpty else { return }
+        encoder.setRenderPipelineState(glyphPipeline)
+        if let buf = renderer.makeTemporaryBuffer(vertices: vertices) {
+            var uniforms = MetalRenderer.MetalUniforms(viewportSize: viewportSize, cursorOpacity: 0, time: 0)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalRenderer.MetalUniforms>.size, index: 1)
+            encoder.setFragmentTexture(atlas, index: 0)
+            encoder.setFragmentSamplerState(renderer.samplerState, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count / 12)
+        }
     }
 
     private func drawWorkspaceNoteButton(
