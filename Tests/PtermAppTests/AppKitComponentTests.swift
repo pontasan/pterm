@@ -116,6 +116,16 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(window?.minSize.height, 400)
     }
 
+    func testWindowMaterialPolicyAlwaysUsesTranslucencyForIntegratedView() {
+        XCTAssertTrue(AppDelegate.shouldUseTranslucentWindowMaterial(isIntegratedViewVisible: true, terminalBackgroundOpacity: 1.0))
+        XCTAssertTrue(AppDelegate.shouldUseTranslucentWindowMaterial(isIntegratedViewVisible: true, terminalBackgroundOpacity: 0.0))
+    }
+
+    func testWindowMaterialPolicyUsesOpacityOutsideIntegratedView() {
+        XCTAssertFalse(AppDelegate.shouldUseTranslucentWindowMaterial(isIntegratedViewVisible: false, terminalBackgroundOpacity: 1.0))
+        XCTAssertTrue(AppDelegate.shouldUseTranslucentWindowMaterial(isIntegratedViewVisible: false, terminalBackgroundOpacity: 0.5))
+    }
+
     func testSettingsWindowControllerUsesDarkAppearanceAndSpecifiedInitialSize() {
         let controller = SettingsWindowController()
         let window = controller.window
@@ -168,6 +178,15 @@ final class AppKitComponentTests: XCTestCase {
 
         XCTAssertEqual(termPopup.itemTitles, ["xterm-256color", "xterm", "vt100"])
         XCTAssertEqual(encodingPopup.itemTitles, ["UTF-8", "UTF-16", "UTF-16LE", "UTF-16BE"])
+    }
+
+    func testSettingsWindowGeneralSectionShowsFactoryResetButton() throws {
+        let controller = SettingsWindowController()
+        let buttons = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }
+
+        let resetButton = try XCTUnwrap(buttons.first(where: { $0.identifier?.rawValue == "factoryResetButton" }))
+
+        XCTAssertEqual(resetButton.title, "Restore Defaults…")
     }
 
     func testSettingsWindowAuditSectionStartsWithDependentControlsDisabledWhenAuditIsOff() throws {
@@ -225,23 +244,218 @@ final class AppKitComponentTests: XCTestCase {
 
     func testSettingsWindowAppearanceSectionShowsTerminalColorControlsAndOpacitySlider() throws {
         let controller = SettingsWindowController()
-        let tableView = try XCTUnwrap(findSubview(in: controller.window?.contentView) { $0 is NSTableView } as? NSTableView)
+        controller.showWindow()
+        let windowContentView = try XCTUnwrap(controller.window?.contentView)
+        let tableView = try XCTUnwrap(findSubview(in: windowContentView) { $0 is NSTableView } as? NSTableView)
 
         tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
         controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+        controller.window?.displayIfNeeded()
 
-        let colorWells = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSColorWell }
-        let slider = try XCTUnwrap(allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSSlider }.first)
-        let labels = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSTextField }.map(\.stringValue)
+        let discoveredSubviews = allSubviews(in: windowContentView)
+        let colorWells = discoveredSubviews.compactMap { $0 as? NSColorWell }
+        let slider = try XCTUnwrap(
+            discoveredSubviews
+                .compactMap { $0 as? NSSlider }
+                .first { $0.identifier?.rawValue == "terminalBackgroundOpacitySlider" }
+        )
+        let labels = discoveredSubviews.compactMap { $0 as? NSTextField }.map(\.stringValue)
 
-        XCTAssertEqual(colorWells.count, 2)
-        XCTAssertEqual(slider.doubleValue, 1.0, accuracy: 0.001)
+        let identifiedColorWells = colorWells.filter {
+            $0.identifier?.rawValue == "terminalForegroundColorWell" ||
+                $0.identifier?.rawValue == "terminalBackgroundColorWell"
+        }
+
+        XCTAssertEqual(identifiedColorWells.count, 2)
+        XCTAssertGreaterThanOrEqual(slider.doubleValue, 0.0)
+        XCTAssertLessThanOrEqual(slider.doubleValue, 1.0)
         XCTAssertTrue(labels.contains("Terminal Foreground:"))
         XCTAssertTrue(labels.contains("Terminal Background:"))
         XCTAssertTrue(labels.contains("Background Opacity:"))
-        XCTAssertTrue(labels.contains("#CCCCCC"))
-        XCTAssertTrue(labels.contains("#000000"))
-        XCTAssertTrue(labels.contains("100%"))
+    }
+
+    func testSettingsWindowAppearanceLabelsDoNotOverlapControls() throws {
+        let controller = SettingsWindowController()
+        controller.showWindow()
+        let windowContentView = try XCTUnwrap(controller.window?.contentView)
+        let tableView = try XCTUnwrap(findSubview(in: windowContentView) { $0 is NSTableView } as? NSTableView)
+
+        tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+        controller.window?.displayIfNeeded()
+
+        let subviews = allSubviews(in: windowContentView)
+        let labels = subviews.compactMap { $0 as? NSTextField }.filter {
+            ["Terminal Foreground:", "Terminal Background:", "Background Opacity:"].contains($0.stringValue)
+        }
+        let controls = subviews.compactMap { view -> NSView? in
+            if let colorWell = view as? NSColorWell,
+               let id = colorWell.identifier?.rawValue,
+               ["terminalForegroundColorWell", "terminalBackgroundColorWell"].contains(id) {
+                return colorWell
+            }
+            if let slider = view as? NSSlider, slider.identifier?.rawValue == "terminalBackgroundOpacitySlider" {
+                return slider
+            }
+            return nil
+        }
+
+        XCTAssertEqual(labels.count, 3)
+        XCTAssertEqual(controls.count, 3)
+
+        for label in labels {
+            let overlappingControls = controls.filter { label.frame.intersects($0.frame) }
+            XCTAssertTrue(overlappingControls.isEmpty, "Label \(label.stringValue) should not overlap any control")
+        }
+    }
+
+    func testSettingsWindowAppearanceChangesPersistToConfigFile() throws {
+        try withTemporaryHomeDirectory { _ in
+            PtermDirectories.ensureDirectories()
+
+            let controller = SettingsWindowController()
+            controller.showWindow()
+            let windowContentView = try XCTUnwrap(controller.window?.contentView)
+            let tableView = try XCTUnwrap(findSubview(in: windowContentView) { $0 is NSTableView } as? NSTableView)
+
+            tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+            controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
+
+            let discoveredSubviews = allSubviews(in: windowContentView)
+            let foregroundWell = try XCTUnwrap(
+                discoveredSubviews
+                    .compactMap { $0 as? NSColorWell }
+                    .first { $0.identifier?.rawValue == "terminalForegroundColorWell" }
+            )
+            let backgroundWell = try XCTUnwrap(
+                discoveredSubviews
+                    .compactMap { $0 as? NSColorWell }
+                    .first { $0.identifier?.rawValue == "terminalBackgroundColorWell" }
+            )
+            let slider = try XCTUnwrap(
+                discoveredSubviews
+                    .compactMap { $0 as? NSSlider }
+                    .first { $0.identifier?.rawValue == "terminalBackgroundOpacitySlider" }
+            )
+
+            foregroundWell.color = NSColor(calibratedRed: 0xAA as CGFloat / 255.0,
+                                           green: 0xBB as CGFloat / 255.0,
+                                           blue: 0xCC as CGFloat / 255.0,
+                                           alpha: 1.0)
+            _ = foregroundWell.target?.perform(foregroundWell.action, with: foregroundWell)
+
+            backgroundWell.color = NSColor(calibratedRed: 0x11 as CGFloat / 255.0,
+                                           green: 0x22 as CGFloat / 255.0,
+                                           blue: 0x33 as CGFloat / 255.0,
+                                           alpha: 1.0)
+            _ = backgroundWell.target?.perform(backgroundWell.action, with: backgroundWell)
+
+            slider.doubleValue = 0.42
+            _ = slider.target?.perform(slider.action, with: slider)
+
+            let data = try Data(contentsOf: PtermDirectories.config)
+            let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let appearance = try XCTUnwrap(root["appearance"] as? [String: Any])
+            let storedForeground = try XCTUnwrap(appearance["terminal_foreground_color"] as? String)
+            let storedBackground = try XCTUnwrap(appearance["terminal_background_color"] as? String)
+            let storedOpacity = try XCTUnwrap((appearance["terminal_background_opacity"] as? NSNumber)?.doubleValue)
+
+            XCTAssertNotEqual(storedForeground, RGBColor.defaultTerminalForeground.hexString)
+            XCTAssertNotEqual(storedBackground, RGBColor.defaultTerminalBackground.hexString)
+            XCTAssertEqual(storedOpacity, 0.42, accuracy: 0.0001)
+
+            let config = PtermConfigStore.load()
+            XCTAssertEqual(config.terminalAppearance.foreground.hexString, storedForeground)
+            XCTAssertEqual(config.terminalAppearance.background.hexString, storedBackground)
+            XCTAssertEqual(config.terminalAppearance.backgroundOpacity, 0.42, accuracy: 0.0001)
+        }
+    }
+
+    func testSettingsWindowFactoryResetPreservesUnknownKeysAndRestoresDefaults() throws {
+        try withTemporaryHomeDirectory { _ in
+            PtermDirectories.ensureDirectories()
+
+            let seededConfig: [String: Any] = [
+                "term": "vt100",
+                "text_encoding": "utf-16",
+                "memory_max": 12345678,
+                "memory_initial": 2345678,
+                "font": ["name": "Menlo", "size": 17],
+                "appearance": [
+                    "terminal_foreground_color": "#123456",
+                    "terminal_background_color": "#654321",
+                    "terminal_background_opacity": 0.73,
+                    "preserved_appearance_key": "keep"
+                ],
+                "session": [
+                    "scroll_buffer_persistence": true,
+                    "preserved_session_key": "keep"
+                ],
+                "security": [
+                    "osc52_clipboard_read": true,
+                    "paste_confirmation": false,
+                    "preserved_security_key": "keep"
+                ],
+                "audit": [
+                    "enabled": true,
+                    "retention_days": 7,
+                    "encryption": true,
+                    "preserved_audit_key": "keep"
+                ],
+                "workspaces": [["name": "Keep Workspace"]],
+                "shortcuts": ["zoom_in": "cmd+="],
+                "custom_root_key": "keep"
+            ]
+            let seededData = try JSONSerialization.data(withJSONObject: seededConfig, options: [.prettyPrinted, .sortedKeys])
+            try AtomicFileWriter.write(seededData, to: PtermDirectories.config, permissions: 0o600)
+
+            let controller = SettingsWindowController()
+            controller.resetToFactoryDefaults()
+
+            let data = try Data(contentsOf: PtermDirectories.config)
+            let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+            XCTAssertNil(root["term"])
+            XCTAssertNil(root["text_encoding"])
+            XCTAssertNil(root["memory_max"])
+            XCTAssertNil(root["memory_initial"])
+            XCTAssertNil(root["font"])
+            XCTAssertNil(root["font_name"])
+            XCTAssertNil(root["font_size"])
+
+            XCTAssertEqual(root["custom_root_key"] as? String, "keep")
+            XCTAssertNotNil(root["workspaces"])
+            XCTAssertNotNil(root["shortcuts"])
+
+            let appearance = try XCTUnwrap(root["appearance"] as? [String: Any])
+            XCTAssertNil(appearance["terminal_foreground_color"])
+            XCTAssertNil(appearance["terminal_background_color"])
+            XCTAssertNil(appearance["terminal_background_opacity"])
+            XCTAssertEqual(appearance["preserved_appearance_key"] as? String, "keep")
+
+            let session = try XCTUnwrap(root["session"] as? [String: Any])
+            XCTAssertNil(session["scroll_buffer_persistence"])
+            XCTAssertEqual(session["preserved_session_key"] as? String, "keep")
+
+            let security = try XCTUnwrap(root["security"] as? [String: Any])
+            XCTAssertNil(security["osc52_clipboard_read"])
+            XCTAssertNil(security["paste_confirmation"])
+            XCTAssertEqual(security["preserved_security_key"] as? String, "keep")
+
+            let audit = try XCTUnwrap(root["audit"] as? [String: Any])
+            XCTAssertNil(audit["enabled"])
+            XCTAssertNil(audit["retention_days"])
+            XCTAssertNil(audit["encryption"])
+            XCTAssertEqual(audit["preserved_audit_key"] as? String, "keep")
+
+            let loaded = PtermConfigStore.load()
+            XCTAssertEqual(loaded.term, PtermConfig.default.term)
+            XCTAssertEqual(loaded.textEncoding, PtermConfig.default.textEncoding)
+            XCTAssertEqual(loaded.memoryMax, PtermConfig.default.memoryMax)
+            XCTAssertEqual(loaded.terminalAppearance, PtermConfig.default.terminalAppearance)
+        }
     }
 
     func testTerminalViewApplyAppearanceSettingsUpdatesClearColor() throws {
@@ -262,6 +476,45 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(view.clearColor.blue, Double(0x33) / 255.0, accuracy: 0.0001)
         XCTAssertEqual(view.clearColor.alpha, 0.4, accuracy: 0.0001)
         XCTAssertFalse(view.isOpaque)
+    }
+
+    func testTerminalViewApplyAppearanceSettingsBecomesOpaqueAtFullOpacity() throws {
+        let renderer = try makeRendererOrSkip()
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+
+        renderer.updateTerminalAppearance(
+            TerminalAppearanceConfiguration(
+                foreground: .defaultTerminalForeground,
+                background: RGBColor(red: 0x00, green: 0x00, blue: 0x00),
+                backgroundOpacity: 1.0
+            )
+        )
+        view.applyAppearanceSettings()
+
+        XCTAssertEqual(view.clearColor.alpha, 1.0, accuracy: 0.0001)
+        XCTAssertTrue(view.isOpaque)
+        XCTAssertEqual(view.layer?.isOpaque, true)
+    }
+
+    func testIntegratedViewApplyAppearanceSettingsUpdatesClearColor() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), renderer: renderer, manager: manager)
+
+        renderer.updateTerminalAppearance(
+            TerminalAppearanceConfiguration(
+                foreground: RGBColor(red: 0xF0, green: 0xE0, blue: 0xD0),
+                background: RGBColor(red: 0x12, green: 0x34, blue: 0x56),
+                backgroundOpacity: 0.35
+            )
+        )
+        view.applyAppearanceSettings()
+
+        XCTAssertEqual(view.clearColor.red, 0.0, accuracy: 0.0001)
+        XCTAssertEqual(view.clearColor.green, 0.0, accuracy: 0.0001)
+        XCTAssertEqual(view.clearColor.blue, 0.0, accuracy: 0.0001)
+        XCTAssertEqual(view.clearColor.alpha, 0.0, accuracy: 0.0001)
     }
 
     func testTerminalViewStartsInDemandDrivenRenderingMode() throws {
@@ -299,6 +552,24 @@ final class AppKitComponentTests: XCTestCase {
 
         XCTAssertTrue(terminalViews.allSatisfy { abs($0.clearColor.alpha - 0.5) < 0.0001 })
         XCTAssertEqual(splitRenderView.clearColor.alpha, 0.5, accuracy: 0.0001)
+    }
+
+    func testSplitRenderViewApplyAppearanceSettingsBecomesOpaqueAtFullOpacity() throws {
+        let renderer = try makeRendererOrSkip()
+        let view = SplitRenderView(frame: NSRect(x: 0, y: 0, width: 480, height: 280), renderer: renderer)
+
+        renderer.updateTerminalAppearance(
+            TerminalAppearanceConfiguration(
+                foreground: .defaultTerminalForeground,
+                background: RGBColor(red: 0x00, green: 0x00, blue: 0x00),
+                backgroundOpacity: 1.0
+            )
+        )
+        view.applyAppearanceSettings()
+
+        XCTAssertEqual(view.clearColor.alpha, 1.0, accuracy: 0.0001)
+        XCTAssertTrue(view.isOpaque)
+        XCTAssertEqual(view.layer?.isOpaque, true)
     }
 
     func testSplitRenderViewStartsInDemandDrivenRenderingMode() throws {

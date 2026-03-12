@@ -85,6 +85,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var markedTextSelection = NSRange(location: NSNotFound, length: 0)
     private var pendingTextInputHandled = false
     private var scrollerSyncPending = true
+    private var viewIsOpaque = false
 
     /// URL hover state for Cmd+mouseover visual feedback
     private var hoveredLinkRange: (row: Int, startCol: Int, endCol: Int)?
@@ -104,9 +105,9 @@ final class TerminalView: MTKView, NSTextInputClient {
         self.enableSetNeedsDisplay = true
         self.registerForDraggedTypes([.fileURL])
         self.wantsLayer = true
-        self.layer?.isOpaque = false
         configureMarkedTextLayer()
         demandDrivenRendering = true
+        updateOpacityMode()
 
         _ = self.becomeFirstResponder()
     }
@@ -116,7 +117,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         fatalError("init(coder:) not implemented")
     }
 
-    override var isOpaque: Bool { false }
+    override var isOpaque: Bool { viewIsOpaque }
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -181,8 +182,14 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     func applyAppearanceSettings() {
         clearColor = renderer?.terminalClearColor ?? clearColor
+        updateOpacityMode()
         requestDisplayUpdate()
         updateMarkedTextOverlay()
+    }
+
+    private func updateOpacityMode() {
+        viewIsOpaque = clearColor.alpha >= 0.999
+        layer?.isOpaque = viewIsOpaque
     }
 
     /// Synchronize the glyph atlas scale factor with the current display.

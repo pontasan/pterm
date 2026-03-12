@@ -24,6 +24,8 @@ private final class SettingsContentView: FlippedView {
 // MARK: - Settings Window Controller
 
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
+    private let settingsLabelColumnWidth: CGFloat = 160
+    private let settingsControlSpacing: CGFloat = 8
     private enum Section: Int, CaseIterable {
         case general = 0
         case appearance
@@ -84,6 +86,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var auditEnabledCheck: NSButton?
     private var retentionField: NSTextField?
     private var encryptCheck: NSButton?
+    private var factoryResetButton: NSButton?
 
     init() {
         let contentRect = NSRect(x: 0, y: 0, width: 640, height: 480)
@@ -145,6 +148,55 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             showContentForSection(currentSection)
             NSAlert(error: error).runModal()
         }
+    }
+
+    func resetToFactoryDefaults() {
+        configData = Self.factoryResetConfigData(configData)
+        commitConfigChange()
+        showContentForSection(currentSection)
+    }
+
+    private static func factoryResetConfigData(_ configData: [String: Any]) -> [String: Any] {
+        var reset = configData
+        reset.removeValue(forKey: "term")
+        reset.removeValue(forKey: "text_encoding")
+        reset.removeValue(forKey: "memory_max")
+        reset.removeValue(forKey: "memory_initial")
+        reset.removeValue(forKey: "font")
+        reset.removeValue(forKey: "font_name")
+        reset.removeValue(forKey: "font_size")
+
+        func resetSection(_ key: String, removing managedKeys: Set<String>) {
+            guard var section = reset[key] as? [String: Any] else { return }
+            for managedKey in managedKeys {
+                section.removeValue(forKey: managedKey)
+            }
+            if section.isEmpty {
+                reset.removeValue(forKey: key)
+            } else {
+                reset[key] = section
+            }
+        }
+
+        resetSection("session", removing: ["scroll_buffer_persistence"])
+        resetSection("appearance", removing: [
+            "terminal_foreground_color",
+            "terminal_background_color",
+            "terminal_background_opacity"
+        ])
+        resetSection("security", removing: [
+            "osc52_clipboard_read",
+            "paste_confirmation",
+            "mouse_report_restrict_alternate_screen",
+            "allow_window_resize_sequence"
+        ])
+        resetSection("audit", removing: [
+            "enabled",
+            "retention_days",
+            "encryption"
+        ])
+
+        return reset
     }
 
     // MARK: - UI Setup
@@ -277,6 +329,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         check.action = #selector(scrollPersistenceChanged(_:))
         scrollPersistenceCheck = check
         addView(check, 22)
+        addSpacing(20)
+
+        let resetButton = NSButton(title: "Restore Defaults…", target: self, action: #selector(factoryResetClicked(_:)))
+        resetButton.bezelStyle = .rounded
+        resetButton.contentTintColor = NSColor.systemRed
+        resetButton.identifier = NSUserInterfaceItemIdentifier("factoryResetButton")
+        resetButton.frame = NSRect(x: 0, y: 0, width: 140, height: 28)
+        factoryResetButton = resetButton
+        addView(resetButton, 28)
+        addSpacing(6)
+        addView(
+            makeDescriptionLabel(
+                "Resets Settings-managed values to factory defaults while preserving workspaces and unknown config keys.",
+                width: width
+            ),
+            32
+        )
     }
 
     // MARK: - Section: Appearance
@@ -358,7 +427,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let background = RGBColor(
             hexString: (appearance["terminal_background_color"] as? String) ?? RGBColor.defaultTerminalBackground.hexString
         ) ?? .defaultTerminalBackground
-        let opacity = min(1.0, max(0.0, doubleVal(appearance["terminal_background_opacity"]) ?? 1.0))
+        let opacity = min(
+            1.0,
+            max(0.0, doubleVal(appearance["terminal_background_opacity"]) ?? TerminalAppearanceConfiguration.default.backgroundOpacity)
+        )
 
         let (foregroundRow, foregroundWell, foregroundHexLabel) = makeColorWellRow(
             label: "Terminal Foreground:",
@@ -632,7 +704,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             .defaultTerminalBackground
         let effectiveOpacity = min(
             1.0,
-            max(0.0, opacity ?? doubleVal(appearance["terminal_background_opacity"]) ?? 1.0)
+            max(
+                0.0,
+                opacity ?? doubleVal(appearance["terminal_background_opacity"]) ?? TerminalAppearanceConfiguration.default.backgroundOpacity
+            )
         )
 
         appearance["terminal_foreground_color"] = effectiveForeground.hexString
@@ -687,6 +762,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         commitConfigChange()
     }
 
+    @objc private func factoryResetClicked(_ sender: NSButton) {
+        let alert = NSAlert()
+        alert.messageText = "Restore factory defaults?"
+        alert.informativeText = "This resets Settings-managed values to their defaults and keeps workspaces and unknown config keys."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Restore")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            resetToFactoryDefaults()
+        }
+    }
+
     // MARK: - UI Factories
 
     private func makeLabel(_ text: String) -> NSTextField {
@@ -726,10 +815,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                                width: CGFloat) -> (NSView, NSPopUpButton) {
         let row = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 28))
         let l = makeLabel(label)
-        l.frame = NSRect(x: 0, y: 4, width: 120, height: 20)
+        l.frame = NSRect(x: 0, y: 4, width: settingsLabelColumnWidth, height: 20)
         row.addSubview(l)
 
-        let popup = NSPopUpButton(frame: NSRect(x: 124, y: 0, width: 200, height: 28))
+        let popupX = settingsLabelColumnWidth + settingsControlSpacing
+        let popupWidth = max(160, min(220, width - popupX))
+        let popup = NSPopUpButton(frame: NSRect(x: popupX, y: 0, width: popupWidth, height: 28))
         popup.addItems(withTitles: values)
         popup.selectItem(withTitle: current)
         row.addSubview(popup)
@@ -744,17 +835,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     ) -> (NSView, NSColorWell, NSTextField) {
         let row = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 28))
         let labelView = makeLabel(label)
-        labelView.frame = NSRect(x: 0, y: 4, width: 120, height: 20)
+        labelView.frame = NSRect(x: 0, y: 4, width: settingsLabelColumnWidth, height: 20)
         row.addSubview(labelView)
 
-        let well = NSColorWell(frame: NSRect(x: 124, y: 2, width: 44, height: 24))
+        let controlX = settingsLabelColumnWidth + settingsControlSpacing
+        let well = NSColorWell(frame: NSRect(x: controlX, y: 2, width: 44, height: 24))
         well.color = color
         row.addSubview(well)
 
         let hexLabel = makeLabel(hexValue)
         hexLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         hexLabel.textColor = NSColor(calibratedWhite: 0.7, alpha: 1)
-        hexLabel.frame = NSRect(x: 176, y: 4, width: 100, height: 20)
+        let hexX = controlX + 44 + settingsControlSpacing
+        hexLabel.frame = NSRect(x: hexX, y: 4, width: max(80, width - hexX), height: 20)
         row.addSubview(hexLabel)
 
         return (row, well, hexLabel)
@@ -767,20 +860,24 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     ) -> (NSView, NSSlider, NSTextField) {
         let row = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 28))
         let labelView = makeLabel(label)
-        labelView.frame = NSRect(x: 0, y: 4, width: 120, height: 20)
+        labelView.frame = NSRect(x: 0, y: 4, width: settingsLabelColumnWidth, height: 20)
         row.addSubview(labelView)
 
+        let valueLabelWidth: CGFloat = 50
+        let sliderX = settingsLabelColumnWidth + settingsControlSpacing
+        let valueLabelX = width - valueLabelWidth
+        let sliderWidth = max(120, valueLabelX - sliderX - settingsControlSpacing)
         let slider = NSSlider(value: value, minValue: 0.0, maxValue: 1.0, target: nil, action: nil)
         slider.numberOfTickMarks = 11
         slider.allowsTickMarkValuesOnly = false
-        slider.frame = NSRect(x: 124, y: 2, width: 170, height: 24)
+        slider.frame = NSRect(x: sliderX, y: 2, width: sliderWidth, height: 24)
         row.addSubview(slider)
 
         let valueLabel = makeLabel(opacityPercentString(value))
         valueLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         valueLabel.textColor = NSColor(calibratedWhite: 0.7, alpha: 1)
         valueLabel.alignment = .right
-        valueLabel.frame = NSRect(x: width - 50, y: 4, width: 50, height: 20)
+        valueLabel.frame = NSRect(x: valueLabelX, y: 4, width: valueLabelWidth, height: 20)
         row.addSubview(valueLabel)
 
         return (row, slider, valueLabel)
@@ -789,7 +886,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private func makeTextFieldRow(label: String, value: String, width: CGFloat) -> (NSView, NSTextField) {
         let row = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 28))
         let l = makeLabel(label)
-        l.frame = NSRect(x: 0, y: 4, width: 160, height: 20)
+        l.frame = NSRect(x: 0, y: 4, width: settingsLabelColumnWidth, height: 20)
         row.addSubview(l)
 
         let field = NSTextField()
@@ -799,7 +896,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         field.backgroundColor = NSColor(calibratedWhite: 0.2, alpha: 1)
         field.textColor = .white
         field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        field.frame = NSRect(x: 164, y: 2, width: 80, height: 24)
+        field.frame = NSRect(x: settingsLabelColumnWidth + settingsControlSpacing, y: 2, width: 80, height: 24)
         row.addSubview(field)
         return (row, field)
     }

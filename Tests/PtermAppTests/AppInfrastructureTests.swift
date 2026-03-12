@@ -28,6 +28,18 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertEqual(high.normalizedBackgroundOpacity, 1.0)
     }
 
+    func testDefaultTerminalForegroundIsPureWhite() {
+        XCTAssertEqual(RGBColor.defaultTerminalForeground.hexString, "#FFFFFF")
+        XCTAssertEqual(TerminalAppearanceConfiguration.default.foreground.hexString, "#FFFFFF")
+    }
+
+    func testDefaultTerminalBackgroundIsBlackAndOpacityIsZero() {
+        XCTAssertEqual(RGBColor.defaultTerminalBackground.hexString, "#000000")
+        XCTAssertEqual(TerminalAppearanceConfiguration.default.background.hexString, "#000000")
+        XCTAssertEqual(TerminalAppearanceConfiguration.default.backgroundOpacity, 0.0)
+        XCTAssertEqual(TerminalAppearanceConfiguration.default.normalizedBackgroundOpacity, 0.0)
+    }
+
     func testTerminalColorDefaultDetectionOnlyMatchesDefaultCase() {
         XCTAssertTrue(TerminalColor.default.isDefaultColor)
         XCTAssertFalse(TerminalColor.indexed(0).isDefaultColor)

@@ -23,6 +23,7 @@ final class SplitRenderView: MTKView {
     var cellRefs: [CellRef] = []
     /// Closure to compute border config for a TerminalView each frame.
     var borderConfigProvider: ((TerminalView) -> MetalRenderer.BorderConfig?)?
+    private var viewIsOpaque = false
 
     init(frame: NSRect, renderer: MetalRenderer) {
         self.renderer = renderer
@@ -34,7 +35,7 @@ final class SplitRenderView: MTKView {
         self.enableSetNeedsDisplay = true
         self.preferredFramesPerSecond = 30
         self.wantsLayer = true
-        self.layer?.isOpaque = false
+        updateOpacityMode()
     }
 
     @available(*, unavailable)
@@ -42,7 +43,7 @@ final class SplitRenderView: MTKView {
         fatalError("init(coder:) not implemented")
     }
 
-    override var isOpaque: Bool { false }
+    override var isOpaque: Bool { viewIsOpaque }
 
     deinit {
         renderer.removeBuffers(for: self)
@@ -72,6 +73,7 @@ final class SplitRenderView: MTKView {
 
     func applyAppearanceSettings() {
         clearColor = renderer.terminalClearColor
+        updateOpacityMode()
         setNeedsDisplay(bounds)
     }
 
@@ -90,6 +92,11 @@ final class SplitRenderView: MTKView {
             drawableSize = expectedSize
         }
         setNeedsDisplay(bounds)
+    }
+
+    private func updateOpacityMode() {
+        viewIsOpaque = clearColor.alpha >= 0.999
+        layer?.isOpaque = viewIsOpaque
     }
 }
 

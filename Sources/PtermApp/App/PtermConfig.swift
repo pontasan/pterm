@@ -5,7 +5,7 @@ struct RGBColor: Equatable {
     let green: UInt8
     let blue: UInt8
 
-    static let defaultTerminalForeground = RGBColor(red: 0xCC, green: 0xCC, blue: 0xCC)
+    static let defaultTerminalForeground = RGBColor(red: 0xFF, green: 0xFF, blue: 0xFF)
     static let defaultTerminalBackground = RGBColor(red: 0x00, green: 0x00, blue: 0x00)
 
     init(red: UInt8, green: UInt8, blue: UInt8) {
@@ -39,7 +39,7 @@ struct TerminalAppearanceConfiguration: Equatable {
     static let `default` = TerminalAppearanceConfiguration(
         foreground: .defaultTerminalForeground,
         background: .defaultTerminalBackground,
-        backgroundOpacity: 1.0
+        backgroundOpacity: 0.0
     )
 
     var normalizedBackgroundOpacity: Double {

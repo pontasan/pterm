@@ -28,6 +28,10 @@ final class ScrollDocumentView: NSView {
 /// switches to the focused (occupied) view. Shift+click enables multi-select
 /// for split display.
 final class IntegratedView: MTKView, NSDraggingSource {
+    static func overviewBackgroundClearColor() -> MTLClearColor {
+        MTLClearColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0)
+    }
+
     private struct LayoutGeometryCacheKey: Equatable {
         let boundsSize: NSSize
         let explicitWorkspaceNames: [String]
@@ -228,6 +232,16 @@ final class IntegratedView: MTKView, NSDraggingSource {
         setNeedsDisplay(bounds)
     }
 
+    func selectAllTerminals() {
+        let allTerminals = manager.terminals
+        guard !allTerminals.isEmpty else { return }
+        if allTerminals.count >= 2 {
+            onMultiSelect?(allTerminals)
+        } else if let single = allTerminals.first {
+            onSelectTerminal?(single)
+        }
+    }
+
     /// Callback: user shift-clicked multiple terminals for split view.
     var onMultiSelect: (([TerminalController]) -> Void)?
 
@@ -359,9 +373,12 @@ final class IntegratedView: MTKView, NSDraggingSource {
         self.delegate = self
         self.preferredFramesPerSecond = 12
         self.colorPixelFormat = .bgra8Unorm
-        self.clearColor = MTLClearColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1)
+        self.clearColor = Self.overviewBackgroundClearColor()
         self.isPaused = true
         self.enableSetNeedsDisplay = true
+        self.wantsLayer = true
+        self.layer?.isOpaque = false
+        self.layer?.backgroundColor = NSColor.clear.cgColor
         self.registerForDraggedTypes([.string, Self.terminalPasteboardType, Self.workspacePasteboardType])
 
         updateTrackingArea()
@@ -379,6 +396,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         scrollInteractionTimer?.invalidate()
     }
 
+    override var isOpaque: Bool { false }
     override var acceptsFirstResponder: Bool { true }
 
     // MARK: - Multi-Display Support
@@ -397,6 +415,11 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     func syncScaleFactorIfNeeded() {
         syncScaleFactor()
+    }
+
+    func applyAppearanceSettings() {
+        clearColor = Self.overviewBackgroundClearColor()
+        setNeedsDisplay(bounds)
     }
 
     private func syncScaleFactor() {
@@ -1514,13 +1537,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         // Cmd+A: select all terminals and enter split view
         if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "a" {
-            let allTerminals = manager.terminals
-            guard !allTerminals.isEmpty else { return true }
-            if allTerminals.count >= 2 {
-                onMultiSelect?(allTerminals)
-            } else if let single = allTerminals.first {
-                onSelectTerminal?(single)
-            }
+            selectAllTerminals()
             return true
         }
 
@@ -1556,8 +1573,7 @@ extension IntegratedView: MTKViewDelegate {
         syncCompanionDocumentView()
         invalidateTextVertexCacheIfNeeded()
 
-        renderPassDescriptor.colorAttachments[0].clearColor =
-            MTLClearColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1)
+        renderPassDescriptor.colorAttachments[0].clearColor = Self.overviewBackgroundClearColor()
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(
             descriptor: renderPassDescriptor) else {
@@ -1842,6 +1858,7 @@ extension IntegratedView: MTKViewDelegate {
         let titleY = Float(titleFrame.origin.y) * scaleFactor
         let titleW = Float(titleFrame.width) * scaleFactor
         let titleH = Float(titleFrame.height) * scaleFactor
+        let appearance = renderer.terminalAppearance
         renderer.addQuadPublic(
             to: &vertices, x: titleX, y: titleY, w: titleW, h: titleH,
             tx: 0, ty: 0, tw: 0, th: 0,
@@ -1857,7 +1874,12 @@ extension IntegratedView: MTKViewDelegate {
         renderer.addQuadPublic(
             to: &vertices, x: contentX, y: contentY, w: contentW, h: contentH,
             tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (0.0, 0.0, 0.0, 1.0),
+            fg: (
+                appearance.defaultBackground.r,
+                appearance.defaultBackground.g,
+                appearance.defaultBackground.b,
+                appearance.defaultBackground.a
+            ),
             bg: (0, 0, 0, 0)
         )
 
@@ -1930,7 +1952,6 @@ extension IntegratedView: MTKViewDelegate {
         let w = Float(workspace.frame.width) * scaleFactor
         let h = Float(workspace.frame.height) * scaleFactor
         let bw = Float(Layout.workspaceBorderWidth) * scaleFactor
-
         renderer.addQuadPublic(to: &overlayVertices, x: x, y: y, w: w, h: h,
                                tx: 0, ty: 0, tw: 0, th: 0,
                                fg: (0.07, 0.07, 0.07, 0.65), bg: (0, 0, 0, 0))

@@ -58,7 +58,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var config: PtermConfig = .default
 
     private var statusBarView: StatusBarView!
-    private var windowBackgroundEffectView: NSVisualEffectView?
+    private var windowBackgroundGlassView: NSView?
+    private var windowRootContentView: NSView!
+    private var windowHostedContentView: NSView!
     private var configWatchSource: DispatchSourceFileSystemObject?
     private var pendingConfigReload: DispatchWorkItem?
     private var backShortcutMonitor: Any?
@@ -124,6 +126,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private enum WorkspaceNaming {
         static let uncategorized = "Uncategorized"
+    }
+
+    static func shouldUseTranslucentWindowMaterial(
+        isIntegratedViewVisible: Bool,
+        terminalBackgroundOpacity: Double
+    ) -> Bool {
+        isIntegratedViewVisible || terminalBackgroundOpacity < 0.999
     }
 
     static func newTerminalShortcutContext(
@@ -215,6 +224,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.minSize = NSSize(width: 400, height: 300)
         window.delegate = self
         window.isRestorable = false // Disable macOS state restoration
+        setupWindowContentHierarchy()
         installTitlebarBackButton()
 
         configureWindowAppearance()
@@ -233,7 +243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusBarView.onOpenNote = { [weak self] in
             self?.editAppNote()
         }
-        window.contentView!.addSubview(statusBarView)
+        contentHostView().addSubview(statusBarView)
 
         // Create terminal manager with initial grid size
         let pad = renderer.gridPadding * 2
@@ -281,7 +291,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         integratedView = iv
         syncIntegratedWorkspaceNames()
-        window.contentView!.addSubview(iv)
+        contentHostView().addSubview(iv)
         applyAppearanceSettingsToVisibleViews()
         setupScrollbarOverlay(for: iv)
         isWindowLayoutReady = true
@@ -474,7 +484,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if splitOriginControllers != nil {
             sv.terminalView.cmdClickTooltip = "⌘+Click to return to split view"
         }
-        window.contentView!.addSubview(sv)
+        contentHostView().addSubview(sv)
         terminalScrollView = sv
         terminalView = sv.terminalView
         terminalView?.applyAppearanceSettings()
@@ -525,7 +535,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.splitOriginControllers = controllers
             self.switchToFocused(controller)
         }
-        window.contentView!.addSubview(splitView)
+        contentHostView().addSubview(splitView)
         splitContainerView = splitView
         splitContainerView?.applyAppearanceSettings()
         splitOriginControllers = nil
@@ -603,7 +613,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         iv.frame = availableContentFrame()
         iv.clearSelection()
         syncIntegratedWorkspaceNames()
-        window.contentView!.addSubview(iv)
+        contentHostView().addSubview(iv)
         setupScrollbarOverlay(for: iv)
         applyAppearanceSettingsToVisibleViews()
         iv.syncScaleFactorIfNeeded()
@@ -698,7 +708,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func availableContentFrame() -> NSRect {
-        let bounds = window.contentView!.bounds
+        let bounds = contentHostView().bounds
         let searchInset = searchBarView == nil ? 0 : Layout.searchBarHeight
         return NSRect(
             x: bounds.origin.x,
@@ -709,12 +719,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func statusBarFrame() -> NSRect {
-        let bounds = window.contentView!.bounds
+        let bounds = contentHostView().bounds
         return NSRect(x: bounds.origin.x, y: bounds.origin.y, width: bounds.width, height: Layout.statusBarHeight)
     }
 
     private func searchBarFrame() -> NSRect {
-        let bounds = window.contentView!.bounds
+        let bounds = contentHostView().bounds
         return NSRect(x: bounds.origin.x + 12,
                       y: bounds.maxY - Layout.searchBarHeight - 8,
                       width: bounds.width - 24,
@@ -1604,7 +1614,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .split:
             splitContainerView?.activeTerminalView?.selectAll()
         case .integrated:
-            break
+            integratedView?.selectAllTerminals()
         }
     }
 
@@ -1684,7 +1694,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bar.onNavigateNext = { [weak self] in self?.findNextMatch(nil) }
         bar.onClose = { [weak self] in self?.hideSearchBar() }
         searchBarView = bar
-        window.contentView!.addSubview(bar)
+        contentHostView().addSubview(bar)
         terminalScrollView?.frame = availableContentFrame()
         bar.focus()
     }
@@ -1706,6 +1716,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .integrated:
             return nil
         }
+    }
+
+    private func setupWindowContentHierarchy() {
+        let rootView = NSView(frame: window.contentRect(forFrameRect: window.frame))
+        rootView.autoresizingMask = [.width, .height]
+        rootView.wantsLayer = true
+
+        let hostedContentView = NSView(frame: rootView.bounds)
+        hostedContentView.autoresizingMask = [.width, .height]
+        hostedContentView.wantsLayer = true
+        rootView.addSubview(hostedContentView)
+
+        window.contentView = rootView
+        windowRootContentView = rootView
+        windowHostedContentView = hostedContentView
+    }
+
+    private func contentHostView() -> NSView {
+        windowHostedContentView ?? window.contentView!
+    }
+
+    private func normalizeHostedContentFrame() {
+        guard let rootView = windowRootContentView else { return }
+        windowHostedContentView.frame = rootView.bounds
+        windowHostedContentView.autoresizingMask = [.width, .height]
     }
 
     @objc private func activateFromSecondaryInstance(_ notification: Notification) {
@@ -1815,7 +1850,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let docView = ScrollDocumentView(frame: NSRect(x: 0, y: 0, width: iv.bounds.width, height: iv.bounds.height))
         overlay.documentView = docView
         overlay.contentView.postsBoundsChangedNotifications = true
-        window.contentView!.addSubview(overlay)
+        contentHostView().addSubview(overlay)
         iv.companionScrollView = overlay
         scrollbarOverlay = overlay
     }
@@ -1988,9 +2023,22 @@ extension AppDelegate: NSWindowDelegate {
 
     private func configureWindowAppearance() {
         window.appearance = NSAppearance(named: .darkAqua)
-        window.titlebarAppearsTransparent = true
-        window.contentView?.wantsLayer = true
-        let usesTranslucentMaterial = config.terminalAppearance.normalizedBackgroundOpacity < 0.999
+        window.titlebarAppearsTransparent = false
+        let rootView = windowRootContentView ?? window.contentView
+        let hostedContentView = contentHostView()
+        rootView?.wantsLayer = true
+        hostedContentView.wantsLayer = true
+        normalizeHostedContentFrame()
+        if hostedContentView.superview !== rootView {
+            rootView?.addSubview(hostedContentView)
+        }
+        let usesTranslucentMaterial = Self.shouldUseTranslucentWindowMaterial(
+            isIntegratedViewVisible: {
+                if case .integrated = viewMode { return true }
+                return false
+            }(),
+            terminalBackgroundOpacity: config.terminalAppearance.normalizedBackgroundOpacity
+        )
         let background = config.terminalAppearance.background
         let backgroundColor = NSColor(
             calibratedRed: CGFloat(background.red) / 255.0,
@@ -1999,36 +2047,45 @@ extension AppDelegate: NSWindowDelegate {
             alpha: 1.0
         )
 
-        if windowBackgroundEffectView == nil {
-            let effectView = NSVisualEffectView(frame: window.contentView?.bounds ?? .zero)
-            effectView.autoresizingMask = [.width, .height]
-            effectView.blendingMode = .behindWindow
-            effectView.material = .underWindowBackground
-            effectView.state = .active
-            window.contentView?.addSubview(effectView, positioned: .below, relativeTo: nil)
-            windowBackgroundEffectView = effectView
-        }
-
         if usesTranslucentMaterial {
+            if #available(macOS 26.0, *) {
+                if windowBackgroundGlassView == nil {
+                    let glassView = NSGlassEffectView(frame: rootView?.bounds ?? .zero)
+                    glassView.autoresizingMask = [.width, .height]
+                    glassView.style = .regular
+                    glassView.cornerRadius = 0
+                    windowBackgroundGlassView = glassView
+                }
+                if let glassView = windowBackgroundGlassView as? NSGlassEffectView {
+                    glassView.tintColor = nil
+                    if glassView.superview !== rootView {
+                        rootView?.addSubview(glassView, positioned: .below, relativeTo: hostedContentView)
+                    } else {
+                        rootView?.addSubview(glassView, positioned: .below, relativeTo: hostedContentView)
+                    }
+                    glassView.frame = rootView?.bounds ?? .zero
+                    glassView.isHidden = false
+                }
+            }
             window.isOpaque = false
             window.backgroundColor = .clear
-            window.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
-            windowBackgroundEffectView?.isHidden = false
-            windowBackgroundEffectView?.state = .active
+            rootView?.layer?.backgroundColor = NSColor.clear.cgColor
+            hostedContentView.layer?.backgroundColor = NSColor.clear.cgColor
         } else {
+            windowBackgroundGlassView?.removeFromSuperview()
             window.isOpaque = true
             window.backgroundColor = backgroundColor
-            window.contentView?.layer?.backgroundColor = backgroundColor.cgColor
-            windowBackgroundEffectView?.isHidden = true
-            windowBackgroundEffectView?.state = .inactive
+            rootView?.layer?.backgroundColor = backgroundColor.cgColor
+            hostedContentView.layer?.backgroundColor = backgroundColor.cgColor
         }
     }
 
     private func applyAppearanceSettingsToVisibleViews() {
         configureWindowAppearance()
+        synchronizeWindowLayout(shouldPersistSession: false)
+        integratedView?.applyAppearanceSettings()
         terminalView?.applyAppearanceSettings()
         splitContainerView?.applyAppearanceSettings()
-        integratedView?.setNeedsDisplay(integratedView?.bounds ?? .zero)
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
