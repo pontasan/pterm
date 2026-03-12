@@ -188,6 +188,35 @@ final class TerminalControllerTests: XCTestCase {
         }
     }
 
+    func testDetectedImagePlaceholderReturnsHoveredPlaceholderRangeAndIndex() {
+        let controller = makeController(rows: 2, cols: 16)
+        controller.withModel { model in
+            let text = "[Image #12]"
+            for (index, scalar) in text.unicodeScalars.enumerated() {
+                model.grid.setCell(Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: index)
+            }
+        }
+
+        let detected = controller.detectedImagePlaceholder(at: .init(row: 0, col: 5))
+
+        XCTAssertEqual(detected?.index, 12)
+        XCTAssertEqual(detected?.originalText, "[Image #12]")
+        XCTAssertEqual(detected?.startCol, 0)
+        XCTAssertEqual(detected?.endCol, 10)
+    }
+
+    func testDetectedImagePlaceholderIgnoresNonPlaceholderText() {
+        let controller = makeController(rows: 2, cols: 12)
+        controller.withModel { model in
+            let text = "[Image nope]"
+            for (index, scalar) in text.unicodeScalars.enumerated() {
+                model.grid.setCell(Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: index)
+            }
+        }
+
+        XCTAssertNil(controller.detectedImagePlaceholder(at: .init(row: 0, col: 3)))
+    }
+
     func testAllTextSelectedTextAndFindMatchesIncludeScrollbackAndVisibleGrid() {
         let controller = makeController(rows: 3, cols: 4)
         controller.scrollback.appendRow(ArraySlice([

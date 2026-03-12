@@ -80,6 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Tracks terminals that have been idle at least once (initial output burst is over).
     private var terminalsEverIdle: Set<UUID> = []
     private let clipboardFileStore = ClipboardFileStore()
+    private let pastedImageRegistry = PastedImageRegistry()
     private var clipboardCleanupService: ClipboardCleanupService?
     private let sessionStore = SessionStore()
     private let singleInstanceLock = SingleInstanceLock()
@@ -549,6 +550,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sv.autoresizingMask = [.width, .height]
         sv.shortcutConfiguration = config.shortcuts
         sv.terminalView.terminalController = controller
+        sv.terminalView.imagePreviewURLProvider = { [weak self] index in
+            self?.pastedImageRegistry.url(forPlaceholderIndex: index)
+        }
         sv.terminalView.onBackToIntegrated = { [weak self] in
             self?.switchToIntegrated()
         }
@@ -600,6 +604,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                    controllers: controllers)
         splitView.autoresizingMask = [.width, .height]
         splitView.shortcutConfiguration = config.shortcuts
+        splitView.imagePreviewURLProvider = { [weak self] index in
+            self?.pastedImageRegistry.url(forPlaceholderIndex: index)
+        }
         splitView.onActiveControllerChange = { [weak self] controller in
             self?.applyRendererSettings(for: controller)
         }
@@ -1253,6 +1260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         do {
             if let result = try clipboardFileStore.importFromPasteboard(pasteboard) {
+                pastedImageRegistry.register(createdFiles: result.createdFiles)
                 controller.sendInput(result.textToPaste)
             }
         } catch {

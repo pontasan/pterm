@@ -600,6 +600,24 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(view.clearColor.alpha, 0.0, accuracy: 0.0001)
     }
 
+    func testTerminalViewImagePreviewClampFitsWithin640By480() {
+        let size = TerminalView.clampedImagePreviewSize(
+            for: NSSize(width: 4000, height: 2000)
+        )
+
+        XCTAssertEqual(size.width, 640, accuracy: 0.0001)
+        XCTAssertEqual(size.height, 320, accuracy: 0.0001)
+    }
+
+    func testTerminalViewImagePreviewClampPreservesSmallerImages() {
+        let size = TerminalView.clampedImagePreviewSize(
+            for: NSSize(width: 320, height: 200)
+        )
+
+        XCTAssertEqual(size.width, 320, accuracy: 0.0001)
+        XCTAssertEqual(size.height, 200, accuracy: 0.0001)
+    }
+
     func testIntegratedViewUsesSRGBRenderTargetConfiguration() throws {
         let renderer = try makeRendererOrSkip()
         let manager = TerminalManager(rows: 24, cols: 80, config: .default)

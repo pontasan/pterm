@@ -90,6 +90,36 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertEqual(TerminalAppearanceConfiguration.default.normalizedBackgroundOpacity, 0.0)
     }
 
+    func testPastedImageRegistryRegistersOnlyImageFilesAndResolvesOneBasedIndices() throws {
+        try withTemporaryDirectory { directory in
+            let image = directory.appendingPathComponent("preview.png")
+            let text = directory.appendingPathComponent("note.txt")
+            try Data([0x89, 0x50, 0x4E, 0x47]).write(to: image)
+            try Data("hello".utf8).write(to: text)
+
+            let registry = PastedImageRegistry()
+            registry.register(createdFiles: [text, image])
+
+            XCTAssertEqual(registry.registeredImageCount(), 1)
+            XCTAssertNil(registry.url(forPlaceholderIndex: 0))
+            XCTAssertEqual(registry.url(forPlaceholderIndex: 1), image)
+            XCTAssertNil(registry.url(forPlaceholderIndex: 2))
+        }
+    }
+
+    func testPastedImageRegistrySkipsMissingFilesDuringLookup() throws {
+        try withTemporaryDirectory { directory in
+            let image = directory.appendingPathComponent("preview.png")
+            try Data([0x89, 0x50, 0x4E, 0x47]).write(to: image)
+
+            let registry = PastedImageRegistry()
+            registry.register(createdFiles: [image])
+            try FileManager.default.removeItem(at: image)
+
+            XCTAssertNil(registry.url(forPlaceholderIndex: 1))
+        }
+    }
+
     func testTerminalColorDefaultDetectionOnlyMatchesDefaultCase() {
         XCTAssertTrue(TerminalColor.default.isDefaultColor)
         XCTAssertFalse(TerminalColor.indexed(0).isDefaultColor)

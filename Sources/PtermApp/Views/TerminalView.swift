@@ -35,6 +35,8 @@ final class TerminalView: MTKView, NSTextInputClient {
     var cmdClickTooltip: String? {
         didSet { toolTip = cmdClickTooltip }
     }
+    /// Resolves terminal `[Image #x]` placeholders to locally stored pasted images.
+    var imagePreviewURLProvider: ((Int) -> URL?)?
 
     /// When true, rendering is demand-driven (only on model changes) instead of 60fps continuous.
     /// Used in split view to avoid overwhelming GPU with many independent display links.
@@ -89,6 +91,9 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     /// URL hover state for Cmd+mouseover visual feedback
     private var hoveredLinkRange: (row: Int, startCol: Int, endCol: Int)?
+    private var hoveredImagePlaceholder: TerminalController.DetectedImagePlaceholder?
+    private var imagePreviewWindow: NSWindow?
+    private var imagePreviewView: NSImageView?
 
     // MARK: - Initialization
 
@@ -138,7 +143,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         }
         let area = NSTrackingArea(
             rect: bounds,
-            options: [.activeInKeyWindow, .inVisibleRect, .mouseMoved],
+            options: [.activeInKeyWindow, .inVisibleRect, .mouseMoved, .mouseEnteredAndExited],
             owner: self,
             userInfo: nil
         )
@@ -238,6 +243,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     deinit {
         cursorBlinkTimer?.invalidate()
         removeWindowObservers()
+        hideImagePreview()
         renderer?.removeBuffers(for: self)
     }
 
@@ -328,6 +334,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     // MARK: - Keyboard Input
 
     override func keyDown(with event: NSEvent) {
+        hideImagePreview()
         if shortcutConfiguration.matches(.backToIntegrated, event: event) {
             onBackToIntegrated?()
             return
@@ -360,7 +367,39 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     override func mouseMoved(with event: NSEvent) {
         if !sendMouseEventIfNeeded(event, phase: .moved) {
+            updateImagePreviewHover(with: event)
             updateLinkHover(with: event)
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hideImagePreview()
+        if hoveredLinkRange != nil {
+            hoveredLinkRange = nil
+            NSCursor.arrow.set()
+        }
+    }
+
+    private func updateImagePreviewHover(with event: NSEvent) {
+        guard let controller = terminalController,
+              let position = gridPosition(from: event),
+              let placeholder = controller.detectedImagePlaceholder(at: position),
+              let imageURL = imagePreviewURLProvider?(placeholder.index) else {
+            hoveredImagePlaceholder = nil
+            hideImagePreview()
+            return
+        }
+
+        let hoverChanged = hoveredImagePlaceholder != placeholder
+        hoveredImagePlaceholder = placeholder
+        if hoverChanged || imagePreviewWindow == nil {
+            guard let image = NSImage(contentsOf: imageURL) else {
+                hideImagePreview()
+                return
+            }
+            showImagePreview(image, for: event)
+        } else {
+            positionImagePreview(near: event)
         }
     }
 
@@ -412,6 +451,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     // MARK: - Mouse Events
 
     override func mouseDown(with event: NSEvent) {
+        hideImagePreview()
         window?.makeFirstResponder(self)
 
         if event.modifierFlags.contains(.command) {
@@ -507,6 +547,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     override func rightMouseDown(with event: NSEvent) {
+        hideImagePreview()
         window?.makeFirstResponder(self)
         if !sendMouseEventIfNeeded(event, phase: .down, buttonOverride: 2) {
             super.rightMouseDown(with: event)
@@ -514,6 +555,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     override func otherMouseDown(with event: NSEvent) {
+        hideImagePreview()
         window?.makeFirstResponder(self)
         if !sendMouseEventIfNeeded(event, phase: .down, buttonOverride: 1) {
             super.otherMouseDown(with: event)
@@ -602,6 +644,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     override func scrollWheel(with event: NSEvent) {
+        hideImagePreview()
         if sendMouseEventIfNeeded(event, phase: .scroll) {
             return
         }
@@ -856,12 +899,14 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
+        hideImagePreview()
         updateTerminalSize()
         updateMarkedTextOverlay()
     }
 
     override func setBoundsSize(_ newSize: NSSize) {
         super.setBoundsSize(newSize)
+        hideImagePreview()
         updateTerminalSize()
         updateMarkedTextOverlay()
     }
@@ -901,6 +946,105 @@ final class TerminalView: MTKView, NSTextInputClient {
     /// Update only the IME overlay without triggering a terminal resize.
     func updateMarkedTextOverlayPublic() {
         updateMarkedTextOverlay()
+    }
+
+    static func clampedImagePreviewSize(
+        for imageSize: NSSize,
+        maxSize: NSSize = NSSize(width: 640, height: 480)
+    ) -> NSSize {
+        guard imageSize.width > 0, imageSize.height > 0 else { return .zero }
+        let widthScale = maxSize.width / imageSize.width
+        let heightScale = maxSize.height / imageSize.height
+        let scale = min(1.0, widthScale, heightScale)
+        return NSSize(width: floor(imageSize.width * scale), height: floor(imageSize.height * scale))
+    }
+
+    private func showImagePreview(_ image: NSImage, for event: NSEvent) {
+        let clampedSize = Self.clampedImagePreviewSize(for: image.size)
+        guard clampedSize.width > 0, clampedSize.height > 0 else {
+            hideImagePreview()
+            return
+        }
+
+        let previewWindow: NSWindow
+        let previewView: NSImageView
+        if let existingWindow = imagePreviewWindow, let existingView = imagePreviewView {
+            previewWindow = existingWindow
+            previewView = existingView
+        } else {
+            let window = NSWindow(
+                contentRect: NSRect(origin: .zero, size: NSSize(width: clampedSize.width + 16, height: clampedSize.height + 16)),
+                styleMask: .borderless,
+                backing: .buffered,
+                defer: false
+            )
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.level = .statusBar
+            window.hasShadow = true
+            window.ignoresMouseEvents = true
+            window.collectionBehavior = [.transient, .ignoresCycle, .moveToActiveSpace]
+
+            let root = NSVisualEffectView(frame: NSRect(origin: .zero, size: window.frame.size))
+            root.material = .hudWindow
+            root.blendingMode = .withinWindow
+            root.state = .active
+            root.wantsLayer = true
+            root.layer?.cornerRadius = 10
+            root.layer?.masksToBounds = true
+
+            let imageView = NSImageView(frame: root.bounds.insetBy(dx: 8, dy: 8))
+            imageView.imageScaling = .scaleProportionallyUpOrDown
+            imageView.imageAlignment = .alignCenter
+            root.addSubview(imageView)
+            window.contentView = root
+
+            imagePreviewWindow = window
+            imagePreviewView = imageView
+            previewWindow = window
+            previewView = imageView
+        }
+
+        previewView.image = image
+        previewWindow.setContentSize(NSSize(width: clampedSize.width + 16, height: clampedSize.height + 16))
+        if let root = previewWindow.contentView {
+            root.frame = NSRect(origin: .zero, size: previewWindow.frame.size)
+            previewView.frame = root.bounds.insetBy(dx: 8, dy: 8)
+        }
+        positionImagePreview(near: event)
+        previewWindow.orderFront(nil)
+    }
+
+    private func positionImagePreview(near event: NSEvent) {
+        guard let previewWindow = imagePreviewWindow,
+              let hostWindow = window else { return }
+
+        let pointInView = convert(event.locationInWindow, from: nil)
+        var screenPoint = hostWindow.convertToScreen(NSRect(
+            x: pointInView.x + 16,
+            y: pointInView.y - 16,
+            width: 0,
+            height: 0
+        )).origin
+        let previewSize = previewWindow.frame.size
+
+        if let visibleFrame = hostWindow.screen?.visibleFrame ?? NSScreen.main?.visibleFrame {
+            if screenPoint.x + previewSize.width > visibleFrame.maxX {
+                screenPoint.x = max(visibleFrame.minX, visibleFrame.maxX - previewSize.width - 12)
+            }
+            if screenPoint.y - previewSize.height < visibleFrame.minY {
+                screenPoint.y = min(visibleFrame.maxY - previewSize.height, screenPoint.y + 32)
+            } else {
+                screenPoint.y -= previewSize.height
+            }
+        }
+
+        previewWindow.setFrameOrigin(screenPoint)
+    }
+
+    private func hideImagePreview() {
+        hoveredImagePlaceholder = nil
+        imagePreviewWindow?.orderOut(nil)
     }
 
     private func currentCursorRect() -> NSRect {

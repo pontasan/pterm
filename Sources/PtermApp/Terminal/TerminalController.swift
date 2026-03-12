@@ -25,6 +25,13 @@ final class TerminalController {
         let endCol: Int
     }
 
+    struct DetectedImagePlaceholder: Equatable {
+        let index: Int
+        let originalText: String
+        let startCol: Int
+        let endCol: Int
+    }
+
     struct SearchMatch: Equatable {
         let absoluteRow: Int
         let startCol: Int
@@ -656,6 +663,47 @@ final class TerminalController {
         }
     }
 
+    func detectedImagePlaceholder(at position: GridPosition) -> DetectedImagePlaceholder? {
+        lock.withReadLock {
+            let rows = visibleRowsLocked()
+            guard position.row >= 0, position.row < rows.count else { return nil }
+
+            let row = rows[position.row]
+            let projection = Self.projectVisibleText(from: row.cells)
+            guard !projection.text.isEmpty,
+                  position.col >= 0,
+                  let characterIndex = projection.characterIndexByColumn[position.col] else {
+                return nil
+            }
+
+            let text = projection.text as NSString
+            let searchRange = NSRange(location: 0, length: text.length)
+            let regex = Self.imagePlaceholderRegex
+            let matches = regex.matches(in: projection.text, options: [], range: searchRange)
+            for match in matches {
+                guard match.numberOfRanges >= 2,
+                      NSLocationInRange(characterIndex, match.range),
+                      let range = Range(match.range(at: 1), in: projection.text),
+                      let index = Int(projection.text[range]) else {
+                    continue
+                }
+                let matchStart = match.range.location
+                let matchEnd = matchStart + match.range.length - 1
+                guard let startCol = projection.columnByCharacterIndex[matchStart],
+                      let endCol = projection.columnByCharacterIndex[matchEnd] else {
+                    continue
+                }
+                return DetectedImagePlaceholder(
+                    index: index,
+                    originalText: text.substring(with: match.range),
+                    startCol: startCol,
+                    endCol: endCol
+                )
+            }
+            return nil
+        }
+    }
+
     private func visibleRowsLocked() -> [ViewportRow] {
         let scrollbackCount = scrollback.rowCount
         let firstAbsolute = scrollOffset > 0 ? max(0, scrollbackCount - scrollOffset) : scrollbackCount
@@ -857,6 +905,8 @@ final class TerminalController {
 
         return (text, colToChar, charToCol)
     }
+
+    private static let imagePlaceholderRegex = try! NSRegularExpression(pattern: #"\[Image #([0-9]+)\]"#)
 }
 
 private extension NSLock {

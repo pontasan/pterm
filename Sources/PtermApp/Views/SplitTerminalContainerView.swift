@@ -25,6 +25,11 @@ final class SplitTerminalContainerView: NSView {
     var onBackToIntegrated: (() -> Void)?
     var onActiveControllerChange: ((TerminalController) -> Void)?
     var onMaximizeTerminal: ((TerminalController) -> Void)?
+    var imagePreviewURLProvider: ((Int) -> URL?)? {
+        didSet {
+            scrollViews.forEach { $0.terminalView.imagePreviewURLProvider = imagePreviewURLProvider }
+        }
+    }
 
     init(frame: NSRect, renderer: MetalRenderer, controllers: [TerminalController]) {
         self.renderer = renderer
@@ -113,6 +118,7 @@ final class SplitTerminalContainerView: NSView {
             scrollView.terminalView.isPaused = true
             scrollView.terminalView.enableSetNeedsDisplay = false
             scrollView.terminalView.alphaValue = 0
+            scrollView.terminalView.imagePreviewURLProvider = imagePreviewURLProvider
             scrollView.terminalView.terminalController = controller
             scrollView.terminalView.onBecameFirstResponder = { [weak self, weak controller] in
                 guard let self, let controller else { return }
