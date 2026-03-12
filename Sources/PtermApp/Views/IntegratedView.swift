@@ -188,6 +188,12 @@ final class IntegratedView: MTKView, NSDraggingSource {
         let glyphVertices: [Float]
     }
 
+    private struct CachedCPUStatus {
+        let pid: pid_t
+        let shellPID: pid_t
+        let text: String?
+    }
+
     private struct TextAtlasSignature: Equatable {
         let fontName: String
         let fontSize: CGFloat
@@ -318,6 +324,9 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private var textVertexCache: [TextVertexCacheKey: CachedTextVertices] = [:]
     private var textAtlasSignature: TextAtlasSignature?
     private var thumbnailVertexCache: [ThumbnailVertexCacheKey: CachedThumbnailVertices] = [:]
+    private var cachedCPUStatusByTerminalID: [UUID: CachedCPUStatus] = [:]
+    private var scrollInteractionTimer: Timer?
+    private var isOverviewScrolling = false
 
     /// Layout constants
     private struct Layout {
@@ -367,6 +376,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         if let companionScrollObserver {
             NotificationCenter.default.removeObserver(companionScrollObserver)
         }
+        scrollInteractionTimer?.invalidate()
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -667,6 +677,27 @@ final class IntegratedView: MTKView, NSDraggingSource {
         }
     }
 
+    private func pruneCPUStatusCache(activeTerminalIDs: Set<UUID>) {
+        guard !cachedCPUStatusByTerminalID.isEmpty else { return }
+        cachedCPUStatusByTerminalID = cachedCPUStatusByTerminalID.filter { activeTerminalIDs.contains($0.key) }
+    }
+
+    private func beginOverviewScrollInteraction() {
+        let wasScrolling = isOverviewScrolling
+        isOverviewScrolling = true
+        scrollInteractionTimer?.invalidate()
+        scrollInteractionTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.isOverviewScrolling = false
+            self.updateRenderLoopState()
+            self.setNeedsDisplay(self.bounds)
+        }
+        if !wasScrolling {
+            hideTooltip()
+            updateRenderLoopState()
+        }
+    }
+
     private func invalidateTextVertexCacheIfNeeded() {
         let signature = TextAtlasSignature(
             fontName: renderer.glyphAtlas.fontName,
@@ -680,7 +711,9 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     private func updateLayoutCacheIfNeeded() {
         let terminals = manager.terminals
-        pruneThumbnailVertexCache(activeTerminalIDs: Set(terminals.map(\.id)))
+        let activeTerminalIDs = Set(terminals.map(\.id))
+        pruneThumbnailVertexCache(activeTerminalIDs: activeTerminalIDs)
+        pruneCPUStatusCache(activeTerminalIDs: activeTerminalIDs)
         let workspaceNames = terminals.map {
             let trimmed = $0.sessionSnapshot.workspaceName.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? "Uncategorized" : trimmed
@@ -999,6 +1032,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     override func scrollWheel(with event: NSEvent) {
         // Forward scroll events to the companion NSScrollView for native scrollbar behavior
+        beginOverviewScrollInteraction()
         companionScrollView?.scrollWheel(with: event)
         setNeedsDisplay(bounds)
     }
@@ -1070,6 +1104,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
 
     override func mouseMoved(with event: NSEvent) {
+        if isOverviewScrolling { return }
         let point = convert(event.locationInWindow, from: nil)
         let newHoveredIndex = thumbnailOrTitleIndex(at: point)
         let newHoveredCloseID = closeButtonController(at: point)?.id
@@ -1617,6 +1652,7 @@ extension IntegratedView: MTKViewDelegate {
 
             // Draw title text
             drawTitle(
+                controllerID: controller.id,
                 title: controller.title,
                 pid: controller.foregroundProcessID ?? controller.processID,
                 shellPID: controller.processID,
@@ -1753,7 +1789,7 @@ extension IntegratedView: MTKViewDelegate {
 
     private func updateRenderLoopState() {
         let isDragging = dragAutoScrollTimer != nil || dragInsertionIndicator != nil || dragWorkspaceIndicator != nil
-        let shouldAnimate = !activeOutputTerminals.isEmpty || isDragging
+        let shouldAnimate = isDragging || (!isOverviewScrolling && !activeOutputTerminals.isEmpty)
         preferredFramesPerSecond = isDragging ? 30 : 8
         isPaused = !shouldAnimate
         enableSetNeedsDisplay = !shouldAnimate
@@ -1776,6 +1812,7 @@ extension IntegratedView: MTKViewDelegate {
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
+            self.beginOverviewScrollInteraction()
             self.syncScrollOffsetFromCompanionScrollView()
             self.setNeedsDisplay(self.bounds)
         }
@@ -1954,6 +1991,7 @@ extension IntegratedView: MTKViewDelegate {
     }
 
     private func drawTitle(
+        controllerID: UUID,
         title: String,
         pid: pid_t,
         shellPID: pid_t,
@@ -1974,19 +2012,26 @@ extension IntegratedView: MTKViewDelegate {
             to: &glyphVertices
         )
 
-        if let usage = cpuUsageProvider?(pid),
-           usage >= 0 {
-            drawRightAlignedTitleText(
-                text: String(format: "CPU: %.0f%%", usage),
-                frame: frame,
-                scaleFactor: scaleFactor,
-                viewportSize: viewportSize,
-                glyphVertices: &glyphVertices
-            )
+        let cpuStatusText: String?
+        if isOverviewScrolling {
+            let cached = cachedCPUStatusByTerminalID[controllerID]
+            cpuStatusText = (cached?.pid == pid && cached?.shellPID == shellPID) ? cached?.text : nil
+        } else if let usage = cpuUsageProvider?(pid), usage >= 0 {
+            let text = String(format: "CPU: %.0f%%", usage)
+            cachedCPUStatusByTerminalID[controllerID] = CachedCPUStatus(pid: pid, shellPID: shellPID, text: text)
+            cpuStatusText = text
         } else if pid != shellPID {
-            // Foreground process (e.g., setuid binary) is not accessible via proc_pidinfo.
+            let text = "CPU: N/A"
+            cachedCPUStatusByTerminalID[controllerID] = CachedCPUStatus(pid: pid, shellPID: shellPID, text: text)
+            cpuStatusText = text
+        } else {
+            cachedCPUStatusByTerminalID[controllerID] = CachedCPUStatus(pid: pid, shellPID: shellPID, text: nil)
+            cpuStatusText = nil
+        }
+
+        if let cpuStatusText {
             drawRightAlignedTitleText(
-                text: "CPU: N/A",
+                text: cpuStatusText,
                 frame: frame,
                 scaleFactor: scaleFactor,
                 viewportSize: viewportSize,
