@@ -107,13 +107,14 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(labels.first(where: { $0.stringValue == "|" })?.isHidden, true)
     }
 
-    func testSettingsWindowControllerBuildsExpectedWindowShell() {
-        let controller = SettingsWindowController()
-        let window = controller.window
+    func testSettingsWindowControllerBuildsExpectedWindowShell() throws {
+        try withIsolatedSettingsController { controller in
+            let window = controller.window
 
-        XCTAssertEqual(window?.title, "Settings")
-        XCTAssertEqual(window?.minSize.width, 540)
-        XCTAssertEqual(window?.minSize.height, 400)
+            XCTAssertEqual(window?.title, "Settings")
+            XCTAssertEqual(window?.minSize.width, 540)
+            XCTAssertEqual(window?.minSize.height, 400)
+        }
     }
 
     func testWindowMaterialPolicyAlwaysUsesTranslucencyForIntegratedView() {
@@ -126,188 +127,199 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(AppDelegate.shouldUseTranslucentWindowMaterial(isIntegratedViewVisible: false, terminalBackgroundOpacity: 0.5))
     }
 
-    func testSettingsWindowControllerUsesDarkAppearanceAndSpecifiedInitialSize() {
-        let controller = SettingsWindowController()
-        let window = controller.window
-        let contentRect = window.map { $0.contentRect(forFrameRect: $0.frame) }
+    func testSettingsWindowControllerUsesDarkAppearanceAndSpecifiedInitialSize() throws {
+        try withIsolatedSettingsController { controller in
+            let window = controller.window
+            let contentRect = window.map { $0.contentRect(forFrameRect: $0.frame) }
 
-        XCTAssertEqual(window?.appearance?.name, .darkAqua)
-        XCTAssertEqual(window?.isReleasedWhenClosed, false)
-        XCTAssertEqual(Double(contentRect?.size.width ?? 0), 640, accuracy: 0.5)
-        XCTAssertEqual(Double(contentRect?.size.height ?? 0), 480, accuracy: 0.5)
+            XCTAssertEqual(window?.appearance?.name, .darkAqua)
+            XCTAssertEqual(window?.isReleasedWhenClosed, false)
+            XCTAssertEqual(Double(contentRect?.size.width ?? 0), 640, accuracy: 0.5)
+            XCTAssertEqual(Double(contentRect?.size.height ?? 0), 480, accuracy: 0.5)
+        }
     }
 
-    func testSettingsWindowControllerSupportsExpectedWindowControls() {
-        let controller = SettingsWindowController()
-        let styleMask = controller.window?.styleMask ?? []
+    func testSettingsWindowControllerSupportsExpectedWindowControls() throws {
+        try withIsolatedSettingsController { controller in
+            let styleMask = controller.window?.styleMask ?? []
 
-        XCTAssertTrue(styleMask.contains(.titled))
-        XCTAssertTrue(styleMask.contains(.closable))
-        XCTAssertTrue(styleMask.contains(.resizable))
-        XCTAssertTrue(styleMask.contains(.miniaturizable))
+            XCTAssertTrue(styleMask.contains(.titled))
+            XCTAssertTrue(styleMask.contains(.closable))
+            XCTAssertTrue(styleMask.contains(.resizable))
+            XCTAssertTrue(styleMask.contains(.miniaturizable))
+        }
     }
 
-    func testSettingsWindowControllerInvokesOnCloseCallback() {
-        let controller = SettingsWindowController()
-        var didClose = false
-        controller.onClose = { didClose = true }
+    func testSettingsWindowControllerInvokesOnCloseCallback() throws {
+        try withIsolatedSettingsController { controller in
+            var didClose = false
+            controller.onClose = { didClose = true }
 
-        controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
+            controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
 
-        XCTAssertTrue(didClose)
+            XCTAssertTrue(didClose)
+        }
     }
 
     func testSettingsWindowSidebarListsSpecSectionsInOrder() throws {
-        let controller = SettingsWindowController()
-        let tableView = try XCTUnwrap(findSubview(in: controller.window?.contentView) { $0 is NSTableView } as? NSTableView)
+        try withIsolatedSettingsController { controller in
+            let tableView = try XCTUnwrap(findSubview(in: controller.window?.contentView) { $0 is NSTableView } as? NSTableView)
 
-        let sectionLabels = (0..<tableView.numberOfRows).compactMap { row -> String? in
-            let cell = controller.tableView(tableView, viewFor: tableView.tableColumns.first, row: row) as? NSTableCellView
-            return cell?.textField?.stringValue
+            let sectionLabels = (0..<tableView.numberOfRows).compactMap { row -> String? in
+                let cell = controller.tableView(tableView, viewFor: tableView.tableColumns.first, row: row) as? NSTableCellView
+                return cell?.textField?.stringValue
+            }
+
+            XCTAssertEqual(sectionLabels, ["General", "Appearance", "Memory", "Security", "Audit"])
         }
-
-        XCTAssertEqual(sectionLabels, ["General", "Appearance", "Memory", "Security", "Audit"])
     }
 
     func testSettingsWindowGeneralSectionShowsExpectedPopupChoices() throws {
-        let controller = SettingsWindowController()
-        let popups = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSPopUpButton }
+        try withIsolatedSettingsController { controller in
+            let popups = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSPopUpButton }
 
-        let termPopup = try XCTUnwrap(popups.first(where: { Set($0.itemTitles) == Set(["xterm-256color", "xterm", "vt100"]) }))
-        let encodingPopup = try XCTUnwrap(popups.first(where: { $0.itemTitles.contains("UTF-8") && $0.itemTitles.contains("UTF-16") }))
+            let termPopup = try XCTUnwrap(popups.first(where: { Set($0.itemTitles) == Set(["xterm-256color", "xterm", "vt100"]) }))
+            let encodingPopup = try XCTUnwrap(popups.first(where: { $0.itemTitles.contains("UTF-8") && $0.itemTitles.contains("UTF-16") }))
 
-        XCTAssertEqual(termPopup.itemTitles, ["xterm-256color", "xterm", "vt100"])
-        XCTAssertEqual(encodingPopup.itemTitles, ["UTF-8", "UTF-16", "UTF-16LE", "UTF-16BE"])
+            XCTAssertEqual(termPopup.itemTitles, ["xterm-256color", "xterm", "vt100"])
+            XCTAssertEqual(encodingPopup.itemTitles, ["UTF-8", "UTF-16", "UTF-16LE", "UTF-16BE"])
+        }
     }
 
     func testSettingsWindowGeneralSectionShowsFactoryResetButton() throws {
-        let controller = SettingsWindowController()
-        let buttons = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }
+        try withIsolatedSettingsController { controller in
+            let buttons = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }
 
-        let resetButton = try XCTUnwrap(buttons.first(where: { $0.identifier?.rawValue == "factoryResetButton" }))
+            let resetButton = try XCTUnwrap(buttons.first(where: { $0.identifier?.rawValue == "factoryResetButton" }))
 
-        XCTAssertEqual(resetButton.title, "Restore Defaults…")
+            XCTAssertEqual(resetButton.title, "Restore Defaults…")
+        }
     }
 
     func testSettingsWindowAuditSectionStartsWithDependentControlsDisabledWhenAuditIsOff() throws {
-        let controller = SettingsWindowController()
-        let tableView = try XCTUnwrap(findSubview(in: controller.window?.contentView) { $0 is NSTableView } as? NSTableView)
+        try withIsolatedSettingsController { controller in
+            let tableView = try XCTUnwrap(findSubview(in: controller.window?.contentView) { $0 is NSTableView } as? NSTableView)
 
-        tableView.selectRowIndexes(IndexSet(integer: 4), byExtendingSelection: false)
-        controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
+            tableView.selectRowIndexes(IndexSet(integer: 4), byExtendingSelection: false)
+            controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
 
-        let enableAudit = try XCTUnwrap(allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }.first(where: { $0.title == "Enable audit logging" }))
-        let encryptLogs = try XCTUnwrap(allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }.first(where: { $0.title == "Encrypt audit logs" }))
-        let textFields = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSTextField }
-        let retentionField = try XCTUnwrap(textFields.first(where: { $0.isEditable && $0.stringValue == "30" }))
+            let enableAudit = try XCTUnwrap(allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }.first(where: { $0.title == "Enable audit logging" }))
+            let encryptLogs = try XCTUnwrap(allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }.first(where: { $0.title == "Encrypt audit logs" }))
+            let textFields = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSTextField }
+            let retentionField = try XCTUnwrap(textFields.first(where: { $0.isEditable && $0.stringValue == "30" }))
 
-        enableAudit.state = .off
-        _ = enableAudit.target?.perform(enableAudit.action, with: enableAudit)
+            enableAudit.state = .off
+            _ = enableAudit.target?.perform(enableAudit.action, with: enableAudit)
 
-        XCTAssertEqual(enableAudit.state, .off)
-        XCTAssertFalse(retentionField.isEnabled)
-        XCTAssertFalse(encryptLogs.isEnabled)
+            XCTAssertEqual(enableAudit.state, .off)
+            XCTAssertFalse(retentionField.isEnabled)
+            XCTAssertFalse(encryptLogs.isEnabled)
+        }
     }
 
     func testSettingsWindowAuditSectionEnablingAuditActivatesDependentControls() throws {
-        let controller = SettingsWindowController()
-        let tableView = try XCTUnwrap(findSubview(in: controller.window?.contentView) { $0 is NSTableView } as? NSTableView)
+        try withIsolatedSettingsController { controller in
+            let tableView = try XCTUnwrap(findSubview(in: controller.window?.contentView) { $0 is NSTableView } as? NSTableView)
 
-        tableView.selectRowIndexes(IndexSet(integer: 4), byExtendingSelection: false)
-        controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
+            tableView.selectRowIndexes(IndexSet(integer: 4), byExtendingSelection: false)
+            controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
 
-        let enableAudit = try XCTUnwrap(allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }.first(where: { $0.title == "Enable audit logging" }))
-        let encryptLogs = try XCTUnwrap(allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }.first(where: { $0.title == "Encrypt audit logs" }))
-        let textFields = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSTextField }
-        let retentionField = try XCTUnwrap(textFields.first(where: { $0.isEditable && $0.stringValue == "30" }))
+            let enableAudit = try XCTUnwrap(allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }.first(where: { $0.title == "Enable audit logging" }))
+            let encryptLogs = try XCTUnwrap(allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }.first(where: { $0.title == "Encrypt audit logs" }))
+            let textFields = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSTextField }
+            let retentionField = try XCTUnwrap(textFields.first(where: { $0.isEditable && $0.stringValue == "30" }))
 
-        enableAudit.state = .on
-        _ = enableAudit.target?.perform(enableAudit.action, with: enableAudit)
+            enableAudit.state = .on
+            _ = enableAudit.target?.perform(enableAudit.action, with: enableAudit)
 
-        XCTAssertEqual(enableAudit.state, .on)
-        XCTAssertTrue(retentionField.isEnabled)
-        XCTAssertTrue(encryptLogs.isEnabled)
+            XCTAssertEqual(enableAudit.state, .on)
+            XCTAssertTrue(retentionField.isEnabled)
+            XCTAssertTrue(encryptLogs.isEnabled)
+        }
     }
 
     func testSettingsWindowShowWindowPreservesSelectedSection() throws {
-        let controller = SettingsWindowController()
-        let tableView = try XCTUnwrap(findSubview(in: controller.window?.contentView) { $0 is NSTableView } as? NSTableView)
+        try withIsolatedSettingsController { controller in
+            let tableView = try XCTUnwrap(findSubview(in: controller.window?.contentView) { $0 is NSTableView } as? NSTableView)
 
-        tableView.selectRowIndexes(IndexSet(integer: 3), byExtendingSelection: false)
-        controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
-        controller.showWindow()
+            tableView.selectRowIndexes(IndexSet(integer: 3), byExtendingSelection: false)
+            controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
+            controller.showWindow()
 
-        XCTAssertEqual(tableView.selectedRow, 3)
-        let buttonTitles = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }.map(\.title)
-        XCTAssertTrue(buttonTitles.contains("Allow OSC 52 clipboard read"))
+            XCTAssertEqual(tableView.selectedRow, 3)
+            let buttonTitles = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }.map(\.title)
+            XCTAssertTrue(buttonTitles.contains("Allow OSC 52 clipboard read"))
+        }
     }
 
     func testSettingsWindowAppearanceSectionShowsTerminalColorControlsAndOpacitySlider() throws {
-        let controller = SettingsWindowController()
-        controller.showWindow()
-        let windowContentView = try XCTUnwrap(controller.window?.contentView)
-        let tableView = try XCTUnwrap(findSubview(in: windowContentView) { $0 is NSTableView } as? NSTableView)
+        try withIsolatedSettingsController { controller in
+            controller.showWindow()
+            let windowContentView = try XCTUnwrap(controller.window?.contentView)
+            let tableView = try XCTUnwrap(findSubview(in: windowContentView) { $0 is NSTableView } as? NSTableView)
 
-        tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
-        controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
-        controller.window?.contentView?.layoutSubtreeIfNeeded()
-        controller.window?.displayIfNeeded()
+            tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+            controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
+            controller.window?.contentView?.layoutSubtreeIfNeeded()
+            controller.window?.displayIfNeeded()
 
-        let discoveredSubviews = allSubviews(in: windowContentView)
-        let colorWells = discoveredSubviews.compactMap { $0 as? NSColorWell }
-        let slider = try XCTUnwrap(
-            discoveredSubviews
-                .compactMap { $0 as? NSSlider }
-                .first { $0.identifier?.rawValue == "terminalBackgroundOpacitySlider" }
-        )
-        let labels = discoveredSubviews.compactMap { $0 as? NSTextField }.map(\.stringValue)
+            let discoveredSubviews = allSubviews(in: windowContentView)
+            let colorWells = discoveredSubviews.compactMap { $0 as? NSColorWell }
+            let slider = try XCTUnwrap(
+                discoveredSubviews
+                    .compactMap { $0 as? NSSlider }
+                    .first { $0.identifier?.rawValue == "terminalBackgroundOpacitySlider" }
+            )
+            let labels = discoveredSubviews.compactMap { $0 as? NSTextField }.map(\.stringValue)
 
-        let identifiedColorWells = colorWells.filter {
-            $0.identifier?.rawValue == "terminalForegroundColorWell" ||
-                $0.identifier?.rawValue == "terminalBackgroundColorWell"
+            let identifiedColorWells = colorWells.filter {
+                $0.identifier?.rawValue == "terminalForegroundColorWell" ||
+                    $0.identifier?.rawValue == "terminalBackgroundColorWell"
+            }
+
+            XCTAssertEqual(identifiedColorWells.count, 2)
+            XCTAssertGreaterThanOrEqual(slider.doubleValue, 0.0)
+            XCTAssertLessThanOrEqual(slider.doubleValue, 1.0)
+            XCTAssertTrue(labels.contains("Terminal Foreground:"))
+            XCTAssertTrue(labels.contains("Terminal Background:"))
+            XCTAssertTrue(labels.contains("Background Opacity:"))
         }
-
-        XCTAssertEqual(identifiedColorWells.count, 2)
-        XCTAssertGreaterThanOrEqual(slider.doubleValue, 0.0)
-        XCTAssertLessThanOrEqual(slider.doubleValue, 1.0)
-        XCTAssertTrue(labels.contains("Terminal Foreground:"))
-        XCTAssertTrue(labels.contains("Terminal Background:"))
-        XCTAssertTrue(labels.contains("Background Opacity:"))
     }
 
     func testSettingsWindowAppearanceLabelsDoNotOverlapControls() throws {
-        let controller = SettingsWindowController()
-        controller.showWindow()
-        let windowContentView = try XCTUnwrap(controller.window?.contentView)
-        let tableView = try XCTUnwrap(findSubview(in: windowContentView) { $0 is NSTableView } as? NSTableView)
+        try withIsolatedSettingsController { controller in
+            controller.showWindow()
+            let windowContentView = try XCTUnwrap(controller.window?.contentView)
+            let tableView = try XCTUnwrap(findSubview(in: windowContentView) { $0 is NSTableView } as? NSTableView)
 
-        tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
-        controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
-        controller.window?.contentView?.layoutSubtreeIfNeeded()
-        controller.window?.displayIfNeeded()
+            tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+            controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
+            controller.window?.contentView?.layoutSubtreeIfNeeded()
+            controller.window?.displayIfNeeded()
 
-        let subviews = allSubviews(in: windowContentView)
-        let labels = subviews.compactMap { $0 as? NSTextField }.filter {
-            ["Terminal Foreground:", "Terminal Background:", "Background Opacity:"].contains($0.stringValue)
-        }
-        let controls = subviews.compactMap { view -> NSView? in
-            if let colorWell = view as? NSColorWell,
-               let id = colorWell.identifier?.rawValue,
-               ["terminalForegroundColorWell", "terminalBackgroundColorWell"].contains(id) {
-                return colorWell
+            let subviews = allSubviews(in: windowContentView)
+            let labels = subviews.compactMap { $0 as? NSTextField }.filter {
+                ["Terminal Foreground:", "Terminal Background:", "Background Opacity:"].contains($0.stringValue)
             }
-            if let slider = view as? NSSlider, slider.identifier?.rawValue == "terminalBackgroundOpacitySlider" {
-                return slider
+            let controls = subviews.compactMap { view -> NSView? in
+                if let colorWell = view as? NSColorWell,
+                   let id = colorWell.identifier?.rawValue,
+                   ["terminalForegroundColorWell", "terminalBackgroundColorWell"].contains(id) {
+                    return colorWell
+                }
+                if let slider = view as? NSSlider, slider.identifier?.rawValue == "terminalBackgroundOpacitySlider" {
+                    return slider
+                }
+                return nil
             }
-            return nil
-        }
 
-        XCTAssertEqual(labels.count, 3)
-        XCTAssertEqual(controls.count, 3)
+            XCTAssertEqual(labels.count, 3)
+            XCTAssertEqual(controls.count, 3)
 
-        for label in labels {
-            let overlappingControls = controls.filter { label.frame.intersects($0.frame) }
-            XCTAssertTrue(overlappingControls.isEmpty, "Label \(label.stringValue) should not overlap any control")
+            for label in labels {
+                let overlappingControls = controls.filter { label.frame.intersects($0.frame) }
+                XCTAssertTrue(overlappingControls.isEmpty, "Label \(label.stringValue) should not overlap any control")
+            }
         }
     }
 
@@ -3145,6 +3157,15 @@ final class AppKitComponentTests: XCTestCase {
         }
 
         try testCase()
+    }
+
+    private func withIsolatedSettingsController<T>(
+        _ body: (SettingsWindowController) throws -> T
+    ) throws -> T {
+        try withTemporaryHomeDirectory { _ in
+            PtermDirectories.ensureDirectories()
+            return try body(SettingsWindowController())
+        }
     }
 
 }
