@@ -39,7 +39,7 @@ final class AppKitComponentTests: XCTestCase {
         view.layoutSubtreeIfNeeded()
 
         let labels = view.subviews.compactMap { $0 as? NSTextField }.map(\.stringValue)
-        XCTAssertTrue(labels.contains("CPU: 12% | MEM: 512MB"))
+        XCTAssertTrue(labels.contains("CPU: 12.4% | MEM: 512MB"))
 
         let buttonTitles = view.subviews.compactMap { $0 as? NSButton }.map(\.title)
         XCTAssertTrue(buttonTitles.contains("Edit Notes"))
@@ -51,7 +51,7 @@ final class AppKitComponentTests: XCTestCase {
         view.layoutSubtreeIfNeeded()
 
         let labels = allSubviews(in: view).compactMap { $0 as? NSTextField }.map(\.stringValue)
-        XCTAssertTrue(labels.contains("CPU: --% | MEM: -- MB"))
+        XCTAssertTrue(labels.contains("CPU: --.-% | MEM: -- MB"))
     }
 
     func testStatusBarButtonsInvokeCallbacks() {
@@ -1411,7 +1411,7 @@ final class AppKitComponentTests: XCTestCase {
         view.layoutSubtreeIfNeeded()
 
         let labels = allSubviews(in: view).compactMap { $0 as? NSTextField }.map(\.stringValue)
-        XCTAssertTrue(labels.contains("CPU: 13% | MEM: 2MB"))
+        XCTAssertTrue(labels.contains("CPU: 12.6% | MEM: 2MB"))
     }
 
     func testStatusBarFormatsZeroMetricsWithoutPlaceholderSpacing() {
@@ -1421,7 +1421,7 @@ final class AppKitComponentTests: XCTestCase {
         view.layoutSubtreeIfNeeded()
 
         let labels = allSubviews(in: view).compactMap { $0 as? NSTextField }.map(\.stringValue)
-        XCTAssertTrue(labels.contains("CPU: 0% | MEM: 0MB"))
+        XCTAssertTrue(labels.contains("CPU: 0.0% | MEM: 0MB"))
     }
 
     func testSearchBarLayoutPlacesCountLabelOnRightEdge() {
@@ -1576,7 +1576,7 @@ final class AppKitComponentTests: XCTestCase {
 
         let labels = allSubviews(in: view).compactMap { $0 as? NSTextField }.map(\.stringValue)
 
-        XCTAssertTrue(labels.contains("CPU: 21% | MEM: 256MB"))
+        XCTAssertTrue(labels.contains("CPU: 21.0% | MEM: 256MB"))
     }
 
     func testStatusBarMemoryUpdateKeepsExistingCpuValue() {
@@ -1588,7 +1588,7 @@ final class AppKitComponentTests: XCTestCase {
 
         let labels = allSubviews(in: view).compactMap { $0 as? NSTextField }.map(\.stringValue)
 
-        XCTAssertTrue(labels.contains("CPU: 33% | MEM: 384MB"))
+        XCTAssertTrue(labels.contains("CPU: 33.0% | MEM: 384MB"))
     }
 
     func testStatusBarRepeatedBackButtonVisibilityCallKeepsControlsVisible() {

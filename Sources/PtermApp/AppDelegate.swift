@@ -52,6 +52,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         static let searchBarHeight: CGFloat = 40
     }
 
+    private enum SessionPersistence {
+        static let debounceInterval: TimeInterval = 0.15
+        static let queueLabel = "com.pterm.session-persistence"
+    }
+
     /// The single application window
     private var window: NSWindow!
 
@@ -84,6 +89,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cpuUsageByPID: [pid_t: Double] = [:]
     private var lastMemoryByPID: [pid_t: UInt64] = [:]
     private var lastAppMemoryBytes: UInt64 = 0
+    private let sessionPersistenceQueue = DispatchQueue(label: SessionPersistence.queueLabel, qos: .utility)
+    private lazy var sessionPersistenceCoordinator = DebouncedActionCoordinator(
+        debounceInterval: SessionPersistence.debounceInterval,
+        scheduleQueue: .main
+    ) { [weak self] in
+        self?.persistSessionAsynchronously()
+    }
 
     /// Metal renderer (shared by all views)
     private var renderer: MetalRenderer!
@@ -128,11 +140,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         static let uncategorized = "Uncategorized"
     }
 
+    enum TerminalListPresentation: Equatable {
+        case integrated
+        case focused(UUID)
+        case split([UUID])
+    }
+
     static func shouldUseTranslucentWindowMaterial(
         isIntegratedViewVisible: Bool,
         terminalBackgroundOpacity: Double
     ) -> Bool {
         isIntegratedViewVisible || terminalBackgroundOpacity < 0.999
+    }
+
+    static func reconcilePresentationAfterTerminalListChange(
+        currentPresentation: TerminalListPresentation,
+        remainingTerminalIDs: [UUID]
+    ) -> TerminalListPresentation {
+        let remainingSet = Set(remainingTerminalIDs)
+        switch currentPresentation {
+        case .integrated:
+            return .integrated
+        case .focused(let id):
+            return remainingSet.contains(id) ? .focused(id) : .integrated
+        case .split(let ids):
+            let remaining = ids.filter { remainingSet.contains($0) }
+            if remaining.count >= 2 {
+                return .split(remaining)
+            }
+            if let first = remaining.first {
+                return .focused(first)
+            }
+            return .integrated
+        }
     }
 
     static func newTerminalShortcutContext(
@@ -263,7 +303,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.promptCreateWorkspace()
         }
         iv.onAddTerminalToWorkspace = { [weak self] workspace in
-            self?.addNewTerminal(workspaceName: workspace)
+            self?.addNewTerminal(workspaceName: workspace, startAsynchronously: true)
         }
         iv.onRemoveWorkspace = { [weak self] workspace in
             self?.removeWorkspace(named: workspace)
@@ -374,7 +414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if !isTerminating {
             isTerminating = true
-            persistSession()
+            flushPendingSessionPersistence()
         }
         clipboardCleanupService?.stop()
         manager.stopAll(
@@ -395,7 +435,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 textEncoding: TerminalTextEncoding? = nil,
                                 fontName: String? = nil,
                                 fontSize: Double? = nil,
-                                id: UUID = UUID()) -> TerminalController? {
+                                id: UUID = UUID(),
+                                startAsynchronously: Bool = false) -> TerminalController? {
         ensureWorkspaceExists(named: workspaceName)
         do {
             let controller = try manager.addTerminal(
@@ -406,6 +447,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 fontName: fontName ?? renderer.glyphAtlas.fontName,
                 fontSize: fontSize ?? Double(renderer.glyphAtlas.fontSize),
                 id: id,
+                startAsynchronously: startAsynchronously,
+                onStartFailure: { error in
+                    let alert = NSAlert.pterm()
+                    alert.messageText = "Failed to start terminal"
+                    alert.informativeText = "\(error)"
+                    alert.alertStyle = .critical
+                    alert.runModal()
+                },
                 configure: { [weak self] controller in
                     self?.configureController(controller)
                 }
@@ -426,34 +475,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        if manager.count == 0 && workspaceNames.isEmpty {
-            NSApplication.shared.terminate(nil)
-            return
+        let currentPresentation: TerminalListPresentation
+        switch viewMode {
+        case .integrated:
+            currentPresentation = .integrated
+        case .focused(let controller):
+            currentPresentation = .focused(controller.id)
+        case .split(let controllers):
+            currentPresentation = .split(controllers.map(\.id))
         }
 
-        // If the focused terminal was removed, switch back to integrated view
-        switch viewMode {
-        case .focused(let controller):
-            if !manager.terminals.contains(where: { $0 === controller }) {
+        let nextPresentation = Self.reconcilePresentationAfterTerminalListChange(
+            currentPresentation: currentPresentation,
+            remainingTerminalIDs: manager.terminals.map(\.id)
+        )
+
+        switch nextPresentation {
+        case .integrated:
+            if case .integrated = viewMode {
+                break
+            }
+            switchToIntegrated()
+        case .focused(let id):
+            guard let controller = manager.terminals.first(where: { $0.id == id }) else {
                 switchToIntegrated()
+                break
             }
-        case .split(let controllers):
-            let remaining = controllers.filter { current in
-                manager.terminals.contains(where: { $0 === current })
+            switchToFocused(controller)
+        case .split(let ids):
+            let controllers = ids.compactMap { id in
+                manager.terminals.first(where: { $0.id == id })
             }
-            if remaining.count >= 2 {
-                switchToSplit(remaining)
-            } else if let first = remaining.first {
+            if controllers.count >= 2 {
+                switchToSplit(controllers)
+            } else if let first = controllers.first {
                 switchToFocused(first)
             } else {
                 switchToIntegrated()
             }
-        case .integrated:
-            break
         }
 
         updateWindowTitle()
-        persistSession()
+        requestSessionPersist()
     }
 
     // MARK: - View Switching
@@ -497,7 +560,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sv.terminalView.syncScaleFactorIfNeeded()
 
         updateWindowTitle()
-        persistSession()
+        requestSessionPersist()
     }
 
     private func switchToSplit(_ controllers: [TerminalController]) {
@@ -549,7 +612,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.makeFirstResponder(first.terminalView)
         }
         updateWindowTitle()
-        persistSession()
+        requestSessionPersist()
     }
 
     private func switchToIntegrated() {
@@ -581,7 +644,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.promptCreateWorkspace()
             }
             iv.onAddTerminalToWorkspace = { [weak self] workspace in
-                self?.addNewTerminal(workspaceName: workspace)
+                self?.addNewTerminal(workspaceName: workspace, startAsynchronously: true)
             }
             iv.onRemoveWorkspace = { [weak self] workspace in
                 self?.removeWorkspace(named: workspace)
@@ -623,7 +686,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeFirstResponder(iv)
 
         updateWindowTitle()
-        persistSession()
+        requestSessionPersist()
     }
 
     private func applyRendererSettings(for controller: TerminalController) {
@@ -1064,7 +1127,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         guard let shortcutContext,
-              let newController = addNewTerminal(workspaceName: shortcutContext.workspaceName) else {
+              let newController = addNewTerminal(
+                workspaceName: shortcutContext.workspaceName,
+                startAsynchronously: true
+              ) else {
             return
         }
         switchToSplit(shortcutContext.displayedControllers + [newController])
@@ -1230,12 +1296,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onTitleChange = { [weak self] _ in
             DispatchQueue.main.async {
                 self?.updateWindowTitle()
-                self?.persistSession()
+                self?.requestSessionPersist()
             }
         }
         controller.onStateChange = { [weak self] in
             DispatchQueue.main.async {
-                self?.persistSession()
+                self?.requestSessionPersist()
             }
         }
         controller.onOutputActivity = { [weak self, weak controller] in
@@ -1288,14 +1354,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func persistSession() {
+    private func requestSessionPersist() {
+        guard !isTerminating else { return }
+        sessionPersistenceCoordinator.schedule()
+    }
+
+    private func flushPendingSessionPersistence() {
+        guard !Thread.isMainThread else {
+            sessionPersistenceCoordinator.flush()
+            persistSessionSynchronously()
+            return
+        }
+        DispatchQueue.main.sync { [weak self] in
+            self?.sessionPersistenceCoordinator.flush()
+            self?.persistSessionSynchronously()
+        }
+    }
+
+    private func persistSessionAsynchronously() {
         guard Thread.isMainThread else {
             DispatchQueue.main.async { [weak self] in
-                self?.persistSession()
+                self?.persistSessionAsynchronously()
             }
             return
         }
-        guard let window, let manager else { return }
+        guard let payload = sessionPersistencePayload() else { return }
+        sessionPersistenceQueue.async { [weak self] in
+            self?.performSessionPersistence(payload)
+        }
+    }
+
+    private func persistSessionSynchronously() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.sync { [weak self] in
+                self?.persistSessionSynchronously()
+            }
+            return
+        }
+        guard let payload = sessionPersistencePayload() else { return }
+        sessionPersistenceQueue.sync { [weak self] in
+            self?.performSessionPersistence(payload)
+        }
+    }
+
+    private func sessionPersistencePayload() -> (
+        state: PersistedSessionState,
+        shouldCleanup: Bool,
+        sessionScrollBufferPersistenceEnabled: Bool
+    )? {
+        guard let window, let manager else { return nil }
         let presentedMode: PersistedSessionState.PresentedMode
         let splitIDs: [UUID]
         switch viewMode {
@@ -1317,9 +1424,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             workspaceNames: workspaceNames,
             terminals: manager.terminals.map(\.sessionSnapshot)
         )
-        try? sessionStore.save(state)
-        if !isRestoringSession {
-            cleanupOrphanedScrollbackFiles(retaining: Set(state.terminals.map(\.id)))
+        return (state, !isRestoringSession, config.sessionScrollBufferPersistence)
+    }
+
+    private func performSessionPersistence(_ payload: (
+        state: PersistedSessionState,
+        shouldCleanup: Bool,
+        sessionScrollBufferPersistenceEnabled: Bool
+    )) {
+        try? sessionStore.save(payload.state)
+        if payload.shouldCleanup {
+            cleanupOrphanedScrollbackFiles(
+                sessionScrollBufferPersistenceEnabled: payload.sessionScrollBufferPersistenceEnabled,
+                retaining: Set(payload.state.terminals.map(\.id))
+            )
         }
     }
 
@@ -1372,7 +1490,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        cleanupOrphanedScrollbackFiles(retaining: Set(state.terminals.map(\.id)))
+        cleanupOrphanedScrollbackFiles(
+            sessionScrollBufferPersistenceEnabled: config.sessionScrollBufferPersistence,
+            retaining: Set(state.terminals.map(\.id))
+        )
 
         if state.terminals.isEmpty {
             if !workspaceNames.isEmpty {
@@ -1756,12 +1877,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func removeWorkspace(named workspace: String) {
         let normalized = normalizedWorkspaceName(workspace)
         let targets = manager.terminals.filter { $0.sessionSnapshot.workspaceName == normalized }
-        for controller in targets {
-            manager.removeTerminal(controller)
-        }
+        manager.removeTerminals(targets)
         workspaceNames.removeAll { $0 == normalized }
         syncIntegratedWorkspaceNames()
-        persistSession()
+        requestSessionPersist()
     }
 
     private func renameWorkspace(from oldName: String, to newName: String) {
@@ -1777,14 +1896,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         workspaceNames = deduplicatedWorkspaceNamesPreservingOrder(workspaceNames)
         syncIntegratedWorkspaceNames()
-        persistSession()
+        requestSessionPersist()
     }
 
     private func moveTerminal(_ controller: TerminalController, toWorkspace workspace: String) {
         let normalized = normalizedWorkspaceName(workspace)
         controller.setWorkspaceName(normalized)
         ensureWorkspaceExists(named: normalized)
-        persistSession()
+        requestSessionPersist()
     }
 
     private func reorderTerminal(_ controller: TerminalController, toWorkspace workspace: String, atIndex index: Int) {
@@ -1792,7 +1911,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.setWorkspaceName(normalized)
         ensureWorkspaceExists(named: normalized)
         manager.reorderTerminal(controller, toWorkspace: normalized, atIndex: index)
-        persistSession()
+        requestSessionPersist()
     }
 
     private func reorderWorkspace(_ name: String, toIndex index: Int) {
@@ -1802,12 +1921,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let adjustedIndex = min(index > fromIndex ? index - 1 : index, workspaceNames.count)
         workspaceNames.insert(normalized, at: adjustedIndex)
         syncIntegratedWorkspaceNames()
-        persistSession()
+        requestSessionPersist()
     }
 
     private func renameTerminalTitle(_ controller: TerminalController, title: String?) {
         controller.setCustomTitle(title)
-        persistSession()
+        requestSessionPersist()
     }
 
     private func applyInitialFontConfiguration(_ restoredSession: PersistedSessionState?) {
@@ -1834,7 +1953,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for controller in manager.terminals {
             controller.updateFontSettings(name: fontName, size: fontSize, notify: false)
         }
-        persistSession()
+        requestSessionPersist()
     }
 
     private func setupScrollbarOverlay(for iv: IntegratedView) {
@@ -1907,13 +2026,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let normalized = normalizedWorkspaceName(trimmed)
             guard normalized != WorkspaceNaming.uncategorized else { return }
             ensureWorkspaceExists(named: normalized)
-            persistSession()
+            requestSessionPersist()
             return
         }
     }
 
-    private func cleanupOrphanedScrollbackFiles(retaining ids: Set<UUID>) {
-        guard config.sessionScrollBufferPersistence else {
+    private func cleanupOrphanedScrollbackFiles(
+        sessionScrollBufferPersistenceEnabled: Bool,
+        retaining ids: Set<UUID>
+    ) {
+        guard sessionScrollBufferPersistenceEnabled else {
             try? FileManager.default.removeItem(at: PtermDirectories.sessionScrollback)
             PtermDirectories.ensureDirectories()
             return
@@ -1994,12 +2116,12 @@ extension AppDelegate: NSWindowDelegate {
         manager.updateFullSize(rows: rows, cols: cols)
         updateWindowTitle()
         if shouldPersistSession {
-            persistSession()
+            requestSessionPersist()
         }
     }
 
     func windowDidMove(_ notification: Notification) {
-        persistSession()
+        requestSessionPersist()
     }
 
     func windowDidChangeScreen(_ notification: Notification) {
@@ -2114,7 +2236,7 @@ extension AppDelegate: NSWindowDelegate {
             }
         }
         isTerminating = true
-        persistSession()
+        flushPendingSessionPersistence()
         return true
     }
 

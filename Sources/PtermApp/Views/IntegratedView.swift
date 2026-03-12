@@ -2065,7 +2065,7 @@ extension IntegratedView: MTKViewDelegate {
             let cached = cachedCPUStatusByTerminalID[controllerID]
             cpuStatusText = (cached?.pid == pid && cached?.shellPID == shellPID) ? cached?.text : nil
         } else if let usage = cpuUsageProvider?(pid), usage >= 0 {
-            let text = String(format: "CPU: %.0f%%", usage)
+            let text = String(format: "CPU: %.1f%%", usage)
             cachedCPUStatusByTerminalID[controllerID] = CachedCPUStatus(pid: pid, shellPID: shellPID, text: text)
             cpuStatusText = text
         } else if pid != shellPID {

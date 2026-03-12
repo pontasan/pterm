@@ -11,6 +11,8 @@
 typedef struct {
     uint32_t magic;
     uint32_t version;
+    uint64_t initial_data_capacity;
+    uint64_t initial_row_capacity;
     uint64_t data_capacity;
     uint64_t max_data_capacity;
     uint64_t write_offset;
@@ -22,7 +24,7 @@ typedef struct {
 } RingBufferDiskHeader;
 
 #define RING_BUFFER_DISK_MAGIC   0x5054524D  /* PTRM */
-#define RING_BUFFER_DISK_VERSION 2
+#define RING_BUFFER_DISK_VERSION 3
 
 static void ring_buffer_zero_memory(void *ptr, size_t len) {
     if (!ptr || len == 0) return;
@@ -52,10 +54,25 @@ static bool ring_buffer_add_overflow(size_t a, size_t b, size_t *out) {
     return false;
 }
 
-static size_t ring_buffer_mmap_length(size_t capacity) {
+static uint32_t ring_buffer_compute_initial_row_capacity(size_t initial_data_capacity) {
+    const size_t target_row_bytes = 128;
+    size_t rows = (initial_data_capacity + (target_row_bytes - 1)) / target_row_bytes;
+    if (rows < RING_BUFFER_MIN_ROWS) {
+        rows = RING_BUFFER_MIN_ROWS;
+    }
+    if (rows > RING_BUFFER_MAX_ROWS) {
+        rows = RING_BUFFER_MAX_ROWS;
+    }
+    return (uint32_t)rows;
+}
+
+static size_t ring_buffer_mmap_length(size_t capacity, uint32_t row_capacity) {
     size_t rows_bytes = 0;
     size_t total = 0;
-    if (ring_buffer_mul_overflow(sizeof(RingRowEntry), (size_t)RING_BUFFER_MAX_ROWS, &rows_bytes)) {
+    if (row_capacity == 0 || row_capacity > RING_BUFFER_MAX_ROWS) {
+        return 0;
+    }
+    if (ring_buffer_mul_overflow(sizeof(RingRowEntry), (size_t)row_capacity, &rows_bytes)) {
         return 0;
     }
     if (ring_buffer_add_overflow(sizeof(RingBufferDiskHeader), rows_bytes, &total)) {
@@ -73,6 +90,8 @@ static void ring_buffer_sync_header(RingBuffer *rb) {
     RingBufferDiskHeader *header = (RingBufferDiskHeader *)rb->mmap_header;
     header->magic = RING_BUFFER_DISK_MAGIC;
     header->version = RING_BUFFER_DISK_VERSION;
+    header->initial_data_capacity = (uint64_t)rb->initial_data_capacity;
+    header->initial_row_capacity = (uint64_t)rb->initial_row_capacity;
     header->data_capacity = (uint64_t)rb->data_capacity;
     header->max_data_capacity = (uint64_t)rb->max_data_capacity;
     header->write_offset = (uint64_t)rb->write_offset;
@@ -83,14 +102,18 @@ static void ring_buffer_sync_header(RingBuffer *rb) {
     header->bytes_used = (uint64_t)rb->bytes_used;
 }
 
-static RingBuffer *ring_buffer_alloc_struct(size_t capacity, size_t max_capacity) {
+static RingBuffer *ring_buffer_alloc_struct(size_t capacity,
+                                            size_t max_capacity,
+                                            uint32_t initial_row_capacity) {
     RingBuffer *rb = calloc(1, sizeof(RingBuffer));
     if (!rb) return NULL;
 
+    rb->initial_data_capacity = capacity;
+    rb->initial_row_capacity = initial_row_capacity;
     rb->data_capacity = capacity;
     rb->max_data_capacity = max_capacity;
     rb->write_offset = 0;
-    rb->row_capacity = RING_BUFFER_MAX_ROWS;
+    rb->row_capacity = initial_row_capacity;
     rb->row_count = 0;
     rb->row_head = 0;
     rb->row_tail = 0;
@@ -104,7 +127,7 @@ static RingBuffer *ring_buffer_alloc_struct(size_t capacity, size_t max_capacity
     rb->copy_buf = NULL;
     rb->copy_buf_cap = 0;
 
-    if (max_capacity > 0) {
+    if (initial_row_capacity > 0) {
         rb->rows = calloc(rb->row_capacity, sizeof(RingRowEntry));
         if (!rb->rows) {
             free(rb);
@@ -122,7 +145,9 @@ RingBuffer *ring_buffer_create(size_t capacity) {
 RingBuffer *ring_buffer_create_sized(size_t initial_capacity, size_t max_capacity) {
     if (initial_capacity == 0 || max_capacity == 0 || initial_capacity > max_capacity) return NULL;
 
-    RingBuffer *rb = ring_buffer_alloc_struct(initial_capacity, max_capacity);
+    RingBuffer *rb = ring_buffer_alloc_struct(initial_capacity,
+                                              max_capacity,
+                                              ring_buffer_compute_initial_row_capacity(initial_capacity));
     if (!rb) return NULL;
 
     rb->data = malloc(initial_capacity);
@@ -164,10 +189,12 @@ static bool ring_buffer_repack_into(const RingBuffer *rb,
                                     uint8_t *destination_data,
                                     size_t destination_capacity,
                                     RingRowEntry *destination_rows,
+                                    uint32_t destination_row_capacity,
                                     size_t *out_bytes_used,
                                     size_t *out_write_offset,
                                     uint32_t *out_row_count) {
     if (!rb || !destination_data || !destination_rows || destination_capacity == 0) return false;
+    if (rb->row_count > destination_row_capacity) return false;
 
     size_t offset = 0;
     for (uint32_t row = 0; row < rb->row_count; row++) {
@@ -195,24 +222,19 @@ static bool ring_buffer_repack_into(const RingBuffer *rb,
     return true;
 }
 
-static bool ring_buffer_grow_heap(RingBuffer *rb, size_t required_capacity) {
+static bool ring_buffer_resize_heap(RingBuffer *rb,
+                                    size_t target_data_capacity,
+                                    uint32_t target_row_capacity) {
     if (!rb || (rb->flags & RING_FLAG_MMAP)) return false;
-
-    size_t new_capacity = rb->data_capacity;
-    while (new_capacity < required_capacity && new_capacity < rb->max_data_capacity) {
-        size_t doubled = new_capacity * 2;
-        if (doubled <= new_capacity) {
-            new_capacity = rb->max_data_capacity;
-            break;
-        }
-        new_capacity = doubled > rb->max_data_capacity ? rb->max_data_capacity : doubled;
-    }
-    if (new_capacity < required_capacity || new_capacity == rb->data_capacity) {
+    if (target_data_capacity == 0 || target_data_capacity > rb->max_data_capacity) return false;
+    if (target_row_capacity == 0 || target_row_capacity > RING_BUFFER_MAX_ROWS) return false;
+    if (target_data_capacity == rb->data_capacity && target_row_capacity == rb->row_capacity) {
         return false;
     }
+    if (rb->bytes_used > target_data_capacity || rb->row_count > target_row_capacity) return false;
 
-    uint8_t *new_data = calloc(1, new_capacity);
-    RingRowEntry *new_rows = calloc(rb->row_capacity, sizeof(RingRowEntry));
+    uint8_t *new_data = calloc(1, target_data_capacity);
+    RingRowEntry *new_rows = calloc(target_row_capacity, sizeof(RingRowEntry));
     if (!new_data || !new_rows) {
         free(new_data);
         free(new_rows);
@@ -222,7 +244,7 @@ static bool ring_buffer_grow_heap(RingBuffer *rb, size_t required_capacity) {
     size_t bytes_used = 0;
     size_t write_offset = 0;
     uint32_t row_count = 0;
-    if (!ring_buffer_repack_into(rb, new_data, new_capacity, new_rows,
+    if (!ring_buffer_repack_into(rb, new_data, target_data_capacity, new_rows, target_row_capacity,
                                  &bytes_used, &write_offset, &row_count)) {
         free(new_data);
         free(new_rows);
@@ -235,7 +257,8 @@ static bool ring_buffer_grow_heap(RingBuffer *rb, size_t required_capacity) {
 
     rb->data = new_data;
     rb->rows = new_rows;
-    rb->data_capacity = new_capacity;
+    rb->data_capacity = target_data_capacity;
+    rb->row_capacity = target_row_capacity;
     rb->write_offset = write_offset;
     rb->bytes_used = bytes_used;
     rb->row_count = row_count;
@@ -244,24 +267,19 @@ static bool ring_buffer_grow_heap(RingBuffer *rb, size_t required_capacity) {
     return true;
 }
 
-static bool ring_buffer_grow_mmap(RingBuffer *rb, size_t required_capacity) {
+static bool ring_buffer_resize_mmap(RingBuffer *rb,
+                                    size_t target_data_capacity,
+                                    uint32_t target_row_capacity) {
     if (!rb || !(rb->flags & RING_FLAG_MMAP)) return false;
-
-    size_t new_capacity = rb->data_capacity;
-    while (new_capacity < required_capacity && new_capacity < rb->max_data_capacity) {
-        size_t doubled = new_capacity * 2;
-        if (doubled <= new_capacity) {
-            new_capacity = rb->max_data_capacity;
-            break;
-        }
-        new_capacity = doubled > rb->max_data_capacity ? rb->max_data_capacity : doubled;
-    }
-    if (new_capacity < required_capacity || new_capacity == rb->data_capacity) {
+    if (target_data_capacity == 0 || target_data_capacity > rb->max_data_capacity) return false;
+    if (target_row_capacity == 0 || target_row_capacity > RING_BUFFER_MAX_ROWS) return false;
+    if (target_data_capacity == rb->data_capacity && target_row_capacity == rb->row_capacity) {
         return false;
     }
+    if (rb->bytes_used > target_data_capacity || rb->row_count > target_row_capacity) return false;
 
-    uint8_t *packed_data = calloc(1, new_capacity);
-    RingRowEntry *packed_rows = calloc(rb->row_capacity, sizeof(RingRowEntry));
+    uint8_t *packed_data = calloc(1, target_data_capacity);
+    RingRowEntry *packed_rows = calloc(target_row_capacity, sizeof(RingRowEntry));
     if (!packed_data || !packed_rows) {
         free(packed_data);
         free(packed_rows);
@@ -271,14 +289,14 @@ static bool ring_buffer_grow_mmap(RingBuffer *rb, size_t required_capacity) {
     size_t bytes_used = 0;
     size_t write_offset = 0;
     uint32_t row_count = 0;
-    if (!ring_buffer_repack_into(rb, packed_data, new_capacity, packed_rows,
+    if (!ring_buffer_repack_into(rb, packed_data, target_data_capacity, packed_rows, target_row_capacity,
                                  &bytes_used, &write_offset, &row_count)) {
         free(packed_data);
         free(packed_rows);
         return false;
     }
 
-    size_t new_mapping_len = ring_buffer_mmap_length(new_capacity);
+    size_t new_mapping_len = ring_buffer_mmap_length(target_data_capacity, target_row_capacity);
     if (new_mapping_len == 0) {
         free(packed_data);
         free(packed_rows);
@@ -308,9 +326,9 @@ static bool ring_buffer_grow_mmap(RingBuffer *rb, size_t required_capacity) {
 
     RingBufferDiskHeader *header = (RingBufferDiskHeader *)mapped;
     RingRowEntry *rows = (RingRowEntry *)((uint8_t *)mapped + sizeof(RingBufferDiskHeader));
-    uint8_t *data = (uint8_t *)rows + (sizeof(RingRowEntry) * (size_t)RING_BUFFER_MAX_ROWS);
+    uint8_t *data = (uint8_t *)rows + (sizeof(RingRowEntry) * (size_t)target_row_capacity);
     memset(mapped, 0, new_mapping_len);
-    memcpy(rows, packed_rows, sizeof(RingRowEntry) * rb->row_capacity);
+    memcpy(rows, packed_rows, sizeof(RingRowEntry) * (size_t)target_row_capacity);
     memcpy(data, packed_data, bytes_used);
 
     rb->mapping_base = mapped;
@@ -318,7 +336,8 @@ static bool ring_buffer_grow_mmap(RingBuffer *rb, size_t required_capacity) {
     rb->mmap_header = header;
     rb->rows = rows;
     rb->data = data;
-    rb->data_capacity = new_capacity;
+    rb->data_capacity = target_data_capacity;
+    rb->row_capacity = target_row_capacity;
     rb->write_offset = write_offset;
     rb->bytes_used = bytes_used;
     rb->row_count = row_count;
@@ -335,10 +354,119 @@ static bool ring_buffer_grow_if_needed(RingBuffer *rb, size_t needed_capacity) {
     if (!rb) return false;
     if (needed_capacity <= rb->data_capacity) return true;
     if (needed_capacity > rb->max_data_capacity) return false;
-    if (rb->flags & RING_FLAG_MMAP) {
-        return ring_buffer_grow_mmap(rb, needed_capacity);
+    size_t new_capacity = rb->data_capacity;
+    while (new_capacity < needed_capacity && new_capacity < rb->max_data_capacity) {
+        size_t doubled = new_capacity * 2;
+        if (doubled <= new_capacity) {
+            new_capacity = rb->max_data_capacity;
+            break;
+        }
+        new_capacity = doubled > rb->max_data_capacity ? rb->max_data_capacity : doubled;
     }
-    return ring_buffer_grow_heap(rb, needed_capacity);
+    if (new_capacity < needed_capacity || new_capacity == rb->data_capacity) {
+        return false;
+    }
+    if (rb->flags & RING_FLAG_MMAP) {
+        return ring_buffer_resize_mmap(rb, new_capacity, rb->row_capacity);
+    }
+    return ring_buffer_resize_heap(rb, new_capacity, rb->row_capacity);
+}
+
+static bool ring_buffer_grow_rows_if_needed(RingBuffer *rb, uint32_t needed_rows) {
+    if (!rb) return false;
+    if (needed_rows <= rb->row_capacity) return true;
+    if (needed_rows > RING_BUFFER_MAX_ROWS) return false;
+
+    uint32_t new_row_capacity = rb->row_capacity;
+    while (new_row_capacity < needed_rows && new_row_capacity < RING_BUFFER_MAX_ROWS) {
+        uint32_t doubled = new_row_capacity * 2;
+        if (doubled <= new_row_capacity) {
+            new_row_capacity = RING_BUFFER_MAX_ROWS;
+            break;
+        }
+        new_row_capacity = doubled > RING_BUFFER_MAX_ROWS ? RING_BUFFER_MAX_ROWS : doubled;
+    }
+    if (new_row_capacity < needed_rows || new_row_capacity == rb->row_capacity) {
+        return false;
+    }
+    if (rb->flags & RING_FLAG_MMAP) {
+        return ring_buffer_resize_mmap(rb, rb->data_capacity, new_row_capacity);
+    }
+    return ring_buffer_resize_heap(rb, rb->data_capacity, new_row_capacity);
+}
+
+static bool ring_buffer_shrink_heap(RingBuffer *rb, size_t target_capacity) {
+    return ring_buffer_resize_heap(rb, target_capacity, rb->row_capacity);
+}
+
+static bool ring_buffer_shrink_mmap(RingBuffer *rb, size_t target_capacity) {
+    return ring_buffer_resize_mmap(rb, target_capacity, rb->row_capacity);
+}
+
+static bool ring_buffer_shrink_to(RingBuffer *rb, size_t target_capacity) {
+    if (!rb) return false;
+    if (rb->flags & RING_FLAG_MMAP) {
+        return ring_buffer_shrink_mmap(rb, target_capacity);
+    }
+    return ring_buffer_shrink_heap(rb, target_capacity);
+}
+
+static bool ring_buffer_shrink_rows_to(RingBuffer *rb, uint32_t target_row_capacity) {
+    if (!rb) return false;
+    if (target_row_capacity >= rb->row_capacity || target_row_capacity < rb->row_count) return false;
+    if (target_row_capacity < rb->initial_row_capacity) return false;
+    if (rb->flags & RING_FLAG_MMAP) {
+        return ring_buffer_resize_mmap(rb, rb->data_capacity, target_row_capacity);
+    }
+    return ring_buffer_resize_heap(rb, rb->data_capacity, target_row_capacity);
+}
+
+static void ring_buffer_maybe_shrink(RingBuffer *rb) {
+    if (!rb) return;
+    if (rb->data_capacity <= rb->initial_data_capacity) return;
+
+    size_t target = rb->data_capacity;
+    while (target > rb->initial_data_capacity) {
+        size_t next = target / 2;
+        if (next < rb->initial_data_capacity) {
+            next = rb->initial_data_capacity;
+        }
+        if (rb->bytes_used > next / 8) {
+            break;
+        }
+        target = next;
+        if (target == rb->initial_data_capacity) {
+            break;
+        }
+    }
+
+    if (target < rb->data_capacity) {
+        (void)ring_buffer_shrink_to(rb, target);
+    }
+}
+
+static void ring_buffer_maybe_shrink_rows(RingBuffer *rb) {
+    if (!rb) return;
+    if (rb->row_capacity <= rb->initial_row_capacity) return;
+
+    uint32_t target = rb->row_capacity;
+    while (target > rb->initial_row_capacity) {
+        uint32_t next = target / 2;
+        if (next < rb->initial_row_capacity) {
+            next = rb->initial_row_capacity;
+        }
+        if (rb->row_count > next / 4) {
+            break;
+        }
+        target = next;
+        if (target == rb->initial_row_capacity) {
+            break;
+        }
+    }
+
+    if (target < rb->row_capacity) {
+        (void)ring_buffer_shrink_rows_to(rb, target);
+    }
 }
 
 RingBuffer *ring_buffer_create_mmap_sized(const char *path,
@@ -346,8 +474,13 @@ RingBuffer *ring_buffer_create_mmap_sized(const char *path,
                                           size_t max_capacity) {
     if (!path || initial_capacity == 0 || max_capacity == 0 || initial_capacity > max_capacity) return NULL;
 
-    RingBuffer *rb = ring_buffer_alloc_struct(0, max_capacity);
+    uint32_t initial_row_capacity = ring_buffer_compute_initial_row_capacity(initial_capacity);
+    RingBuffer *rb = calloc(1, sizeof(RingBuffer));
     if (!rb) return NULL;
+    rb->initial_data_capacity = initial_capacity;
+    rb->initial_row_capacity = initial_row_capacity;
+    rb->max_data_capacity = max_capacity;
+    rb->mmap_fd = -1;
 
     /* O_NOFOLLOW prevents symlink attacks */
     int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
@@ -359,7 +492,8 @@ RingBuffer *ring_buffer_create_mmap_sized(const char *path,
     struct stat st;
     bool has_existing = fstat(fd, &st) == 0 && (size_t)st.st_size >= sizeof(RingBufferDiskHeader);
     size_t current_capacity = initial_capacity;
-    size_t mapping_len = ring_buffer_mmap_length(initial_capacity);
+    uint32_t current_row_capacity = initial_row_capacity;
+    size_t mapping_len = ring_buffer_mmap_length(initial_capacity, initial_row_capacity);
     if (mapping_len == 0) {
         close(fd);
         free(rb);
@@ -372,12 +506,19 @@ RingBuffer *ring_buffer_create_mmap_sized(const char *path,
         if (bytes == (ssize_t)sizeof(disk_header) &&
             disk_header.magic == RING_BUFFER_DISK_MAGIC &&
             disk_header.version == RING_BUFFER_DISK_VERSION &&
+            disk_header.initial_data_capacity == (uint64_t)initial_capacity &&
+            disk_header.initial_row_capacity >= (uint64_t)RING_BUFFER_MIN_ROWS &&
+            disk_header.initial_row_capacity <= (uint64_t)RING_BUFFER_MAX_ROWS &&
             disk_header.max_data_capacity == (uint64_t)max_capacity &&
             disk_header.data_capacity >= initial_capacity &&
-            disk_header.data_capacity <= max_capacity) {
-            size_t existing_mapping_len = ring_buffer_mmap_length((size_t)disk_header.data_capacity);
+            disk_header.data_capacity <= max_capacity &&
+            disk_header.row_capacity >= disk_header.initial_row_capacity &&
+            disk_header.row_capacity <= (uint64_t)RING_BUFFER_MAX_ROWS) {
+            size_t existing_mapping_len = ring_buffer_mmap_length((size_t)disk_header.data_capacity,
+                                                                  (uint32_t)disk_header.row_capacity);
             if (existing_mapping_len != 0 && (size_t)st.st_size == existing_mapping_len) {
                 current_capacity = (size_t)disk_header.data_capacity;
+                current_row_capacity = (uint32_t)disk_header.row_capacity;
                 mapping_len = existing_mapping_len;
             }
         }
@@ -398,17 +539,19 @@ RingBuffer *ring_buffer_create_mmap_sized(const char *path,
 
     RingBufferDiskHeader *header = (RingBufferDiskHeader *)mapped;
     RingRowEntry *rows = (RingRowEntry *)((uint8_t *)mapped + sizeof(RingBufferDiskHeader));
-    uint8_t *data = (uint8_t *)rows + (sizeof(RingRowEntry) * (size_t)RING_BUFFER_MAX_ROWS);
+    uint8_t *data = (uint8_t *)rows + (sizeof(RingRowEntry) * (size_t)current_row_capacity);
 
     rb->mapping_base = mapped;
     rb->mapping_length = mapping_len;
     rb->mmap_header = header;
     rb->rows = rows;
     rb->data = data;
+    rb->initial_data_capacity = initial_capacity;
+    rb->initial_row_capacity = initial_row_capacity;
     rb->data_capacity = current_capacity;
     rb->mmap_fd = fd;
     rb->flags |= RING_FLAG_MMAP;
-    rb->row_capacity = RING_BUFFER_MAX_ROWS;
+    rb->row_capacity = current_row_capacity;
 
     /* Store path for destroy_and_unlink */
     rb->mmap_path = strdup(path);
@@ -421,16 +564,21 @@ RingBuffer *ring_buffer_create_mmap_sized(const char *path,
 
     if (header->magic == RING_BUFFER_DISK_MAGIC &&
         header->version == RING_BUFFER_DISK_VERSION &&
+        header->initial_data_capacity == (uint64_t)initial_capacity &&
+        header->initial_row_capacity == (uint64_t)initial_row_capacity &&
         header->data_capacity == (uint64_t)current_capacity &&
         header->max_data_capacity == (uint64_t)max_capacity &&
-        header->row_capacity == (uint64_t)RING_BUFFER_MAX_ROWS &&
+        header->row_capacity == (uint64_t)current_row_capacity &&
         header->write_offset <= (uint64_t)current_capacity &&
-        header->row_count <= (uint64_t)RING_BUFFER_MAX_ROWS &&
+        header->row_count <= (uint64_t)current_row_capacity &&
         header->bytes_used <= (uint64_t)current_capacity &&
         header->row_head <= header->row_tail &&
         (header->row_tail - header->row_head) == header->row_count) {
         rb->data_capacity = (size_t)header->data_capacity;
         rb->max_data_capacity = (size_t)header->max_data_capacity;
+        rb->initial_data_capacity = (size_t)header->initial_data_capacity;
+        rb->initial_row_capacity = (uint32_t)header->initial_row_capacity;
+        rb->row_capacity = (uint32_t)header->row_capacity;
         rb->write_offset = (size_t)header->write_offset;
         rb->row_count = (uint32_t)header->row_count;
         rb->row_head = header->row_head;
@@ -527,7 +675,7 @@ int64_t ring_buffer_append_row(RingBuffer *rb,
     ring_buffer_evict(rb, (size_t)length);
 
     /* Also evict if row index is full */
-    if (rb->row_count >= rb->row_capacity) {
+    if (rb->row_count >= rb->row_capacity && !ring_buffer_grow_rows_if_needed(rb, rb->row_count + 1)) {
         uint32_t head_idx = rb->row_head % rb->row_capacity;
         rb->bytes_used -= rb->rows[head_idx].length;
         rb->row_head++;
@@ -555,6 +703,8 @@ int64_t ring_buffer_append_row(RingBuffer *rb,
     rb->bytes_used += (size_t)length;
     rb->row_tail++;
     rb->row_count++;
+    ring_buffer_maybe_shrink(rb);
+    ring_buffer_maybe_shrink_rows(rb);
     ring_buffer_sync_header(rb);
 
     return (int64_t)(rb->row_tail - 1);
@@ -603,6 +753,10 @@ uint32_t ring_buffer_row_count(const RingBuffer *rb) {
     return rb ? rb->row_count : 0;
 }
 
+uint32_t ring_buffer_row_index_capacity(const RingBuffer *rb) {
+    return rb ? rb->row_capacity : 0;
+}
+
 size_t ring_buffer_capacity(const RingBuffer *rb) {
     return rb ? rb->data_capacity : 0;
 }
@@ -624,6 +778,12 @@ void ring_buffer_clear(RingBuffer *rb) {
     rb->bytes_used = 0;
     if (rb->rows) {
         memset(rb->rows, 0, sizeof(RingRowEntry) * rb->row_capacity);
+    }
+    if (rb->data_capacity > rb->initial_data_capacity) {
+        (void)ring_buffer_shrink_to(rb, rb->initial_data_capacity);
+    }
+    if (rb->row_capacity > rb->initial_row_capacity) {
+        (void)ring_buffer_shrink_rows_to(rb, rb->initial_row_capacity);
     }
     ring_buffer_sync_header(rb);
 }

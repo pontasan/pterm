@@ -23,6 +23,7 @@
 
 /* Maximum number of rows the index can track */
 #define RING_BUFFER_MAX_ROWS (1 << 20)  /* ~1M rows */
+#define RING_BUFFER_MIN_ROWS 16
 
 /* Row metadata stored in the index */
 typedef struct {
@@ -37,6 +38,8 @@ typedef struct {
 
 typedef struct {
     uint8_t      *data;          /* Circular data buffer */
+    size_t        initial_data_capacity; /* Baseline capacity to shrink back to */
+    uint32_t      initial_row_capacity;  /* Baseline row index capacity */
     size_t        data_capacity; /* Total data buffer size in bytes */
     size_t        max_data_capacity; /* Growth limit in bytes */
     size_t        write_offset;  /* Current write position in data buffer */
@@ -116,6 +119,9 @@ bool ring_buffer_get_row(RingBuffer *rb, uint32_t row_index,
 
 /* Get the number of rows currently stored. */
 uint32_t ring_buffer_row_count(const RingBuffer *rb);
+
+/* Get the current row-index capacity. */
+uint32_t ring_buffer_row_index_capacity(const RingBuffer *rb);
 
 /* Get the total data capacity in bytes. */
 size_t ring_buffer_capacity(const RingBuffer *rb);

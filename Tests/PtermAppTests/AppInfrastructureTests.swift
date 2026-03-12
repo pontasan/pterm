@@ -5,6 +5,56 @@ import XCTest
 @testable import PtermApp
 
 final class AppInfrastructureTests: XCTestCase {
+    func testTerminalListReconciliationKeepsIntegratedPresentationWhenLastTerminalRemoved() {
+        let result = AppDelegate.reconcilePresentationAfterTerminalListChange(
+            currentPresentation: .integrated,
+            remainingTerminalIDs: []
+        )
+
+        XCTAssertEqual(result, .integrated)
+    }
+
+    func testTerminalListReconciliationFallsBackToIntegratedWhenFocusedTerminalRemoved() {
+        let focusedID = UUID()
+        let result = AppDelegate.reconcilePresentationAfterTerminalListChange(
+            currentPresentation: .focused(focusedID),
+            remainingTerminalIDs: []
+        )
+
+        XCTAssertEqual(result, .integrated)
+    }
+
+    func testTerminalListReconciliationCollapsesSplitToFocusedThenIntegrated() {
+        let first = UUID()
+        let second = UUID()
+        let third = UUID()
+
+        let focusedResult = AppDelegate.reconcilePresentationAfterTerminalListChange(
+            currentPresentation: .split([first, second, third]),
+            remainingTerminalIDs: [second]
+        )
+        XCTAssertEqual(focusedResult, .focused(second))
+
+        let integratedResult = AppDelegate.reconcilePresentationAfterTerminalListChange(
+            currentPresentation: .split([first, second, third]),
+            remainingTerminalIDs: []
+        )
+        XCTAssertEqual(integratedResult, .integrated)
+    }
+
+    func testTerminalListReconciliationPreservesRemainingSplitOrder() {
+        let first = UUID()
+        let second = UUID()
+        let third = UUID()
+
+        let result = AppDelegate.reconcilePresentationAfterTerminalListChange(
+            currentPresentation: .split([first, second, third]),
+            remainingTerminalIDs: [third, first]
+        )
+
+        XCTAssertEqual(result, .split([first, third]))
+    }
+
     func testRGBColorParsesHexAndFormatsBackToUppercaseHex() {
         let color = RGBColor(hexString: "#12abEF")
 
@@ -93,6 +143,101 @@ final class AppInfrastructureTests: XCTestCase {
     func testFileNameSanitizerReplacesReservedCharactersAndFallsBackForBlankValues() {
         XCTAssertEqual(FileNameSanitizer.sanitize(" a/b:c\n", fallback: "fallback"), "a_b_c")
         XCTAssertEqual(FileNameSanitizer.sanitize("   ", fallback: "fallback"), "fallback")
+    }
+
+    func testCoalescedCallbackSignalsImmediatelyOutsideBatch() {
+        var callbackCount = 0
+        let callback = CoalescedCallback {
+            callbackCount += 1
+        }
+
+        callback.signal()
+        callback.signal()
+
+        XCTAssertEqual(callbackCount, 2)
+    }
+
+    func testCoalescedCallbackCoalescesSignalsWithinSingleBatch() {
+        var callbackCount = 0
+        let callback = CoalescedCallback {
+            callbackCount += 1
+        }
+
+        callback.performBatch {
+            callback.signal()
+            callback.signal()
+            callback.signal()
+        }
+
+        XCTAssertEqual(callbackCount, 1)
+    }
+
+    func testCoalescedCallbackNestedBatchesStillEmitSingleCallback() {
+        var callbackCount = 0
+        let callback = CoalescedCallback {
+            callbackCount += 1
+        }
+
+        callback.performBatch {
+            callback.signal()
+            callback.performBatch {
+                callback.signal()
+                callback.signal()
+            }
+            callback.signal()
+        }
+
+        XCTAssertEqual(callbackCount, 1)
+    }
+
+    @MainActor
+    func testDebouncedActionCoordinatorCoalescesRapidSchedules() {
+        let fired = expectation(description: "debounced action fired once")
+        fired.expectedFulfillmentCount = 1
+        fired.assertForOverFulfill = true
+
+        let coordinator = DebouncedActionCoordinator(
+            debounceInterval: 0.05,
+            scheduleQueue: .main
+        ) {
+            fired.fulfill()
+        }
+
+        coordinator.schedule()
+        coordinator.schedule()
+        coordinator.schedule()
+
+        wait(for: [fired], timeout: 1.0)
+    }
+
+    @MainActor
+    func testDebouncedActionCoordinatorFlushRunsPendingActionImmediately() {
+        var fireCount = 0
+        let coordinator = DebouncedActionCoordinator(
+            debounceInterval: 1.0,
+            scheduleQueue: .main
+        ) {
+            fireCount += 1
+        }
+
+        coordinator.schedule()
+        coordinator.flush()
+
+        XCTAssertEqual(fireCount, 1)
+    }
+
+    @MainActor
+    func testDebouncedActionCoordinatorCancelPreventsPendingAction() {
+        let coordinator = DebouncedActionCoordinator(
+            debounceInterval: 0.05,
+            scheduleQueue: .main
+        ) {
+            XCTFail("Canceled debounced action should not fire")
+        }
+
+        coordinator.schedule()
+        coordinator.cancel()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
     }
 
     func testSessionStoreReturnsNoneWhenNoSessionExistsAndCreatesCrashMarker() throws {
@@ -1011,6 +1156,17 @@ final class AppInfrastructureTests: XCTestCase {
         monitor.start(pidsProvider: { [] })
         wait(for: [expectation], timeout: 1.0)
         monitor.stop()
+    }
+
+    func testProcessMetricsMonitorConvertsAbsoluteTicksUsingMachTimebase() {
+        let monitor = ProcessMetricsMonitor(interval: 60)
+        var timebase = mach_timebase_info_data_t()
+        mach_timebase_info(&timebase)
+
+        let ticksPerSecond = UInt64((1_000_000_000.0 * Double(timebase.denom)) / Double(timebase.numer))
+        let seconds = monitor.cpuTimeSeconds(fromAbsoluteTicks: ticksPerSecond)
+
+        XCTAssertEqual(seconds, 1.0, accuracy: 0.001)
     }
 
     @MainActor

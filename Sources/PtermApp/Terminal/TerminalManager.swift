@@ -6,6 +6,10 @@ import Foundation
 /// The integrated view observes this manager to display thumbnails.
 final class TerminalManager {
     private var config: PtermConfig
+    private lazy var listChangeCallback = CoalescedCallback { [weak self] in
+        self?.onListChanged?()
+    }
+    private let lifecycleQueue = DispatchQueue(label: "com.pterm.terminal-lifecycle", qos: .userInitiated)
 
     /// All active terminal controllers, in display order.
     private(set) var terminals: [TerminalController] = []
@@ -52,6 +56,8 @@ final class TerminalManager {
                      fontName: String,
                      fontSize: Double,
                      id: UUID = UUID(),
+                     startAsynchronously: Bool = false,
+                     onStartFailure: ((Error) -> Void)? = nil,
                      configure: ((TerminalController) -> Void)? = nil) throws -> TerminalController {
         let scrollbackPath = config.sessionScrollBufferPersistence
             ? Self.scrollbackPath(for: id).path
@@ -82,19 +88,69 @@ final class TerminalManager {
 
         configure?(controller)
         terminals.append(controller)
-        try controller.start()
-        onListChanged?()
+
+        if startAsynchronously {
+            notifyListChanged()
+            lifecycleQueue.async { [weak self, weak controller] in
+                guard let self, let controller else { return }
+                do {
+                    try controller.start()
+                } catch {
+                    DispatchQueue.main.async {
+                        self.removeTerminal(controller, preserveScrollback: true)
+                        onStartFailure?(error)
+                    }
+                }
+            }
+            return controller
+        }
+
+        do {
+            try controller.start()
+        } catch {
+            terminals.removeAll { $0 === controller }
+            throw error
+        }
+        notifyListChanged()
         return controller
     }
 
     /// Remove a terminal session and stop its process.
     func removeTerminal(_ controller: TerminalController, preserveScrollback: Bool = false) {
-        controller.stop()
-        if !preserveScrollback {
-            controller.discardPersistentScrollback()
-        }
+        controller.onExit = nil
+        let previousCount = terminals.count
         terminals.removeAll { $0 === controller }
-        onListChanged?()
+        guard terminals.count != previousCount else { return }
+        notifyListChanged()
+        lifecycleQueue.async {
+            controller.stop()
+            if !preserveScrollback {
+                controller.discardPersistentScrollback()
+            }
+        }
+    }
+
+    /// Remove multiple terminal sessions while notifying observers only once.
+    func removeTerminals(_ controllers: [TerminalController], preserveScrollback: Bool = false) {
+        guard !controllers.isEmpty else { return }
+        let targetIDs = Set(controllers.map(\.id))
+        listChangeCallback.performBatch {
+            for controller in controllers {
+                controller.onExit = nil
+            }
+            let previousCount = terminals.count
+            terminals.removeAll { targetIDs.contains($0.id) }
+            guard terminals.count != previousCount else { return }
+            notifyListChanged()
+        }
+        lifecycleQueue.async {
+            for controller in controllers {
+                controller.stop()
+                if !preserveScrollback {
+                    controller.discardPersistentScrollback()
+                }
+            }
+        }
     }
 
     /// Stop all terminals.
@@ -138,7 +194,7 @@ final class TerminalManager {
         terminals.remove(at: fromIndex)
         let clampedIndex = min(toIndex, terminals.count)
         terminals.insert(controller, at: clampedIndex)
-        onListChanged?()
+        notifyListChanged()
     }
 
     /// Reorder a terminal to a specific position within a workspace.
@@ -166,7 +222,7 @@ final class TerminalManager {
         }
 
         terminals.insert(controller, at: min(globalIndex, terminals.count))
-        onListChanged?()
+        notifyListChanged()
     }
 
     /// Number of active terminals.
@@ -183,5 +239,9 @@ final class TerminalManager {
 
     private static func scrollbackPath(for id: UUID) -> URL {
         PtermDirectories.sessionScrollback.appendingPathComponent("\(id.uuidString).bin")
+    }
+
+    private func notifyListChanged() {
+        listChangeCallback.signal()
     }
 }

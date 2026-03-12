@@ -1,7 +1,7 @@
 import AppKit
 
 final class StatusBarView: NSView {
-    private let metricsLabel = NSTextField(labelWithString: "CPU: --% | MEM: -- MB")
+    private let metricsLabel = NSTextField(labelWithString: "CPU: --.-% | MEM: -- MB")
     private var currentCpu: Double = 0
     private var currentMemBytes: UInt64 = 0
     private let backButton: NSButton
@@ -99,7 +99,7 @@ final class StatusBarView: NSView {
 
     private func refreshMetricsLabel() {
         let megabytes = Double(currentMemBytes) / (1024 * 1024)
-        metricsLabel.stringValue = String(format: "CPU: %.0f%% | MEM: %.0fMB", currentCpu, megabytes)
+        metricsLabel.stringValue = String(format: "CPU: %.1f%% | MEM: %.0fMB", currentCpu, megabytes)
         needsLayout = true
     }
 

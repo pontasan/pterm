@@ -20,11 +20,15 @@ final class ProcessMetricsMonitor {
     private var timer: Timer?
     private var lastSamples: [pid_t: CPUSample] = [:]
     private let interval: TimeInterval
-    private let cpuCount: Double
+    private let timebaseNumer: Double
+    private let timebaseDenom: Double
 
     init(interval: TimeInterval = 3.0) {
         self.interval = interval
-        self.cpuCount = max(1, Double(ProcessInfo.processInfo.processorCount))
+        var timebase = mach_timebase_info_data_t()
+        mach_timebase_info(&timebase)
+        self.timebaseNumer = max(1, Double(timebase.numer))
+        self.timebaseDenom = max(1, Double(timebase.denom))
     }
 
     func start(pidsProvider: @escaping () -> [pid_t]) {
@@ -58,10 +62,10 @@ final class ProcessMetricsMonitor {
             }
 
             if let previous = lastSamples[pid], sample.timestamp > previous.timestamp {
-                let deltaTime = Double(sample.totalTime &- previous.totalTime) / 1_000_000.0
+                let deltaTime = cpuTimeSeconds(fromAbsoluteTicks: sample.totalTime &- previous.totalTime)
                 let elapsed = sample.timestamp - previous.timestamp
                 if elapsed > 0 {
-                    let percent = min(999.0, max(0, (deltaTime / elapsed) * 100.0 / cpuCount))
+                    let percent = min(999.0, max(0, (deltaTime / elapsed) * 100.0))
                     usage[pid] = percent
                 }
             } else {
@@ -79,10 +83,10 @@ final class ProcessMetricsMonitor {
                     let childSample = CPUSample(totalTime: childTime, timestamp: now)
                     nextSamples[child] = childSample
                     if let prev = lastSamples[child], childSample.timestamp > prev.timestamp {
-                        let dt = Double(childSample.totalTime &- prev.totalTime) / 1_000_000.0
+                        let dt = cpuTimeSeconds(fromAbsoluteTicks: childSample.totalTime &- prev.totalTime)
                         let elapsed = childSample.timestamp - prev.timestamp
                         if elapsed > 0 {
-                            let pct = min(999.0, max(0, (dt / elapsed) * 100.0 / cpuCount))
+                            let pct = min(999.0, max(0, (dt / elapsed) * 100.0))
                             usage[child] = pct
                         }
                     } else {
@@ -107,6 +111,12 @@ final class ProcessMetricsMonitor {
         let size = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, Int32(MemoryLayout<proc_taskinfo>.stride))
         guard size == Int32(MemoryLayout<proc_taskinfo>.stride) else { return nil }
         return UInt64(info.pti_total_user) + UInt64(info.pti_total_system)
+    }
+
+    func cpuTimeSeconds(fromAbsoluteTicks ticks: UInt64) -> Double {
+        // proc_taskinfo CPU counters are reported in the platform's absolute-time units.
+        // Convert them through mach_timebase_info so our CPU percentages match the system tools.
+        (Double(ticks) * timebaseNumer / timebaseDenom) / 1_000_000_000.0
     }
 
     private func currentProcessResidentMemory() -> UInt64 {
