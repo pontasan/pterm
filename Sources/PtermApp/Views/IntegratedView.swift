@@ -28,9 +28,8 @@ final class ScrollDocumentView: NSView {
 /// switches to the focused (occupied) view. Shift+click enables multi-select
 /// for split display.
 final class IntegratedView: MTKView, NSDraggingSource {
-    private struct LayoutCacheKey: Equatable {
+    private struct LayoutGeometryCacheKey: Equatable {
         let boundsSize: NSSize
-        let scrollOffset: CGFloat
         let explicitWorkspaceNames: [String]
         let terminalIDs: [UUID]
         let workspaceNames: [String]
@@ -87,6 +86,106 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private struct CachedTextVertices {
         let vertices: [Float]
         let width: Float
+    }
+
+    private struct ThumbnailVertexCacheKey: Hashable {
+        let controllerID: UUID
+        let rows: Int
+        let cols: Int
+        let scrollbackRowCount: Int
+        let scrollOffset: Int
+        let contentVersion: UInt64
+        let fontName: String
+        let fontSizeBits: UInt64
+        let glyphScaleBits: UInt32
+        let thumbnailWidthBits: UInt64
+        let thumbnailHeightBits: UInt64
+        let defaultForegroundBits: (UInt32, UInt32, UInt32)
+        let defaultBackgroundBits: (UInt32, UInt32, UInt32, UInt32)
+
+        init(
+            controllerID: UUID,
+            rows: Int,
+            cols: Int,
+            scrollbackRowCount: Int,
+            scrollOffset: Int,
+            contentVersion: UInt64,
+            fontName: String,
+            fontSize: Double,
+            glyphScale: Float,
+            thumbnailSize: NSSize,
+            terminalAppearance: MetalRenderer.TerminalAppearance
+        ) {
+            self.controllerID = controllerID
+            self.rows = rows
+            self.cols = cols
+            self.scrollbackRowCount = scrollbackRowCount
+            self.scrollOffset = scrollOffset
+            self.contentVersion = contentVersion
+            self.fontName = fontName
+            self.fontSizeBits = fontSize.bitPattern
+            self.glyphScaleBits = glyphScale.bitPattern
+            self.thumbnailWidthBits = Double(thumbnailSize.width).bitPattern
+            self.thumbnailHeightBits = Double(thumbnailSize.height).bitPattern
+            self.defaultForegroundBits = (
+                terminalAppearance.defaultForeground.r.bitPattern,
+                terminalAppearance.defaultForeground.g.bitPattern,
+                terminalAppearance.defaultForeground.b.bitPattern
+            )
+            self.defaultBackgroundBits = (
+                terminalAppearance.defaultBackground.r.bitPattern,
+                terminalAppearance.defaultBackground.g.bitPattern,
+                terminalAppearance.defaultBackground.b.bitPattern,
+                terminalAppearance.defaultBackground.a.bitPattern
+            )
+        }
+
+        static func == (lhs: ThumbnailVertexCacheKey, rhs: ThumbnailVertexCacheKey) -> Bool {
+            lhs.controllerID == rhs.controllerID &&
+                lhs.rows == rhs.rows &&
+                lhs.cols == rhs.cols &&
+                lhs.scrollbackRowCount == rhs.scrollbackRowCount &&
+                lhs.scrollOffset == rhs.scrollOffset &&
+                lhs.contentVersion == rhs.contentVersion &&
+                lhs.fontName == rhs.fontName &&
+                lhs.fontSizeBits == rhs.fontSizeBits &&
+                lhs.glyphScaleBits == rhs.glyphScaleBits &&
+                lhs.thumbnailWidthBits == rhs.thumbnailWidthBits &&
+                lhs.thumbnailHeightBits == rhs.thumbnailHeightBits &&
+                lhs.defaultForegroundBits.0 == rhs.defaultForegroundBits.0 &&
+                lhs.defaultForegroundBits.1 == rhs.defaultForegroundBits.1 &&
+                lhs.defaultForegroundBits.2 == rhs.defaultForegroundBits.2 &&
+                lhs.defaultBackgroundBits.0 == rhs.defaultBackgroundBits.0 &&
+                lhs.defaultBackgroundBits.1 == rhs.defaultBackgroundBits.1 &&
+                lhs.defaultBackgroundBits.2 == rhs.defaultBackgroundBits.2 &&
+                lhs.defaultBackgroundBits.3 == rhs.defaultBackgroundBits.3
+        }
+
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(controllerID)
+            hasher.combine(rows)
+            hasher.combine(cols)
+            hasher.combine(scrollbackRowCount)
+            hasher.combine(scrollOffset)
+            hasher.combine(contentVersion)
+            hasher.combine(fontName)
+            hasher.combine(fontSizeBits)
+            hasher.combine(glyphScaleBits)
+            hasher.combine(thumbnailWidthBits)
+            hasher.combine(thumbnailHeightBits)
+            hasher.combine(defaultForegroundBits.0)
+            hasher.combine(defaultForegroundBits.1)
+            hasher.combine(defaultForegroundBits.2)
+            hasher.combine(defaultBackgroundBits.0)
+            hasher.combine(defaultBackgroundBits.1)
+            hasher.combine(defaultBackgroundBits.2)
+            hasher.combine(defaultBackgroundBits.3)
+        }
+    }
+
+    private struct CachedThumbnailVertices {
+        let bgVertices: [Float]
+        let glyphVertices: [Float]
     }
 
     private struct TextAtlasSignature: Equatable {
@@ -209,12 +308,16 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private static let dragAutoScrollEdge: CGFloat = 60
     private static let dragAutoScrollSpeed: CGFloat = 24
     private var companionScrollObserver: NSObjectProtocol?
-    private var cachedLayoutKey: LayoutCacheKey?
+    private var cachedLayoutGeometryKey: LayoutGeometryCacheKey?
+    private var cachedLayoutScrollOffset: CGFloat?
+    private var cachedBaseWorkspaceLayouts: [WorkspaceLayout] = []
+    private var cachedBaseFlattenedThumbnails: [ThumbnailLayout] = []
     private var cachedVisibleWorkspaceLayouts: [WorkspaceLayout] = []
     private var cachedFlattenedThumbnails: [ThumbnailLayout] = []
     private var cachedVisibleThumbnails: [ThumbnailLayout] = []
     private var textVertexCache: [TextVertexCacheKey: CachedTextVertices] = [:]
     private var textAtlasSignature: TextAtlasSignature?
+    private var thumbnailVertexCache: [ThumbnailVertexCacheKey: CachedThumbnailVertices] = [:]
 
     /// Layout constants
     private struct Layout {
@@ -245,7 +348,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         super.init(frame: frame, device: renderer.device)
 
         self.delegate = self
-        self.preferredFramesPerSecond = 30 // Lower FPS for thumbnails
+        self.preferredFramesPerSecond = 12
         self.colorPixelFormat = .bgra8Unorm
         self.clearColor = MTLClearColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1)
         self.isPaused = true
@@ -458,7 +561,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
         // Phase 3: compute layouts with scroll offset applied
         var layouts: [WorkspaceLayout] = []
-        var currentY = outerPad - scrollOffset
+        var currentY = outerPad
 
         for (rowIndex, row) in rows.enumerated() {
             let rowHeight = rowHeights[rowIndex]
@@ -545,10 +648,23 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
 
     private func invalidateLayoutCache() {
-        cachedLayoutKey = nil
+        cachedLayoutGeometryKey = nil
+        cachedLayoutScrollOffset = nil
+        cachedBaseWorkspaceLayouts = []
+        cachedBaseFlattenedThumbnails = []
+        cachedWorkspaceLayouts = []
         cachedVisibleWorkspaceLayouts = []
         cachedFlattenedThumbnails = []
         cachedVisibleThumbnails = []
+    }
+
+    private func pruneThumbnailVertexCache(activeTerminalIDs: Set<UUID>) {
+        guard !thumbnailVertexCache.isEmpty else { return }
+        thumbnailVertexCache = thumbnailVertexCache.filter { activeTerminalIDs.contains($0.key.controllerID) }
+        let softLimit = max(96, activeTerminalIDs.count * 4)
+        if thumbnailVertexCache.count > softLimit {
+            thumbnailVertexCache.removeAll(keepingCapacity: true)
+        }
     }
 
     private func invalidateTextVertexCacheIfNeeded() {
@@ -564,27 +680,126 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     private func updateLayoutCacheIfNeeded() {
         let terminals = manager.terminals
+        pruneThumbnailVertexCache(activeTerminalIDs: Set(terminals.map(\.id)))
         let workspaceNames = terminals.map {
             let trimmed = $0.sessionSnapshot.workspaceName.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? "Uncategorized" : trimmed
         }
-        let key = LayoutCacheKey(
+        let geometryKey = LayoutGeometryCacheKey(
             boundsSize: bounds.size,
-            scrollOffset: scrollOffset,
             explicitWorkspaceNames: explicitWorkspaceNames,
             terminalIDs: terminals.map(\.id),
             workspaceNames: workspaceNames
         )
-        if cachedLayoutKey == key { return }
 
-        let sections = workspaceSections(from: terminals)
-        let layouts = workspaceLayouts(from: sections)
-        cachedLayoutKey = key
-        cachedWorkspaceLayouts = layouts
-        cachedVisibleWorkspaceLayouts = layouts.filter { $0.frame.intersects(bounds) }
-        cachedFlattenedThumbnails = layouts.flatMap(\.terminals)
+        if cachedLayoutGeometryKey != geometryKey {
+            let sections = workspaceSections(from: terminals)
+            let layouts = workspaceLayouts(from: sections)
+            cachedLayoutGeometryKey = geometryKey
+            cachedBaseWorkspaceLayouts = layouts
+            cachedBaseFlattenedThumbnails = layouts.flatMap(\.terminals)
+            cachedLayoutScrollOffset = nil
+        }
+
+        if cachedLayoutScrollOffset == scrollOffset,
+           !cachedWorkspaceLayouts.isEmpty || cachedBaseWorkspaceLayouts.isEmpty {
+            return
+        }
+
+        cachedLayoutScrollOffset = scrollOffset
+        cachedWorkspaceLayouts = cachedBaseWorkspaceLayouts.map {
+            translatedWorkspaceLayout($0, yOffset: -scrollOffset)
+        }
+        cachedFlattenedThumbnails = cachedWorkspaceLayouts.flatMap(\.terminals)
+        cachedVisibleWorkspaceLayouts = cachedWorkspaceLayouts.filter { $0.frame.intersects(bounds) }
         cachedVisibleThumbnails = cachedVisibleWorkspaceLayouts.flatMap { workspace in
             workspace.terminals.filter { $0.title.union($0.thumbnail).intersects(bounds) }
+        }
+    }
+
+    private func translatedWorkspaceLayout(_ layout: WorkspaceLayout, yOffset: CGFloat) -> WorkspaceLayout {
+        WorkspaceLayout(
+            name: layout.name,
+            frame: layout.frame.offsetBy(dx: 0, dy: yOffset),
+            headerFrame: layout.headerFrame.offsetBy(dx: 0, dy: yOffset),
+            addFrame: layout.addFrame.offsetBy(dx: 0, dy: yOffset),
+            closeFrame: layout.closeFrame.offsetBy(dx: 0, dy: yOffset),
+            selectAllFrame: layout.selectAllFrame.offsetBy(dx: 0, dy: yOffset),
+            deselectFrame: layout.deselectFrame.offsetBy(dx: 0, dy: yOffset),
+            terminals: layout.terminals.map { translatedThumbnailLayout($0, yOffset: yOffset) }
+        )
+    }
+
+    private func translatedThumbnailLayout(_ layout: ThumbnailLayout, yOffset: CGFloat) -> ThumbnailLayout {
+        ThumbnailLayout(
+            controller: layout.controller,
+            thumbnail: layout.thumbnail.offsetBy(dx: 0, dy: yOffset),
+            title: layout.title.offsetBy(dx: 0, dy: yOffset),
+            close: layout.close.offsetBy(dx: 0, dy: yOffset),
+            workspace: layout.workspace
+        )
+    }
+
+    private func appendTranslatedVertices(
+        from source: [Float],
+        dx: Float,
+        dy: Float,
+        to destination: inout [Float]
+    ) {
+        guard !source.isEmpty else { return }
+        destination.reserveCapacity(destination.count + source.count)
+        let stride = 12
+        source.withUnsafeBufferPointer { buffer in
+            var index = 0
+            while index < buffer.count {
+                destination.append(buffer[index] + dx)
+                destination.append(buffer[index + 1] + dy)
+                for component in 2..<stride {
+                    destination.append(buffer[index + component])
+                }
+                index += stride
+            }
+        }
+    }
+
+    private func cachedThumbnailVertices(
+        for controller: TerminalController,
+        thumbnailSize: NSSize,
+        scaleFactor: Float
+    ) -> CachedThumbnailVertices {
+        let fontSettings = controller.persistedFontSettings
+        return controller.withViewport { model, scrollback, scrollOffset in
+            let key = ThumbnailVertexCacheKey(
+                controllerID: controller.id,
+                rows: model.rows,
+                cols: model.cols,
+                scrollbackRowCount: scrollback.rowCount,
+                scrollOffset: scrollOffset,
+                contentVersion: controller.thumbnailContentVersion,
+                fontName: fontSettings.name,
+                fontSize: fontSettings.size,
+                glyphScale: scaleFactor,
+                thumbnailSize: thumbnailSize,
+                terminalAppearance: renderer.terminalAppearance
+            )
+            if let cached = thumbnailVertexCache[key] {
+                return cached
+            }
+
+            var bgVertices: [Float] = []
+            var glyphVertices: [Float] = []
+            renderer.appendThumbnailVertexData(
+                model: model,
+                scrollback: scrollback,
+                scrollOffset: scrollOffset,
+                thumbnailRect: NSRect(origin: .zero, size: thumbnailSize),
+                scaleFactor: scaleFactor,
+                bgVertices: &bgVertices,
+                glyphVertices: &glyphVertices
+            )
+            let cached = CachedThumbnailVertices(bgVertices: bgVertices, glyphVertices: glyphVertices)
+            thumbnailVertexCache[key] = cached
+            return cached
         }
     }
 
@@ -1382,18 +1597,23 @@ extension IntegratedView: MTKViewDelegate {
                 vertices: &preContentOverlayVertices
             )
 
-            // Draw terminal content scaled to thumbnail size
-            controller.withViewport { model, scrollback, scrollOffset in
-                renderer.appendThumbnailVertexData(
-                    model: model,
-                    scrollback: scrollback,
-                    scrollOffset: scrollOffset,
-                    thumbnailRect: frame.thumbnail,
-                    scaleFactor: sf,
-                    bgVertices: &thumbnailBgVertices,
-                    glyphVertices: &thumbnailGlyphVertices
-                )
-            }
+            let cachedThumbnailVertices = cachedThumbnailVertices(
+                for: controller,
+                thumbnailSize: frame.thumbnail.size,
+                scaleFactor: sf
+            )
+            appendTranslatedVertices(
+                from: cachedThumbnailVertices.bgVertices,
+                dx: Float(frame.thumbnail.origin.x) * sf,
+                dy: Float(frame.thumbnail.origin.y) * sf,
+                to: &thumbnailBgVertices
+            )
+            appendTranslatedVertices(
+                from: cachedThumbnailVertices.glyphVertices,
+                dx: Float(frame.thumbnail.origin.x) * sf,
+                dy: Float(frame.thumbnail.origin.y) * sf,
+                to: &thumbnailGlyphVertices
+            )
 
             // Draw title text
             drawTitle(
@@ -1532,8 +1752,9 @@ extension IntegratedView: MTKViewDelegate {
     }
 
     private func updateRenderLoopState() {
-        let shouldAnimate = !activeOutputTerminals.isEmpty || dragAutoScrollTimer != nil
-            || dragInsertionIndicator != nil || dragWorkspaceIndicator != nil
+        let isDragging = dragAutoScrollTimer != nil || dragInsertionIndicator != nil || dragWorkspaceIndicator != nil
+        let shouldAnimate = !activeOutputTerminals.isEmpty || isDragging
+        preferredFramesPerSecond = isDragging ? 30 : 8
         isPaused = !shouldAnimate
         enableSetNeedsDisplay = !shouldAnimate
         if !shouldAnimate {
@@ -1556,7 +1777,6 @@ extension IntegratedView: MTKViewDelegate {
         ) { [weak self] _ in
             guard let self else { return }
             self.syncScrollOffsetFromCompanionScrollView()
-            self.invalidateLayoutCache()
             self.setNeedsDisplay(self.bounds)
         }
     }

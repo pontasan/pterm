@@ -69,6 +69,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var fontSizeField: NSTextField?
     private var selectedFontName: String?
     private var selectedFontSize: Double?
+    private var terminalForegroundWell: NSColorWell?
+    private var terminalForegroundHexLabel: NSTextField?
+    private var terminalBackgroundWell: NSColorWell?
+    private var terminalBackgroundHexLabel: NSTextField?
+    private var terminalBackgroundOpacitySlider: NSSlider?
+    private var terminalBackgroundOpacityValueLabel: NSTextField?
     private var memoryMaxField: NSTextField?
     private var memoryInitialField: NSTextField?
     private var osc52Check: NSButton?
@@ -343,6 +349,65 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         ptHint.frame = NSRect(x: 206, y: 4, width: 80, height: 20)
         sizeRow.addSubview(ptHint)
         addView(sizeRow, 28)
+        addSpacing(16)
+
+        let appearance = (configData["appearance"] as? [String: Any]) ?? [:]
+        let foreground = RGBColor(
+            hexString: (appearance["terminal_foreground_color"] as? String) ?? RGBColor.defaultTerminalForeground.hexString
+        ) ?? .defaultTerminalForeground
+        let background = RGBColor(
+            hexString: (appearance["terminal_background_color"] as? String) ?? RGBColor.defaultTerminalBackground.hexString
+        ) ?? .defaultTerminalBackground
+        let opacity = min(1.0, max(0.0, doubleVal(appearance["terminal_background_opacity"]) ?? 1.0))
+
+        let (foregroundRow, foregroundWell, foregroundHexLabel) = makeColorWellRow(
+            label: "Terminal Foreground:",
+            color: nsColor(for: foreground),
+            hexValue: foreground.hexString,
+            width: width
+        )
+        foregroundWell.identifier = NSUserInterfaceItemIdentifier("terminalForegroundColorWell")
+        foregroundWell.target = self
+        foregroundWell.action = #selector(terminalForegroundColorChanged(_:))
+        terminalForegroundWell = foregroundWell
+        terminalForegroundHexLabel = foregroundHexLabel
+        addView(foregroundRow, 28)
+        addSpacing(12)
+
+        let (backgroundRow, backgroundWell, backgroundHexLabel) = makeColorWellRow(
+            label: "Terminal Background:",
+            color: nsColor(for: background),
+            hexValue: background.hexString,
+            width: width
+        )
+        backgroundWell.identifier = NSUserInterfaceItemIdentifier("terminalBackgroundColorWell")
+        backgroundWell.target = self
+        backgroundWell.action = #selector(terminalBackgroundColorChanged(_:))
+        terminalBackgroundWell = backgroundWell
+        terminalBackgroundHexLabel = backgroundHexLabel
+        addView(backgroundRow, 28)
+        addSpacing(12)
+
+        let (opacityRow, opacitySlider, opacityValueLabel) = makeSliderRow(
+            label: "Background Opacity:",
+            value: opacity,
+            width: width
+        )
+        opacitySlider.identifier = NSUserInterfaceItemIdentifier("terminalBackgroundOpacitySlider")
+        opacitySlider.target = self
+        opacitySlider.action = #selector(terminalBackgroundOpacityChanged(_:))
+        terminalBackgroundOpacitySlider = opacitySlider
+        terminalBackgroundOpacityValueLabel = opacityValueLabel
+        terminalBackgroundOpacityValueLabel?.stringValue = opacityPercentString(opacity)
+        addView(opacityRow, 28)
+        addSpacing(8)
+        addView(
+            makeDescriptionLabel(
+                "Lower opacity lets the macOS window material show through behind the terminal.",
+                width: width
+            ),
+            18
+        )
     }
 
     // MARK: - Section: Memory
@@ -527,6 +592,61 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         commitConfigChange()
     }
 
+    @objc private func terminalForegroundColorChanged(_ sender: NSColorWell) {
+        saveTerminalAppearance(
+            foreground: rgbColor(from: sender.color),
+            background: nil,
+            opacity: nil
+        )
+    }
+
+    @objc private func terminalBackgroundColorChanged(_ sender: NSColorWell) {
+        saveTerminalAppearance(
+            foreground: nil,
+            background: rgbColor(from: sender.color),
+            opacity: nil
+        )
+    }
+
+    @objc private func terminalBackgroundOpacityChanged(_ sender: NSSlider) {
+        let opacity = min(1.0, max(0.0, sender.doubleValue))
+        terminalBackgroundOpacityValueLabel?.stringValue = opacityPercentString(opacity)
+        saveTerminalAppearance(
+            foreground: nil,
+            background: nil,
+            opacity: opacity
+        )
+    }
+
+    private func saveTerminalAppearance(
+        foreground: RGBColor?,
+        background: RGBColor?,
+        opacity: Double?
+    ) {
+        var appearance = (configData["appearance"] as? [String: Any]) ?? [:]
+        let effectiveForeground = foreground ??
+            RGBColor(hexString: appearance["terminal_foreground_color"] as? String ?? "") ??
+            .defaultTerminalForeground
+        let effectiveBackground = background ??
+            RGBColor(hexString: appearance["terminal_background_color"] as? String ?? "") ??
+            .defaultTerminalBackground
+        let effectiveOpacity = min(
+            1.0,
+            max(0.0, opacity ?? doubleVal(appearance["terminal_background_opacity"]) ?? 1.0)
+        )
+
+        appearance["terminal_foreground_color"] = effectiveForeground.hexString
+        appearance["terminal_background_color"] = effectiveBackground.hexString
+        appearance["terminal_background_opacity"] = effectiveOpacity
+        configData["appearance"] = appearance
+
+        terminalForegroundHexLabel?.stringValue = effectiveForeground.hexString
+        terminalBackgroundHexLabel?.stringValue = effectiveBackground.hexString
+        terminalBackgroundOpacityValueLabel?.stringValue = opacityPercentString(effectiveOpacity)
+
+        commitConfigChange()
+    }
+
     @objc private func memoryChanged(_ sender: NSTextField) {
         guard let maxMB = Int(memoryMaxField?.stringValue ?? ""),
               let initMB = Int(memoryInitialField?.stringValue ?? "") else { return }
@@ -616,6 +736,56 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return (row, popup)
     }
 
+    private func makeColorWellRow(
+        label: String,
+        color: NSColor,
+        hexValue: String,
+        width: CGFloat
+    ) -> (NSView, NSColorWell, NSTextField) {
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 28))
+        let labelView = makeLabel(label)
+        labelView.frame = NSRect(x: 0, y: 4, width: 120, height: 20)
+        row.addSubview(labelView)
+
+        let well = NSColorWell(frame: NSRect(x: 124, y: 2, width: 44, height: 24))
+        well.color = color
+        row.addSubview(well)
+
+        let hexLabel = makeLabel(hexValue)
+        hexLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        hexLabel.textColor = NSColor(calibratedWhite: 0.7, alpha: 1)
+        hexLabel.frame = NSRect(x: 176, y: 4, width: 100, height: 20)
+        row.addSubview(hexLabel)
+
+        return (row, well, hexLabel)
+    }
+
+    private func makeSliderRow(
+        label: String,
+        value: Double,
+        width: CGFloat
+    ) -> (NSView, NSSlider, NSTextField) {
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 28))
+        let labelView = makeLabel(label)
+        labelView.frame = NSRect(x: 0, y: 4, width: 120, height: 20)
+        row.addSubview(labelView)
+
+        let slider = NSSlider(value: value, minValue: 0.0, maxValue: 1.0, target: nil, action: nil)
+        slider.numberOfTickMarks = 11
+        slider.allowsTickMarkValuesOnly = false
+        slider.frame = NSRect(x: 124, y: 2, width: 170, height: 24)
+        row.addSubview(slider)
+
+        let valueLabel = makeLabel(opacityPercentString(value))
+        valueLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        valueLabel.textColor = NSColor(calibratedWhite: 0.7, alpha: 1)
+        valueLabel.alignment = .right
+        valueLabel.frame = NSRect(x: width - 50, y: 4, width: 50, height: 20)
+        row.addSubview(valueLabel)
+
+        return (row, slider, valueLabel)
+    }
+
     private func makeTextFieldRow(label: String, value: String, width: CGFloat) -> (NSView, NSTextField) {
         let row = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 28))
         let l = makeLabel(label)
@@ -648,6 +818,28 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private func intVal(_ value: Any?) -> Int? {
         if let n = value as? NSNumber { return n.intValue }
         return value as? Int
+    }
+
+    private func nsColor(for color: RGBColor) -> NSColor {
+        NSColor(
+            calibratedRed: CGFloat(color.red) / 255.0,
+            green: CGFloat(color.green) / 255.0,
+            blue: CGFloat(color.blue) / 255.0,
+            alpha: 1.0
+        )
+    }
+
+    private func rgbColor(from color: NSColor) -> RGBColor {
+        let converted = color.usingColorSpace(.deviceRGB) ?? color
+        return RGBColor(
+            red: UInt8((max(0.0, min(1.0, converted.redComponent)) * 255.0).rounded()),
+            green: UInt8((max(0.0, min(1.0, converted.greenComponent)) * 255.0).rounded()),
+            blue: UInt8((max(0.0, min(1.0, converted.blueComponent)) * 255.0).rounded())
+        )
+    }
+
+    private func opacityPercentString(_ value: Double) -> String {
+        "\(Int((value * 100.0).rounded()))%"
     }
 }
 

@@ -58,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var config: PtermConfig = .default
 
     private var statusBarView: StatusBarView!
+    private var windowBackgroundEffectView: NSVisualEffectView?
     private var configWatchSource: DispatchSourceFileSystemObject?
     private var pendingConfigReload: DispatchWorkItem?
     private var backShortcutMonitor: Any?
@@ -187,6 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             fatalError("Failed to initialize Metal. GPU rendering is required.")
         }
         self.renderer = renderer
+        renderer.updateTerminalAppearance(config.terminalAppearance)
 
         // Load Metal shaders
         loadShaders()
@@ -215,11 +217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.isRestorable = false // Disable macOS state restoration
         installTitlebarBackButton()
 
-        // Dark appearance — standard dark mode title bar with visible title text,
-        // matching macOS Terminal.app behavior
-        window.appearance = NSAppearance(named: .darkAqua)
-        window.backgroundColor = .black
-        window.isOpaque = true
+        configureWindowAppearance()
 
         let restoredSession = loadRestorableSession()
         applyInitialFontConfiguration(restoredSession)
@@ -284,6 +282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         integratedView = iv
         syncIntegratedWorkspaceNames()
         window.contentView!.addSubview(iv)
+        applyAppearanceSettingsToVisibleViews()
         setupScrollbarOverlay(for: iv)
         isWindowLayoutReady = true
         synchronizeWindowLayout(shouldPersistSession: false)
@@ -478,6 +477,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView!.addSubview(sv)
         terminalScrollView = sv
         terminalView = sv.terminalView
+        terminalView?.applyAppearanceSettings()
         focusedController = controller
 
         viewMode = .focused(controller)
@@ -527,6 +527,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         window.contentView!.addSubview(splitView)
         splitContainerView = splitView
+        splitContainerView?.applyAppearanceSettings()
         splitOriginControllers = nil
         viewMode = .split(controllers)
         updateTitlebarBackButtonVisibility()
@@ -604,6 +605,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         syncIntegratedWorkspaceNames()
         window.contentView!.addSubview(iv)
         setupScrollbarOverlay(for: iv)
+        applyAppearanceSettingsToVisibleViews()
         iv.syncScaleFactorIfNeeded()
         viewMode = .integrated
         updateTitlebarBackButtonVisibility()
@@ -620,6 +622,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let targetFontSize = CGFloat(settings.size)
         guard renderer.glyphAtlas.fontName != targetFontName ||
                 abs(renderer.glyphAtlas.fontSize - targetFontSize) > 0.001 else {
+            applyAppearanceSettingsToVisibleViews()
             return
         }
 
@@ -627,6 +630,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminalView?.fontSizeDidChange()
         splitContainerView?.fontSizeDidChange()
         integratedView?.setNeedsDisplay(integratedView?.bounds ?? .zero)
+        applyAppearanceSettingsToVisibleViews()
         updateWindowTitle()
     }
 
@@ -902,6 +906,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminalView?.shortcutConfiguration = config.shortcuts
         splitContainerView?.shortcutConfiguration = config.shortcuts
         integratedView?.shortcutConfiguration = config.shortcuts
+        renderer.updateTerminalAppearance(config.terminalAppearance)
 
         let fontName = config.fontName ?? renderer.glyphAtlas.fontName
         let fontSize = CGFloat(config.fontSize ?? Double(renderer.glyphAtlas.fontSize))
@@ -919,6 +924,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminalView?.updateMarkedTextOverlayPublic()
         splitContainerView?.fontSizeDidChange()
         splitContainerView?.updateMarkedTextForFontChange()
+        applyAppearanceSettingsToVisibleViews()
         integratedView?.setNeedsDisplay(integratedView?.bounds ?? .zero)
         synchronizeWindowLayout(shouldPersistSession: false)
 
@@ -1978,6 +1984,51 @@ extension AppDelegate: NSWindowDelegate {
         integratedView?.syncScaleFactorIfNeeded()
         terminalView?.syncScaleFactorIfNeeded()
         splitContainerView?.syncScaleFactorIfNeeded()
+    }
+
+    private func configureWindowAppearance() {
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.titlebarAppearsTransparent = true
+        window.contentView?.wantsLayer = true
+        let usesTranslucentMaterial = config.terminalAppearance.normalizedBackgroundOpacity < 0.999
+        let background = config.terminalAppearance.background
+        let backgroundColor = NSColor(
+            calibratedRed: CGFloat(background.red) / 255.0,
+            green: CGFloat(background.green) / 255.0,
+            blue: CGFloat(background.blue) / 255.0,
+            alpha: 1.0
+        )
+
+        if windowBackgroundEffectView == nil {
+            let effectView = NSVisualEffectView(frame: window.contentView?.bounds ?? .zero)
+            effectView.autoresizingMask = [.width, .height]
+            effectView.blendingMode = .behindWindow
+            effectView.material = .underWindowBackground
+            effectView.state = .active
+            window.contentView?.addSubview(effectView, positioned: .below, relativeTo: nil)
+            windowBackgroundEffectView = effectView
+        }
+
+        if usesTranslucentMaterial {
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
+            windowBackgroundEffectView?.isHidden = false
+            windowBackgroundEffectView?.state = .active
+        } else {
+            window.isOpaque = true
+            window.backgroundColor = backgroundColor
+            window.contentView?.layer?.backgroundColor = backgroundColor.cgColor
+            windowBackgroundEffectView?.isHidden = true
+            windowBackgroundEffectView?.state = .inactive
+        }
+    }
+
+    private func applyAppearanceSettingsToVisibleViews() {
+        configureWindowAppearance()
+        terminalView?.applyAppearanceSettings()
+        splitContainerView?.applyAppearanceSettings()
+        integratedView?.setNeedsDisplay(integratedView?.bounds ?? .zero)
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {

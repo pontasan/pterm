@@ -57,6 +57,13 @@ enum TerminalColor: Equatable {
     case indexed(UInt8)          // 0-255 color index
     case rgb(UInt8, UInt8, UInt8) // 24-bit TrueColor
 
+    var isDefaultColor: Bool {
+        if case .default = self {
+            return true
+        }
+        return false
+    }
+
     /// Standard ANSI 16 color palette (dark theme defaults)
     static let ansiPalette: [(r: UInt8, g: UInt8, b: UInt8)] = [
         // Normal colors (0-7)

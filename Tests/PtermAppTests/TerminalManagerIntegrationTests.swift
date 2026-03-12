@@ -8,6 +8,7 @@ final class TerminalManagerIntegrationTests: XCTestCase {
             textEncoding: .utf16,
             fontName: nil,
             fontSize: nil,
+            terminalAppearance: .default,
             memoryMax: 2 * 1024 * 1024,
             memoryInitial: 1024 * 1024,
             sessionScrollBufferPersistence: false,

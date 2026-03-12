@@ -42,8 +42,9 @@ final class TerminalView: MTKView, NSTextInputClient {
         didSet {
             isPaused = demandDrivenRendering
             enableSetNeedsDisplay = demandDrivenRendering
+            updateCursorBlinkTimer()
             if demandDrivenRendering {
-                setNeedsDisplay(bounds)
+                requestDisplayUpdate()
             }
         }
     }
@@ -59,7 +60,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     /// Current text selection (nil = no selection)
     private(set) var selection: TerminalSelection? {
         didSet {
-            setNeedsDisplay(bounds)
+            requestDisplayUpdate()
         }
     }
 
@@ -78,6 +79,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var trackingArea: NSTrackingArea?
     private var pressedMouseButton: Int?
     private var windowObservers: [NSObjectProtocol] = []
+    private var cursorBlinkTimer: Timer?
     private let markedTextLayer = CATextLayer()
     private var markedTextStorage = NSMutableAttributedString()
     private var markedTextSelection = NSRange(location: NSNotFound, length: 0)
@@ -95,14 +97,16 @@ final class TerminalView: MTKView, NSTextInputClient {
         super.init(frame: frame, device: renderer.device)
 
         self.delegate = self
-        self.preferredFramesPerSecond = 60
+        self.preferredFramesPerSecond = 30
         self.colorPixelFormat = .bgra8Unorm
-        self.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        self.isPaused = false
-        self.enableSetNeedsDisplay = false
+        self.clearColor = renderer.terminalClearColor
+        self.isPaused = true
+        self.enableSetNeedsDisplay = true
         self.registerForDraggedTypes([.fileURL])
         self.wantsLayer = true
+        self.layer?.isOpaque = false
         configureMarkedTextLayer()
+        demandDrivenRendering = true
 
         _ = self.becomeFirstResponder()
     }
@@ -112,6 +116,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         fatalError("init(coder:) not implemented")
     }
 
+    override var isOpaque: Bool { false }
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -119,6 +124,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         let accepted = super.becomeFirstResponder()
         if accepted {
             onBecameFirstResponder?()
+            updateCursorBlinkTimer()
         }
         return accepted
     }
@@ -173,6 +179,12 @@ final class TerminalView: MTKView, NSTextInputClient {
         syncScaleFactor()
     }
 
+    func applyAppearanceSettings() {
+        clearColor = renderer?.terminalClearColor ?? clearColor
+        requestDisplayUpdate()
+        updateMarkedTextOverlay()
+    }
+
     /// Synchronize the glyph atlas scale factor with the current display.
     private func syncScaleFactor() {
         guard let renderer = renderer else { return }
@@ -182,6 +194,7 @@ final class TerminalView: MTKView, NSTextInputClient {
             updateTerminalSize()
         }
         updateMarkedTextOverlay()
+        requestDisplayUpdate()
     }
 
     // MARK: - Setup
@@ -192,19 +205,21 @@ final class TerminalView: MTKView, NSTextInputClient {
         keyboardHandler = KeyboardHandler(controller: controller)
 
         controller.onNeedsDisplay = { [weak self] in
-            self?.setNeedsDisplay(self?.bounds ?? .zero)
+            self?.requestDisplayUpdate()
             self?.updateMarkedTextOverlay()
             self?.scrollerSyncPending = true
         }
         controller.notifyFocusChanged(window?.isKeyWindow == true)
         scrollerSyncPending = true
         updateTerminalSize()
+        updateCursorBlinkTimer()
         // When a controller is assigned to a new view (e.g., returning to split view),
         // ensure we show the latest output, not stale scrollback position.
         controller.scrollToBottom()
     }
 
     deinit {
+        cursorBlinkTimer?.invalidate()
         removeWindowObservers()
         renderer?.removeBuffers(for: self)
     }
@@ -220,6 +235,7 @@ final class TerminalView: MTKView, NSTextInputClient {
                 queue: .main
             ) { [weak self] _ in
                 self?.terminalController?.notifyFocusChanged(true)
+                self?.updateCursorBlinkTimer()
             },
             center.addObserver(
                 forName: NSWindow.didResignKeyNotification,
@@ -227,6 +243,7 @@ final class TerminalView: MTKView, NSTextInputClient {
                 queue: .main
             ) { [weak self] _ in
                 self?.terminalController?.notifyFocusChanged(false)
+                self?.updateCursorBlinkTimer()
             }
         ]
     }
@@ -244,6 +261,30 @@ final class TerminalView: MTKView, NSTextInputClient {
         markedTextLayer.alignmentMode = .left
         markedTextLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
         layer?.addSublayer(markedTextLayer)
+    }
+
+    private func requestDisplayUpdate() {
+        setNeedsDisplay(bounds)
+        if renderingSuppressed,
+           let splitContainer = enclosingScrollView?.superview as? SplitTerminalContainerView {
+            splitContainer.requestRender()
+        }
+    }
+
+    private func updateCursorBlinkTimer() {
+        cursorBlinkTimer?.invalidate()
+        cursorBlinkTimer = nil
+        guard demandDrivenRendering,
+              !renderingSuppressed,
+              window?.isKeyWindow == true,
+              let controller = terminalController else {
+            return
+        }
+        let shouldBlink = controller.withModel { $0.cursor.visible && $0.cursor.blinking }
+        guard shouldBlink else { return }
+        cursorBlinkTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.requestDisplayUpdate()
+        }
     }
 
     // MARK: - Grid Position from Mouse

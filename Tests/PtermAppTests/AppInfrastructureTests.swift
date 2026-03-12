@@ -5,6 +5,35 @@ import XCTest
 @testable import PtermApp
 
 final class AppInfrastructureTests: XCTestCase {
+    func testRGBColorParsesHexAndFormatsBackToUppercaseHex() {
+        let color = RGBColor(hexString: "#12abEF")
+
+        XCTAssertEqual(color, RGBColor(red: 0x12, green: 0xAB, blue: 0xEF))
+        XCTAssertEqual(color?.hexString, "#12ABEF")
+    }
+
+    func testTerminalAppearanceConfigurationClampsBackgroundOpacity() {
+        let low = TerminalAppearanceConfiguration(
+            foreground: .defaultTerminalForeground,
+            background: .defaultTerminalBackground,
+            backgroundOpacity: -1.0
+        )
+        let high = TerminalAppearanceConfiguration(
+            foreground: .defaultTerminalForeground,
+            background: .defaultTerminalBackground,
+            backgroundOpacity: 3.0
+        )
+
+        XCTAssertEqual(low.normalizedBackgroundOpacity, 0.0)
+        XCTAssertEqual(high.normalizedBackgroundOpacity, 1.0)
+    }
+
+    func testTerminalColorDefaultDetectionOnlyMatchesDefaultCase() {
+        XCTAssertTrue(TerminalColor.default.isDefaultColor)
+        XCTAssertFalse(TerminalColor.indexed(0).isDefaultColor)
+        XCTAssertFalse(TerminalColor.rgb(0, 0, 0).isDefaultColor)
+    }
+
     func testPersistedWindowFrameRoundTripsNSRect() {
         let rect = NSRect(x: 10, y: 20, width: 640, height: 480)
         let persisted = PersistedWindowFrame(frame: rect)

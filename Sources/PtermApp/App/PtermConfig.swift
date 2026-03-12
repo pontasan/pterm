@@ -1,5 +1,52 @@
 import Foundation
 
+struct RGBColor: Equatable {
+    let red: UInt8
+    let green: UInt8
+    let blue: UInt8
+
+    static let defaultTerminalForeground = RGBColor(red: 0xCC, green: 0xCC, blue: 0xCC)
+    static let defaultTerminalBackground = RGBColor(red: 0x00, green: 0x00, blue: 0x00)
+
+    init(red: UInt8, green: UInt8, blue: UInt8) {
+        self.red = red
+        self.green = green
+        self.blue = blue
+    }
+
+    init?(hexString: String) {
+        let trimmed = hexString.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = trimmed.hasPrefix("#") ? String(trimmed.dropFirst()) : trimmed
+        guard normalized.count == 6,
+              let value = UInt32(normalized, radix: 16) else {
+            return nil
+        }
+        self.red = UInt8((value >> 16) & 0xFF)
+        self.green = UInt8((value >> 8) & 0xFF)
+        self.blue = UInt8(value & 0xFF)
+    }
+
+    var hexString: String {
+        String(format: "#%02X%02X%02X", red, green, blue)
+    }
+}
+
+struct TerminalAppearanceConfiguration: Equatable {
+    let foreground: RGBColor
+    let background: RGBColor
+    let backgroundOpacity: Double
+
+    static let `default` = TerminalAppearanceConfiguration(
+        foreground: .defaultTerminalForeground,
+        background: .defaultTerminalBackground,
+        backgroundOpacity: 1.0
+    )
+
+    var normalizedBackgroundOpacity: Double {
+        min(1.0, max(0.0, backgroundOpacity))
+    }
+}
+
 struct ConfiguredWorkspaceTerminal: Equatable {
     let title: String?
     let initialDirectory: String?
@@ -25,6 +72,7 @@ struct PtermConfig {
     let textEncoding: TerminalTextEncoding
     let fontName: String?
     let fontSize: Double?
+    let terminalAppearance: TerminalAppearanceConfiguration
     let memoryMax: Int
     let memoryInitial: Int
     let sessionScrollBufferPersistence: Bool
@@ -38,6 +86,7 @@ struct PtermConfig {
         textEncoding: .utf8,
         fontName: nil,
         fontSize: nil,
+        terminalAppearance: .default,
         memoryMax: 64 * 1024 * 1024,
         memoryInitial: 2 * 1024 * 1024,
         sessionScrollBufferPersistence: false,
@@ -142,6 +191,7 @@ enum PtermConfigStore {
             max(1024 * 1024, intValue(root["memory_initial"]) ?? configuredMax)
         )
         let font = dictionaryValue(root["font"])
+        let appearance = dictionaryValue(root["appearance"])
         let session = dictionaryValue(root["session"])
         let audit = dictionaryValue(root["audit"])
         let security = dictionaryValue(root["security"])
@@ -153,6 +203,11 @@ enum PtermConfigStore {
             textEncoding: stringValue(root["text_encoding"]).flatMap(TerminalTextEncoding.init(configuredValue:)) ?? defaults.textEncoding,
             fontName: stringValue(font?["name"]) ?? stringValue(root["font_name"]),
             fontSize: normalizedFontSize(doubleValue(font?["size"]) ?? doubleValue(root["font_size"])),
+            terminalAppearance: TerminalAppearanceConfiguration(
+                foreground: stringValue(appearance?["terminal_foreground_color"]).flatMap(RGBColor.init(hexString:)) ?? defaults.terminalAppearance.foreground,
+                background: stringValue(appearance?["terminal_background_color"]).flatMap(RGBColor.init(hexString:)) ?? defaults.terminalAppearance.background,
+                backgroundOpacity: normalizedOpacity(doubleValue(appearance?["terminal_background_opacity"]) ?? defaults.terminalAppearance.backgroundOpacity)
+            ),
             memoryMax: configuredMax,
             memoryInitial: configuredInitial,
             sessionScrollBufferPersistence: boolValue(session?["scroll_buffer_persistence"]) ?? defaults.sessionScrollBufferPersistence,
@@ -205,6 +260,10 @@ enum PtermConfigStore {
         guard let value else { return nil }
         let clamped = min(Double(MetalRenderer.maxFontSize), max(Double(MetalRenderer.minFontSize), value))
         return clamped
+    }
+
+    private static func normalizedOpacity(_ value: Double) -> Double {
+        min(1.0, max(0.0, value))
     }
 
     private static func workspaceList(_ value: Any?) -> [ConfiguredWorkspace] {

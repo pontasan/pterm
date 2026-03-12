@@ -31,7 +31,7 @@ final class SplitTerminalContainerView: NSView {
         self.controllers = controllers
         super.init(frame: frame)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.black.cgColor
+        layer?.backgroundColor = NSColor.clear.cgColor
         backButton.bezelStyle = .texturedRounded
         backButton.isBordered = true
         backButton.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
@@ -139,6 +139,7 @@ final class SplitTerminalContainerView: NSView {
         addSubview(overlay)
         splitRenderView = overlay
         syncRenderCells()
+        applyAppearanceSettings()
     }
 
     /// Sync the SplitRenderView's cell references from current scroll view layout.
@@ -196,6 +197,18 @@ final class SplitTerminalContainerView: NSView {
         for scrollView in scrollViews {
             scrollView.terminalView.updateMarkedTextOverlayPublic()
         }
+    }
+
+    func applyAppearanceSettings() {
+        layer?.backgroundColor = NSColor.clear.cgColor
+        for scrollView in scrollViews {
+            scrollView.terminalView.applyAppearanceSettings()
+        }
+        splitRenderView?.applyAppearanceSettings()
+    }
+
+    func requestRender() {
+        splitRenderView?.requestRender()
     }
 
     func syncScaleFactorIfNeeded() {

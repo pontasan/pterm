@@ -223,6 +223,92 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(buttonTitles.contains("Allow OSC 52 clipboard read"))
     }
 
+    func testSettingsWindowAppearanceSectionShowsTerminalColorControlsAndOpacitySlider() throws {
+        let controller = SettingsWindowController()
+        let tableView = try XCTUnwrap(findSubview(in: controller.window?.contentView) { $0 is NSTableView } as? NSTableView)
+
+        tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
+
+        let colorWells = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSColorWell }
+        let slider = try XCTUnwrap(allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSSlider }.first)
+        let labels = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSTextField }.map(\.stringValue)
+
+        XCTAssertEqual(colorWells.count, 2)
+        XCTAssertEqual(slider.doubleValue, 1.0, accuracy: 0.001)
+        XCTAssertTrue(labels.contains("Terminal Foreground:"))
+        XCTAssertTrue(labels.contains("Terminal Background:"))
+        XCTAssertTrue(labels.contains("Background Opacity:"))
+        XCTAssertTrue(labels.contains("#CCCCCC"))
+        XCTAssertTrue(labels.contains("#000000"))
+        XCTAssertTrue(labels.contains("100%"))
+    }
+
+    func testTerminalViewApplyAppearanceSettingsUpdatesClearColor() throws {
+        let renderer = try makeRendererOrSkip()
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+
+        renderer.updateTerminalAppearance(
+            TerminalAppearanceConfiguration(
+                foreground: RGBColor(red: 0xF0, green: 0xE0, blue: 0xD0),
+                background: RGBColor(red: 0x11, green: 0x22, blue: 0x33),
+                backgroundOpacity: 0.4
+            )
+        )
+        view.applyAppearanceSettings()
+
+        XCTAssertEqual(view.clearColor.red, Double(0x11) / 255.0, accuracy: 0.0001)
+        XCTAssertEqual(view.clearColor.green, Double(0x22) / 255.0, accuracy: 0.0001)
+        XCTAssertEqual(view.clearColor.blue, Double(0x33) / 255.0, accuracy: 0.0001)
+        XCTAssertEqual(view.clearColor.alpha, 0.4, accuracy: 0.0001)
+        XCTAssertFalse(view.isOpaque)
+    }
+
+    func testTerminalViewStartsInDemandDrivenRenderingMode() throws {
+        let renderer = try makeRendererOrSkip()
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+
+        XCTAssertTrue(view.demandDrivenRendering)
+        XCTAssertTrue(view.isPaused)
+        XCTAssertTrue(view.enableSetNeedsDisplay)
+    }
+
+    func testSplitTerminalContainerApplyAppearanceSettingsPropagatesClearColor() throws {
+        let renderer = try makeRendererOrSkip()
+        let controllers = [
+            TerminalController(rows: 4, cols: 12, termEnv: "xterm-256color", textEncoding: .utf8, scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096, fontName: "Menlo", fontSize: 13),
+            TerminalController(rows: 4, cols: 12, termEnv: "xterm-256color", textEncoding: .utf8, scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096, fontName: "Menlo", fontSize: 13)
+        ]
+        let container = SplitTerminalContainerView(
+            frame: NSRect(x: 0, y: 0, width: 480, height: 280),
+            renderer: renderer,
+            controllers: controllers
+        )
+
+        renderer.updateTerminalAppearance(
+            TerminalAppearanceConfiguration(
+                foreground: .defaultTerminalForeground,
+                background: RGBColor(red: 0x20, green: 0x40, blue: 0x60),
+                backgroundOpacity: 0.5
+            )
+        )
+        container.applyAppearanceSettings()
+
+        let terminalViews = allSubviews(in: container).compactMap { $0 as? TerminalView }
+        let splitRenderView = try XCTUnwrap(allSubviews(in: container).compactMap { $0 as? SplitRenderView }.first)
+
+        XCTAssertTrue(terminalViews.allSatisfy { abs($0.clearColor.alpha - 0.5) < 0.0001 })
+        XCTAssertEqual(splitRenderView.clearColor.alpha, 0.5, accuracy: 0.0001)
+    }
+
+    func testSplitRenderViewStartsInDemandDrivenRenderingMode() throws {
+        let renderer = try makeRendererOrSkip()
+        let view = SplitRenderView(frame: NSRect(x: 0, y: 0, width: 480, height: 280), renderer: renderer)
+
+        XCTAssertTrue(view.isPaused)
+        XCTAssertTrue(view.enableSetNeedsDisplay)
+    }
+
     func testSearchBarViewUpdatesCountAndInvokesCallbacks() {
         let view = SearchBarView(frame: NSRect(x: 0, y: 0, width: 300, height: 32))
         var queries: [String] = []

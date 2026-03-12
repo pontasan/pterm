@@ -29,17 +29,20 @@ final class SplitRenderView: MTKView {
         super.init(frame: frame, device: renderer.device)
 
         self.colorPixelFormat = .bgra8Unorm
-        self.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        self.isPaused = false
-        self.enableSetNeedsDisplay = false
-        self.preferredFramesPerSecond = 60
+        self.clearColor = renderer.terminalClearColor
+        self.isPaused = true
+        self.enableSetNeedsDisplay = true
+        self.preferredFramesPerSecond = 30
         self.wantsLayer = true
+        self.layer?.isOpaque = false
     }
 
     @available(*, unavailable)
     required init(coder: NSCoder) {
         fatalError("init(coder:) not implemented")
     }
+
+    override var isOpaque: Bool { false }
 
     deinit {
         renderer.removeBuffers(for: self)
@@ -65,6 +68,15 @@ final class SplitRenderView: MTKView {
 
     func syncScaleFactorIfNeeded() {
         syncScaleFactor()
+    }
+
+    func applyAppearanceSettings() {
+        clearColor = renderer.terminalClearColor
+        setNeedsDisplay(bounds)
+    }
+
+    func requestRender() {
+        setNeedsDisplay(bounds)
     }
 
     private func syncScaleFactor() {
@@ -97,8 +109,7 @@ extension SplitRenderView: MTKViewDelegate {
         }
 
         renderPassDescriptor.colorAttachments[0].loadAction = .clear
-        renderPassDescriptor.colorAttachments[0].clearColor =
-            MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        renderPassDescriptor.colorAttachments[0].clearColor = renderer.terminalClearColor
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(
             descriptor: renderPassDescriptor) else {

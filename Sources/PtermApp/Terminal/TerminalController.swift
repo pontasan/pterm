@@ -103,6 +103,7 @@ final class TerminalController {
     private var pendingNeedsDisplay = false
     private var pendingOutputActivity = false
     private var pendingStateChange = false
+    private var renderContentVersion: UInt64 = 0
 
     /// Decode buffer for UTF-8 -> codepoints
     private var codepointBuffer = [UInt32](repeating: 0, count: 16384)
@@ -129,6 +130,12 @@ final class TerminalController {
     var persistedFontSettings: (name: String, size: Double) {
         lock.withReadLock {
             (persistedFontName, persistedFontSize)
+        }
+    }
+
+    var thumbnailContentVersion: UInt64 {
+        callbackLock.withLock {
+            renderContentVersion
         }
     }
 
@@ -681,6 +688,9 @@ final class TerminalController {
         stateChange: Bool = false
     ) {
         let shouldSchedule = callbackLock.withLock {
+            if needsDisplay {
+                renderContentVersion &+= 1
+            }
             pendingNeedsDisplay = pendingNeedsDisplay || needsDisplay
             pendingOutputActivity = pendingOutputActivity || outputActivity
             pendingStateChange = pendingStateChange || stateChange

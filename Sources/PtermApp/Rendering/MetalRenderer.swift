@@ -14,6 +14,16 @@ import QuartzCore
 /// Supports Retina (HiDPI) rendering and virtualized scrollback
 /// (only visible rows are rendered, regardless of scrollback size).
 final class MetalRenderer {
+    struct TerminalAppearance {
+        var defaultForeground: (r: Float, g: Float, b: Float)
+        var defaultBackground: (r: Float, g: Float, b: Float, a: Float)
+
+        static let `default` = TerminalAppearance(
+            defaultForeground: (0.8, 0.8, 0.8),
+            defaultBackground: (0.0, 0.0, 0.0, 1.0)
+        )
+    }
+
     /// Result of building vertex data for a single frame.
     struct VertexData {
         var bgVertices: [Float] = []
@@ -48,6 +58,7 @@ final class MetalRenderer {
 
     /// Glyph atlas
     let glyphAtlas: GlyphAtlas
+    var terminalAppearance: TerminalAppearance = .default
 
     /// Sampler state for glyph texture (nearest-neighbor for full-size)
     private var sampler: MTLSamplerState?
@@ -176,6 +187,32 @@ final class MetalRenderer {
     func updateFont(name: String, size: CGFloat) {
         let clamped = min(MetalRenderer.maxFontSize, max(MetalRenderer.minFontSize, size))
         glyphAtlas.updateFont(name: name, size: clamped)
+    }
+
+    func updateTerminalAppearance(_ appearance: TerminalAppearanceConfiguration) {
+        terminalAppearance = TerminalAppearance(
+            defaultForeground: (
+                Float(appearance.foreground.red) / 255.0,
+                Float(appearance.foreground.green) / 255.0,
+                Float(appearance.foreground.blue) / 255.0
+            ),
+            defaultBackground: (
+                Float(appearance.background.red) / 255.0,
+                Float(appearance.background.green) / 255.0,
+                Float(appearance.background.blue) / 255.0,
+                Float(appearance.normalizedBackgroundOpacity)
+            )
+        )
+    }
+
+    var terminalClearColor: MTLClearColor {
+        let background = terminalAppearance.defaultBackground
+        return MTLClearColor(
+            red: Double(background.r),
+            green: Double(background.g),
+            blue: Double(background.b),
+            alpha: Double(background.a)
+        )
     }
 
     /// Load Metal shaders and create render pipelines.
@@ -319,10 +356,9 @@ final class MetalRenderer {
             time: Float(CACurrentMediaTime() - startTime)
         )
 
-        // Clear color: black background
+        // Clear color: terminal background
         renderPassDescriptor.colorAttachments[0].loadAction = .clear
-        renderPassDescriptor.colorAttachments[0].clearColor =
-            MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        renderPassDescriptor.colorAttachments[0].clearColor = terminalClearColor
 
         // Build vertex data using the atlas's scale factor.
         let sf = Float(glyphAtlas.scaleFactor)
@@ -512,9 +548,10 @@ final class MetalRenderer {
 
                 // Resolve colors (handle inverse and selection)
                 var fgColor: (r: Float, g: Float, b: Float)
-                var bgColor: (r: Float, g: Float, b: Float)
+                var bgColor: (r: Float, g: Float, b: Float, a: Float)
 
                 let isSelected = selectedColumnRange?.contains(col) ?? false
+                let usesDefaultBackground = cell.attributes.background.isDefaultColor
 
                 var searchMatchType: Int = 0 // 0=none, 1=match, 2=current match
                 while currentMatchIndex < rowMatches.count && col > rowMatches[currentMatchIndex].end {
@@ -529,36 +566,42 @@ final class MetalRenderer {
 
                 if cell.attributes.inverse != isSelected {
                     // Inverse XOR selected: swap fg/bg
-                    fgColor = cell.attributes.background.resolve(isForeground: false)
-                    bgColor = cell.attributes.foreground.resolve(isForeground: true)
+                    fgColor = resolveBackgroundColorAsForeground(cell.attributes.background)
+                    bgColor = resolveForegroundColorAsBackground(cell.attributes.foreground)
                 } else {
                     fgColor = resolveForegroundColor(for: cell)
-                    bgColor = cell.attributes.background.resolve(isForeground: false)
+                    bgColor = resolveBackgroundColor(cell.attributes.background)
                 }
 
                 // Apply search match highlight
                 if searchMatchType == 2 {
                     // Current match: bright orange background, dark foreground
-                    bgColor = (0.90, 0.60, 0.10)
+                    bgColor = (0.90, 0.60, 0.10, 1.0)
                     fgColor = (0.0, 0.0, 0.0)
                 } else if searchMatchType == 1 {
                     // Other matches: dim yellow background
-                    bgColor = (0.55, 0.45, 0.10)
+                    bgColor = (0.55, 0.45, 0.10, 1.0)
                     fgColor = (0.0, 0.0, 0.0)
                 }
 
                 if cell.attributes.hidden {
-                    fgColor = bgColor
+                    fgColor = (bgColor.r, bgColor.g, bgColor.b)
                 } else if cell.attributes.dim && searchMatchType == 0 {
                     fgColor = (fgColor.r * 0.66, fgColor.g * 0.66, fgColor.b * 0.66)
                 }
 
-                // Background quad (skip if default black to save draw calls, but always draw for selected/highlighted cells)
-                if isSelected || searchMatchType > 0 || bgColor.r > 0.001 || bgColor.g > 0.001 || bgColor.b > 0.001 {
+                // Skip default-background quads in the common case: the render pass clear color
+                // already fills the terminal with the configured default background.
+                let needsBackgroundQuad =
+                    isSelected ||
+                    searchMatchType > 0 ||
+                    (cell.attributes.inverse != isSelected) ||
+                    !usesDefaultBackground
+                if needsBackgroundQuad {
                     addQuad(to: &vd.bgVertices, x: x, y: y, w: w, h: h,
                            tx: 0, ty: 0, tw: 0, th: 0,
-                           fg: (bgColor.r, bgColor.g, bgColor.b, 1),
-                           bg: (bgColor.r, bgColor.g, bgColor.b, 1))
+                           fg: (bgColor.r, bgColor.g, bgColor.b, bgColor.a),
+                           bg: (bgColor.r, bgColor.g, bgColor.b, bgColor.a))
                 }
 
                 // Block/quadrant elements render more faithfully as geometry.
@@ -665,7 +708,36 @@ final class MetalRenderer {
             return TerminalColor.indexed(idx + 8).resolve(isForeground: true)
         }
 
-        return cell.attributes.foreground.resolve(isForeground: true)
+        return resolveForegroundColor(cell.attributes.foreground)
+    }
+
+    private func resolveForegroundColor(_ color: TerminalColor) -> (r: Float, g: Float, b: Float) {
+        switch color {
+        case .default:
+            return terminalAppearance.defaultForeground
+        default:
+            return color.resolve(isForeground: true)
+        }
+    }
+
+    private func resolveBackgroundColor(_ color: TerminalColor) -> (r: Float, g: Float, b: Float, a: Float) {
+        switch color {
+        case .default:
+            return terminalAppearance.defaultBackground
+        default:
+            let resolved = color.resolve(isForeground: false)
+            return (resolved.r, resolved.g, resolved.b, 1.0)
+        }
+    }
+
+    private func resolveBackgroundColorAsForeground(_ color: TerminalColor) -> (r: Float, g: Float, b: Float) {
+        let background = resolveBackgroundColor(color)
+        return (background.r, background.g, background.b)
+    }
+
+    private func resolveForegroundColorAsBackground(_ color: TerminalColor) -> (r: Float, g: Float, b: Float, a: Float) {
+        let foreground = resolveForegroundColor(color)
+        return (foreground.r, foreground.g, foreground.b, 1.0)
     }
 
     @discardableResult
@@ -992,22 +1064,23 @@ final class MetalRenderer {
 
                 // Resolve colors
                 var fgColor: (r: Float, g: Float, b: Float)
-                var bgColor: (r: Float, g: Float, b: Float)
+                var bgColor: (r: Float, g: Float, b: Float, a: Float)
+                let usesDefaultBackground = cell.attributes.background.isDefaultColor
 
                 if cell.attributes.inverse {
-                    fgColor = cell.attributes.background.resolve(isForeground: false)
-                    bgColor = cell.attributes.foreground.resolve(isForeground: true)
+                    fgColor = resolveBackgroundColorAsForeground(cell.attributes.background)
+                    bgColor = resolveForegroundColorAsBackground(cell.attributes.foreground)
                 } else {
-                    fgColor = cell.attributes.foreground.resolve(isForeground: true)
-                    bgColor = cell.attributes.background.resolve(isForeground: false)
+                    fgColor = resolveForegroundColor(cell.attributes.foreground)
+                    bgColor = resolveBackgroundColor(cell.attributes.background)
                 }
 
-                // Background
-                if bgColor.r > 0.001 || bgColor.g > 0.001 || bgColor.b > 0.001 {
+                let needsBackgroundQuad = cell.attributes.inverse || !usesDefaultBackground
+                if needsBackgroundQuad {
                     addQuad(to: &bgVertices, x: x, y: y, w: w, h: h,
                            tx: 0, ty: 0, tw: 0, th: 0,
-                           fg: (bgColor.r, bgColor.g, bgColor.b, 1),
-                           bg: (bgColor.r, bgColor.g, bgColor.b, 1))
+                           fg: (bgColor.r, bgColor.g, bgColor.b, bgColor.a),
+                           bg: (bgColor.r, bgColor.g, bgColor.b, bgColor.a))
                 }
 
                 // Glyph
