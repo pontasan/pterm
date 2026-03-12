@@ -13,7 +13,7 @@ final class StatusBarView: NSView {
     override init(frame frameRect: NSRect) {
         backButton = NSButton(title: "◀ Overview", target: nil, action: nil)
         separatorLabel = NSTextField(labelWithString: "|")
-        noteButton = NSButton(title: "Edit Notes", target: nil, action: nil)
+        noteButton = NSButton(title: "📝 Notes", target: nil, action: nil)
         super.init(frame: frameRect)
         backButton.target = self
         backButton.action = #selector(backButtonClicked)
@@ -48,7 +48,7 @@ final class StatusBarView: NSView {
         noteButton.isBordered = false
         noteButton.contentTintColor = textColor
         noteButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        noteButton.toolTip = "Notes"
+        noteButton.toolTip = "Workspace Notes"
         addSubview(noteButton)
     }
 

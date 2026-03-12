@@ -1,0 +1,411 @@
+import XCTest
+@testable import PtermApp
+
+final class TextModelTests: XCTestCase {
+    func testCharacterWidthClassifiesASCIICJKCombiningEmojiAndControl() {
+        XCTAssertEqual(CharacterWidth.width(of: 0x41), 1)
+        XCTAssertEqual(CharacterWidth.width(of: 0x3042), 2)
+        XCTAssertEqual(CharacterWidth.width(of: 0x0301), 0)
+        XCTAssertEqual(CharacterWidth.width(of: 0x1F600), 2)
+        XCTAssertEqual(CharacterWidth.width(of: 0x0A), -1)
+    }
+
+    func testTerminalColorResolveSupportsDefaultIndexedCubeGrayscaleAndRGB() {
+        XCTAssertEqual(TerminalColor.default.resolve(isForeground: true).r, 0.8, accuracy: 0.001)
+        XCTAssertEqual(TerminalColor.default.resolve(isForeground: false).r, 0.0, accuracy: 0.001)
+
+        let ansi = TerminalColor.indexed(1).resolve(isForeground: true)
+        XCTAssertGreaterThan(ansi.r, 0.7)
+        XCTAssertLessThan(ansi.g, 0.3)
+
+        let cube = TerminalColor.indexed(46).resolve(isForeground: true)
+        XCTAssertGreaterThan(cube.g, 0.7)
+
+        let gray = TerminalColor.indexed(244).resolve(isForeground: true)
+        XCTAssertEqual(gray.r, gray.g, accuracy: 0.001)
+        XCTAssertEqual(gray.g, gray.b, accuracy: 0.001)
+
+        let rgb = TerminalColor.rgb(10, 20, 30).resolve(isForeground: true)
+        XCTAssertEqual(rgb.r, Float(10.0 / 255.0), accuracy: 0.001)
+        XCTAssertEqual(rgb.g, Float(20.0 / 255.0), accuracy: 0.001)
+        XCTAssertEqual(rgb.b, Float(30.0 / 255.0), accuracy: 0.001)
+    }
+
+    func testTerminalTextEncodingRoundTripsUTF8AndUTF16() throws {
+        let sample = "abc日本語😀"
+        for encoding in [TerminalTextEncoding.utf8, .utf16, .utf16LittleEndian, .utf16BigEndian] {
+            let encoded = try XCTUnwrap(encoding.encode(sample))
+            XCTAssertEqual(encoding.decode(encoded), sample)
+        }
+    }
+
+    func testTerminalTextEncodingConfiguredValueNormalization() {
+        XCTAssertEqual(TerminalTextEncoding(configuredValue: "UTF8"), .utf8)
+        XCTAssertEqual(TerminalTextEncoding(configuredValue: "utf_16"), .utf16)
+        XCTAssertEqual(TerminalTextEncoding(configuredValue: "utf16le"), .utf16LittleEndian)
+        XCTAssertEqual(TerminalTextEncoding(configuredValue: "utf-16be"), .utf16BigEndian)
+        XCTAssertNil(TerminalTextEncoding(configuredValue: "shift-jis"))
+    }
+
+    func testTerminalTextEncodingStringUsesReplacementCharacterForInvalidScalar() {
+        let string = TerminalTextEncoding.string(from: [0x41, 0x110000, 0x42])
+        XCTAssertEqual(string, "A\u{FFFD}B")
+    }
+
+    func testTerminalTextDecoderHandlesSplitUTF16Surrogates() {
+        let decoder = TerminalTextDecoder(encoding: .utf16LittleEndian)
+        var output = [UInt32](repeating: 0, count: 4)
+
+        let firstChunk = Data([0x3D, 0xD8])
+        let secondChunk = Data([0x00, 0xDE, 0x41, 0x00])
+
+        let firstCount = firstChunk.withUnsafeBytes { rawBuffer in
+            decoder.decode(rawBuffer.bindMemory(to: UInt8.self), into: &output)
+        }
+        XCTAssertEqual(firstCount, 0)
+
+        let secondCount = secondChunk.withUnsafeBytes { rawBuffer in
+            decoder.decode(rawBuffer.bindMemory(to: UInt8.self), into: &output)
+        }
+        XCTAssertEqual(Array(output.prefix(secondCount)), [0x1F600, 0x41])
+    }
+
+    func testTerminalTextDecoderAutoDetectsUTF16BOM() {
+        let decoder = TerminalTextDecoder(encoding: .utf16)
+        var output = [UInt32](repeating: 0, count: 4)
+        let data = Data([0xFE, 0xFF, 0x30, 0x42, 0x00, 0x41]) // あA in UTF-16BE
+
+        let count = data.withUnsafeBytes { rawBuffer in
+            decoder.decode(rawBuffer.bindMemory(to: UInt8.self), into: &output)
+        }
+
+        XCTAssertEqual(Array(output.prefix(count)), [0x3042, 0x41])
+    }
+
+    func testTerminalTextDecoderAutoDetectsLittleEndianBOM() {
+        let decoder = TerminalTextDecoder(encoding: .utf16)
+        var output = [UInt32](repeating: 0, count: 4)
+        let data = Data([0xFF, 0xFE, 0x42, 0x30, 0x41, 0x00]) // あA in UTF-16LE
+
+        let count = data.withUnsafeBytes { rawBuffer in
+            decoder.decode(rawBuffer.bindMemory(to: UInt8.self), into: &output)
+        }
+
+        XCTAssertEqual(Array(output.prefix(count)), [0x3042, 0x41])
+    }
+
+    func testTerminalTextDecoderResetClearsPendingState() {
+        let decoder = TerminalTextDecoder(encoding: .utf16LittleEndian)
+        var output = [UInt32](repeating: 0, count: 4)
+
+        let partial = Data([0x3D, 0xD8])
+        _ = partial.withUnsafeBytes { rawBuffer in
+            decoder.decode(rawBuffer.bindMemory(to: UInt8.self), into: &output)
+        }
+
+        decoder.reset()
+
+        let ascii = Data([0x41, 0x00])
+        let count = ascii.withUnsafeBytes { rawBuffer in
+            decoder.decode(rawBuffer.bindMemory(to: UInt8.self), into: &output)
+        }
+        XCTAssertEqual(Array(output.prefix(count)), [0x41])
+    }
+
+    func testTerminalTextDecoderEmitsReplacementForDanglingLowSurrogate() {
+        let decoder = TerminalTextDecoder(encoding: .utf16LittleEndian)
+        var output = [UInt32](repeating: 0, count: 4)
+        let data = Data([0x00, 0xDC])
+
+        let count = data.withUnsafeBytes { rawBuffer in
+            decoder.decode(rawBuffer.bindMemory(to: UInt8.self), into: &output)
+        }
+        XCTAssertEqual(Array(output.prefix(count)), [0xFFFD])
+    }
+
+    func testTerminalGridResizeRowsOnlyReturnsTrimmedRows() {
+        let grid = TerminalGrid(rows: 3, cols: 4)
+        grid.setCell(Cell(codepoint: 0x41, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 0)
+        grid.setCell(Cell(codepoint: 0x42, attributes: .default, width: 1, isWideContinuation: false), at: 1, col: 0)
+        grid.setWrapped(1, true)
+
+        let result = grid.resize(newRows: 2, newCols: 4, cursorRow: 2, cursorCol: 1)
+
+        XCTAssertEqual(result.trimmedRows.count, 1)
+        XCTAssertEqual(result.trimmedRows.first?.cells.first?.codepoint, 0x41)
+        XCTAssertEqual(result.cursorRow, 1)
+        XCTAssertEqual(grid.rows, 2)
+        XCTAssertEqual(grid.cols, 4)
+    }
+
+    func testTerminalGridScrollUpWithinCustomScrollRegion() {
+        let grid = TerminalGrid(rows: 4, cols: 2)
+        for row in 0..<4 {
+            for col in 0..<2 {
+                grid.setCell(Cell(codepoint: UInt32(65 + row), attributes: .default, width: 1, isWideContinuation: false),
+                             at: row, col: col)
+            }
+        }
+        grid.scrollTop = 1
+        grid.scrollBottom = 3
+
+        grid.scrollUp()
+
+        XCTAssertEqual(grid.cell(at: 0, col: 0).codepoint, 65)
+        XCTAssertEqual(grid.cell(at: 1, col: 0).codepoint, 67)
+        XCTAssertEqual(grid.cell(at: 2, col: 0).codepoint, 68)
+        XCTAssertEqual(grid.cell(at: 3, col: 0).codepoint, 0x20)
+    }
+
+    func testTerminalGridScrollDownWithinCustomScrollRegion() {
+        let grid = TerminalGrid(rows: 4, cols: 2)
+        for row in 0..<4 {
+            for col in 0..<2 {
+                grid.setCell(Cell(codepoint: UInt32(65 + row), attributes: .default, width: 1, isWideContinuation: false),
+                             at: row, col: col)
+            }
+        }
+        grid.scrollTop = 0
+        grid.scrollBottom = 2
+
+        grid.scrollDown()
+
+        XCTAssertEqual(grid.cell(at: 0, col: 0).codepoint, 0x20)
+        XCTAssertEqual(grid.cell(at: 1, col: 0).codepoint, 65)
+        XCTAssertEqual(grid.cell(at: 2, col: 0).codepoint, 66)
+        XCTAssertEqual(grid.cell(at: 3, col: 0).codepoint, 68)
+    }
+
+    func testTerminalGridClearOperationsResetCellsAndWrapFlags() {
+        let grid = TerminalGrid(rows: 2, cols: 3)
+        grid.setCell(Cell(codepoint: 0x41, attributes: .default, width: 1, isWideContinuation: false), at: 1, col: 1)
+        grid.setWrapped(1, true)
+        grid.clearCells(row: 1, fromCol: 1, toCol: 1)
+        XCTAssertEqual(grid.cell(at: 1, col: 1).codepoint, 0x20)
+        XCTAssertTrue(grid.isWrapped(1))
+
+        grid.clearRow(1)
+        XCTAssertFalse(grid.isWrapped(1))
+
+        grid.setCell(Cell(codepoint: 0x42, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 0)
+        grid.clearAll()
+        XCTAssertEqual(grid.cell(at: 0, col: 0).codepoint, 0x20)
+        XCTAssertFalse(grid.isWrapped(0))
+    }
+
+    func testTerminalGridOutOfBoundsAccessIsSafe() {
+        let grid = TerminalGrid(rows: 2, cols: 2)
+        XCTAssertEqual(grid.cell(at: -1, col: 0).codepoint, 0x20)
+        XCTAssertEqual(grid.cell(at: 99, col: 99).codepoint, 0x20)
+        grid.setCell(Cell(codepoint: 0x41, attributes: .default, width: 1, isWideContinuation: false), at: 99, col: 99)
+        XCTAssertEqual(grid.cell(at: 0, col: 0).codepoint, 0x20)
+    }
+
+    func testTerminalGridInsertDeleteClampCountsToRowWidth() {
+        let grid = TerminalGrid(rows: 1, cols: 4)
+        for (col, codepoint) in [UInt32(65), 66, 67, 68].enumerated() {
+            grid.setCell(Cell(codepoint: codepoint, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: col)
+        }
+
+        grid.insertBlanks(row: 0, col: 2, count: 99)
+        XCTAssertEqual(grid.rowCells(0).map(\.codepoint), [65, 66, 0x20, 0x20])
+
+        grid.deleteCells(row: 0, col: 1, count: 99)
+        XCTAssertEqual(grid.rowCells(0).map(\.codepoint), [65, 0x20, 0x20, 0x20])
+    }
+
+    func testTerminalGridScrollByRegionHeightClearsRegion() {
+        let grid = TerminalGrid(rows: 3, cols: 2)
+        for row in 0..<3 {
+            for col in 0..<2 {
+                grid.setCell(Cell(codepoint: UInt32(65 + row), attributes: .default, width: 1, isWideContinuation: false), at: row, col: col)
+            }
+        }
+        grid.scrollTop = 0
+        grid.scrollBottom = 1
+
+        grid.scrollUp(count: 2)
+
+        XCTAssertEqual(grid.cell(at: 0, col: 0).codepoint, 0x20)
+        XCTAssertEqual(grid.cell(at: 1, col: 0).codepoint, 0x20)
+        XCTAssertEqual(grid.cell(at: 2, col: 0).codepoint, 67)
+    }
+
+    func testTerminalGridResizeRewrapsLogicalLinesAndPreservesCursor() {
+        let grid = TerminalGrid(rows: 2, cols: 4)
+        let characters: [UInt32] = [0x41, 0x42, 0x43, 0x44, 0x45, 0x46]
+        for (index, codepoint) in characters.enumerated() {
+            grid.setCell(Cell(codepoint: codepoint, attributes: .default, width: 1, isWideContinuation: false),
+                         at: index / 4, col: index % 4)
+        }
+        grid.setWrapped(1, true)
+
+        let result = grid.resize(newRows: 3, newCols: 3, cursorRow: 1, cursorCol: 1)
+
+        XCTAssertEqual(result.cursorRow, 1)
+        XCTAssertEqual(result.cursorCol, 2)
+        XCTAssertEqual(grid.cell(at: 0, col: 0).codepoint, 0x41)
+        XCTAssertEqual(grid.cell(at: 0, col: 2).codepoint, 0x43)
+        XCTAssertEqual(grid.cell(at: 1, col: 0).codepoint, 0x44)
+        XCTAssertEqual(grid.cell(at: 1, col: 2).codepoint, 0x46)
+        XCTAssertTrue(grid.isWrapped(1))
+        XCTAssertFalse(grid.isWrapped(0))
+    }
+
+    func testTerminalSelectionExtractsNormalSelectionAcrossWrappedLinesWithoutExtraNewline() {
+        let grid = TerminalGrid(rows: 2, cols: 4)
+        let row0: [UInt32] = [0x61, 0x62, 0x63, 0x20]
+        let row1: [UInt32] = [0x64, 0x65, 0x20, 0x20]
+        for (col, codepoint) in row0.enumerated() {
+            grid.setCell(Cell(codepoint: codepoint, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: col)
+        }
+        for (col, codepoint) in row1.enumerated() {
+            grid.setCell(Cell(codepoint: codepoint, attributes: .default, width: 1, isWideContinuation: false), at: 1, col: col)
+        }
+        grid.setWrapped(1, true)
+
+        let selection = TerminalSelection(anchor: .init(row: 0, col: 0), active: .init(row: 1, col: 1), mode: .normal)
+        XCTAssertEqual(selection.extractText(from: grid), "abcde")
+    }
+
+    func testTerminalSelectionExtractsRectangularSelectionWithRowBreaks() {
+        let grid = TerminalGrid(rows: 2, cols: 4)
+        for row in 0..<2 {
+            for col in 0..<4 {
+                let codepoint = UInt32(65 + row * 4 + col)
+                grid.setCell(Cell(codepoint: codepoint, attributes: .default, width: 1, isWideContinuation: false), at: row, col: col)
+            }
+        }
+
+        let selection = TerminalSelection(anchor: .init(row: 0, col: 1), active: .init(row: 1, col: 2), mode: .rectangular)
+        XCTAssertEqual(selection.extractText(from: grid), "BC\nFG")
+    }
+
+    func testTerminalSelectionSkipsWideContinuationCellWhenExtracting() {
+        let grid = TerminalGrid(rows: 1, cols: 2)
+        grid.setCell(Cell(codepoint: 0x3042, attributes: .default, width: 2, isWideContinuation: false), at: 0, col: 0)
+        grid.setCell(Cell(codepoint: 0x20, attributes: .default, width: 0, isWideContinuation: true), at: 0, col: 1)
+
+        let selection = TerminalSelection(anchor: .init(row: 0, col: 0), active: .init(row: 0, col: 1), mode: .normal)
+        XCTAssertEqual(selection.extractText(from: grid), "あ")
+    }
+
+    func testTerminalSelectionWordSelectionStopsAtConfiguredDelimiters() {
+        let grid = TerminalGrid(rows: 1, cols: 12)
+        let text = Array("/tmp/foo.txt".unicodeScalars.map(\.value))
+        for (col, codepoint) in text.enumerated() {
+            grid.setCell(Cell(codepoint: codepoint, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: col)
+        }
+
+        let selection = TerminalSelection.wordSelection(at: .init(row: 0, col: 5), in: grid)
+        XCTAssertEqual(selection.extractText(from: grid), "foo")
+    }
+
+    func testTerminalSelectionWordDelimiterClassification() {
+        XCTAssertTrue(TerminalSelection.isWordDelimiter(UInt32(Character("/").unicodeScalars.first!.value)))
+        XCTAssertTrue(TerminalSelection.isWordDelimiter(UInt32(Character(" ").unicodeScalars.first!.value)))
+        XCTAssertFalse(TerminalSelection.isWordDelimiter(UInt32(Character("A").unicodeScalars.first!.value)))
+    }
+
+    func testTerminalSelectionLineSelectionCoversEntireRow() {
+        let selection = TerminalSelection.lineSelection(row: 3, cols: 5)
+        XCTAssertEqual(selection.start, .init(row: 3, col: 0))
+        XCTAssertEqual(selection.end, .init(row: 3, col: 4))
+        XCTAssertFalse(selection.isEmpty)
+    }
+
+    func testTerminalSelectionRectangularContainsOnlyColumnsWithinBounds() {
+        let selection = TerminalSelection(
+            anchor: .init(row: 2, col: 4),
+            active: .init(row: 0, col: 1),
+            mode: .rectangular
+        )
+
+        XCTAssertEqual(selection.start, .init(row: 0, col: 1))
+        XCTAssertEqual(selection.end, .init(row: 2, col: 4))
+        XCTAssertTrue(selection.contains(row: 1, col: 3))
+        XCTAssertFalse(selection.contains(row: 1, col: 0))
+        XCTAssertFalse(selection.contains(row: 3, col: 3))
+    }
+
+    func testTerminalSelectionRectangularExtractionTrimsTrailingSpacesPerRow() {
+        let grid = TerminalGrid(rows: 2, cols: 4)
+        grid.setCell(Cell(codepoint: 0x41, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 0)
+        grid.setCell(Cell(codepoint: 0x42, attributes: .default, width: 1, isWideContinuation: false), at: 1, col: 0)
+
+        let selection = TerminalSelection(
+            anchor: .init(row: 0, col: 0),
+            active: .init(row: 1, col: 3),
+            mode: .rectangular
+        )
+
+        XCTAssertEqual(selection.extractText(from: grid), "A\nB   ")
+    }
+
+    func testTerminalSelectionWordSelectionAtDelimiterReturnsDelimiterCellOnly() {
+        let grid = TerminalGrid(rows: 1, cols: 5)
+        for (col, scalar) in Array("a/b c".unicodeScalars.map(\.value)).enumerated() {
+            guard col < grid.cols else { break }
+            grid.setCell(Cell(codepoint: scalar, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: col)
+        }
+
+        let selection = TerminalSelection.wordSelection(at: .init(row: 0, col: 1), in: grid)
+        XCTAssertEqual(selection.start, .init(row: 0, col: 0))
+        XCTAssertEqual(selection.end, .init(row: 0, col: 2))
+        XCTAssertEqual(selection.extractText(from: grid), "a/b")
+    }
+
+    func testTerminalSelectionNormalizesReversedAnchorAndContainsExpectedCells() {
+        let selection = TerminalSelection(
+            anchor: .init(row: 2, col: 4),
+            active: .init(row: 1, col: 1),
+            mode: .normal
+        )
+
+        XCTAssertEqual(selection.start, .init(row: 1, col: 1))
+        XCTAssertEqual(selection.end, .init(row: 2, col: 4))
+        XCTAssertTrue(selection.contains(row: 1, col: 3))
+        XCTAssertTrue(selection.contains(row: 2, col: 2))
+        XCTAssertFalse(selection.contains(row: 0, col: 0))
+    }
+
+    func testTerminalSelectionEmptyExtractsNothing() {
+        let grid = TerminalGrid(rows: 1, cols: 1)
+        let selection = TerminalSelection(anchor: .init(row: 0, col: 0), active: .init(row: 0, col: 0), mode: .normal)
+        XCTAssertTrue(selection.isEmpty)
+        XCTAssertEqual(selection.extractText(from: grid), "")
+    }
+
+    func testScrollbackBufferRoundTripsCellsAndWrapFlags() throws {
+        let buffer = ScrollbackBuffer(initialCapacity: 1024, maxCapacity: 1024)
+        let cell = Cell(codepoint: 0x3042, attributes: .init(foreground: .rgb(1, 2, 3), background: .indexed(4), bold: true, italic: false, underline: true, strikethrough: false, inverse: false, hidden: false, dim: true, blink: false), width: 2, isWideContinuation: false)
+        let continuation = Cell(codepoint: 0x20, attributes: .default, width: 0, isWideContinuation: true)
+
+        buffer.appendRow([cell, continuation][0...1], isWrapped: true)
+
+        let row = try XCTUnwrap(buffer.getRow(at: 0))
+        XCTAssertEqual(row.count, 2)
+        XCTAssertEqual(row[0].codepoint, 0x3042)
+        XCTAssertEqual(row[0].attributes.foreground, .rgb(1, 2, 3))
+        XCTAssertEqual(row[0].attributes.background, .indexed(4))
+        XCTAssertTrue(buffer.isRowWrapped(at: 0))
+    }
+
+    func testScrollbackBufferPersistentStoreCanBeDiscarded() throws {
+        try withTemporaryDirectory { directory in
+            let backingFile = directory.appendingPathComponent("scrollback.bin")
+            var buffer: ScrollbackBuffer? = ScrollbackBuffer(
+                initialCapacity: 1024,
+                maxCapacity: 1024,
+                persistentPath: backingFile.path
+            )
+            buffer?.appendRow([Cell.empty][0...0], isWrapped: false)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: backingFile.path))
+
+            buffer?.discardPersistentBackingStore()
+            buffer = nil
+
+            XCTAssertFalse(FileManager.default.fileExists(atPath: backingFile.path))
+        }
+    }
+}

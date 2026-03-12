@@ -324,10 +324,10 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
     private var keyMonitor: Any?
     private var isDirty = false
     private var baseTitle: String
-    private var saveFn: (String) -> Void
+    private var saveFn: (String) throws -> Void
     var onClose: (() -> Void)?
 
-    init(initialText: String, onSave: @escaping (String) -> Void) {
+    init(initialText: String, onSave: @escaping (String) throws -> Void) {
         self.saveFn = onSave
         self.baseTitle = "Notes"
         let contentRect = NSRect(x: 0, y: 0, width: 720, height: 560)
@@ -491,11 +491,18 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         window?.title = "* \(baseTitle)"
     }
 
-    private func save() {
-        guard isDirty else { return }
-        saveFn(textView.string)
+    @discardableResult
+    private func save() -> Bool {
+        guard isDirty else { return true }
+        do {
+            try saveFn(textView.string)
+        } catch {
+            NSAlert(error: error).runModal()
+            return false
+        }
         isDirty = false
         window?.title = baseTitle
+        return true
     }
 
     func showEditorWindow() {
@@ -525,8 +532,7 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         let response = alert.runModal()
         switch response {
         case .alertFirstButtonReturn:
-            save()
-            return true
+            return save()
         case .alertSecondButtonReturn:
             return true
         default:

@@ -1595,11 +1595,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isOpeningNote = true
         defer { isOpeningNote = false }
 
-        let initialText = ((try? appNoteStore.loadNote()) ?? nil) ?? ""
+        let initialText: String
+        do {
+            initialText = try appNoteStore.loadNote() ?? ""
+        } catch {
+            NSAlert(error: error).runModal()
+            return
+        }
         let editorController = MarkdownEditorWindowController(
             initialText: initialText,
             onSave: { [appNoteStore] text in
-                try? appNoteStore.saveNote(text)
+                try appNoteStore.saveNote(text)
             }
         )
         editorController.onClose = { [weak self] in

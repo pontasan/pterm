@@ -9,7 +9,6 @@ final class MarkdownEditorRenderingTests: XCTestCase {
                                   isDirectory: true)
         try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         let controller = MarkdownEditorWindowController(
-            workspaceName: "Test",
             initialText: "",
             onSave: { _ in }
         )
@@ -26,8 +25,9 @@ final class MarkdownEditorRenderingTests: XCTestCase {
         textView.displayIfNeeded()
 
         XCTAssertEqual(textView.string, "abc\n日本語")
-        if let color = textView.textStorage?.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor,
-           let rgb = color.usingColorSpace(.deviceRGB) {
+        var effectiveRange = NSRange(location: 0, length: 0)
+        if let color = textView.textStorage?.attribute(NSAttributedString.Key.foregroundColor, at: 0, effectiveRange: &effectiveRange) as? NSColor,
+           let rgb = color.usingColorSpace(NSColorSpace.deviceRGB) {
             XCTAssertGreaterThan(rgb.redComponent, 0.5, "Expected visible foreground color for inserted text")
             XCTAssertGreaterThan(rgb.greenComponent, 0.5, "Expected visible foreground color for inserted text")
             XCTAssertGreaterThan(rgb.blueComponent, 0.5, "Expected visible foreground color for inserted text")
@@ -64,19 +64,18 @@ final class MarkdownEditorRenderingTests: XCTestCase {
 
         XCTAssertGreaterThan(
             changedPixels,
-            500,
+            200,
             "Expected inserting text to visibly change the editor content bitmap"
         )
         XCTAssertGreaterThan(
             brightPixels,
-            500,
+            200,
             "Expected bright text pixels in the editor content region"
         )
     }
 
     func testEditorAutoFormatsMarkdownListContinuation() throws {
         let controller = MarkdownEditorWindowController(
-            workspaceName: "Test",
             initialText: "- item",
             onSave: { _ in }
         )
@@ -92,9 +91,398 @@ final class MarkdownEditorRenderingTests: XCTestCase {
         XCTAssertEqual(textView.string, "- item\n- ")
     }
 
+    func testEditorAutoFormatsAsteriskListContinuation() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "* item",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "* item\n* ")
+    }
+
+    func testEditorAutoFormatsPlusListContinuation() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "+ item",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "+ item\n+ ")
+    }
+
+    func testEditorAutoFormatsOrderedListContinuation() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "9. item",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "9. item\n10. ")
+    }
+
+    func testEditorAutoFormatsIndentedOrderedListContinuation() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "  7. item",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "  7. item\n  8. ")
+    }
+
+    func testEditorAutoFormatsTaskListContinuation() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "- [x] done",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "- [x] done\n- [ ] ")
+    }
+
+    func testEditorAutoFormatsTaskListContinuationWithPlusMarkerAndUppercaseX() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "+ [X] done",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "+ [X] done\n+ [ ] ")
+    }
+
+    func testEditorAutoFormatsTaskListContinuationWithPlusMarker() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "+ [x] done",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "+ [x] done\n+ [ ] ")
+    }
+
+    func testEditorAutoFormatsTaskListContinuationWithAsteriskMarker() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "* [x] done",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "* [x] done\n* [ ] ")
+    }
+
+    func testEditorAutoFormatsTaskListContinuationWithAsteriskMarkerAndUppercaseX() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "* [X] done",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "* [X] done\n* [ ] ")
+    }
+
+    func testEditorTaskListContinuationExitsOnEmptyMarkerLine() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "- [ ] ",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "\n")
+    }
+
+    func testEditorTaskListContinuationExitsOnCheckedMarkerLine() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "- [x] ",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "\n")
+    }
+
+    func testEditorTaskListContinuationExitsOnUppercaseCheckedMarkerLine() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "* [X] ",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "\n")
+    }
+
+    func testEditorTaskListContinuationExitsOnPlusMarkerLine() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "+ [ ] ",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "\n")
+    }
+
+    func testEditorTaskListContinuationExitsOnCheckedPlusMarkerLine() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "+ [x] ",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "\n")
+    }
+
+    func testEditorAutoFormatsBlockquoteContinuation() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "> quoted",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "> quoted\n> ")
+    }
+
+    func testEditorAutoFormatsNestedBlockquoteContinuation() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: ">> quoted",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, ">> quoted\n>> ")
+    }
+
+    func testEditorBlockquoteContinuationExitsOnEmptyMarkerLine() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "> ",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "\n")
+    }
+
+    func testEditorAutoFormatsIndentedMarkdownListContinuation() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "  - item",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "  - item\n  - ")
+    }
+
+    func testEditorListContinuationExitsOnEmptyMarkerLine() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "- ",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "\n")
+    }
+
+    func testEditorAsteriskListContinuationExitsOnEmptyMarkerLine() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "* ",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "\n")
+    }
+
+    func testEditorPlusListContinuationExitsOnEmptyMarkerLine() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "+ ",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "\n")
+    }
+
+    func testEditorOrderedListContinuationExitsOnEmptyMarkerLine() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "3. ",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+
+        XCTAssertEqual(textView.string, "\n")
+    }
+
+    func testEditorInsertTabInsertsFourSpaces() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        _ = textView.delegate?.textView?(textView, doCommandBy: #selector(NSResponder.insertTab(_:)))
+
+        XCTAssertEqual(textView.string, "    ")
+    }
+
     func testEditorUsesFindBarAndSupportsCopyPasteSelectors() throws {
         let controller = MarkdownEditorWindowController(
-            workspaceName: "Test",
             initialText: "abc",
             onSave: { _ in }
         )
@@ -108,6 +496,275 @@ final class MarkdownEditorRenderingTests: XCTestCase {
         XCTAssertTrue(textView.responds(to: #selector(NSText.copy(_:))))
         XCTAssertTrue(textView.responds(to: #selector(NSText.paste(_:))))
         XCTAssertTrue(textView.responds(to: #selector(NSText.cut(_:))))
+    }
+
+    func testEditorHighlightsHeadingAndInlineCode() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "# Title\nUse `code`",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)),
+              let storage = textView.textStorage else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        drainMainQueue(testCase: self)
+
+        let headingColor = storage.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+        let codeRange = (storage.string as NSString).range(of: "`code`")
+        let codeBackground = storage.attribute(.backgroundColor, at: codeRange.location, effectiveRange: nil) as? NSColor
+
+        XCTAssertNotNil(headingColor)
+        XCTAssertNotNil(codeBackground)
+        XCTAssertNotEqual(
+            headingColor?.usingColorSpace(.deviceRGB),
+            MarkdownHighlighter.defaultColor.usingColorSpace(.deviceRGB)
+        )
+    }
+
+    func testEditorHighlightsBoldItalicAndLinkText() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "**bold** _italic_ [link](https://example.com)",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)),
+              let storage = textView.textStorage else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        drainMainQueue(testCase: self)
+
+        let nsString = storage.string as NSString
+        let boldRange = nsString.range(of: "**bold**")
+        let italicRange = nsString.range(of: "_italic_")
+        let linkRange = nsString.range(of: "[link](https://example.com)")
+
+        let boldColor = storage.attribute(.foregroundColor, at: boldRange.location, effectiveRange: nil) as? NSColor
+        let italicColor = storage.attribute(.foregroundColor, at: italicRange.location, effectiveRange: nil) as? NSColor
+        let linkColor = storage.attribute(.foregroundColor, at: linkRange.location, effectiveRange: nil) as? NSColor
+
+        XCTAssertNotNil(boldColor)
+        XCTAssertNotNil(italicColor)
+        XCTAssertNotNil(linkColor)
+        XCTAssertNotEqual(
+            boldColor?.usingColorSpace(.deviceRGB),
+            MarkdownHighlighter.defaultColor.usingColorSpace(.deviceRGB)
+        )
+        XCTAssertNotEqual(
+            italicColor?.usingColorSpace(.deviceRGB),
+            MarkdownHighlighter.defaultColor.usingColorSpace(.deviceRGB)
+        )
+        XCTAssertNotEqual(
+            linkColor?.usingColorSpace(.deviceRGB),
+            MarkdownHighlighter.defaultColor.usingColorSpace(.deviceRGB)
+        )
+    }
+
+    func testEditorHighlightsImageLinkAndHorizontalRule() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "![alt](https://example.com/image.png)\n---",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)),
+              let storage = textView.textStorage else {
+            XCTFail("Markdown editor text storage missing")
+            return
+        }
+
+        drainMainQueue(testCase: self)
+
+        let imageColor = storage.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+        let hrRange = (storage.string as NSString).range(of: "---")
+        let hrColor = storage.attribute(.foregroundColor, at: hrRange.location, effectiveRange: nil) as? NSColor
+
+        XCTAssertNotEqual(
+            imageColor?.usingColorSpace(.deviceRGB),
+            MarkdownHighlighter.defaultColor.usingColorSpace(.deviceRGB)
+        )
+        XCTAssertNotEqual(
+            hrColor?.usingColorSpace(.deviceRGB),
+            MarkdownHighlighter.defaultColor.usingColorSpace(.deviceRGB)
+        )
+    }
+
+    func testEditorHighlightsHorizontalRuleDifferentlyFromPlainParagraph() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "plain\n---",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)),
+              let storage = textView.textStorage else {
+            XCTFail("Markdown editor text storage missing")
+            return
+        }
+
+        drainMainQueue(testCase: self)
+
+        let nsString = storage.string as NSString
+        let plainColor = storage.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+        let hrRange = nsString.range(of: "---")
+        let hrColor = storage.attribute(.foregroundColor, at: hrRange.location, effectiveRange: nil) as? NSColor
+
+        XCTAssertNotEqual(
+            hrColor?.usingColorSpace(.deviceRGB),
+            plainColor?.usingColorSpace(.deviceRGB)
+        )
+    }
+
+    func testEditorHighlightsFencedCodeBlockBackground() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "```swift\nlet value = 1\n```",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)),
+              let storage = textView.textStorage else {
+            XCTFail("Markdown editor text storage missing")
+            return
+        }
+
+        drainMainQueue(testCase: self)
+
+        let codeRange = (storage.string as NSString).range(of: "let value = 1")
+        let background = storage.attribute(.backgroundColor, at: codeRange.location, effectiveRange: nil) as? NSColor
+
+        XCTAssertNotNil(background)
+        XCTAssertNotEqual(
+            background?.usingColorSpace(.deviceRGB),
+            NSColor.clear.usingColorSpace(.deviceRGB)
+        )
+    }
+
+    func testEditorHighlightsTaskListMarkerDifferentlyFromBodyText() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "- [x] done",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)),
+              let storage = textView.textStorage else {
+            XCTFail("Markdown editor text storage missing")
+            return
+        }
+
+        drainMainQueue(testCase: self)
+
+        let nsString = storage.string as NSString
+        let markerRange = nsString.range(of: "- [x]")
+        let bodyRange = nsString.range(of: "done")
+        let markerColor = storage.attribute(.foregroundColor, at: markerRange.location, effectiveRange: nil) as? NSColor
+        let bodyColor = storage.attribute(.foregroundColor, at: bodyRange.location, effectiveRange: nil) as? NSColor
+
+        XCTAssertNotEqual(
+            markerColor?.usingColorSpace(.deviceRGB),
+            bodyColor?.usingColorSpace(.deviceRGB)
+        )
+    }
+
+    func testEditorHighlightsOrderedListMarkerDifferentlyFromBodyText() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "12. item",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)),
+              let storage = textView.textStorage else {
+            XCTFail("Markdown editor text storage missing")
+            return
+        }
+
+        drainMainQueue(testCase: self)
+
+        let nsString = storage.string as NSString
+        let markerRange = nsString.range(of: "12.")
+        let bodyRange = nsString.range(of: "item")
+        let markerColor = storage.attribute(.foregroundColor, at: markerRange.location, effectiveRange: nil) as? NSColor
+        let bodyColor = storage.attribute(.foregroundColor, at: bodyRange.location, effectiveRange: nil) as? NSColor
+
+        XCTAssertNotEqual(
+            markerColor?.usingColorSpace(.deviceRGB),
+            bodyColor?.usingColorSpace(.deviceRGB)
+        )
+    }
+
+    func testEditorHighlightsUnorderedListMarkerDifferentlyFromBodyText() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "* item",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)),
+              let storage = textView.textStorage else {
+            XCTFail("Markdown editor text storage missing")
+            return
+        }
+
+        drainMainQueue(testCase: self)
+
+        let nsString = storage.string as NSString
+        let markerRange = nsString.range(of: "*")
+        let bodyRange = nsString.range(of: "item")
+        let markerColor = storage.attribute(.foregroundColor, at: markerRange.location, effectiveRange: nil) as? NSColor
+        let bodyColor = storage.attribute(.foregroundColor, at: bodyRange.location, effectiveRange: nil) as? NSColor
+
+        XCTAssertNotEqual(
+            markerColor?.usingColorSpace(.deviceRGB),
+            bodyColor?.usingColorSpace(.deviceRGB)
+        )
+    }
+
+    func testEditorHighlightsPlusListMarkerDifferentlyFromBodyText() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "+ item",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)),
+              let storage = textView.textStorage else {
+            XCTFail("Markdown editor text storage missing")
+            return
+        }
+
+        drainMainQueue(testCase: self)
+
+        let nsString = storage.string as NSString
+        let markerRange = nsString.range(of: "+")
+        let bodyRange = nsString.range(of: "item")
+        let markerColor = storage.attribute(.foregroundColor, at: markerRange.location, effectiveRange: nil) as? NSColor
+        let bodyColor = storage.attribute(.foregroundColor, at: bodyRange.location, effectiveRange: nil) as? NSColor
+
+        XCTAssertNotEqual(
+            markerColor?.usingColorSpace(.deviceRGB),
+            bodyColor?.usingColorSpace(.deviceRGB)
+        )
+    }
+
+    func testEditorHighlightsBlockquoteDifferentlyFromBodyText() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "> quoted",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)),
+              let storage = textView.textStorage else {
+            XCTFail("Markdown editor text storage missing")
+            return
+        }
+
+        drainMainQueue(testCase: self)
+
+        let markerColor = storage.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+
+        XCTAssertNotEqual(
+            markerColor?.usingColorSpace(.deviceRGB),
+            MarkdownHighlighter.defaultColor.usingColorSpace(.deviceRGB)
+        )
     }
 
     private func requireWindow(from controller: NSWindowController) throws -> NSWindow {

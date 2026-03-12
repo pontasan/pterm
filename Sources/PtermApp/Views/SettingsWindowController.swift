@@ -125,12 +125,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         configData = json
     }
 
-    private func saveConfigData() {
-        guard let data = try? JSONSerialization.data(withJSONObject: configData,
-                                                     options: [.prettyPrinted, .sortedKeys]) else {
-            return
+    private func saveConfigData() throws {
+        let data = try JSONSerialization.data(withJSONObject: configData,
+                                              options: [.prettyPrinted, .sortedKeys])
+        try AtomicFileWriter.write(data, to: PtermDirectories.config, permissions: 0o600)
+    }
+
+    private func commitConfigChange() {
+        do {
+            try saveConfigData()
+        } catch {
+            loadConfigData()
+            showContentForSection(currentSection)
+            NSAlert(error: error).runModal()
         }
-        try? AtomicFileWriter.write(data, to: PtermDirectories.config, permissions: 0o600)
     }
 
     // MARK: - UI Setup
@@ -455,20 +463,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     @objc private func termChanged(_ sender: NSPopUpButton) {
         configData["term"] = sender.titleOfSelectedItem
-        saveConfigData()
+        commitConfigChange()
     }
 
     @objc private func encodingChanged(_ sender: NSPopUpButton) {
         let map = ["UTF-8": "utf-8", "UTF-16": "utf-16", "UTF-16LE": "utf-16le", "UTF-16BE": "utf-16be"]
         configData["text_encoding"] = map[sender.titleOfSelectedItem ?? "UTF-8"] ?? "utf-8"
-        saveConfigData()
+        commitConfigChange()
     }
 
     @objc private func scrollPersistenceChanged(_ sender: NSButton) {
         var session = (configData["session"] as? [String: Any]) ?? [:]
         session["scroll_buffer_persistence"] = (sender.state == .on)
         configData["session"] = session
-        saveConfigData()
+        commitConfigChange()
     }
 
     @objc private func chooseFontClicked(_ sender: NSButton) {
@@ -516,7 +524,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         configData["font"] = font
         configData.removeValue(forKey: "font_name")
         configData.removeValue(forKey: "font_size")
-        saveConfigData()
+        commitConfigChange()
     }
 
     @objc private func memoryChanged(_ sender: NSTextField) {
@@ -526,7 +534,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let initBytes = min(maxBytes, max(1, initMB) * 1024 * 1024)
         configData["memory_max"] = maxBytes
         configData["memory_initial"] = initBytes
-        saveConfigData()
+        commitConfigChange()
     }
 
     @objc private func securityChanged(_ sender: NSButton) {
@@ -534,9 +542,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         sec["osc52_clipboard_read"] = (osc52Check?.state == .on)
         sec["paste_confirmation"] = (pasteConfirmCheck?.state == .on)
         sec["mouse_report_restrict_alternate_screen"] = (mouseRestrictCheck?.state == .on)
-        sec["allow_window_resize_sequence"] = (windowResizeCheck?.state == .on)
+       sec["allow_window_resize_sequence"] = (windowResizeCheck?.state == .on)
         configData["security"] = sec
-        saveConfigData()
+        commitConfigChange()
     }
 
     @objc private func auditEnabledChanged(_ sender: NSButton) {
@@ -556,7 +564,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         audit["encryption"] = (encryptCheck?.state == .on)
         configData["audit"] = audit
-        saveConfigData()
+        commitConfigChange()
     }
 
     // MARK: - UI Factories

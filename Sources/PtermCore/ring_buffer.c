@@ -508,8 +508,20 @@ int64_t ring_buffer_append_row(RingBuffer *rb,
                                bool continuation) {
     if (!rb || !data) return -1;
 
+    if ((size_t)length > rb->max_data_capacity) return -1;
+
     size_t required_capacity = rb->bytes_used + (size_t)length;
-    if (!ring_buffer_grow_if_needed(rb, required_capacity)) return -1;
+    if (required_capacity > rb->data_capacity) {
+        size_t grow_target = required_capacity <= rb->max_data_capacity
+            ? required_capacity
+            : rb->data_capacity;
+        if (grow_target > rb->data_capacity && !ring_buffer_grow_if_needed(rb, grow_target)) {
+            return -1;
+        }
+        if ((size_t)length > rb->data_capacity && !ring_buffer_grow_if_needed(rb, (size_t)length)) {
+            return -1;
+        }
+    }
 
     /* Evict old rows to make space */
     ring_buffer_evict(rb, (size_t)length);

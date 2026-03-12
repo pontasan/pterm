@@ -5,6 +5,7 @@ import Foundation
 enum PtermExportImportError: Error {
     case passwordRequired
     case invalidArchive
+    case unsafeArchiveEntry(String)
     case commandFailed(String)
     case invalidKeyEnvelope
 }
@@ -92,6 +93,7 @@ final class PtermExportImportManager {
         guard let extractedRoot = try firstDirectory(in: extractionRoot) else {
             throw PtermExportImportError.invalidArchive
         }
+        try validateExtractedArchive(root: extractedRoot)
         let envelopeURL = extractedRoot.appendingPathComponent("keys.enc")
         let envelope = try Data(contentsOf: envelopeURL)
         let noteKey = try decryptKeyEnvelope(envelope, password: password)
@@ -141,6 +143,7 @@ final class PtermExportImportManager {
         guard let extractedRoot = try firstDirectory(in: extractionRoot) else {
             throw PtermExportImportError.invalidArchive
         }
+        try validateExtractedArchive(root: extractedRoot)
 
         let candidates: [(label: String, archived: URL, destination: URL)] = [
             ("config.json", extractedRoot.appendingPathComponent("config.json"), configURL),
@@ -214,6 +217,25 @@ final class PtermExportImportManager {
         let contents = try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil,
                                                            options: [.skipsHiddenFiles])
         return contents.first(where: { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true })
+    }
+
+    private func validateExtractedArchive(root: URL) throws {
+        let rootPath = root.standardizedFileURL.path
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
+        guard let enumerator = fileManager.enumerator(at: root,
+                                                      includingPropertiesForKeys: Array(keys),
+                                                      options: [.skipsHiddenFiles]) else {
+            throw PtermExportImportError.invalidArchive
+        }
+
+        for case let entry as URL in enumerator {
+            let values = try entry.resourceValues(forKeys: keys)
+            if values.isSymbolicLink == true {
+                let standardized = entry.standardizedFileURL.path
+                let relative = String(standardized.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                throw PtermExportImportError.unsafeArchiveEntry(relative.isEmpty ? entry.lastPathComponent : relative)
+            }
+        }
     }
 
     private func encryptKeyEnvelope(key: Data, password: String) throws -> Data {
