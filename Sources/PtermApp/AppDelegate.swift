@@ -117,6 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var splitContainerView: SplitTerminalContainerView?
     private var appNoteEditor: MarkdownEditorWindowController?
     private var settingsController: SettingsWindowController?
+    private var aboutController: AboutWindowController?
 
     /// Currently focused terminal controller (nil = integrated view mode)
     private var focusedController: TerminalController?
@@ -306,7 +307,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.addNewTerminal(workspaceName: workspace, startAsynchronously: true)
         }
         iv.onRemoveWorkspace = { [weak self] workspace in
-            self?.removeWorkspace(named: workspace)
+            self?.confirmAndRemoveWorkspace(named: workspace)
+        }
+        iv.onRemoveTerminal = { [weak self] controller in
+            self?.confirmAndRemoveTerminal(controller)
         }
         iv.onRenameWorkspace = { [weak self] oldName, newName in
             self?.renameWorkspace(from: oldName, to: newName)
@@ -475,6 +479,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        let wasIntegrated = {
+            if case .integrated = viewMode { return true }
+            return false
+        }()
+
         let currentPresentation: TerminalListPresentation
         switch viewMode {
         case .integrated:
@@ -513,6 +522,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 switchToIntegrated()
             }
+        }
+
+        if wasIntegrated, case .integrated = viewMode {
+            integratedView?.terminalListDidChange()
         }
 
         updateWindowTitle()
@@ -647,7 +660,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.addNewTerminal(workspaceName: workspace, startAsynchronously: true)
             }
             iv.onRemoveWorkspace = { [weak self] workspace in
-                self?.removeWorkspace(named: workspace)
+                self?.confirmAndRemoveWorkspace(named: workspace)
+            }
+            iv.onRemoveTerminal = { [weak self] controller in
+                self?.confirmAndRemoveTerminal(controller)
             }
             iv.onRenameWorkspace = { [weak self] oldName, newName in
                 self?.renameWorkspace(from: oldName, to: newName)
@@ -1742,12 +1758,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isOpeningNote = false
 
     @objc func showAboutPanel() {
-        var options: [NSApplication.AboutPanelOptionKey: Any] = [:]
-        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
-           let icon = NSImage(contentsOf: iconURL) {
-            options[.applicationIcon] = icon
+        if let existing = aboutController {
+            existing.showAboutWindow()
+            return
         }
-        NSApp.orderFrontStandardAboutPanel(options: options)
+        let controller = AboutWindowController(bundle: .main)
+        aboutController = controller
+        controller.showAboutWindow()
     }
 
     @objc func editAppNote(_ sender: Any? = nil) {
@@ -1874,6 +1891,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switchToFocused(manager.terminals[index])
     }
 
+    private func confirmAndRemoveTerminal(_ controller: TerminalController) {
+        let (title, message, confirmTitle) = Self.terminalRemovalConfirmation(
+            customTitle: controller.customTitle,
+            fallbackTitle: controller.title
+        )
+        let alert = NSAlert.pterm()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: confirmTitle)
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        manager.removeTerminal(controller)
+    }
+
+    private func confirmAndRemoveWorkspace(named workspace: String) {
+        let normalized = normalizedWorkspaceName(workspace)
+        let terminalCount = manager.terminals.filter { $0.sessionSnapshot.workspaceName == normalized }.count
+        let (title, message, confirmTitle) = Self.workspaceRemovalConfirmation(
+            workspaceName: normalized,
+            terminalCount: terminalCount
+        )
+        let alert = NSAlert.pterm()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: confirmTitle)
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        removeWorkspace(named: normalized)
+    }
+
     private func removeWorkspace(named workspace: String) {
         let normalized = normalizedWorkspaceName(workspace)
         let targets = manager.terminals.filter { $0.sessionSnapshot.workspaceName == normalized }
@@ -1904,6 +1953,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.setWorkspaceName(normalized)
         ensureWorkspaceExists(named: normalized)
         requestSessionPersist()
+    }
+
+    static func terminalRemovalConfirmation(
+        customTitle: String?,
+        fallbackTitle: String
+    ) -> (title: String, message: String, confirmButton: String) {
+        let trimmedCustomTitle = customTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let effectiveTitle = trimmedCustomTitle.isEmpty
+            ? fallbackTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            : trimmedCustomTitle
+        let displayTitle = effectiveTitle.isEmpty ? "this terminal" : "\"\(effectiveTitle)\""
+        return (
+            title: "Remove Terminal?",
+            message: "This will stop and remove \(displayTitle) from the overview.",
+            confirmButton: "Remove Terminal"
+        )
+    }
+
+    static func workspaceRemovalConfirmation(
+        workspaceName: String,
+        terminalCount: Int
+    ) -> (title: String, message: String, confirmButton: String) {
+        let normalized = workspaceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = normalized.isEmpty ? "Uncategorized" : normalized
+        let terminalDescription: String
+        if terminalCount == 1 {
+            terminalDescription = "1 terminal"
+        } else {
+            terminalDescription = "\(terminalCount) terminals"
+        }
+        return (
+            title: "Remove Workspace?",
+            message: "This will stop and remove the workspace \"\(displayName)\" and its \(terminalDescription).",
+            confirmButton: "Remove Workspace"
+        )
     }
 
     private func reorderTerminal(_ controller: TerminalController, toWorkspace workspace: String, atIndex index: Int) {

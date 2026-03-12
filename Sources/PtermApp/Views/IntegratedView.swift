@@ -216,6 +216,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     var onAddWorkspace: (() -> Void)?
     var onAddTerminalToWorkspace: ((String) -> Void)?
     var onRemoveWorkspace: ((String) -> Void)?
+    var onRemoveTerminal: ((TerminalController) -> Void)?
     var onRenameWorkspace: ((String, String) -> Void)?
     var onMoveTerminalToWorkspace: ((TerminalController, String) -> Void)?
     var onRenameTerminalTitle: ((TerminalController, String?) -> Void)?
@@ -423,6 +424,16 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     func applyAppearanceSettings() {
         clearColor = Self.overviewBackgroundClearColor()
+        setNeedsDisplay(bounds)
+    }
+
+    func terminalListDidChange() {
+        let activeTerminalIDs = Set(manager.terminals.map(\.id))
+        selectedTerminals.formIntersection(activeTerminalIDs)
+        invalidateLayoutCache()
+        updateLayoutCacheIfNeeded()
+        syncCompanionDocumentView()
+        updateRenderLoopState()
         setNeedsDisplay(bounds)
     }
 
@@ -975,7 +986,11 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
         // Check close button first
         if let controller = closeButtonController(at: point) {
-            manager.removeTerminal(controller)
+            guard let onRemoveTerminal else {
+                assertionFailure("IntegratedView.onRemoveTerminal must be configured before handling terminal removal")
+                return
+            }
+            onRemoveTerminal(controller)
             return
         }
 

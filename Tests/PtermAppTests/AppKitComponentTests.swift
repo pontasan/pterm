@@ -117,6 +117,47 @@ final class AppKitComponentTests: XCTestCase {
         }
     }
 
+    func testAboutWindowControllerBuildsExpectedWindowShell() {
+        let controller = AboutWindowController()
+        let window = controller.window
+
+        XCTAssertEqual(window?.title, "About pterm")
+        XCTAssertEqual(window?.isReleasedWhenClosed, false)
+        XCTAssertTrue(window?.styleMask.contains(.titled) ?? false)
+        XCTAssertTrue(window?.styleMask.contains(.closable) ?? false)
+        XCTAssertTrue(window?.styleMask.contains(.miniaturizable) ?? false)
+        XCTAssertFalse(window?.styleMask.contains(.resizable) ?? true)
+    }
+
+    func testAboutWindowControllerUsesDarkAppearanceAndTransparentBackground() {
+        let controller = AboutWindowController()
+        let window = controller.window
+        guard let background = window?.backgroundColor.usingColorSpace(.deviceRGB) else {
+            XCTFail("About window background color missing")
+            return
+        }
+
+        XCTAssertEqual(window?.appearance?.name, .darkAqua)
+        XCTAssertFalse(window?.isOpaque ?? true)
+        XCTAssertEqual(Double(background.alphaComponent), 0.0, accuracy: 0.0001)
+    }
+
+    func testAboutWindowControllerInstallsGlassBackgroundWhenAvailable() {
+        let controller = AboutWindowController()
+
+        if #available(macOS 26.0, *) {
+            XCTAssertNotNil(findSubview(in: controller.window?.contentView) { $0 is NSGlassEffectView })
+        }
+    }
+
+    func testAboutWindowControllerShowsApplicationMetadata() {
+        let controller = AboutWindowController()
+        let labels = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSTextField }.map(\.stringValue)
+
+        XCTAssertTrue(labels.contains("pterm"))
+        XCTAssertTrue(labels.contains { $0.hasPrefix("Version") })
+    }
+
     func testWindowMaterialPolicyAlwaysUsesTranslucencyForIntegratedView() {
         XCTAssertTrue(AppDelegate.shouldUseTranslucentWindowMaterial(isIntegratedViewVisible: true, terminalBackgroundOpacity: 1.0))
         XCTAssertTrue(AppDelegate.shouldUseTranslucentWindowMaterial(isIntegratedViewVisible: true, terminalBackgroundOpacity: 0.0))
@@ -2178,6 +2219,76 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(visibleLayouts.allSatisfy { $0.frame.intersects(view.bounds) })
     }
 
+    func testIntegratedViewTerminalListDidChangeRefreshesCachedLayoutsImmediatelyAfterAdd() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        _ = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            workspaceName: "WS",
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: view.frame)
+        window.contentView?.addSubview(view)
+        let overlay = ScrollbarOverlayView(frame: view.frame)
+        overlay.documentView = ScrollDocumentView(frame: view.bounds)
+        overlay.contentView.postsBoundsChangedNotifications = true
+        view.companionScrollView = overlay
+
+        renderFrame(for: view)
+        XCTAssertEqual(reflectedWorkspaceLayouts(from: view).flatMap(\.terminals).count, 1)
+
+        _ = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            workspaceName: "WS",
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+
+        view.terminalListDidChange()
+
+        XCTAssertEqual(reflectedWorkspaceLayouts(from: view).flatMap(\.terminals).count, 2)
+    }
+
+    func testIntegratedViewTerminalListDidChangeRefreshesCachedLayoutsImmediatelyAfterRemove() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let first = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            workspaceName: "WS",
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+        _ = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            workspaceName: "WS",
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: view.frame)
+        window.contentView?.addSubview(view)
+        let overlay = ScrollbarOverlayView(frame: view.frame)
+        overlay.documentView = ScrollDocumentView(frame: view.bounds)
+        overlay.contentView.postsBoundsChangedNotifications = true
+        view.companionScrollView = overlay
+
+        renderFrame(for: view)
+        XCTAssertEqual(reflectedWorkspaceLayouts(from: view).flatMap(\.terminals).count, 2)
+
+        manager.removeTerminal(first, preserveScrollback: true)
+        view.terminalListDidChange()
+
+        XCTAssertEqual(reflectedWorkspaceLayouts(from: view).flatMap(\.terminals).count, 1)
+    }
+
     func testIntegratedViewRespondsToSimulatedDisplayScaleChange() throws {
         guard let renderer = MetalRenderer(scaleFactor: 1.0) else {
             throw XCTSkip("Metal unavailable")
@@ -2565,6 +2676,55 @@ final class AppKitComponentTests: XCTestCase {
         view.mouseUp(with: up)
 
         XCTAssertFalse(didSelect)
+    }
+
+    func testIntegratedViewCloseButtonInvokesRemoveTerminalCallbackInsteadOfDirectRemoval() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let terminal = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), fontName: "Menlo", fontSize: 13)
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), renderer: renderer, manager: manager)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 540),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        window.makeKeyAndOrderFront(nil)
+        renderFrame(for: view)
+
+        let layout = try XCTUnwrap(reflectedWorkspaceLayouts(from: view).first?.terminals.first(where: { $0.controllerID == terminal.id }))
+        var removedID: UUID?
+        view.onRemoveTerminal = { removedID = $0.id }
+
+        let closePoint = NSPoint(x: layout.title.minX + 8, y: layout.title.midY)
+        let down = try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: closePoint, in: view, window: window))
+        view.mouseDown(with: down)
+
+        XCTAssertEqual(removedID, terminal.id)
+        XCTAssertEqual(manager.terminals.count, 1)
+    }
+
+    func testTerminalRemovalConfirmationUsesCustomTitleWhenPresent() {
+        let confirmation = AppDelegate.terminalRemovalConfirmation(
+            customTitle: "Build Logs",
+            fallbackTitle: "wk"
+        )
+
+        XCTAssertEqual(confirmation.title, "Remove Terminal?")
+        XCTAssertEqual(confirmation.confirmButton, "Remove Terminal")
+        XCTAssertEqual(confirmation.message, "This will stop and remove \"Build Logs\" from the overview.")
+    }
+
+    func testWorkspaceRemovalConfirmationIncludesWorkspaceNameAndTerminalCount() {
+        let confirmation = AppDelegate.workspaceRemovalConfirmation(
+            workspaceName: "Alpha",
+            terminalCount: 2
+        )
+
+        XCTAssertEqual(confirmation.title, "Remove Workspace?")
+        XCTAssertEqual(confirmation.confirmButton, "Remove Workspace")
+        XCTAssertEqual(confirmation.message, "This will stop and remove the workspace \"Alpha\" and its 2 terminals.")
     }
 
     func testIntegratedViewSelectAllButtonSelectsWorkspaceTerminals() throws {
