@@ -1671,9 +1671,40 @@ final class AppKitComponentTests: XCTestCase {
 
         XCTAssertEqual(window?.appearance?.name, .darkAqua)
         XCTAssertEqual(window?.isReleasedWhenClosed, false)
-        XCTAssertLessThan(Double(background.redComponent), 0.2)
-        XCTAssertEqual(Double(background.redComponent), Double(background.greenComponent), accuracy: 0.0001)
-        XCTAssertEqual(Double(background.greenComponent), Double(background.blueComponent), accuracy: 0.0001)
+        XCTAssertEqual(Double(background.alphaComponent), 0.0, accuracy: 0.0001)
+        XCTAssertFalse(window?.isOpaque ?? true)
+    }
+
+    func testMarkdownEditorUsesTransparentEditorBackgroundLikeIntegratedView() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "",
+            onSave: { _ in }
+        )
+
+        let textView = try XCTUnwrap(findSubview(in: controller.window?.contentView) { $0 is NSTextView } as? NSTextView)
+        let scrollView = try XCTUnwrap(findSubview(in: controller.window?.contentView) { $0 is NSScrollView } as? NSScrollView)
+
+        guard let textBackground = textView.backgroundColor.usingColorSpace(.deviceRGB),
+              let scrollBackground = scrollView.backgroundColor.usingColorSpace(.deviceRGB) else {
+            XCTFail("Markdown editor backgrounds missing")
+            return
+        }
+
+        XCTAssertEqual(Double(textBackground.alphaComponent), 0.0, accuracy: 0.0001)
+        XCTAssertEqual(Double(scrollBackground.alphaComponent), 0.0, accuracy: 0.0001)
+        XCTAssertFalse(textView.drawsBackground)
+        XCTAssertFalse(scrollView.drawsBackground)
+    }
+
+    func testMarkdownEditorInstallsGlassBackgroundWhenAvailable() {
+        let controller = MarkdownEditorWindowController(
+            initialText: "",
+            onSave: { _ in }
+        )
+
+        if #available(macOS 26.0, *) {
+            XCTAssertNotNil(findSubview(in: controller.window?.contentView) { $0 is NSGlassEffectView })
+        }
     }
 
     func testMarkdownEditorWindowStartsCleanWithoutDirtyMarker() {

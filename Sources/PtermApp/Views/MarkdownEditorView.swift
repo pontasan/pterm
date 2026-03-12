@@ -121,13 +121,13 @@ final class MarkdownHighlighter {
 final class LineNumberGutterView: NSView {
     static let gutterWidth: CGFloat = 44
     private let gutterTextColor = NSColor(calibratedWhite: 0.45, alpha: 1)
-    private let gutterBgColor = NSColor(calibratedRed: 0.10, green: 0.10, blue: 0.10, alpha: 1)
     weak var textView: NSTextView?
+    var gutterBackgroundColor = NSColor(calibratedRed: 0.10, green: 0.10, blue: 0.10, alpha: 1)
 
     override var isFlipped: Bool { true }
 
     override func draw(_ dirtyRect: NSRect) {
-        gutterBgColor.setFill()
+        gutterBackgroundColor.setFill()
         dirtyRect.fill()
 
         guard let textView,
@@ -316,11 +316,16 @@ final class MarkdownAutoFormatDelegate: NSObject, NSTextViewDelegate {
 /// Creates and configures a standard NSTextView (no subclassing) with
 /// Markdown highlighting, line numbers, and auto-format support.
 final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate {
+    private static let editorBaseBackgroundColor = NSColor(calibratedRed: 0.118, green: 0.118, blue: 0.118, alpha: 1)
+    private static let editorGlassBackgroundColor = NSColor.clear
     private var textView: NSTextView!
     private var gutterView: LineNumberGutterView!
     private var autoFormatDelegate: MarkdownAutoFormatDelegate!
     private var highlighter: MarkdownHighlighter!
     private weak var scrollView: NSScrollView?
+    private weak var hostedContentView: NSView?
+    private weak var rootContentView: NSView?
+    private var backgroundGlassView: NSView?
     private var keyMonitor: Any?
     private var isDirty = false
     private var baseTitle: String
@@ -334,18 +339,35 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         let styleMask: NSWindow.StyleMask = [.titled, .closable, .resizable, .miniaturizable]
         let window = NSWindow(contentRect: contentRect, styleMask: styleMask, backing: .buffered, defer: false)
         window.title = baseTitle
-        window.backgroundColor = NSColor(calibratedRed: 0.118, green: 0.118, blue: 0.118, alpha: 1)
+        window.backgroundColor = .clear
         window.appearance = NSAppearance(named: .darkAqua)
         window.minSize = NSSize(width: 400, height: 300)
         window.isReleasedWhenClosed = false
+        window.isOpaque = false
+        window.titlebarAppearsTransparent = false
         window.center()
 
         super.init(window: window)
         window.delegate = self
 
         let editorFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-        let contentView = window.contentView!
-        let editorBg = NSColor(calibratedRed: 0.118, green: 0.118, blue: 0.118, alpha: 1)
+        let rootView = NSView(frame: window.contentView?.bounds ?? contentRect)
+        rootView.autoresizingMask = [.width, .height]
+        rootView.wantsLayer = true
+        rootView.layer?.backgroundColor = NSColor.clear.cgColor
+        window.contentView = rootView
+        rootContentView = rootView
+
+        let hostedView = NSView(frame: rootView.bounds)
+        hostedView.autoresizingMask = [.width, .height]
+        hostedView.wantsLayer = true
+        hostedView.layer?.backgroundColor = NSColor.clear.cgColor
+        rootView.addSubview(hostedView)
+        hostedContentView = hostedView
+        installGlassBackgroundIfNeeded()
+
+        let contentView = hostedView
+        let editorBg = Self.editorGlassBackgroundColor
         let editorFg = MarkdownHighlighter.defaultColor
         let gutterW = LineNumberGutterView.gutterWidth
 
@@ -360,6 +382,7 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         // Line number gutter — standalone NSView on the left
         let gutter = LineNumberGutterView(frame: NSRect(x: 0, y: 0, width: gutterW, height: contentView.bounds.height))
         gutter.autoresizingMask = [.height]
+        gutter.gutterBackgroundColor = editorBg
         contentView.addSubview(gutter)
         gutterView = gutter
 
@@ -373,7 +396,7 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         scrollView.hasHorizontalScroller = false
         scrollView.borderType = .noBorder
         scrollView.backgroundColor = editorBg
-        scrollView.drawsBackground = true
+        scrollView.drawsBackground = false
         scrollView.scrollerStyle = .overlay
 
         let contentSize = scrollView.contentSize
@@ -399,7 +422,7 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         tv.usesFindBar = true
 
         tv.backgroundColor = editorBg
-        tv.drawsBackground = true
+        tv.drawsBackground = false
         tv.insertionPointColor = NSColor.white
         tv.selectedTextAttributes = [
             .backgroundColor: NSColor(calibratedRed: 0.17, green: 0.33, blue: 0.53, alpha: 1),
@@ -479,6 +502,30 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) not implemented")
+    }
+
+    private func installGlassBackgroundIfNeeded() {
+        guard let rootContentView else { return }
+        if #available(macOS 26.0, *) {
+            let glassView: NSGlassEffectView
+            if let existing = backgroundGlassView as? NSGlassEffectView {
+                glassView = existing
+            } else {
+                glassView = NSGlassEffectView(frame: rootContentView.bounds)
+                glassView.autoresizingMask = [.width, .height]
+                glassView.style = .regular
+                glassView.cornerRadius = 0
+                backgroundGlassView = glassView
+            }
+            glassView.tintColor = nil
+            if glassView.superview !== rootContentView {
+                rootContentView.addSubview(glassView, positioned: .below, relativeTo: hostedContentView)
+            } else if let hostedContentView {
+                rootContentView.addSubview(glassView, positioned: .below, relativeTo: hostedContentView)
+            }
+            glassView.frame = rootContentView.bounds
+            glassView.isHidden = false
+        }
     }
 
     @objc private func scrollOrTextDidChange(_ notification: Notification) {
