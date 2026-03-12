@@ -32,7 +32,10 @@ final class AppNoteStore {
         let data = try Data(contentsOf: url)
         let key = try loadOrCreateKey()
         let plaintext = try decrypt(data, using: key)
-        return String(data: plaintext, encoding: .utf8)
+        guard let note = String(data: plaintext, encoding: .utf8) else {
+            throw AppNoteError.invalidFormat
+        }
+        return note
     }
 
     func saveNote(_ note: String) throws {
@@ -69,6 +72,7 @@ final class AppNoteStore {
         guard status == errSecSuccess else {
             throw AppNoteError.keychain(status)
         }
+        cachedKey = key
     }
 
     private var noteURL: URL {

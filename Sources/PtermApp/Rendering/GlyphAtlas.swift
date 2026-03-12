@@ -43,6 +43,7 @@ final class GlyphAtlas {
 
     /// Metal device
     private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue?
 
     struct GlyphInfo {
         var textureX: Float     // Texture coordinate X (0..1)
@@ -58,6 +59,7 @@ final class GlyphAtlas {
 
     init(device: MTLDevice, fontSize: CGFloat, scaleFactor: CGFloat) {
         self.device = device
+        self.commandQueue = device.makeCommandQueue()
         self.scaleFactor = scaleFactor
         self.fontSize = fontSize
 
@@ -251,8 +253,7 @@ final class GlyphAtlas {
     /// No-op for shared storage (Apple Silicon unified memory).
     private func syncTextureToGPU() {
         guard let texture = texture, texture.storageMode == .managed else { return }
-        guard let queue = device.makeCommandQueue(),
-              let cmdBuf = queue.makeCommandBuffer(),
+        guard let cmdBuf = commandQueue?.makeCommandBuffer(),
               let blit = cmdBuf.makeBlitCommandEncoder() else { return }
         blit.synchronize(resource: texture)
         blit.endEncoding()

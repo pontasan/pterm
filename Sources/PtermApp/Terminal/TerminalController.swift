@@ -97,6 +97,13 @@ final class TerminalController {
     var onTitleChange: ((String) -> Void)?
     var onStateChange: (() -> Void)?
 
+    /// Coalesces bursty PTY-driven callbacks onto a single main-queue hop.
+    private let callbackLock = NSLock()
+    private var mainCallbacksScheduled = false
+    private var pendingNeedsDisplay = false
+    private var pendingOutputActivity = false
+    private var pendingStateChange = false
+
     /// Decode buffer for UTF-8 -> codepoints
     private var codepointBuffer = [UInt32](repeating: 0, count: 16384)
 
@@ -278,9 +285,7 @@ final class TerminalController {
                 scrollOffset = min(scrollback.rowCount, model.rows)
             }
         }
-        DispatchQueue.main.async { [weak self] in
-            self?.onNeedsDisplay?()
-        }
+        scheduleMainCallbacks(needsDisplay: true)
     }
 
     func clearScrollback() {
@@ -288,10 +293,7 @@ final class TerminalController {
             scrollback.clear()
             scrollOffset = 0
         }
-        DispatchQueue.main.async { [weak self] in
-            self?.onNeedsDisplay?()
-            self?.onStateChange?()
-        }
+        scheduleMainCallbacks(needsDisplay: true, stateChange: true)
     }
 
     func updateCurrentDirectory(path: String) {
@@ -415,14 +417,11 @@ final class TerminalController {
             }
         }
 
-        // Request redraw on main thread
-        DispatchQueue.main.async { [weak self] in
-            self?.onOutputActivity?()
-            self?.onNeedsDisplay?()
-            if clearedScrollback {
-                self?.onStateChange?()
-            }
-        }
+        scheduleMainCallbacks(
+            needsDisplay: true,
+            outputActivity: true,
+            stateChange: clearedScrollback
+        )
     }
 
     // MARK: - Resize
@@ -520,25 +519,48 @@ final class TerminalController {
 
     func allText() -> String {
         lock.withReadLock {
-            var rows: [ViewportRow] = []
-            rows.reserveCapacity(scrollback.rowCount + model.rows)
-            for row in 0..<scrollback.rowCount {
-                rows.append(
-                    ViewportRow(
-                        cells: scrollback.getRow(at: row) ?? [],
-                        isWrapped: scrollback.isRowWrapped(at: row)
-                    )
-                )
+            let totalRows = scrollback.rowCount + model.rows
+            guard totalRows > 0 else { return "" }
+
+            var result = ""
+            result.reserveCapacity(max(totalRows * max(model.cols, 1), model.cols))
+            var gridRowBuffer: [Cell] = []
+            gridRowBuffer.reserveCapacity(model.cols)
+
+            for absoluteRow in 0..<totalRows {
+                let isScrollbackRow = absoluteRow < scrollback.rowCount
+                let cells: [Cell]
+                if isScrollbackRow {
+                    cells = scrollback.getRow(at: absoluteRow) ?? []
+                } else {
+                    let gridRow = absoluteRow - scrollback.rowCount
+                    gridRowBuffer.removeAll(keepingCapacity: true)
+                    for col in 0..<model.cols {
+                        gridRowBuffer.append(model.grid.cell(at: gridRow, col: col))
+                    }
+                    cells = gridRowBuffer
+                }
+
+                Self.appendCells(in: cells, from: 0, through: max(model.cols - 1, 0), to: &result)
+
+                if absoluteRow < totalRows - 1 {
+                    Self.trimTrailingSpaces(from: &result)
+                    let nextIsWrapped: Bool
+                    if absoluteRow + 1 < scrollback.rowCount {
+                        nextIsWrapped = scrollback.isRowWrapped(at: absoluteRow + 1)
+                    } else if absoluteRow + 1 < totalRows {
+                        let nextGridRow = absoluteRow + 1 - scrollback.rowCount
+                        nextIsWrapped = model.grid.isWrapped(nextGridRow)
+                    } else {
+                        nextIsWrapped = false
+                    }
+                    if !nextIsWrapped {
+                        result.append("\n")
+                    }
+                }
             }
-            for row in 0..<model.rows {
-                rows.append(
-                    ViewportRow(
-                        cells: (0..<model.cols).map { model.grid.cell(at: row, col: $0) },
-                        isWrapped: model.grid.isWrapped(row)
-                    )
-                )
-            }
-            return Self.extractAllText(rows: rows, cols: model.cols)
+
+            return result
         }
     }
 
@@ -548,19 +570,21 @@ final class TerminalController {
 
         return lock.withReadLock {
             var matches: [SearchMatch] = []
+            matches.reserveCapacity(max(16, scrollback.rowCount / 4))
             for row in 0..<scrollback.rowCount {
                 if let cells = scrollback.getRow(at: row) {
-                    matches.append(contentsOf: Self.findMatches(in: cells, row: row, query: needle))
+                    Self.appendMatches(in: cells, row: row, query: needle, to: &matches)
                 }
             }
 
+            var cells: [Cell] = []
+            cells.reserveCapacity(model.cols)
             for row in 0..<model.rows {
-                var cells: [Cell] = []
-                cells.reserveCapacity(model.cols)
+                cells.removeAll(keepingCapacity: true)
                 for col in 0..<model.cols {
                     cells.append(model.grid.cell(at: row, col: col))
                 }
-                matches.append(contentsOf: Self.findMatches(in: cells, row: scrollback.rowCount + row, query: needle))
+                Self.appendMatches(in: cells, row: scrollback.rowCount + row, query: needle, to: &matches)
             }
 
             return matches
@@ -629,19 +653,69 @@ final class TerminalController {
         let scrollbackCount = scrollback.rowCount
         let firstAbsolute = scrollOffset > 0 ? max(0, scrollbackCount - scrollOffset) : scrollbackCount
 
-        return (0..<model.rows).map { row in
+        var rows: [ViewportRow] = []
+        rows.reserveCapacity(model.rows)
+        for row in 0..<model.rows {
             let absoluteRow = firstAbsolute + row
             if absoluteRow < scrollbackCount {
-                return ViewportRow(
+                rows.append(ViewportRow(
                     cells: scrollback.getRow(at: absoluteRow) ?? [],
                     isWrapped: scrollback.isRowWrapped(at: absoluteRow)
-                )
+                ))
+                continue
             }
             let gridRow = absoluteRow - scrollbackCount
-            return ViewportRow(
-                cells: (0..<model.cols).map { model.grid.cell(at: gridRow, col: $0) },
-                isWrapped: model.grid.isWrapped(gridRow)
-            )
+            var cells: [Cell] = []
+            cells.reserveCapacity(model.cols)
+            for col in 0..<model.cols {
+                cells.append(model.grid.cell(at: gridRow, col: col))
+            }
+            rows.append(ViewportRow(cells: cells, isWrapped: model.grid.isWrapped(gridRow)))
+        }
+        return rows
+    }
+
+    private func scheduleMainCallbacks(
+        needsDisplay: Bool = false,
+        outputActivity: Bool = false,
+        stateChange: Bool = false
+    ) {
+        let shouldSchedule = callbackLock.withLock {
+            pendingNeedsDisplay = pendingNeedsDisplay || needsDisplay
+            pendingOutputActivity = pendingOutputActivity || outputActivity
+            pendingStateChange = pendingStateChange || stateChange
+            if mainCallbacksScheduled {
+                return false
+            }
+            mainCallbacksScheduled = true
+            return true
+        }
+
+        guard shouldSchedule else { return }
+
+        DispatchQueue.main.async { [weak self] in
+            self?.flushScheduledCallbacks()
+        }
+    }
+
+    private func flushScheduledCallbacks() {
+        let callbacks = callbackLock.withLock { () -> (Bool, Bool, Bool) in
+            let callbacks = (pendingOutputActivity, pendingNeedsDisplay, pendingStateChange)
+            pendingOutputActivity = false
+            pendingNeedsDisplay = false
+            pendingStateChange = false
+            mainCallbacksScheduled = false
+            return callbacks
+        }
+
+        if callbacks.0 {
+            onOutputActivity?()
+        }
+        if callbacks.1 {
+            onNeedsDisplay?()
+        }
+        if callbacks.2 {
+            onStateChange?()
         }
     }
 
@@ -722,8 +796,16 @@ final class TerminalController {
     }
 
     private static func findMatches(in cells: [Cell], row: Int, query: String) -> [SearchMatch] {
+        var results: [SearchMatch] = []
+        appendMatches(in: cells, row: row, query: query, to: &results)
+        return results
+    }
+
+    private static func appendMatches(in cells: [Cell], row: Int, query: String, to results: inout [SearchMatch]) {
         var text = ""
         var columns: [Int] = []
+        text.reserveCapacity(cells.count)
+        columns.reserveCapacity(cells.count)
         for (index, cell) in cells.enumerated() {
             if cell.isWideContinuation { continue }
             if let scalar = Unicode.Scalar(cell.codepoint) {
@@ -733,9 +815,8 @@ final class TerminalController {
         }
 
         let haystack = text.lowercased()
-        guard !haystack.isEmpty else { return [] }
+        guard !haystack.isEmpty else { return }
 
-        var results: [SearchMatch] = []
         var start = haystack.startIndex
         while let range = haystack.range(of: query, range: start..<haystack.endIndex) {
             let startOffset = haystack.distance(from: haystack.startIndex, to: range.lowerBound)
@@ -747,7 +828,6 @@ final class TerminalController {
             }
             start = range.upperBound
         }
-        return results
     }
 
     private static func projectVisibleText(from cells: [Cell]) -> (text: String, characterIndexByColumn: [Int: Int], columnByCharacterIndex: [Int: Int]) {
@@ -766,5 +846,13 @@ final class TerminalController {
         }
 
         return (text, colToChar, charToCol)
+    }
+}
+
+private extension NSLock {
+    func withLock<T>(_ body: () -> T) -> T {
+        lock()
+        defer { unlock() }
+        return body()
     }
 }

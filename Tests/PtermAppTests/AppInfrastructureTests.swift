@@ -1,4 +1,5 @@
 import AppKit
+import CommonCrypto
 import CryptoKit
 import XCTest
 @testable import PtermApp
@@ -170,6 +171,40 @@ final class AppInfrastructureTests: XCTestCase {
                     return XCTFail("Expected invalidFormat, got \(error)")
                 }
             }
+        }
+    }
+
+    func testAppNoteStoreLoadNoteRejectsDecryptedPayloadWithInvalidUTF8() throws {
+        try withTemporaryDirectory { directory in
+            let store = AppNoteStore(rootDirectory: directory)
+            let originalKey = try store.exportEncryptionKey()
+            defer { try? store.importEncryptionKey(originalKey) }
+
+            let importedKey = Data(repeating: 0x44, count: 32)
+            try store.importEncryptionKey(importedKey)
+            let ciphertext = try encryptedNotePayloadForTest(plaintext: Data([0xFF]), key: importedKey)
+            try ciphertext.write(to: directory.appendingPathComponent("note.enc"))
+
+            XCTAssertThrowsError(try store.loadNote()) { error in
+                guard case AppNoteError.invalidFormat = error else {
+                    return XCTFail("Expected invalidFormat, got \(error)")
+                }
+            }
+        }
+    }
+
+    func testAppNoteStoreImportEncryptionKeyRefreshesCachedKeyImmediately() throws {
+        try withTemporaryDirectory { directory in
+            let store = AppNoteStore(rootDirectory: directory)
+            let originalKey = try store.exportEncryptionKey()
+            defer { try? store.importEncryptionKey(originalKey) }
+
+            let importedKey = Data(repeating: 0x55, count: 32)
+            XCTAssertNotEqual(originalKey, importedKey)
+
+            try store.importEncryptionKey(importedKey)
+
+            XCTAssertEqual(try store.exportEncryptionKey(), importedKey)
         }
     }
 
@@ -970,4 +1005,38 @@ final class AppInfrastructureTests: XCTestCase {
             monitor.stop()
         }
     }
+}
+
+private func encryptedNotePayloadForTest(plaintext: Data, key: Data) throws -> Data {
+    let magic = Data("PTN1".utf8)
+    let salt = Data(repeating: 0x11, count: 16)
+    let iv = Data(repeating: 0x22, count: kCCBlockSizeAES128)
+    var output = Data(count: plaintext.count + kCCBlockSizeAES128)
+    let outputCapacity = output.count
+    var outLength = 0
+
+    let status = output.withUnsafeMutableBytes { outputBytes in
+        plaintext.withUnsafeBytes { inputBytes in
+            key.withUnsafeBytes { keyBytes in
+                iv.withUnsafeBytes { ivBytes in
+                    CCCrypt(
+                        CCOperation(kCCEncrypt),
+                        CCAlgorithm(kCCAlgorithmAES),
+                        CCOptions(kCCOptionPKCS7Padding),
+                        keyBytes.baseAddress, key.count,
+                        ivBytes.baseAddress,
+                        inputBytes.baseAddress, plaintext.count,
+                        outputBytes.baseAddress, outputCapacity,
+                        &outLength
+                    )
+                }
+            }
+        }
+    }
+
+    guard status == kCCSuccess else {
+        throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+    }
+    output.removeSubrange(outLength..<output.count)
+    return magic + salt + iv + output
 }

@@ -8,6 +8,13 @@ import XCTest
 
 @MainActor
 final class AppKitComponentTests: XCTestCase {
+    private static func projectRootURL(filePath: StaticString = #filePath) -> URL {
+        URL(fileURLWithPath: "\(filePath)")
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
     private func makeRendererOrSkip() throws -> MetalRenderer {
         guard let renderer = MetalRenderer(scaleFactor: 2.0) else {
             throw XCTSkip("Metal unavailable")
@@ -17,7 +24,8 @@ final class AppKitComponentTests: XCTestCase {
 
     private func makeRendererWithPipelinesOrSkip() throws -> MetalRenderer {
         let renderer = try makeRendererOrSkip()
-        let shaderURL = URL(fileURLWithPath: "/Users/umedatomohiro/Developments/workspace/pterm/Sources/PtermApp/Rendering/Shaders/terminal.metal")
+        let shaderURL = Self.projectRootURL()
+            .appendingPathComponent("Sources/PtermApp/Rendering/Shaders/terminal.metal")
         let source = try String(contentsOf: shaderURL, encoding: .utf8)
         let library = try renderer.device.makeLibrary(source: source, options: nil)
         renderer.setupPipelines(library: library)
@@ -34,7 +42,7 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(labels.contains("CPU: 12% | MEM: 512MB"))
 
         let buttonTitles = view.subviews.compactMap { $0 as? NSButton }.map(\.title)
-        XCTAssertTrue(buttonTitles.contains("📝 Notes"))
+        XCTAssertTrue(buttonTitles.contains("Edit Notes"))
         XCTAssertTrue(buttonTitles.contains("◀ Overview"))
     }
 
@@ -57,7 +65,7 @@ final class AppKitComponentTests: XCTestCase {
 
         let buttons = view.subviews.compactMap { $0 as? NSButton }
         buttons.first(where: { $0.title == "◀ Overview" })?.performClick(nil)
-        buttons.first(where: { $0.title == "📝 Notes" })?.performClick(nil)
+        buttons.first(where: { $0.title == "Edit Notes" })?.performClick(nil)
 
         XCTAssertTrue(didBack)
         XCTAssertTrue(didOpenNote)
@@ -911,19 +919,42 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(splitRenderView.layer?.contentsScale, 3.0)
     }
 
+    func testSplitRenderViewSyncScaleFactorIfNeededUpdatesDrawableSizeAndAtlasScale() throws {
+        let renderer = try makeRendererOrSkip()
+        let splitRenderView = SplitRenderView(frame: NSRect(x: 0, y: 0, width: 420, height: 260), renderer: renderer)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 320))
+        window.testBackingScaleFactor = 1.0
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(splitRenderView)
+
+        splitRenderView.viewDidMoveToWindow()
+        XCTAssertEqual(splitRenderView.layer?.contentsScale, 1.0)
+        XCTAssertEqual(splitRenderView.drawableSize.width, 420.0, accuracy: 0.5)
+        XCTAssertEqual(splitRenderView.drawableSize.height, 260.0, accuracy: 0.5)
+        XCTAssertEqual(renderer.glyphAtlas.scaleFactor, 1.0)
+
+        window.testBackingScaleFactor = 2.0
+        splitRenderView.syncScaleFactorIfNeeded()
+
+        XCTAssertEqual(splitRenderView.layer?.contentsScale, 2.0)
+        XCTAssertEqual(splitRenderView.drawableSize.width, 840.0, accuracy: 0.5)
+        XCTAssertEqual(splitRenderView.drawableSize.height, 520.0, accuracy: 0.5)
+        XCTAssertEqual(renderer.glyphAtlas.scaleFactor, 2.0)
+    }
+
     func testStatusBarButtonsExposeExpectedTooltips() {
         let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
         let buttons = allSubviews(in: view).compactMap { $0 as? NSButton }
 
         XCTAssertEqual(buttons.first(where: { $0.title == "◀ Overview" })?.toolTip, "Back to Overview (Cmd+`)")
-        XCTAssertEqual(buttons.first(where: { $0.title == "📝 Notes" })?.toolTip, "Workspace Notes")
+        XCTAssertEqual(buttons.first(where: { $0.title == "Edit Notes" })?.toolTip, "Edit Notes")
     }
 
     func testStatusBarNotesButtonMatchesSpecTitle() {
         let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
         let buttons = allSubviews(in: view).compactMap { $0 as? NSButton }
 
-        XCTAssertNotNil(buttons.first(where: { $0.title == "📝 Notes" }))
+        XCTAssertNotNil(buttons.first(where: { $0.title == "Edit Notes" }))
     }
 
     func testStatusBarMetricsRoundToNearestWholeValues() {
@@ -1046,7 +1077,7 @@ final class AppKitComponentTests: XCTestCase {
         view.layoutSubtreeIfNeeded()
 
         let buttons = allSubviews(in: view).compactMap { $0 as? NSButton }
-        let noteButton = buttons.first(where: { $0.title == "📝 Notes" })
+        let noteButton = buttons.first(where: { $0.title == "Edit Notes" })
         let overviewButton = buttons.first(where: { $0.title == "◀ Overview" })
 
         XCTAssertEqual(overviewButton?.isHidden, true)
@@ -1059,7 +1090,7 @@ final class AppKitComponentTests: XCTestCase {
         view.layoutSubtreeIfNeeded()
 
         let buttons = allSubviews(in: view).compactMap { $0 as? NSButton }
-        let noteButton = buttons.first(where: { $0.title == "📝 Notes" })
+        let noteButton = buttons.first(where: { $0.title == "Edit Notes" })
         let overviewButton = buttons.first(where: { $0.title == "◀ Overview" })
 
         XCTAssertEqual(overviewButton?.isHidden, false)
@@ -1514,6 +1545,85 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(selectedID, terminal.id)
     }
 
+    func testNewTerminalShortcutContextUsesFocusedControllerWorkspaceAndAppendsNewTerminalToSplit() {
+        let focused = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            workspaceName: "Alpha"
+        )
+        let newController = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            workspaceName: "Alpha"
+        )
+
+        let context = AppDelegate.newTerminalShortcutContext(
+            focusedController: focused,
+            splitControllers: []
+        )
+
+        XCTAssertEqual(context?.workspaceName, "Alpha")
+        XCTAssertEqual(context?.displayedControllers.map(\.id) ?? [], [focused.id])
+        XCTAssertEqual((context?.displayedControllers.map(\.id) ?? []) + [newController.id], [focused.id, newController.id])
+    }
+
+    func testNewTerminalShortcutContextUsesLastDisplayedSplitControllerWorkspaceAndAppendsNewTerminal() {
+        let first = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            workspaceName: "Alpha"
+        )
+        let last = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            workspaceName: "Beta"
+        )
+        let newController = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            workspaceName: "Beta"
+        )
+
+        let context = AppDelegate.newTerminalShortcutContext(
+            focusedController: nil,
+            splitControllers: [first, last]
+        )
+
+        XCTAssertEqual(context?.workspaceName, "Beta")
+        XCTAssertEqual(context?.displayedControllers.map(\.id) ?? [], [first.id, last.id])
+        XCTAssertEqual((context?.displayedControllers.map(\.id) ?? []) + [newController.id], [first.id, last.id, newController.id])
+    }
+
     func testIntegratedViewSyncScaleFactorUpdatesDrawableSizeAndAtlasScale() throws {
         guard let renderer = MetalRenderer(scaleFactor: 1.0) else {
             throw XCTSkip("Metal unavailable")
@@ -1533,6 +1643,61 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(renderer.glyphAtlas.scaleFactor, scale)
         XCTAssertEqual(Double(view.drawableSize.width), Double(view.bounds.width * scale), accuracy: 1.0)
         XCTAssertEqual(Double(view.drawableSize.height), Double(view.bounds.height * scale), accuracy: 1.0)
+    }
+
+    func testIntegratedViewUsesDemandDrivenRenderingWhenIdleAndContinuousRenderingForActiveOutput() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let controller = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 640, height: 360), renderer: renderer, manager: manager)
+
+        XCTAssertTrue(view.isPaused)
+        XCTAssertTrue(view.enableSetNeedsDisplay)
+
+        XCTAssertTrue(view.setTerminalOutputActive(controller.id, isActive: true))
+
+        XCTAssertFalse(view.isPaused)
+        XCTAssertFalse(view.enableSetNeedsDisplay)
+
+        XCTAssertTrue(view.setTerminalOutputActive(controller.id, isActive: false))
+
+        XCTAssertTrue(view.isPaused)
+        XCTAssertTrue(view.enableSetNeedsDisplay)
+    }
+
+    func testIntegratedViewCachesOnlyVisibleWorkspaceLayoutsForDrawing() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        for index in 0..<18 {
+            _ = try manager.addTerminal(
+                initialDirectory: NSTemporaryDirectory(),
+                workspaceName: "WS-\(index)",
+                fontName: renderer.glyphAtlas.fontName,
+                fontSize: Double(renderer.glyphAtlas.fontSize)
+            )
+        }
+
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: view.frame)
+        window.contentView?.addSubview(view)
+        let overlay = ScrollbarOverlayView(frame: view.frame)
+        overlay.documentView = ScrollDocumentView(frame: view.bounds)
+        overlay.contentView.postsBoundsChangedNotifications = true
+        view.companionScrollView = overlay
+
+        renderFrame(for: view)
+
+        let allLayouts = reflectedWorkspaceLayouts(from: view)
+        let visibleLayouts = reflectedVisibleWorkspaceLayouts(from: view)
+        XCTAssertGreaterThan(allLayouts.count, visibleLayouts.count)
+        XCTAssertTrue(visibleLayouts.allSatisfy { $0.frame.intersects(view.bounds) })
     }
 
     func testIntegratedViewRespondsToSimulatedDisplayScaleChange() throws {
@@ -1760,6 +1925,47 @@ final class AppKitComponentTests: XCTestCase {
 
         XCTAssertTrue(terminalViews.allSatisfy { $0.renderer?.glyphAtlas.scaleFactor == 2.0 })
         XCTAssertEqual(splitRenderView.layer?.contentsScale, 2.0)
+    }
+
+    func testSplitTerminalContainerSyncScaleFactorIfNeededUpdatesSplitRenderViewAndTerminalViews() throws {
+        let renderer = try makeRendererOrSkip()
+        let controllers = (0..<2).map { index in
+            TerminalController(
+                rows: 4,
+                cols: 12,
+                termEnv: "xterm-256color",
+                textEncoding: .utf8,
+                scrollbackInitialCapacity: 4096,
+                scrollbackMaxCapacity: 4096,
+                fontName: "Menlo",
+                fontSize: 13,
+                initialDirectory: "/tmp/syncscale\(index)"
+            )
+        }
+        let container = SplitTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 420, height: 260), renderer: renderer, controllers: controllers)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 320))
+        window.testBackingScaleFactor = 1.0
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(container)
+        container.layoutSubtreeIfNeeded()
+
+        let terminalViews = allSubviews(in: container).compactMap { $0 as? TerminalView }
+        terminalViews.forEach { $0.viewDidMoveToWindow() }
+        let splitRenderView = try XCTUnwrap(allSubviews(in: container).compactMap { $0 as? SplitRenderView }.first)
+        splitRenderView.viewDidMoveToWindow()
+
+        XCTAssertTrue(terminalViews.allSatisfy { $0.renderer?.glyphAtlas.scaleFactor == 1.0 })
+        XCTAssertEqual(splitRenderView.layer?.contentsScale, 1.0)
+        XCTAssertEqual(splitRenderView.drawableSize.width, 420.0, accuracy: 0.5)
+        XCTAssertEqual(splitRenderView.drawableSize.height, 260.0, accuracy: 0.5)
+
+        window.testBackingScaleFactor = 2.0
+        container.syncScaleFactorIfNeeded()
+
+        XCTAssertTrue(terminalViews.allSatisfy { $0.renderer?.glyphAtlas.scaleFactor == 2.0 })
+        XCTAssertEqual(splitRenderView.layer?.contentsScale, 2.0)
+        XCTAssertEqual(splitRenderView.drawableSize.width, 840.0, accuracy: 0.5)
+        XCTAssertEqual(splitRenderView.drawableSize.height, 520.0, accuracy: 0.5)
     }
 
     func testIntegratedViewShiftSelectionCommitsMultiSelectOnShiftRelease() throws {
@@ -2295,6 +2501,15 @@ final class AppKitComponentTests: XCTestCase {
             terminals: manager.terminals,
             explicitWorkspaceNames: explicitWorkspaceNames
         )
+    }
+
+    private func reflectedVisibleWorkspaceLayouts(from view: IntegratedView) -> [ReflectedWorkspaceLayout] {
+        guard let rawLayouts = mirroredChildValue(named: "cachedVisibleWorkspaceLayouts", in: view) else {
+            return []
+        }
+        return Mirror(reflecting: rawLayouts).children.compactMap { child in
+            reflectWorkspaceLayout(child.value)
+        }
     }
 
     private func expectedWorkspaceLayouts(

@@ -125,6 +125,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         static let uncategorized = "Uncategorized"
     }
 
+    static func newTerminalShortcutContext(
+        focusedController: TerminalController?,
+        splitControllers: [TerminalController]
+    ) -> (workspaceName: String, displayedControllers: [TerminalController])? {
+        if let focusedController {
+            return (focusedController.sessionSnapshot.workspaceName, [focusedController])
+        }
+        guard let lastDisplayedController = splitControllers.last else {
+            return nil
+        }
+        return (lastDisplayedController.sessionSnapshot.workspaceName, splitControllers)
+    }
+
     private var viewMode: ViewMode = .integrated
     private var isTerminating = false
     private var isRestoringSession = false
@@ -153,6 +166,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self,
             selector: #selector(activateFromSecondaryInstance(_:)),
             name: SingleInstanceLock.activationNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(workspaceDidWake(_:)),
+            name: NSWorkspace.didWakeNotification,
             object: nil
         )
 
@@ -304,8 +323,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard isNoteEditorSelfTestEnabled else {
             return
         }
-        let diagnosticsRoot = URL(fileURLWithPath: "/Users/umedatomohiro/Developments/workspace/pterm-ai/.tmp/note-editor-selftest",
-                                  isDirectory: true)
+        let diagnosticsRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pterm-note-editor-selftest", isDirectory: true)
         try? FileManager.default.createDirectory(at: diagnosticsRoot, withIntermediateDirectories: true)
         let logURL = diagnosticsRoot.appendingPathComponent("selftest.log")
         try? "start\n".write(to: logURL, atomically: true, encoding: .utf8)
@@ -1012,12 +1031,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Actions
 
     @objc func newTerminal(_ sender: Any?) {
-        if case .focused(let controller) = viewMode {
-            addNewTerminal(workspaceName: controller.sessionSnapshot.workspaceName)
-        } else if case .split(let controllers) = viewMode,
-                  let first = controllers.first {
-            addNewTerminal(workspaceName: first.sessionSnapshot.workspaceName)
+        let shortcutContext: (workspaceName: String, displayedControllers: [TerminalController])?
+        switch viewMode {
+        case .focused(let controller):
+            shortcutContext = Self.newTerminalShortcutContext(
+                focusedController: controller,
+                splitControllers: []
+            )
+        case .split(let controllers):
+            shortcutContext = Self.newTerminalShortcutContext(
+                focusedController: nil,
+                splitControllers: controllers
+            )
+        case .integrated:
+            shortcutContext = nil
         }
+
+        guard let shortcutContext,
+              let newController = addNewTerminal(workspaceName: shortcutContext.workspaceName) else {
+            return
+        }
+        switchToSplit(shortcutContext.displayedControllers + [newController])
     }
 
     @objc func backToIntegratedView(_ sender: Any?) {
@@ -1199,7 +1233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Only show indicator for terminals that have been idle at least once.
             // This prevents the initial shell startup output from triggering the indicator.
             guard self.terminalsEverIdle.contains(controller.id) else { return }
-            self.integratedView?.activeOutputTerminals.insert(controller.id)
+            _ = self.integratedView?.setTerminalOutputActive(controller.id, isActive: true)
         }
         if config.audit.enabled {
             let logger = TerminalAuditLogger(
@@ -1224,12 +1258,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { timer.invalidate(); return }
             let now = Date()
             let idleThreshold: TimeInterval = 1.5
-            var changed = false
             for (id, lastTime) in self.lastOutputTimes {
                 if now.timeIntervalSince(lastTime) >= idleThreshold {
-                    if self.integratedView?.activeOutputTerminals.remove(id) != nil {
-                        changed = true
-                    }
+                    _ = self.integratedView?.setTerminalOutputActive(id, isActive: false)
                     self.lastOutputTimes.removeValue(forKey: id)
                     self.terminalsEverIdle.insert(id)
                 }
@@ -1237,9 +1268,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if self.lastOutputTimes.isEmpty {
                 timer.invalidate()
                 self.outputIdleTimer = nil
-            }
-            if changed {
-                self.integratedView?.setNeedsDisplay(self.integratedView?.bounds ?? .zero)
             }
         }
     }
@@ -1934,15 +1962,22 @@ extension AppDelegate: NSWindowDelegate {
     }
 
     func windowDidChangeScreen(_ notification: Notification) {
-        layoutTitlebarBackButton()
-        integratedView?.syncScaleFactorIfNeeded()
-        terminalView?.syncScaleFactorIfNeeded()
+        syncVisibleRenderScaleFactors()
     }
 
     func windowDidChangeBackingProperties(_ notification: Notification) {
+        syncVisibleRenderScaleFactors()
+    }
+
+    @objc private func workspaceDidWake(_ notification: Notification) {
+        syncVisibleRenderScaleFactors()
+    }
+
+    private func syncVisibleRenderScaleFactors() {
         layoutTitlebarBackButton()
         integratedView?.syncScaleFactorIfNeeded()
         terminalView?.syncScaleFactorIfNeeded()
+        splitContainerView?.syncScaleFactorIfNeeded()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {

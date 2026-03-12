@@ -198,6 +198,15 @@ final class SplitTerminalContainerView: NSView {
         }
     }
 
+    func syncScaleFactorIfNeeded() {
+        for scrollView in scrollViews {
+            scrollView.terminalView.syncScaleFactorIfNeeded()
+        }
+        splitRenderView?.syncScaleFactorIfNeeded()
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+    }
+
     @objc private func backButtonPressed(_ sender: Any?) {
         onBackToIntegrated?()
     }

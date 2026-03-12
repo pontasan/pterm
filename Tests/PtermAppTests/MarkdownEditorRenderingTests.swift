@@ -5,8 +5,8 @@ import XCTest
 @MainActor
 final class MarkdownEditorRenderingTests: XCTestCase {
     func testEditorRendersVisibleGlyphsForNonEmptyText() throws {
-        let outputDirectory = URL(fileURLWithPath: "/Users/umedatomohiro/Developments/workspace/pterm-ai/.tmp/test-note-editor",
-                                  isDirectory: true)
+        let outputDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pterm-test-note-editor", isDirectory: true)
         try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         let controller = MarkdownEditorWindowController(
             initialText: "",

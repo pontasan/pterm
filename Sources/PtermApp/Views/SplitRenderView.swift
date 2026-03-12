@@ -55,16 +55,29 @@ final class SplitRenderView: MTKView {
     /// Detect backing scale factor changes (moving between Retina/non-Retina displays).
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
-        if let sf = window?.backingScaleFactor {
-            layer?.contentsScale = sf
-        }
+        syncScaleFactor()
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if let sf = window?.backingScaleFactor {
-            layer?.contentsScale = sf
+        syncScaleFactor()
+    }
+
+    func syncScaleFactorIfNeeded() {
+        syncScaleFactor()
+    }
+
+    private func syncScaleFactor() {
+        let newScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        layer?.contentsScale = newScale
+        if newScale != renderer.glyphAtlas.scaleFactor {
+            renderer.glyphAtlas.updateScaleFactor(newScale)
         }
+        let expectedSize = CGSize(width: bounds.width * newScale, height: bounds.height * newScale)
+        if abs(drawableSize.width - expectedSize.width) > 1 || abs(drawableSize.height - expectedSize.height) > 1 {
+            drawableSize = expectedSize
+        }
+        setNeedsDisplay(bounds)
     }
 }
 
@@ -121,7 +134,8 @@ extension SplitRenderView: MTKViewDelegate {
                     encoder: encoder,
                     viewportSize: viewportSize,
                     cellRect: flippedRect,
-                    scaleFactor: sf
+                    scaleFactor: sf,
+                    in: view
                 )
             }
         }

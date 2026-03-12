@@ -82,6 +82,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var markedTextStorage = NSMutableAttributedString()
     private var markedTextSelection = NSRange(location: NSNotFound, length: 0)
     private var pendingTextInputHandled = false
+    private var scrollerSyncPending = true
 
     /// URL hover state for Cmd+mouseover visual feedback
     private var hoveredLinkRange: (row: Int, startCol: Int, endCol: Int)?
@@ -193,8 +194,10 @@ final class TerminalView: MTKView, NSTextInputClient {
         controller.onNeedsDisplay = { [weak self] in
             self?.setNeedsDisplay(self?.bounds ?? .zero)
             self?.updateMarkedTextOverlay()
+            self?.scrollerSyncPending = true
         }
         controller.notifyFocusChanged(window?.isKeyWindow == true)
+        scrollerSyncPending = true
         updateTerminalSize()
         // When a controller is assigned to a new view (e.g., returning to split view),
         // ensure we show the latest output, not stale scrollback position.
@@ -913,8 +916,10 @@ extension TerminalView: MTKViewDelegate {
                           borderConfig: border, in: view)
         }
 
-        // Keep the native scroller in sync every frame
-        (enclosingScrollView as? TerminalScrollView)?.syncScroller()
+        if scrollerSyncPending {
+            (enclosingScrollView as? TerminalScrollView)?.syncScroller()
+            scrollerSyncPending = false
+        }
     }
 }
 
@@ -1020,6 +1025,14 @@ extension TerminalView {
 /// frame height (to reflect scrollback size) must not trigger a resize
 /// cascade that tries to re-acquire the TerminalController lock.
 final class TerminalScrollView: NSScrollView {
+    private struct ScrollSyncSignature: Equatable {
+        let scrollbackRowCount: Int
+        let viewRows: Int
+        let scrollOffset: Int
+        let viewportSize: NSSize
+        let cellHeight: CGFloat
+    }
+
     private enum Layout {
         static let backButtonInset: CGFloat = 10
         static let backButtonSize = NSSize(width: 30, height: 24)
@@ -1036,6 +1049,7 @@ final class TerminalScrollView: NSScrollView {
 
     /// Guard against feedback loops during programmatic scroller updates.
     private var isSyncing = false
+    private var lastScrollSyncSignature: ScrollSyncSignature?
 
     init(frame: NSRect, renderer: MetalRenderer) {
         super.init(frame: frame)
@@ -1098,6 +1112,8 @@ final class TerminalScrollView: NSScrollView {
         documentView?.frame.size.width = bounds.width
         pinTerminalViewToViewport()
         layoutBackButton()
+        lastScrollSyncSignature = nil
+        terminalView?.setNeedsDisplay(terminalView.bounds)
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -1159,6 +1175,17 @@ final class TerminalScrollView: NSScrollView {
         let totalRows = sbCount + viewRows
         let viewportHeight = self.bounds.height
         let documentHeight = max(viewportHeight, CGFloat(totalRows) * cellH)
+        let signature = ScrollSyncSignature(
+            scrollbackRowCount: sbCount,
+            viewRows: viewRows,
+            scrollOffset: scrollOffset,
+            viewportSize: bounds.size,
+            cellHeight: cellH
+        )
+        let targetFrame = NSRect(origin: contentView.bounds.origin, size: contentView.bounds.size)
+        if lastScrollSyncSignature == signature, terminalView.frame == targetFrame {
+            return
+        }
 
         // Step 2: All UI mutations under isSyncing to block re-entrant notifications.
         isSyncing = true
@@ -1190,6 +1217,7 @@ final class TerminalScrollView: NSScrollView {
         }
 
         pinTerminalViewToViewport()
+        lastScrollSyncSignature = signature
     }
 
     /// Handle user-initiated scrolling (scroll wheel, trackpad, knob drag).
@@ -1213,6 +1241,7 @@ final class TerminalScrollView: NSScrollView {
         let sbCount = controller.withViewport { _, scrollback, _ in scrollback.rowCount }
         let newOffset = sbCount - Int(fraction * CGFloat(sbCount))
         controller.setScrollOffset(newOffset)
+        lastScrollSyncSignature = nil
 
         pinTerminalViewToViewport()
     }

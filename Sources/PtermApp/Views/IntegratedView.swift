@@ -28,6 +28,14 @@ final class ScrollDocumentView: NSView {
 /// switches to the focused (occupied) view. Shift+click enables multi-select
 /// for split display.
 final class IntegratedView: MTKView, NSDraggingSource {
+    private struct LayoutCacheKey: Equatable {
+        let boundsSize: NSSize
+        let scrollOffset: CGFloat
+        let explicitWorkspaceNames: [String]
+        let terminalIDs: [UUID]
+        let workspaceNames: [String]
+    }
+
     private struct WorkspaceSection {
         let name: String
         let terminals: [TerminalController]
@@ -50,6 +58,41 @@ final class IntegratedView: MTKView, NSDraggingSource {
         let selectAllFrame: NSRect
         let deselectFrame: NSRect
         let terminals: [ThumbnailLayout]
+    }
+
+    private struct TextVertexCacheKey: Hashable {
+        let text: String
+        let glyphScaleBits: UInt32
+        let colorBits: (UInt32, UInt32, UInt32, UInt32)
+
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(text)
+            hasher.combine(glyphScaleBits)
+            hasher.combine(colorBits.0)
+            hasher.combine(colorBits.1)
+            hasher.combine(colorBits.2)
+            hasher.combine(colorBits.3)
+        }
+
+        static func == (lhs: TextVertexCacheKey, rhs: TextVertexCacheKey) -> Bool {
+            lhs.text == rhs.text &&
+                lhs.glyphScaleBits == rhs.glyphScaleBits &&
+                lhs.colorBits.0 == rhs.colorBits.0 &&
+                lhs.colorBits.1 == rhs.colorBits.1 &&
+                lhs.colorBits.2 == rhs.colorBits.2 &&
+                lhs.colorBits.3 == rhs.colorBits.3
+        }
+    }
+
+    private struct CachedTextVertices {
+        let vertices: [Float]
+        let width: Float
+    }
+
+    private struct TextAtlasSignature: Equatable {
+        let fontName: String
+        let fontSize: CGFloat
+        let scaleFactor: CGFloat
     }
 
     /// Terminal manager
@@ -77,6 +120,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     /// Resets multi-select state (e.g. when returning to integrated view).
     func clearSelection() {
         selectedTerminals.removeAll()
+        setNeedsDisplay(bounds)
     }
 
     /// Callback: user shift-clicked multiple terminals for split view.
@@ -86,10 +130,27 @@ final class IntegratedView: MTKView, NSDraggingSource {
     var cpuUsageProvider: ((pid_t) -> Double?)?
 
     /// Terminals that are actively producing output (border pulses red).
-    var activeOutputTerminals: Set<UUID> = []
+    private(set) var activeOutputTerminals: Set<UUID> = [] {
+        didSet {
+            updateRenderLoopState()
+            setNeedsDisplay(bounds)
+        }
+    }
+
+    @discardableResult
+    func setTerminalOutputActive(_ terminalID: UUID, isActive: Bool) -> Bool {
+        if isActive {
+            let inserted = activeOutputTerminals.insert(terminalID).inserted
+            return inserted
+        }
+        return activeOutputTerminals.remove(terminalID) != nil
+    }
     var shortcutConfiguration: ShortcutConfiguration = .default
     var explicitWorkspaceNames: [String] = [] {
-        didSet { setNeedsDisplay(bounds) }
+        didSet {
+            invalidateLayoutCache()
+            setNeedsDisplay(bounds)
+        }
     }
 
     /// Cached × icon texture for close buttons (r8Unorm, same as glyph atlas)
@@ -139,12 +200,21 @@ final class IntegratedView: MTKView, NSDraggingSource {
     /// Companion NSScrollView overlay for native macOS scrollbar behavior.
     /// The scroll view is placed on top of this view and passes through
     /// all events except those targeting its scrollers.
-    weak var companionScrollView: NSScrollView?
+    weak var companionScrollView: NSScrollView? {
+        didSet { updateCompanionScrollObservation(oldValue: oldValue, newValue: companionScrollView) }
+    }
 
     /// Auto-scroll during drag near edges
     private var dragAutoScrollTimer: Timer?
     private static let dragAutoScrollEdge: CGFloat = 60
     private static let dragAutoScrollSpeed: CGFloat = 24
+    private var companionScrollObserver: NSObjectProtocol?
+    private var cachedLayoutKey: LayoutCacheKey?
+    private var cachedVisibleWorkspaceLayouts: [WorkspaceLayout] = []
+    private var cachedFlattenedThumbnails: [ThumbnailLayout] = []
+    private var cachedVisibleThumbnails: [ThumbnailLayout] = []
+    private var textVertexCache: [TextVertexCacheKey: CachedTextVertices] = [:]
+    private var textAtlasSignature: TextAtlasSignature?
 
     /// Layout constants
     private struct Layout {
@@ -178,8 +248,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
         self.preferredFramesPerSecond = 30 // Lower FPS for thumbnails
         self.colorPixelFormat = .bgra8Unorm
         self.clearColor = MTLClearColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1)
-        self.isPaused = false
-        self.enableSetNeedsDisplay = false
+        self.isPaused = true
+        self.enableSetNeedsDisplay = true
         self.registerForDraggedTypes([.string, Self.terminalPasteboardType, Self.workspacePasteboardType])
 
         updateTrackingArea()
@@ -190,6 +260,12 @@ final class IntegratedView: MTKView, NSDraggingSource {
         fatalError("init(coder:) not implemented")
     }
 
+    deinit {
+        if let companionScrollObserver {
+            NotificationCenter.default.removeObserver(companionScrollObserver)
+        }
+    }
+
     override var acceptsFirstResponder: Bool { true }
 
     // MARK: - Multi-Display Support
@@ -197,11 +273,13 @@ final class IntegratedView: MTKView, NSDraggingSource {
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         syncScaleFactor()
+        invalidateLayoutCache()
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         syncScaleFactor()
+        invalidateLayoutCache()
     }
 
     func syncScaleFactorIfNeeded() {
@@ -218,6 +296,16 @@ final class IntegratedView: MTKView, NSDraggingSource {
         if abs(drawableSize.width - expectedSize.width) > 1 || abs(drawableSize.height - expectedSize.height) > 1 {
             drawableSize = expectedSize
         }
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        invalidateLayoutCache()
+    }
+
+    override func setBoundsSize(_ newSize: NSSize) {
+        super.setBoundsSize(newSize)
+        invalidateLayoutCache()
     }
 
     // MARK: - Tracking Area
@@ -241,8 +329,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     // MARK: - Layout
 
-    private func workspaceSections() -> [WorkspaceSection] {
-        let grouped = Dictionary(grouping: manager.terminals) { controller in
+    private func workspaceSections(from terminals: [TerminalController]) -> [WorkspaceSection] {
+        let grouped = Dictionary(grouping: terminals) { controller in
             let name = controller.sessionSnapshot.workspaceName.trimmingCharacters(in: .whitespacesAndNewlines)
             return name.isEmpty ? "Uncategorized" : name
         }
@@ -259,7 +347,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
             orderedNames.append(name)
         }
 
-        for controller in manager.terminals {
+        for controller in terminals {
             let trimmed = controller.sessionSnapshot.workspaceName.trimmingCharacters(in: .whitespacesAndNewlines)
             let name = trimmed.isEmpty ? "Uncategorized" : trimmed
             if !seen.contains(name) {
@@ -271,8 +359,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         return orderedNames.map { WorkspaceSection(name: $0, terminals: grouped[$0] ?? []) }
     }
 
-    private func workspaceLayouts() -> [WorkspaceLayout] {
-        let sections = workspaceSections()
+    private func workspaceLayouts(from sections: [WorkspaceSection]) -> [WorkspaceLayout] {
         guard !sections.isEmpty else {
             totalContentHeight = 0
             return []
@@ -291,9 +378,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         let maxCellWidth = maxW + innerPad
         let fitCols = max(1, Int(ceil(fullContentWidth / maxCellWidth)))
         let thumbWidth = max(minW, min(maxW, (fullContentWidth - innerPad * CGFloat(fitCols)) / CGFloat(fitCols)))
-        let thumbHeight = thumbWidth / aspect
         let cellWidth = thumbWidth + innerPad
-        let cellHeight = thumbHeight + Layout.titleBarHeight + innerPad
 
         // Phase 1: group workspaces into rows that fit within window width
         struct RowItem {
@@ -459,11 +544,54 @@ final class IntegratedView: MTKView, NSDraggingSource {
         return layouts
     }
 
+    private func invalidateLayoutCache() {
+        cachedLayoutKey = nil
+        cachedVisibleWorkspaceLayouts = []
+        cachedFlattenedThumbnails = []
+        cachedVisibleThumbnails = []
+    }
+
+    private func invalidateTextVertexCacheIfNeeded() {
+        let signature = TextAtlasSignature(
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: renderer.glyphAtlas.fontSize,
+            scaleFactor: renderer.glyphAtlas.scaleFactor
+        )
+        guard textAtlasSignature != signature else { return }
+        textAtlasSignature = signature
+        textVertexCache.removeAll(keepingCapacity: true)
+    }
+
+    private func updateLayoutCacheIfNeeded() {
+        let terminals = manager.terminals
+        let workspaceNames = terminals.map {
+            let trimmed = $0.sessionSnapshot.workspaceName.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? "Uncategorized" : trimmed
+        }
+        let key = LayoutCacheKey(
+            boundsSize: bounds.size,
+            scrollOffset: scrollOffset,
+            explicitWorkspaceNames: explicitWorkspaceNames,
+            terminalIDs: terminals.map(\.id),
+            workspaceNames: workspaceNames
+        )
+        if cachedLayoutKey == key { return }
+
+        let sections = workspaceSections(from: terminals)
+        let layouts = workspaceLayouts(from: sections)
+        cachedLayoutKey = key
+        cachedWorkspaceLayouts = layouts
+        cachedVisibleWorkspaceLayouts = layouts.filter { $0.frame.intersects(bounds) }
+        cachedFlattenedThumbnails = layouts.flatMap(\.terminals)
+        cachedVisibleThumbnails = cachedVisibleWorkspaceLayouts.flatMap { workspace in
+            workspace.terminals.filter { $0.title.union($0.thumbnail).intersects(bounds) }
+        }
+    }
+
     /// Return the index of the thumbnail at the given view-coordinates point.
     /// Only matches the thumbnail content area, NOT the title bar.
     private func thumbnailIndex(at point: NSPoint) -> Int? {
-        let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
-        for (index, layout) in flattened.enumerated() {
+        for (index, layout) in cachedFlattenedThumbnails.enumerated() {
             if layout.thumbnail.contains(point) {
                 return index
             }
@@ -474,8 +602,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     /// Return the index of the thumbnail whose title OR thumbnail area contains the point.
     /// Used for hover effects and drag initiation (but NOT for navigation).
     private func thumbnailOrTitleIndex(at point: NSPoint) -> Int? {
-        let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
-        for (index, layout) in flattened.enumerated() {
+        for (index, layout) in cachedFlattenedThumbnails.enumerated() {
             if layout.title.union(layout.thumbnail).contains(point) {
                 return index
             }
@@ -485,8 +612,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     /// Check if a point hits a close button, returning the associated controller.
     private func closeButtonController(at point: NSPoint) -> TerminalController? {
-        let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
-        for f in flattened {
+        for f in cachedFlattenedThumbnails {
             let hitRect = f.close.insetBy(dx: -4, dy: -4)
             if hitRect.contains(point) {
                 return f.controller
@@ -517,8 +643,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
 
     private func terminalTitleTarget(at point: NSPoint) -> TerminalController? {
-        let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
-        for layout in flattened where layout.title.contains(point) && !layout.close.insetBy(dx: -4, dy: -4).contains(point) {
+        for layout in cachedFlattenedThumbnails where layout.title.contains(point) && !layout.close.insetBy(dx: -4, dy: -4).contains(point) {
             return layout.controller
         }
         return nil
@@ -593,9 +718,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
         }
 
         // Check thumbnail or title click: record for drag or click-up navigation
-        let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
-        if let idx = thumbnailOrTitleIndex(at: point), idx < flattened.count {
-            let controller = flattened[idx].controller
+        if let idx = thumbnailOrTitleIndex(at: point), idx < cachedFlattenedThumbnails.count {
+            let controller = cachedFlattenedThumbnails[idx].controller
             mouseDownTerminal = controller
 
             if event.modifierFlags.contains(.shift) {
@@ -631,8 +755,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         // Navigate only if the click lands on the thumbnail content area (not the title bar)
         let point = convert(event.locationInWindow, from: nil)
         if let idx = thumbnailIndex(at: point) {
-            let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
-            if idx < flattened.count && flattened[idx].controller === controller {
+            if idx < cachedFlattenedThumbnails.count && cachedFlattenedThumbnails[idx].controller === controller {
                 selectedTerminals.removeAll()
                 onSelectTerminal?(controller)
             }
@@ -662,14 +785,17 @@ final class IntegratedView: MTKView, NSDraggingSource {
     override func scrollWheel(with event: NSEvent) {
         // Forward scroll events to the companion NSScrollView for native scrollbar behavior
         companionScrollView?.scrollWheel(with: event)
+        setNeedsDisplay(bounds)
     }
 
-    /// Read scroll offset from the companion NSScrollView and update document view height.
-    private func syncWithCompanionScrollView() {
+    private func syncScrollOffsetFromCompanionScrollView() {
         guard let scrollView = companionScrollView else { return }
-        // Read scroll position from the clip view
         scrollOffset = scrollView.contentView.bounds.origin.y
-        // Update document view height to match total content
+    }
+
+    /// Update document view height to match total content.
+    private func syncCompanionDocumentView() {
+        guard let scrollView = companionScrollView else { return }
         if let documentView = scrollView.documentView {
             let targetHeight = max(totalContentHeight, scrollView.contentView.bounds.height)
             if abs(documentView.frame.height - targetHeight) > 1 {
@@ -730,17 +856,30 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        hoveredIndex = thumbnailOrTitleIndex(at: point)
-        hoveredCloseID = closeButtonController(at: point)?.id
-        hoveredWorkspaceClose = workspaceRemoveTarget(at: point)
+        let newHoveredIndex = thumbnailOrTitleIndex(at: point)
+        let newHoveredCloseID = closeButtonController(at: point)?.id
+        let newHoveredWorkspaceClose = workspaceRemoveTarget(at: point)
+        let hoverChanged = hoveredIndex != newHoveredIndex ||
+            hoveredCloseID != newHoveredCloseID ||
+            hoveredWorkspaceClose != newHoveredWorkspaceClose
+        hoveredIndex = newHoveredIndex
+        hoveredCloseID = newHoveredCloseID
+        hoveredWorkspaceClose = newHoveredWorkspaceClose
         updateTooltip(at: point)
+        if hoverChanged {
+            setNeedsDisplay(bounds)
+        }
     }
 
     override func mouseExited(with event: NSEvent) {
+        let hadHover = hoveredIndex != nil || hoveredCloseID != nil || hoveredWorkspaceClose != nil
         hoveredIndex = nil
         hoveredCloseID = nil
         hoveredWorkspaceClose = nil
         hideTooltip()
+        if hadHover {
+            setNeedsDisplay(bounds)
+        }
     }
 
     private func updateTooltip(at point: NSPoint) {
@@ -865,6 +1004,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
             // Workspace drag: show indicator between workspace sections
             dragInsertionIndicator = nil
             dragWorkspaceIndicator = computeWorkspaceDropIndicator(at: point)
+            updateRenderLoopState()
+            setNeedsDisplay(bounds)
             return .move
         }
 
@@ -872,6 +1013,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
             // Terminal drag: show indicator at insertion position
             dragWorkspaceIndicator = nil
             dragInsertionIndicator = computeTerminalDropIndicator(at: point)
+            updateRenderLoopState()
+            setNeedsDisplay(bounds)
 
             // Accept drop on workspace header or terminal grid
             if workspaceHeaderTarget(at: point) != nil || dragInsertionIndicator != nil {
@@ -884,6 +1027,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
         }
         dragInsertionIndicator = nil
         dragWorkspaceIndicator = nil
+        updateRenderLoopState()
+        setNeedsDisplay(bounds)
         return []
     }
 
@@ -891,6 +1036,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         dragInsertionIndicator = nil
         dragWorkspaceIndicator = nil
         stopDragAutoScroll()
+        setNeedsDisplay(bounds)
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -964,6 +1110,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
             dragAutoScrollTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
                 self?.performDragAutoScroll()
             }
+            updateRenderLoopState()
         }
         // Store the delta for the timer callback
         dragAutoScrollDelta = scrollDelta
@@ -986,6 +1133,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         dragAutoScrollTimer?.invalidate()
         dragAutoScrollTimer = nil
         dragAutoScrollDelta = 0
+        updateRenderLoopState()
     }
 
     // MARK: - Drop Position Calculation
@@ -1153,8 +1301,10 @@ extension IntegratedView: MTKViewDelegate {
 
         let sf = Float(renderer.glyphAtlas.scaleFactor)
         let time = Float(CACurrentMediaTime())
-        syncWithCompanionScrollView()
-        cachedWorkspaceLayouts = workspaceLayouts()
+        syncScrollOffsetFromCompanionScrollView()
+        updateLayoutCacheIfNeeded()
+        syncCompanionDocumentView()
+        invalidateTextVertexCacheIfNeeded()
 
         renderPassDescriptor.colorAttachments[0].clearColor =
             MTLClearColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1)
@@ -1166,33 +1316,61 @@ extension IntegratedView: MTKViewDelegate {
 
         let drawableSize = view.drawableSize
         let viewportSize = SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height))
+        var preContentOverlayVertices: [Float] = []
+        var postContentOverlayVertices: [Float] = []
+        var thumbnailBgVertices: [Float] = []
+        var thumbnailGlyphVertices: [Float] = []
+        var atlasGlyphVertices: [Float] = []
+        var iconVertices: [Float] = []
+        var currentOverviewFontName = renderer.glyphAtlas.fontName
+        var currentOverviewFontSize = renderer.glyphAtlas.fontSize
+        preContentOverlayVertices.reserveCapacity(max(256, cachedVisibleWorkspaceLayouts.count * 120 + cachedVisibleThumbnails.count * 120))
+        postContentOverlayVertices.reserveCapacity(max(256, cachedVisibleWorkspaceLayouts.count * 96 + cachedVisibleThumbnails.count * 96))
+        thumbnailBgVertices.reserveCapacity(max(256, cachedVisibleThumbnails.count * 512))
+        thumbnailGlyphVertices.reserveCapacity(max(256, cachedVisibleThumbnails.count * 768))
+        atlasGlyphVertices.reserveCapacity(max(256, cachedVisibleWorkspaceLayouts.count * 384 + cachedVisibleThumbnails.count * 512))
+        iconVertices.reserveCapacity(max(128, cachedVisibleThumbnails.count * 72))
 
         // Render workspace backgrounds (even when empty)
-        for workspace in cachedWorkspaceLayouts {
+        for workspace in cachedVisibleWorkspaceLayouts {
             drawWorkspaceBackground(
-                encoder: encoder,
                 workspace: workspace,
                 scaleFactor: sf,
-                viewportSize: viewportSize
+                viewportSize: viewportSize,
+                overlayVertices: &preContentOverlayVertices,
+                glyphVertices: &atlasGlyphVertices,
+                iconVertices: &iconVertices
             )
         }
 
         // Render terminal thumbnails
-        let flattened = cachedWorkspaceLayouts.flatMap(\.terminals)
-        for (i, frame) in flattened.enumerated() {
+        for frame in cachedVisibleThumbnails {
             let controller = frame.controller
             let fontSettings = controller.persistedFontSettings
-            if renderer.glyphAtlas.fontName != fontSettings.name ||
-                abs(Double(renderer.glyphAtlas.fontSize) - fontSettings.size) > 0.001 {
+            if currentOverviewFontName != fontSettings.name ||
+                abs(Double(currentOverviewFontSize) - fontSettings.size) > 0.001 {
+                flushOverviewContentBatch(
+                    encoder: encoder,
+                    viewportSize: viewportSize,
+                    preContentOverlayVertices: &preContentOverlayVertices,
+                    thumbnailBgVertices: &thumbnailBgVertices,
+                    thumbnailGlyphVertices: &thumbnailGlyphVertices,
+                    atlasGlyphVertices: &atlasGlyphVertices
+                )
                 renderer.updateFont(name: fontSettings.name, size: CGFloat(fontSettings.size))
+                currentOverviewFontName = renderer.glyphAtlas.fontName
+                currentOverviewFontSize = renderer.glyphAtlas.fontSize
+                invalidateTextVertexCacheIfNeeded()
             }
 
             // Draw thumbnail border/background
-            let isHovered = hoveredIndex == i
+            let isHovered = hoveredIndex.flatMap { index in
+                guard index < cachedFlattenedThumbnails.count else { return false }
+                return cachedFlattenedThumbnails[index].controller.id == controller.id
+            } ?? false
             let isSelected = selectedTerminals.contains(controller.id)
             let isActiveOutput = activeOutputTerminals.contains(controller.id)
             drawThumbnailBackground(
-                encoder: encoder,
                 frame: frame.thumbnail,
                 titleFrame: frame.title,
                 isHovered: isHovered,
@@ -1200,86 +1378,192 @@ extension IntegratedView: MTKViewDelegate {
                 isActiveOutput: isActiveOutput,
                 time: time,
                 scaleFactor: sf,
-                viewportSize: viewportSize
+                viewportSize: viewportSize,
+                vertices: &preContentOverlayVertices
             )
 
             // Draw terminal content scaled to thumbnail size
             controller.withViewport { model, scrollback, scrollOffset in
-                renderer.renderThumbnail(
+                renderer.appendThumbnailVertexData(
                     model: model,
                     scrollback: scrollback,
                     scrollOffset: scrollOffset,
-                    encoder: encoder,
-                    viewportSize: viewportSize,
                     thumbnailRect: frame.thumbnail,
-                    scaleFactor: sf
+                    scaleFactor: sf,
+                    bgVertices: &thumbnailBgVertices,
+                    glyphVertices: &thumbnailGlyphVertices
                 )
             }
 
             // Draw title text
             drawTitle(
-                encoder: encoder,
                 title: controller.title,
                 pid: controller.foregroundProcessID ?? controller.processID,
                 shellPID: controller.processID,
                 frame: frame.title,
                 scaleFactor: sf,
-                viewportSize: viewportSize
+                viewportSize: viewportSize,
+                glyphVertices: &atlasGlyphVertices
             )
 
             // Draw close button
             let isCloseHovered = hoveredCloseID == controller.id
             drawCloseButton(
-                encoder: encoder,
                 frame: frame.close,
                 isHovered: isCloseHovered,
                 scaleFactor: sf,
-                viewportSize: viewportSize
+                viewportSize: viewportSize,
+                overlayVertices: &postContentOverlayVertices,
+                iconVertices: &iconVertices
             )
         }
 
+        flushOverviewContentBatch(
+            encoder: encoder,
+            viewportSize: viewportSize,
+            preContentOverlayVertices: &preContentOverlayVertices,
+            thumbnailBgVertices: &thumbnailBgVertices,
+            thumbnailGlyphVertices: &thumbnailGlyphVertices,
+            atlasGlyphVertices: &atlasGlyphVertices
+        )
+
         // Draw "Select All" / "Deselect" buttons (on top of thumbnails, only when Shift is held)
         if isShiftDown {
-            for workspace in cachedWorkspaceLayouts where !workspace.terminals.isEmpty {
+            for workspace in cachedVisibleWorkspaceLayouts where !workspace.terminals.isEmpty {
                 drawTextButton(
-                    encoder: encoder,
                     text: "Select All",
                     frame: workspace.selectAllFrame,
                     scaleFactor: sf,
                     viewportSize: viewportSize,
                     bgColor: (0.15, 0.30, 0.55, 0.9),
-                    fgColor: (0.9, 0.9, 0.9, 1.0)
+                    fgColor: (0.9, 0.9, 0.9, 1.0),
+                    overlayVertices: &postContentOverlayVertices,
+                    glyphVertices: &atlasGlyphVertices
                 )
                 let hasSelection = workspace.terminals.contains { selectedTerminals.contains($0.controller.id) }
                 if hasSelection {
                     drawTextButton(
-                        encoder: encoder,
                         text: "Deselect",
                         frame: workspace.deselectFrame,
                         scaleFactor: sf,
                         viewportSize: viewportSize,
                         bgColor: (0.35, 0.20, 0.15, 0.9),
-                        fgColor: (0.9, 0.9, 0.9, 1.0)
+                        fgColor: (0.9, 0.9, 0.9, 1.0),
+                        overlayVertices: &postContentOverlayVertices,
+                        glyphVertices: &atlasGlyphVertices
                     )
                 }
             }
         }
 
         // Draw "+" button for adding new workspace
-        drawAddWorkspaceButton(encoder: encoder, scaleFactor: sf, viewportSize: viewportSize)
+        drawAddWorkspaceButton(
+            scaleFactor: sf,
+            viewportSize: viewportSize,
+            vertices: &postContentOverlayVertices
+        )
 
         // Draw drag drop indicators
-        drawDropIndicators(encoder: encoder, scaleFactor: sf, viewportSize: viewportSize)
+        drawDropIndicators(
+            scaleFactor: sf,
+            viewportSize: viewportSize,
+            vertices: &postContentOverlayVertices
+        )
+
+        drawVertices(
+            postContentOverlayVertices,
+            encoder: encoder,
+            pipeline: renderer.overlayPipeline,
+            viewportSize: viewportSize,
+            bufferSlot: .overviewPostOverlay
+        )
+        drawGlyphVertices(
+            atlasGlyphVertices,
+            encoder: encoder,
+            texture: renderer.glyphAtlas.texture,
+            viewportSize: viewportSize,
+            bufferSlot: .overviewTextGlyph
+        )
+        drawGlyphVertices(
+            iconVertices,
+            encoder: encoder,
+            texture: ensureCloseIconTexture(),
+            viewportSize: viewportSize,
+            bufferSlot: .overviewIconGlyph
+        )
 
         encoder.endEncoding()
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }
 
+    private func flushOverviewContentBatch(
+        encoder: MTLRenderCommandEncoder,
+        viewportSize: SIMD2<Float>,
+        preContentOverlayVertices: inout [Float],
+        thumbnailBgVertices: inout [Float],
+        thumbnailGlyphVertices: inout [Float],
+        atlasGlyphVertices: inout [Float]
+    ) {
+        drawVertices(
+            preContentOverlayVertices,
+            encoder: encoder,
+            pipeline: renderer.overlayPipeline,
+            viewportSize: viewportSize,
+            bufferSlot: .overviewPreOverlay
+        )
+        drawThumbnailContentVertices(
+            bgVertices: thumbnailBgVertices,
+            glyphVertices: thumbnailGlyphVertices,
+            encoder: encoder,
+            viewportSize: viewportSize
+        )
+        drawGlyphVertices(
+            atlasGlyphVertices,
+            encoder: encoder,
+            texture: renderer.glyphAtlas.texture,
+            viewportSize: viewportSize,
+            bufferSlot: .overviewTextGlyph
+        )
+        preContentOverlayVertices.removeAll(keepingCapacity: true)
+        thumbnailBgVertices.removeAll(keepingCapacity: true)
+        thumbnailGlyphVertices.removeAll(keepingCapacity: true)
+        atlasGlyphVertices.removeAll(keepingCapacity: true)
+    }
+
+    private func updateRenderLoopState() {
+        let shouldAnimate = !activeOutputTerminals.isEmpty || dragAutoScrollTimer != nil
+            || dragInsertionIndicator != nil || dragWorkspaceIndicator != nil
+        isPaused = !shouldAnimate
+        enableSetNeedsDisplay = !shouldAnimate
+        if !shouldAnimate {
+            setNeedsDisplay(bounds)
+        }
+    }
+
+    private func updateCompanionScrollObservation(oldValue: NSScrollView?, newValue: NSScrollView?) {
+        if let companionScrollObserver {
+            NotificationCenter.default.removeObserver(companionScrollObserver)
+            self.companionScrollObserver = nil
+        }
+        oldValue?.contentView.postsBoundsChangedNotifications = false
+        guard let newValue else { return }
+        newValue.contentView.postsBoundsChangedNotifications = true
+        companionScrollObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: newValue.contentView,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.syncScrollOffsetFromCompanionScrollView()
+            self.invalidateLayoutCache()
+            self.setNeedsDisplay(self.bounds)
+        }
+    }
+
     // MARK: - Drawing Helpers
 
     private func drawThumbnailBackground(
-        encoder: MTLRenderCommandEncoder,
         frame: NSRect,
         titleFrame: NSRect,
         isHovered: Bool,
@@ -1287,17 +1571,14 @@ extension IntegratedView: MTKViewDelegate {
         isActiveOutput: Bool,
         time: Float,
         scaleFactor: Float,
-        viewportSize: SIMD2<Float>
+        viewportSize: SIMD2<Float>,
+        vertices: inout [Float]
     ) {
-        guard let pipeline = renderer.overlayPipeline else { return }
-
         let fullFrame = titleFrame.union(frame)
         let x = Float(fullFrame.origin.x) * scaleFactor
         let y = Float(fullFrame.origin.y) * scaleFactor
         let w = Float(fullFrame.width) * scaleFactor
         let h = Float(fullFrame.height) * scaleFactor
-
-        var vertices: [Float] = []
 
         // Title bar background (dark gray)
         let titleX = Float(titleFrame.origin.x) * scaleFactor
@@ -1377,244 +1658,150 @@ extension IntegratedView: MTKViewDelegate {
                                tx: 0, ty: 0, tw: 0, th: 0,
                                fg: (borderColor.0, borderColor.1, borderColor.2, borderAlpha),
                                bg: (0, 0, 0, 0))
-
-        drawVertices(vertices, encoder: encoder, pipeline: pipeline, viewportSize: viewportSize)
     }
 
     private func drawWorkspaceBackground(
-        encoder: MTLRenderCommandEncoder,
         workspace: WorkspaceLayout,
         scaleFactor: Float,
-        viewportSize: SIMD2<Float>
+        viewportSize: SIMD2<Float>,
+        overlayVertices: inout [Float],
+        glyphVertices: inout [Float],
+        iconVertices: inout [Float]
     ) {
-        guard let pipeline = renderer.overlayPipeline else { return }
-
         let x = Float(workspace.frame.origin.x) * scaleFactor
         let y = Float(workspace.frame.origin.y) * scaleFactor
         let w = Float(workspace.frame.width) * scaleFactor
         let h = Float(workspace.frame.height) * scaleFactor
         let bw = Float(Layout.workspaceBorderWidth) * scaleFactor
 
-        var vertices: [Float] = []
-        renderer.addQuadPublic(to: &vertices, x: x, y: y, w: w, h: h,
+        renderer.addQuadPublic(to: &overlayVertices, x: x, y: y, w: w, h: h,
                                tx: 0, ty: 0, tw: 0, th: 0,
                                fg: (0.07, 0.07, 0.07, 0.65), bg: (0, 0, 0, 0))
-        renderer.addQuadPublic(to: &vertices, x: x, y: y, w: w, h: bw,
+        renderer.addQuadPublic(to: &overlayVertices, x: x, y: y, w: w, h: bw,
                                tx: 0, ty: 0, tw: 0, th: 0,
                                fg: (0.28, 0.28, 0.28, 0.7), bg: (0, 0, 0, 0))
-        renderer.addQuadPublic(to: &vertices, x: x, y: y + h - bw, w: w, h: bw,
+        renderer.addQuadPublic(to: &overlayVertices, x: x, y: y + h - bw, w: w, h: bw,
                                tx: 0, ty: 0, tw: 0, th: 0,
                                fg: (0.28, 0.28, 0.28, 0.7), bg: (0, 0, 0, 0))
-        renderer.addQuadPublic(to: &vertices, x: x, y: y, w: bw, h: h,
+        renderer.addQuadPublic(to: &overlayVertices, x: x, y: y, w: bw, h: h,
                                tx: 0, ty: 0, tw: 0, th: 0,
                                fg: (0.28, 0.28, 0.28, 0.7), bg: (0, 0, 0, 0))
-        renderer.addQuadPublic(to: &vertices, x: x + w - bw, y: y, w: bw, h: h,
+        renderer.addQuadPublic(to: &overlayVertices, x: x + w - bw, y: y, w: bw, h: h,
                                tx: 0, ty: 0, tw: 0, th: 0,
                                fg: (0.28, 0.28, 0.28, 0.7), bg: (0, 0, 0, 0))
-        drawVertices(vertices, encoder: encoder, pipeline: pipeline, viewportSize: viewportSize)
 
         drawWorkspaceHeaderText(
-            encoder: encoder,
             text: workspace.name,
             frame: workspace.headerFrame,
             scaleFactor: scaleFactor,
-            viewportSize: viewportSize
+            viewportSize: viewportSize,
+            glyphVertices: &glyphVertices
         )
         drawWorkspaceAddButton(
-            encoder: encoder,
             frame: workspace.addFrame,
             scaleFactor: scaleFactor,
-            viewportSize: viewportSize
+            viewportSize: viewportSize,
+            vertices: &overlayVertices
         )
         drawWorkspaceCloseButton(
-            encoder: encoder,
             frame: workspace.closeFrame,
             isHovered: hoveredWorkspaceClose == workspace.name,
             scaleFactor: scaleFactor,
-            viewportSize: viewportSize
+            viewportSize: viewportSize,
+            overlayVertices: &overlayVertices,
+            iconVertices: &iconVertices
         )
     }
 
     private func drawWorkspaceHeaderText(
-        encoder: MTLRenderCommandEncoder,
         text: String,
         frame: NSRect,
         scaleFactor: Float,
-        viewportSize: SIMD2<Float>
+        viewportSize: SIMD2<Float>,
+        glyphVertices: inout [Float]
     ) {
         let textX = frame.minX + Layout.closeButtonSize + 8
         let halfGlyph = renderer.glyphAtlas.cellHeight * 0.5
         drawRightAlignedTitleText(
-            encoder: encoder,
             text: text,
             frame: NSRect(x: textX, y: frame.minY + halfGlyph - 4, width: frame.width - Layout.closeButtonSize - 8, height: frame.height),
             scaleFactor: scaleFactor,
             viewportSize: viewportSize,
             color: (0.9, 0.9, 0.9, 1.0),
-            alignment: .left
+            alignment: .left,
+            glyphVertices: &glyphVertices
         )
     }
 
     private func drawTitle(
-        encoder: MTLRenderCommandEncoder,
         title: String,
         pid: pid_t,
         shellPID: pid_t,
         frame: NSRect,
         scaleFactor: Float,
-        viewportSize: SIMD2<Float>
+        viewportSize: SIMD2<Float>,
+        glyphVertices: inout [Float]
     ) {
-        guard let pipeline = renderer.glyphPipeline,
-              let atlas = renderer.glyphAtlas.texture else { return }
-
-        var vertices: [Float] = []
-
-        // Render title text character by character using the glyph atlas
-        let titleChars = Array(title.unicodeScalars)
         let maxChars = Int(frame.width / renderer.glyphAtlas.cellWidth) - 2 // Leave room for close button
-        let displayChars = min(titleChars.count, max(0, maxChars))
-
-        // Title text starts after the close button area
-        let textStartX = Float(frame.origin.x + Layout.closeButtonSize + 8) * scaleFactor
-        let textY = Float(frame.origin.y + (Layout.titleBarHeight - renderer.glyphAtlas.cellHeight) / 2) * scaleFactor
-        let cellW = Float(renderer.glyphAtlas.cellWidth) * scaleFactor
-        // Scale factor for thumbnail text: render at a reasonable size
-        let thumbGlyphScale: Float = 0.85
-
-        for i in 0..<displayChars {
-            let cp = titleChars[i].value
-            guard cp > 0x20,
-                  let glyph = renderer.glyphAtlas.glyphInfo(for: cp),
-                  glyph.pixelWidth > 0 else {
-                continue
-            }
-
-            let x = textStartX + Float(i) * cellW * thumbGlyphScale
-            let glyphX = x + Float(glyph.bearingX) * scaleFactor * thumbGlyphScale
-            let baselineScreenY = textY + Float(renderer.glyphAtlas.cellHeight) * scaleFactor * thumbGlyphScale - Float(renderer.glyphAtlas.baseline) * scaleFactor * thumbGlyphScale
-            let glyphY = baselineScreenY - glyph.baselineOffset * thumbGlyphScale
-            let glyphW = Float(glyph.pixelWidth) * thumbGlyphScale
-            let glyphH = Float(glyph.pixelHeight) * thumbGlyphScale
-
-            renderer.addQuadPublic(
-                to: &vertices,
-                x: glyphX, y: glyphY, w: glyphW, h: glyphH,
-                tx: glyph.textureX, ty: glyph.textureY,
-                tw: glyph.textureW, th: glyph.textureH,
-                fg: (0.8, 0.8, 0.8, 1),
-                bg: (0, 0, 0, 0)
-            )
-        }
-
-        if !vertices.isEmpty {
-            encoder.setRenderPipelineState(pipeline)
-            let buf = renderer.makeTemporaryBuffer(vertices: vertices)
-            if let buf = buf {
-                var uniforms = MetalRenderer.MetalUniforms(
-                    viewportSize: viewportSize,
-                    cursorOpacity: 0,
-                    time: 0
-                )
-                encoder.setVertexBuffer(buf, offset: 0, index: 0)
-                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalRenderer.MetalUniforms>.size, index: 1)
-                encoder.setFragmentTexture(atlas, index: 0)
-                encoder.setFragmentSamplerState(renderer.samplerState, index: 0)
-                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
-                                      vertexCount: vertices.count / 12)
-            }
-        }
+        let displayTitle = String(title.prefix(max(0, maxChars)))
+        appendTextVertices(
+            text: displayTitle,
+            scaleFactor: scaleFactor,
+            glyphScale: 0.85,
+            color: (0.8, 0.8, 0.8, 1),
+            originX: Float(frame.origin.x + Layout.closeButtonSize + 8) * scaleFactor,
+            originY: Float(frame.origin.y + (Layout.titleBarHeight - renderer.glyphAtlas.cellHeight) / 2) * scaleFactor,
+            to: &glyphVertices
+        )
 
         if let usage = cpuUsageProvider?(pid),
            usage >= 0 {
             drawRightAlignedTitleText(
-                encoder: encoder,
                 text: String(format: "CPU: %.0f%%", usage),
                 frame: frame,
                 scaleFactor: scaleFactor,
-                viewportSize: viewportSize
+                viewportSize: viewportSize,
+                glyphVertices: &glyphVertices
             )
         } else if pid != shellPID {
             // Foreground process (e.g., setuid binary) is not accessible via proc_pidinfo.
             drawRightAlignedTitleText(
-                encoder: encoder,
                 text: "CPU: N/A",
                 frame: frame,
                 scaleFactor: scaleFactor,
-                viewportSize: viewportSize
+                viewportSize: viewportSize,
+                glyphVertices: &glyphVertices
             )
         }
     }
 
     private func drawRightAlignedTitleText(
-        encoder: MTLRenderCommandEncoder,
         text: String,
         frame: NSRect,
         scaleFactor: Float,
         viewportSize: SIMD2<Float>,
         color: (Float, Float, Float, Float) = (0.55, 0.55, 0.55, 1.0),
-        alignment: NSTextAlignment = .right
+        alignment: NSTextAlignment = .right,
+        glyphVertices: inout [Float]
     ) {
-        guard let pipeline = renderer.glyphPipeline,
-              let atlas = renderer.glyphAtlas.texture else { return }
-
-        let chars = Array(text.unicodeScalars)
-        var vertices: [Float] = []
         let thumbGlyphScale: Float = 0.8
-        let cellW = Float(renderer.glyphAtlas.cellWidth) * scaleFactor * thumbGlyphScale
-        let textWidth = Float(chars.count) * cellW
+        let cached = cachedTextVertices(for: text, scaleFactor: scaleFactor, glyphScale: thumbGlyphScale, color: color)
         let startX: Float
         if alignment == .left {
             startX = Float(frame.minX) * scaleFactor
         } else {
-            startX = Float(frame.maxX) * scaleFactor - textWidth - 8 * scaleFactor
+            startX = Float(frame.maxX) * scaleFactor - cached.width - 8 * scaleFactor
         }
         let textY = Float(frame.origin.y + (Layout.titleBarHeight - renderer.glyphAtlas.cellHeight) / 2) * scaleFactor
-
-        for (index, scalar) in chars.enumerated() {
-            let cp = scalar.value
-            guard cp > 0x20,
-                  let glyph = renderer.glyphAtlas.glyphInfo(for: cp),
-                  glyph.pixelWidth > 0 else {
-                continue
-            }
-
-            let x = startX + Float(index) * cellW
-            let glyphX = x + Float(glyph.bearingX) * scaleFactor * thumbGlyphScale
-            let baselineScreenY = textY + Float(renderer.glyphAtlas.cellHeight) * scaleFactor * thumbGlyphScale - Float(renderer.glyphAtlas.baseline) * scaleFactor * thumbGlyphScale
-            let glyphY = baselineScreenY - glyph.baselineOffset * thumbGlyphScale
-            let glyphW = Float(glyph.pixelWidth) * thumbGlyphScale
-            let glyphH = Float(glyph.pixelHeight) * thumbGlyphScale
-
-            renderer.addQuadPublic(
-                to: &vertices,
-                x: glyphX, y: glyphY, w: glyphW, h: glyphH,
-                tx: glyph.textureX, ty: glyph.textureY,
-                tw: glyph.textureW, th: glyph.textureH,
-                fg: color,
-                bg: (0, 0, 0, 0)
-            )
-        }
-
-        guard !vertices.isEmpty else { return }
-        encoder.setRenderPipelineState(pipeline)
-        if let buf = renderer.makeTemporaryBuffer(vertices: vertices) {
-            var uniforms = MetalRenderer.MetalUniforms(viewportSize: viewportSize, cursorOpacity: 0, time: 0)
-            encoder.setVertexBuffer(buf, offset: 0, index: 0)
-            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalRenderer.MetalUniforms>.size, index: 1)
-            encoder.setFragmentTexture(atlas, index: 0)
-            encoder.setFragmentSamplerState(renderer.samplerState, index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count / 12)
-        }
+        appendTranslatedVertices(cached.vertices, dx: startX, dy: textY, to: &glyphVertices)
     }
 
     private func drawWorkspaceAddButton(
-        encoder: MTLRenderCommandEncoder,
         frame: NSRect,
         scaleFactor: Float,
-        viewportSize: SIMD2<Float>
+        viewportSize: SIMD2<Float>,
+        vertices: inout [Float]
     ) {
-        guard let pipeline = renderer.overlayPipeline else { return }
-        var vertices: [Float] = []
         let x = Float(frame.origin.x) * scaleFactor
         let y = Float(frame.origin.y) * scaleFactor
         let size = Float(frame.width) * scaleFactor
@@ -1631,97 +1818,56 @@ extension IntegratedView: MTKViewDelegate {
         renderer.addQuadPublic(to: &vertices, x: cx - lineW / 2, y: cy - lineLen / 2,
                                w: lineW, h: lineLen, tx: 0, ty: 0, tw: 0, th: 0,
                                fg: (0.85, 0.85, 0.85, 1.0), bg: (0, 0, 0, 0))
-        drawVertices(vertices, encoder: encoder, pipeline: pipeline, viewportSize: viewportSize)
     }
 
     private func drawTextButton(
-        encoder: MTLRenderCommandEncoder,
         text: String,
         frame: NSRect,
         scaleFactor: Float,
         viewportSize: SIMD2<Float>,
         bgColor: (Float, Float, Float, Float),
-        fgColor: (Float, Float, Float, Float)
+        fgColor: (Float, Float, Float, Float),
+        overlayVertices: inout [Float],
+        glyphVertices: inout [Float]
     ) {
-        guard let overlayPipeline = renderer.overlayPipeline,
-              let glyphPipeline = renderer.glyphPipeline,
-              let atlas = renderer.glyphAtlas.texture else { return }
-
         // Draw background
         let x = Float(frame.origin.x) * scaleFactor
         let y = Float(frame.origin.y) * scaleFactor
         let w = Float(frame.width) * scaleFactor
         let h = Float(frame.height) * scaleFactor
-        var bgVertices: [Float] = []
-        renderer.addQuadPublic(to: &bgVertices, x: x, y: y, w: w, h: h,
+        renderer.addQuadPublic(to: &overlayVertices, x: x, y: y, w: w, h: h,
                                tx: 0, ty: 0, tw: 0, th: 0,
                                fg: bgColor, bg: (0, 0, 0, 0))
-        drawVertices(bgVertices, encoder: encoder, pipeline: overlayPipeline, viewportSize: viewportSize)
 
         // Draw horizontally and vertically centered text
-        let chars = Array(text.unicodeScalars)
         let thumbGlyphScale: Float = 0.8
-        let cellW = Float(renderer.glyphAtlas.cellWidth) * scaleFactor * thumbGlyphScale
+        let cached = cachedTextVertices(for: text, scaleFactor: scaleFactor, glyphScale: thumbGlyphScale, color: fgColor)
         let cellH = Float(renderer.glyphAtlas.cellHeight) * scaleFactor * thumbGlyphScale
-        let textWidth = Float(chars.count) * cellW
+        let textWidth = cached.width
         let startX = x + (w - textWidth) / 2
         let startY = y + (h - cellH) / 2
-
-        var vertices: [Float] = []
-        for (index, scalar) in chars.enumerated() {
-            let cp = scalar.value
-            guard cp > 0x20,
-                  let glyph = renderer.glyphAtlas.glyphInfo(for: cp),
-                  glyph.pixelWidth > 0 else {
-                continue
-            }
-
-            let cx = startX + Float(index) * cellW
-            let glyphX = cx + Float(glyph.bearingX) * scaleFactor * thumbGlyphScale
-            let baselineScreenY = startY + cellH - Float(renderer.glyphAtlas.baseline) * scaleFactor * thumbGlyphScale
-            let glyphY = baselineScreenY - glyph.baselineOffset * thumbGlyphScale
-            let glyphW = Float(glyph.pixelWidth) * thumbGlyphScale
-            let glyphH = Float(glyph.pixelHeight) * thumbGlyphScale
-
-            renderer.addQuadPublic(
-                to: &vertices,
-                x: glyphX, y: glyphY, w: glyphW, h: glyphH,
-                tx: glyph.textureX, ty: glyph.textureY,
-                tw: glyph.textureW, th: glyph.textureH,
-                fg: fgColor,
-                bg: (0, 0, 0, 0)
-            )
-        }
-
-        guard !vertices.isEmpty else { return }
-        encoder.setRenderPipelineState(glyphPipeline)
-        if let buf = renderer.makeTemporaryBuffer(vertices: vertices) {
-            var uniforms = MetalRenderer.MetalUniforms(viewportSize: viewportSize, cursorOpacity: 0, time: 0)
-            encoder.setVertexBuffer(buf, offset: 0, index: 0)
-            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalRenderer.MetalUniforms>.size, index: 1)
-            encoder.setFragmentTexture(atlas, index: 0)
-            encoder.setFragmentSamplerState(renderer.samplerState, index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count / 12)
-        }
+        appendTranslatedVertices(cached.vertices, dx: startX, dy: startY, to: &glyphVertices)
     }
 
     private func drawWorkspaceCloseButton(
-        encoder: MTLRenderCommandEncoder,
         frame: NSRect,
         isHovered: Bool,
         scaleFactor: Float,
-        viewportSize: SIMD2<Float>
+        viewportSize: SIMD2<Float>,
+        overlayVertices: inout [Float],
+        iconVertices: inout [Float]
     ) {
         let alpha: Float = isHovered ? 0.9 : 0.7
         let bgColor: (Float, Float, Float) = isHovered ? (0.8, 0.15, 0.15) : (0.6, 0.15, 0.15)
         drawXCloseButton(
-            encoder: encoder,
             frame: frame,
             bgColor: bgColor,
             bgAlpha: alpha,
             fgColor: (1, 1, 1, alpha),
             scaleFactor: scaleFactor,
-            viewportSize: viewportSize
+            viewportSize: viewportSize,
+            overlayVertices: &overlayVertices,
+            iconVertices: &iconVertices
         )
     }
 
@@ -1777,33 +1923,28 @@ extension IntegratedView: MTKViewDelegate {
 
     /// Draws a × close button using a textured icon for both terminal and workspace close buttons.
     private func drawXCloseButton(
-        encoder: MTLRenderCommandEncoder,
         frame: NSRect,
         bgColor: (Float, Float, Float),
         bgAlpha: Float,
         fgColor: (Float, Float, Float, Float),
         scaleFactor: Float,
-        viewportSize: SIMD2<Float>
+        viewportSize: SIMD2<Float>,
+        overlayVertices: inout [Float],
+        iconVertices: inout [Float]
     ) {
-        guard let overlayPipeline = renderer.overlayPipeline else { return }
         let x = Float(frame.origin.x) * scaleFactor
         let y = Float(frame.origin.y) * scaleFactor
         let size = Float(frame.width) * scaleFactor
 
         // Draw background quad
-        var bgVertices: [Float] = []
         renderer.addQuadPublic(
-            to: &bgVertices, x: x, y: y, w: size, h: size,
+            to: &overlayVertices, x: x, y: y, w: size, h: size,
             tx: 0, ty: 0, tw: 0, th: 0,
             fg: (bgColor.0, bgColor.1, bgColor.2, bgAlpha),
             bg: (0, 0, 0, 0)
         )
-        drawVertices(bgVertices, encoder: encoder, pipeline: overlayPipeline, viewportSize: viewportSize)
 
         // Draw × icon from texture
-        guard let glyphPipeline = renderer.glyphPipeline,
-              let iconTexture = ensureCloseIconTexture() else { return }
-        var iconVertices: [Float] = []
         // Full UV (0,0)-(1,1), icon fills the entire texture. Y is flipped for Metal.
         renderer.addQuadPublic(
             to: &iconVertices, x: x, y: y, w: size, h: size,
@@ -1811,49 +1952,35 @@ extension IntegratedView: MTKViewDelegate {
             fg: (fgColor.0, fgColor.1, fgColor.2, fgColor.3),
             bg: (0, 0, 0, 0)
         )
-        if let buf = renderer.makeTemporaryBuffer(vertices: iconVertices) {
-            var uniforms = MetalRenderer.MetalUniforms(
-                viewportSize: viewportSize,
-                cursorOpacity: 0,
-                time: 0
-            )
-            encoder.setRenderPipelineState(glyphPipeline)
-            encoder.setVertexBuffer(buf, offset: 0, index: 0)
-            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalRenderer.MetalUniforms>.size, index: 1)
-            encoder.setFragmentTexture(iconTexture, index: 0)
-            encoder.setFragmentSamplerState(renderer.samplerState, index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
-                                  vertexCount: iconVertices.count / 12)
-        }
     }
 
     private func drawCloseButton(
-        encoder: MTLRenderCommandEncoder,
         frame: NSRect,
         isHovered: Bool,
         scaleFactor: Float,
-        viewportSize: SIMD2<Float>
+        viewportSize: SIMD2<Float>,
+        overlayVertices: inout [Float],
+        iconVertices: inout [Float]
     ) {
         let alpha: Float = isHovered ? 0.9 : 0.7
         let bgColor: (Float, Float, Float) = isHovered ? (0.8, 0.15, 0.15) : (0.6, 0.15, 0.15)
         drawXCloseButton(
-            encoder: encoder,
             frame: frame,
             bgColor: bgColor,
             bgAlpha: alpha,
             fgColor: (1, 1, 1, alpha),
             scaleFactor: scaleFactor,
-            viewportSize: viewportSize
+            viewportSize: viewportSize,
+            overlayVertices: &overlayVertices,
+            iconVertices: &iconVertices
         )
     }
 
     private func drawAddWorkspaceButton(
-        encoder: MTLRenderCommandEncoder,
         scaleFactor: Float,
-        viewportSize: SIMD2<Float>
+        viewportSize: SIMD2<Float>,
+        vertices: inout [Float]
     ) {
-        guard let pipeline = renderer.overlayPipeline else { return }
-
         let btnSize = Layout.addButtonSize
         let margin: CGFloat = 20
         // Always fixed at bottom-right of the visible area
@@ -1863,7 +1990,6 @@ extension IntegratedView: MTKViewDelegate {
         let x = Float(bx) * scaleFactor
         let y = Float(by) * scaleFactor
         let size = Float(btnSize) * scaleFactor
-        var vertices: [Float] = []
 
         // Background
         renderer.addQuadPublic(
@@ -1894,21 +2020,20 @@ extension IntegratedView: MTKViewDelegate {
             fg: (0.85, 0.92, 0.85, 1.0),
             bg: (0, 0, 0, 0)
         )
-        drawVertices(vertices, encoder: encoder, pipeline: pipeline, viewportSize: viewportSize)
         addWorkspaceButtonFrame = NSRect(x: bx, y: by, width: btnSize, height: btnSize)
     }
 
     private func drawVertices(
         _ vertices: [Float],
         encoder: MTLRenderCommandEncoder,
-        pipeline: MTLRenderPipelineState,
-        viewportSize: SIMD2<Float>
+        pipeline: MTLRenderPipelineState?,
+        viewportSize: SIMD2<Float>,
+        bufferSlot: MetalRenderer.ViewBufferSlot
     ) {
-        guard !vertices.isEmpty else { return }
+        guard !vertices.isEmpty, let pipeline else { return }
 
         encoder.setRenderPipelineState(pipeline)
-        let buf = renderer.makeTemporaryBuffer(vertices: vertices)
-        if let buf = buf {
+        if let buf = renderer.reusableBuffer(for: self, slot: bufferSlot, vertices: vertices) {
             var uniforms = MetalRenderer.MetalUniforms(
                 viewportSize: viewportSize,
                 cursorOpacity: 0,
@@ -1921,14 +2046,64 @@ extension IntegratedView: MTKViewDelegate {
         }
     }
 
-    private func drawDropIndicators(
+    private func drawGlyphVertices(
+        _ vertices: [Float],
         encoder: MTLRenderCommandEncoder,
-        scaleFactor: Float,
+        texture: MTLTexture?,
+        viewportSize: SIMD2<Float>,
+        bufferSlot: MetalRenderer.ViewBufferSlot
+    ) {
+        guard !vertices.isEmpty,
+              let pipeline = renderer.glyphPipeline,
+              let texture,
+              let buf = renderer.reusableBuffer(for: self, slot: bufferSlot, vertices: vertices) else {
+            return
+        }
+
+        var uniforms = MetalRenderer.MetalUniforms(viewportSize: viewportSize, cursorOpacity: 0, time: 0)
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setVertexBuffer(buf, offset: 0, index: 0)
+        encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalRenderer.MetalUniforms>.size, index: 1)
+        encoder.setFragmentTexture(texture, index: 0)
+        encoder.setFragmentSamplerState(renderer.samplerState, index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count / 12)
+    }
+
+    private func drawThumbnailContentVertices(
+        bgVertices: [Float],
+        glyphVertices: [Float],
+        encoder: MTLRenderCommandEncoder,
         viewportSize: SIMD2<Float>
     ) {
-        guard let pipeline = renderer.overlayPipeline else { return }
-        var vertices: [Float] = []
+        if !bgVertices.isEmpty,
+           let pipeline = renderer.bgPipeline,
+           let buf = renderer.reusableBuffer(for: self, slot: .overviewThumbnailBg, vertices: bgVertices) {
+            var uniforms = MetalRenderer.MetalUniforms(viewportSize: viewportSize, cursorOpacity: 0, time: 0)
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalRenderer.MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: bgVertices.count / 12)
+        }
 
+        if !glyphVertices.isEmpty,
+           let pipeline = renderer.glyphPipeline,
+           let atlas = renderer.glyphAtlas.texture,
+           let buf = renderer.reusableBuffer(for: self, slot: .overviewThumbnailGlyph, vertices: glyphVertices) {
+            var uniforms = MetalRenderer.MetalUniforms(viewportSize: viewportSize, cursorOpacity: 0, time: 0)
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalRenderer.MetalUniforms>.size, index: 1)
+            encoder.setFragmentTexture(atlas, index: 0)
+            encoder.setFragmentSamplerState(renderer.thumbnailSamplerState, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: glyphVertices.count / 12)
+        }
+    }
+
+    private func drawDropIndicators(
+        scaleFactor: Float,
+        viewportSize: SIMD2<Float>,
+        vertices: inout [Float]
+    ) {
         // Terminal insertion indicator (vertical blue line)
         if let rect = dragInsertionIndicator {
             let x = Float(rect.origin.x) * scaleFactor
@@ -1950,8 +2125,94 @@ extension IntegratedView: MTKViewDelegate {
                                    tx: 0, ty: 0, tw: 0, th: 0,
                                    fg: (0.3, 0.6, 1.0, 0.9), bg: (0, 0, 0, 0))
         }
+    }
 
-        drawVertices(vertices, encoder: encoder, pipeline: pipeline, viewportSize: viewportSize)
+    private func cachedTextVertices(
+        for text: String,
+        scaleFactor: Float,
+        glyphScale: Float,
+        color: (Float, Float, Float, Float)
+    ) -> CachedTextVertices {
+        let key = TextVertexCacheKey(
+            text: text,
+            glyphScaleBits: glyphScale.bitPattern,
+            colorBits: (color.0.bitPattern, color.1.bitPattern, color.2.bitPattern, color.3.bitPattern)
+        )
+        if let cached = textVertexCache[key] {
+            return cached
+        }
+
+        let chars = Array(text.unicodeScalars)
+        let cellW = Float(renderer.glyphAtlas.cellWidth) * scaleFactor * glyphScale
+        let cellH = Float(renderer.glyphAtlas.cellHeight) * scaleFactor * glyphScale
+        let textY: Float = 0
+        var vertices: [Float] = []
+        vertices.reserveCapacity(chars.count * 72)
+
+        for (index, scalar) in chars.enumerated() {
+            let cp = scalar.value
+            guard cp > 0x20,
+                  let glyph = renderer.glyphAtlas.glyphInfo(for: cp),
+                  glyph.pixelWidth > 0 else {
+                continue
+            }
+
+            let x = Float(index) * cellW
+            let glyphX = x + Float(glyph.bearingX) * scaleFactor * glyphScale
+            let baselineScreenY = textY + cellH - Float(renderer.glyphAtlas.baseline) * scaleFactor * glyphScale
+            let glyphY = baselineScreenY - glyph.baselineOffset * glyphScale
+            let glyphW = Float(glyph.pixelWidth) * glyphScale
+            let glyphH = Float(glyph.pixelHeight) * glyphScale
+
+            renderer.addQuadPublic(
+                to: &vertices,
+                x: glyphX, y: glyphY, w: glyphW, h: glyphH,
+                tx: glyph.textureX, ty: glyph.textureY,
+                tw: glyph.textureW, th: glyph.textureH,
+                fg: color,
+                bg: (0, 0, 0, 0)
+            )
+        }
+
+        let cached = CachedTextVertices(vertices: vertices, width: Float(chars.count) * cellW)
+        textVertexCache[key] = cached
+        return cached
+    }
+
+    private func appendTextVertices(
+        text: String,
+        scaleFactor: Float,
+        glyphScale: Float,
+        color: (Float, Float, Float, Float),
+        originX: Float,
+        originY: Float,
+        to target: inout [Float]
+    ) {
+        let cached = cachedTextVertices(for: text, scaleFactor: scaleFactor, glyphScale: glyphScale, color: color)
+        appendTranslatedVertices(cached.vertices, dx: originX, dy: originY, to: &target)
+    }
+
+    private func appendTranslatedVertices(_ source: [Float], dx: Float, dy: Float, to target: inout [Float]) {
+        guard !source.isEmpty else { return }
+        target.reserveCapacity(target.count + source.count)
+        source.withUnsafeBufferPointer { buffer in
+            var index = 0
+            while index < buffer.count {
+                target.append(buffer[index] + dx)
+                target.append(buffer[index + 1] + dy)
+                target.append(buffer[index + 2])
+                target.append(buffer[index + 3])
+                target.append(buffer[index + 4])
+                target.append(buffer[index + 5])
+                target.append(buffer[index + 6])
+                target.append(buffer[index + 7])
+                target.append(buffer[index + 8])
+                target.append(buffer[index + 9])
+                target.append(buffer[index + 10])
+                target.append(buffer[index + 11])
+                index += 12
+            }
+        }
     }
 
 }
