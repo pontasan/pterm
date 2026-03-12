@@ -14,6 +14,30 @@ import QuartzCore
 /// Supports Retina (HiDPI) rendering and virtualized scrollback
 /// (only visible rows are rendered, regardless of scrollback size).
 final class MetalRenderer {
+    static let renderTargetPixelFormat: MTLPixelFormat = .bgra8Unorm_srgb
+    static let renderTargetColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+
+    static func linearizeSRGBComponent(_ component: Float) -> Float {
+        if component <= 0.04045 {
+            return component / 12.92
+        }
+        return pow((component + 0.055) / 1.055, 2.4)
+    }
+
+    static func linearizeSRGBColor(
+        r: Float,
+        g: Float,
+        b: Float,
+        a: Float
+    ) -> (r: Float, g: Float, b: Float, a: Float) {
+        (
+            linearizeSRGBComponent(r),
+            linearizeSRGBComponent(g),
+            linearizeSRGBComponent(b),
+            a
+        )
+    }
+
     struct TerminalAppearance {
         var defaultForeground: (r: Float, g: Float, b: Float)
         var defaultBackground: (r: Float, g: Float, b: Float, a: Float)
@@ -56,6 +80,9 @@ final class MetalRenderer {
     /// Render pipeline for overlay (scrollbar, etc.)
     private(set) var overlayPipeline: MTLRenderPipelineState?
 
+    /// Render pipeline for analytic circles
+    private(set) var circlePipeline: MTLRenderPipelineState?
+
     /// Glyph atlas
     let glyphAtlas: GlyphAtlas
     var terminalAppearance: TerminalAppearance = .default
@@ -86,6 +113,7 @@ final class MetalRenderer {
         var overviewPostOverlayBuffer: MTLBuffer?
         var overviewTextGlyphBuffer: MTLBuffer?
         var overviewIconGlyphBuffer: MTLBuffer?
+        var overviewCircleGlyphBuffer: MTLBuffer?
         var overviewThumbnailBgBuffer: MTLBuffer?
         var overviewThumbnailGlyphBuffer: MTLBuffer?
     }
@@ -95,6 +123,7 @@ final class MetalRenderer {
         case overviewPostOverlay
         case overviewTextGlyph
         case overviewIconGlyph
+        case overviewCircleGlyph
         case overviewThumbnailBg
         case overviewThumbnailGlyph
     }
@@ -207,11 +236,17 @@ final class MetalRenderer {
 
     var terminalClearColor: MTLClearColor {
         let background = terminalAppearance.defaultBackground
+        let linear = Self.linearizeSRGBColor(
+            r: background.r,
+            g: background.g,
+            b: background.b,
+            a: background.a
+        )
         return MTLClearColor(
-            red: Double(background.r),
-            green: Double(background.g),
-            blue: Double(background.b),
-            alpha: Double(background.a)
+            red: Double(linear.r),
+            green: Double(linear.g),
+            blue: Double(linear.b),
+            alpha: Double(linear.a)
         )
     }
 
@@ -224,7 +259,7 @@ final class MetalRenderer {
             let desc = MTLRenderPipelineDescriptor()
             desc.vertexFunction = bgVertex
             desc.fragmentFunction = bgFragment
-            desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+            desc.colorAttachments[0].pixelFormat = Self.renderTargetPixelFormat
             bgPipeline = try? device.makeRenderPipelineState(descriptor: desc)
         }
 
@@ -234,7 +269,7 @@ final class MetalRenderer {
             let desc = MTLRenderPipelineDescriptor()
             desc.vertexFunction = glyphVertex
             desc.fragmentFunction = glyphFragment
-            desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+            desc.colorAttachments[0].pixelFormat = Self.renderTargetPixelFormat
             desc.colorAttachments[0].isBlendingEnabled = true
             desc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
             desc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
@@ -249,7 +284,7 @@ final class MetalRenderer {
             let desc = MTLRenderPipelineDescriptor()
             desc.vertexFunction = cursorVertex
             desc.fragmentFunction = cursorFragment
-            desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+            desc.colorAttachments[0].pixelFormat = Self.renderTargetPixelFormat
             desc.colorAttachments[0].isBlendingEnabled = true
             desc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
             desc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
@@ -264,13 +299,28 @@ final class MetalRenderer {
             let desc = MTLRenderPipelineDescriptor()
             desc.vertexFunction = overlayVertex
             desc.fragmentFunction = overlayFragment
-            desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+            desc.colorAttachments[0].pixelFormat = Self.renderTargetPixelFormat
             desc.colorAttachments[0].isBlendingEnabled = true
             desc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
             desc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
             desc.colorAttachments[0].sourceAlphaBlendFactor = .one
             desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
             overlayPipeline = try? device.makeRenderPipelineState(descriptor: desc)
+        }
+
+        // Analytic circle pipeline (alpha blending, coverage from UV distance)
+        if let circleVertex = library.makeFunction(name: "glyph_vertex"),
+           let circleFragment = library.makeFunction(name: "circle_fragment") {
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction = circleVertex
+            desc.fragmentFunction = circleFragment
+            desc.colorAttachments[0].pixelFormat = Self.renderTargetPixelFormat
+            desc.colorAttachments[0].isBlendingEnabled = true
+            desc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            desc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            desc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            circlePipeline = try? device.makeRenderPipelineState(descriptor: desc)
         }
     }
 
@@ -821,14 +871,16 @@ final class MetalRenderer {
                         tx: Float, ty: Float, tw: Float, th: Float,
                         fg: (r: Float, g: Float, b: Float, a: Float),
                         bg: (r: Float, g: Float, b: Float, a: Float)) {
+        let linearFG = Self.linearizeSRGBColor(r: fg.r, g: fg.g, b: fg.b, a: fg.a)
+        let linearBG = Self.linearizeSRGBColor(r: bg.r, g: bg.g, b: bg.b, a: bg.a)
         // Triangle 1: top-left, top-right, bottom-left
-        appendVertex(to: &vertices, x: x, y: y, tx: tx, ty: ty, fg: fg, bg: bg)
-        appendVertex(to: &vertices, x: x + w, y: y, tx: tx + tw, ty: ty, fg: fg, bg: bg)
-        appendVertex(to: &vertices, x: x, y: y + h, tx: tx, ty: ty + th, fg: fg, bg: bg)
+        appendVertex(to: &vertices, x: x, y: y, tx: tx, ty: ty, fg: linearFG, bg: linearBG)
+        appendVertex(to: &vertices, x: x + w, y: y, tx: tx + tw, ty: ty, fg: linearFG, bg: linearBG)
+        appendVertex(to: &vertices, x: x, y: y + h, tx: tx, ty: ty + th, fg: linearFG, bg: linearBG)
         // Triangle 2: top-right, bottom-right, bottom-left
-        appendVertex(to: &vertices, x: x + w, y: y, tx: tx + tw, ty: ty, fg: fg, bg: bg)
-        appendVertex(to: &vertices, x: x + w, y: y + h, tx: tx + tw, ty: ty + th, fg: fg, bg: bg)
-        appendVertex(to: &vertices, x: x, y: y + h, tx: tx, ty: ty + th, fg: fg, bg: bg)
+        appendVertex(to: &vertices, x: x + w, y: y, tx: tx + tw, ty: ty, fg: linearFG, bg: linearBG)
+        appendVertex(to: &vertices, x: x + w, y: y + h, tx: tx + tw, ty: ty + th, fg: linearFG, bg: linearBG)
+        appendVertex(to: &vertices, x: x, y: y + h, tx: tx, ty: ty + th, fg: linearFG, bg: linearBG)
     }
 
     private func appendVertex(
@@ -885,6 +937,8 @@ final class MetalRenderer {
             return updateVertexBuffer(&bs.overviewTextGlyphBuffer, vertices: vertices)
         case .overviewIconGlyph:
             return updateVertexBuffer(&bs.overviewIconGlyphBuffer, vertices: vertices)
+        case .overviewCircleGlyph:
+            return updateVertexBuffer(&bs.overviewCircleGlyphBuffer, vertices: vertices)
         case .overviewThumbnailBg:
             return updateVertexBuffer(&bs.overviewThumbnailBgBuffer, vertices: vertices)
         case .overviewThumbnailGlyph:

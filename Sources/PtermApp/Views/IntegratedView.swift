@@ -274,8 +274,11 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     /// Cached × icon texture for close buttons (r8Unorm, same as glyph atlas)
     private var closeIconTexture: MTLTexture?
-    /// Size in pixels of the cached icon texture
+    /// Cached circle texture for close button background (r8Unorm)
+    private var closeCircleTexture: MTLTexture?
+    /// Size in pixels of the cached icon textures
     private static let closeIconTextureSize: Int = 64
+    private static let closeButtonInsetPoints: CGFloat = 0.75
 
     /// Custom tooltip window for instant display
     private var tooltipWindow: NSWindow?
@@ -372,13 +375,14 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
         self.delegate = self
         self.preferredFramesPerSecond = 12
-        self.colorPixelFormat = .bgra8Unorm
+        self.colorPixelFormat = MetalRenderer.renderTargetPixelFormat
         self.clearColor = Self.overviewBackgroundClearColor()
         self.isPaused = true
         self.enableSetNeedsDisplay = true
         self.wantsLayer = true
         self.layer?.isOpaque = false
         self.layer?.backgroundColor = NSColor.clear.cgColor
+        applyRenderTargetColorSpace()
         self.registerForDraggedTypes([.string, Self.terminalPasteboardType, Self.workspacePasteboardType])
 
         updateTrackingArea()
@@ -424,6 +428,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     private func syncScaleFactor() {
         let newScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        applyRenderTargetColorSpace()
         if newScale != renderer.glyphAtlas.scaleFactor {
             renderer.glyphAtlas.updateScaleFactor(newScale)
         }
@@ -432,6 +437,13 @@ final class IntegratedView: MTKView, NSDraggingSource {
         if abs(drawableSize.width - expectedSize.width) > 1 || abs(drawableSize.height - expectedSize.height) > 1 {
             drawableSize = expectedSize
         }
+    }
+
+    private func applyRenderTargetColorSpace() {
+        guard let metalLayer = layer as? CAMetalLayer else { return }
+        metalLayer.colorspace = MetalRenderer.renderTargetColorSpace
+        metalLayer.pixelFormat = MetalRenderer.renderTargetPixelFormat
+        metalLayer.isOpaque = false
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -1588,6 +1600,7 @@ extension IntegratedView: MTKViewDelegate {
         var thumbnailGlyphVertices: [Float] = []
         var atlasGlyphVertices: [Float] = []
         var iconVertices: [Float] = []
+        var circleVertices: [Float] = []
         var currentOverviewFontName = renderer.glyphAtlas.fontName
         var currentOverviewFontSize = renderer.glyphAtlas.fontSize
         preContentOverlayVertices.reserveCapacity(max(256, cachedVisibleWorkspaceLayouts.count * 120 + cachedVisibleThumbnails.count * 120))
@@ -1596,6 +1609,7 @@ extension IntegratedView: MTKViewDelegate {
         thumbnailGlyphVertices.reserveCapacity(max(256, cachedVisibleThumbnails.count * 768))
         atlasGlyphVertices.reserveCapacity(max(256, cachedVisibleWorkspaceLayouts.count * 384 + cachedVisibleThumbnails.count * 512))
         iconVertices.reserveCapacity(max(128, cachedVisibleThumbnails.count * 72))
+        circleVertices.reserveCapacity(max(128, cachedVisibleThumbnails.count * 72))
 
         // Render workspace backgrounds (even when empty)
         for workspace in cachedVisibleWorkspaceLayouts {
@@ -1605,6 +1619,7 @@ extension IntegratedView: MTKViewDelegate {
                 viewportSize: viewportSize,
                 overlayVertices: &preContentOverlayVertices,
                 glyphVertices: &atlasGlyphVertices,
+                circleVertices: &circleVertices,
                 iconVertices: &iconVertices
             )
         }
@@ -1685,7 +1700,7 @@ extension IntegratedView: MTKViewDelegate {
                 isHovered: isCloseHovered,
                 scaleFactor: sf,
                 viewportSize: viewportSize,
-                overlayVertices: &postContentOverlayVertices,
+                circleVertices: &circleVertices,
                 iconVertices: &iconVertices
             )
         }
@@ -1756,12 +1771,19 @@ extension IntegratedView: MTKViewDelegate {
             viewportSize: viewportSize,
             bufferSlot: .overviewTextGlyph
         )
+        drawCircleVertices(
+            circleVertices,
+            encoder: encoder,
+            viewportSize: viewportSize,
+            bufferSlot: .overviewCircleGlyph
+        )
         drawGlyphVertices(
             iconVertices,
             encoder: encoder,
             texture: ensureCloseIconTexture(),
             viewportSize: viewportSize,
-            bufferSlot: .overviewIconGlyph
+            bufferSlot: .overviewIconGlyph,
+            samplerState: renderer.thumbnailSamplerState
         )
 
         encoder.endEncoding()
@@ -1862,7 +1884,7 @@ extension IntegratedView: MTKViewDelegate {
         renderer.addQuadPublic(
             to: &vertices, x: titleX, y: titleY, w: titleW, h: titleH,
             tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (0.15, 0.15, 0.15, 1.0),
+            fg: Self.uiThumbnailTitleBarColor(alpha: 1.0),
             bg: (0, 0, 0, 0)
         )
 
@@ -1891,19 +1913,23 @@ extension IntegratedView: MTKViewDelegate {
             // Gentle red pulse: fades between 0.15 and 0.8
             let pulse = 0.475 + 0.325 * sin(time * 3.0)
             borderAlpha = pulse
-            borderColor = (0.9, 0.2, 0.15)
+            let activeBorder = Self.uiActiveOutputBorderColor()
+            borderColor = (activeBorder.r, activeBorder.g, activeBorder.b)
             borderWidth = Float(Layout.borderWidth)
         } else if isSelected {
             borderAlpha = 1.0
-            borderColor = (0.3, 0.6, 1.0)
+            let selectedBorder = Self.uiSelectionBorderColor()
+            borderColor = (selectedBorder.r, selectedBorder.g, selectedBorder.b)
             borderWidth = Float(Layout.selectedBorderWidth)
         } else if isHovered {
             borderAlpha = 0.6
-            borderColor = (0.4, 0.4, 0.4)
+            let hoverBorder = Self.uiNeutralBorderColor()
+            borderColor = (hoverBorder.r, hoverBorder.g, hoverBorder.b)
             borderWidth = Float(Layout.borderWidth)
         } else {
             borderAlpha = 0.3
-            borderColor = (0.4, 0.4, 0.4)
+            let defaultBorder = Self.uiNeutralBorderColor()
+            borderColor = (defaultBorder.r, defaultBorder.g, defaultBorder.b)
             borderWidth = Float(Layout.borderWidth)
         }
         let bw: Float = borderWidth * scaleFactor
@@ -1913,7 +1939,7 @@ extension IntegratedView: MTKViewDelegate {
             renderer.addQuadPublic(
                 to: &vertices, x: contentX, y: contentY, w: contentW, h: contentH,
                 tx: 0, ty: 0, tw: 0, th: 0,
-                fg: (0.15, 0.3, 0.6, 0.15),
+                fg: Self.uiSelectionTintColor(alpha: 0.15),
                 bg: (0, 0, 0, 0)
             )
         }
@@ -1945,6 +1971,7 @@ extension IntegratedView: MTKViewDelegate {
         viewportSize: SIMD2<Float>,
         overlayVertices: inout [Float],
         glyphVertices: inout [Float],
+        circleVertices: inout [Float],
         iconVertices: inout [Float]
     ) {
         let x = Float(workspace.frame.origin.x) * scaleFactor
@@ -1954,19 +1981,19 @@ extension IntegratedView: MTKViewDelegate {
         let bw = Float(Layout.workspaceBorderWidth) * scaleFactor
         renderer.addQuadPublic(to: &overlayVertices, x: x, y: y, w: w, h: h,
                                tx: 0, ty: 0, tw: 0, th: 0,
-                               fg: (0.07, 0.07, 0.07, 0.65), bg: (0, 0, 0, 0))
+                               fg: Self.uiWorkspaceBackgroundColor(alpha: 0.65), bg: (0, 0, 0, 0))
         renderer.addQuadPublic(to: &overlayVertices, x: x, y: y, w: w, h: bw,
                                tx: 0, ty: 0, tw: 0, th: 0,
-                               fg: (0.28, 0.28, 0.28, 0.7), bg: (0, 0, 0, 0))
+                               fg: Self.uiWorkspaceBorderColor(alpha: 0.7), bg: (0, 0, 0, 0))
         renderer.addQuadPublic(to: &overlayVertices, x: x, y: y + h - bw, w: w, h: bw,
                                tx: 0, ty: 0, tw: 0, th: 0,
-                               fg: (0.28, 0.28, 0.28, 0.7), bg: (0, 0, 0, 0))
+                               fg: Self.uiWorkspaceBorderColor(alpha: 0.7), bg: (0, 0, 0, 0))
         renderer.addQuadPublic(to: &overlayVertices, x: x, y: y, w: bw, h: h,
                                tx: 0, ty: 0, tw: 0, th: 0,
-                               fg: (0.28, 0.28, 0.28, 0.7), bg: (0, 0, 0, 0))
+                               fg: Self.uiWorkspaceBorderColor(alpha: 0.7), bg: (0, 0, 0, 0))
         renderer.addQuadPublic(to: &overlayVertices, x: x + w - bw, y: y, w: bw, h: h,
                                tx: 0, ty: 0, tw: 0, th: 0,
-                               fg: (0.28, 0.28, 0.28, 0.7), bg: (0, 0, 0, 0))
+                               fg: Self.uiWorkspaceBorderColor(alpha: 0.7), bg: (0, 0, 0, 0))
 
         drawWorkspaceHeaderText(
             text: workspace.name,
@@ -1986,7 +2013,7 @@ extension IntegratedView: MTKViewDelegate {
             isHovered: hoveredWorkspaceClose == workspace.name,
             scaleFactor: scaleFactor,
             viewportSize: viewportSize,
-            overlayVertices: &overlayVertices,
+            circleVertices: &circleVertices,
             iconVertices: &iconVertices
         )
     }
@@ -2005,7 +2032,7 @@ extension IntegratedView: MTKViewDelegate {
             frame: NSRect(x: textX, y: frame.minY + halfGlyph - 4, width: frame.width - Layout.closeButtonSize - 8, height: frame.height),
             scaleFactor: scaleFactor,
             viewportSize: viewportSize,
-            color: (0.9, 0.9, 0.9, 1.0),
+            color: Self.uiWorkspaceHeaderTextColor(alpha: 1.0),
             alignment: .left,
             glyphVertices: &glyphVertices
         )
@@ -2027,7 +2054,7 @@ extension IntegratedView: MTKViewDelegate {
             text: displayTitle,
             scaleFactor: scaleFactor,
             glyphScale: 0.85,
-            color: (0.8, 0.8, 0.8, 1),
+            color: Self.uiTitleTextColor(alpha: 1.0),
             originX: Float(frame.origin.x + Layout.closeButtonSize + 8) * scaleFactor,
             originY: Float(frame.origin.y + (Layout.titleBarHeight - renderer.glyphAtlas.cellHeight) / 2) * scaleFactor,
             to: &glyphVertices
@@ -2066,7 +2093,7 @@ extension IntegratedView: MTKViewDelegate {
         frame: NSRect,
         scaleFactor: Float,
         viewportSize: SIMD2<Float>,
-        color: (Float, Float, Float, Float) = (0.55, 0.55, 0.55, 1.0),
+        color: (Float, Float, Float, Float) = IntegratedView.uiSecondaryTitleTextColor(alpha: 1.0),
         alignment: NSTextAlignment = .right,
         glyphVertices: inout [Float]
     ) {
@@ -2093,17 +2120,17 @@ extension IntegratedView: MTKViewDelegate {
         let size = Float(frame.width) * scaleFactor
         renderer.addQuadPublic(to: &vertices, x: x, y: y, w: size, h: size,
                                tx: 0, ty: 0, tw: 0, th: 0,
-                               fg: (0.22, 0.22, 0.22, 0.9), bg: (0, 0, 0, 0))
+                               fg: Self.uiWorkspaceAddButtonBackgroundColor(alpha: 0.9), bg: (0, 0, 0, 0))
         let lineW: Float = 2.0 * scaleFactor
         let lineLen: Float = size * 0.5
         let cx = x + size / 2
         let cy = y + size / 2
         renderer.addQuadPublic(to: &vertices, x: cx - lineLen / 2, y: cy - lineW / 2,
                                w: lineLen, h: lineW, tx: 0, ty: 0, tw: 0, th: 0,
-                               fg: (0.85, 0.85, 0.85, 1.0), bg: (0, 0, 0, 0))
+                               fg: Self.uiWorkspaceAddButtonForegroundColor(alpha: 1.0), bg: (0, 0, 0, 0))
         renderer.addQuadPublic(to: &vertices, x: cx - lineW / 2, y: cy - lineLen / 2,
                                w: lineW, h: lineLen, tx: 0, ty: 0, tw: 0, th: 0,
-                               fg: (0.85, 0.85, 0.85, 1.0), bg: (0, 0, 0, 0))
+                               fg: Self.uiWorkspaceAddButtonForegroundColor(alpha: 1.0), bg: (0, 0, 0, 0))
     }
 
     private func drawTextButton(
@@ -2140,26 +2167,29 @@ extension IntegratedView: MTKViewDelegate {
         isHovered: Bool,
         scaleFactor: Float,
         viewportSize: SIMD2<Float>,
-        overlayVertices: inout [Float],
+        circleVertices: inout [Float],
         iconVertices: inout [Float]
     ) {
-        let alpha: Float = isHovered ? 0.9 : 0.7
-        let bgColor: (Float, Float, Float) = isHovered ? (0.8, 0.15, 0.15) : (0.6, 0.15, 0.15)
-        drawXCloseButton(
+        drawMacOSCloseButton(
             frame: frame,
-            bgColor: bgColor,
-            bgAlpha: alpha,
-            fgColor: (1, 1, 1, alpha),
+            isHovered: isHovered,
             scaleFactor: scaleFactor,
-            viewportSize: viewportSize,
-            overlayVertices: &overlayVertices,
+            circleVertices: &circleVertices,
             iconVertices: &iconVertices
         )
     }
 
-    /// Creates and caches an r8Unorm texture with a × icon drawn using Core Graphics.
+    /// Loads the close icon from the bundled PNG resource and creates an r8Unorm texture.
+    /// The white-on-black image is drawn into a grayscale context for single-channel use.
     private func ensureCloseIconTexture() -> MTLTexture? {
         if let existing = closeIconTexture { return existing }
+
+        guard let url = Self.closeIconURL(),
+              let imageSource = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) else {
+            fatalError("Missing bundled close_icon.png resource")
+        }
+
         let size = Self.closeIconTextureSize
         let colorSpace = CGColorSpaceCreateDeviceGray()
         guard let ctx = CGContext(
@@ -2172,20 +2202,11 @@ extension IntegratedView: MTKViewDelegate {
             bitmapInfo: CGImageAlphaInfo.none.rawValue
         ) else { return nil }
 
-        // Clear to black (transparent in r8Unorm usage)
+        // Draw the PNG into a grayscale context at the target texture size.
+        // The white X on transparent background becomes white-on-black in r8Unorm.
         ctx.setFillColor(gray: 0, alpha: 1)
         ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
-
-        // Draw × with rounded line caps
-        let margin = CGFloat(size) * 0.22
-        ctx.setStrokeColor(gray: 1, alpha: 1)
-        ctx.setLineWidth(CGFloat(size) * 0.12)
-        ctx.setLineCap(.round)
-        ctx.move(to: CGPoint(x: margin, y: margin))
-        ctx.addLine(to: CGPoint(x: CGFloat(size) - margin, y: CGFloat(size) - margin))
-        ctx.move(to: CGPoint(x: CGFloat(size) - margin, y: margin))
-        ctx.addLine(to: CGPoint(x: margin, y: CGFloat(size) - margin))
-        ctx.strokePath()
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: size, height: size))
 
         guard let data = ctx.data else { return nil }
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
@@ -2207,57 +2228,216 @@ extension IntegratedView: MTKViewDelegate {
         return texture
     }
 
-    /// Draws a × close button using a textured icon for both terminal and workspace close buttons.
-    private func drawXCloseButton(
+    private static func closeIconURL(filePath: StaticString = #filePath) -> URL? {
+        if let bundled = Bundle.main.url(forResource: "close_icon", withExtension: "png") {
+            return bundled
+        }
+
+        let sourceURL = URL(fileURLWithPath: "\(filePath)")
+        let projectRoot = sourceURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let repositoryResource = projectRoot.appendingPathComponent("Resources/close_icon.png")
+        if FileManager.default.fileExists(atPath: repositoryResource.path) {
+            return repositoryResource
+        }
+
+        return nil
+    }
+
+    /// Programmatically generates a filled circle texture (r8Unorm).
+    /// Uses CoreGraphics to draw a perfect anti-aliased circle with pure white (255) fill,
+    /// guaranteeing exact coverage=1.0 inside the circle for correct color tinting.
+    private func ensureCloseCircleTexture() -> MTLTexture? {
+        if let existing = closeCircleTexture { return existing }
+
+        let size = Self.closeIconTextureSize
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        guard let ctx = CGContext(
+            data: nil,
+            width: size,
+            height: size,
+            bitsPerComponent: 8,
+            bytesPerRow: size,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else { return nil }
+
+        // Black background
+        ctx.setFillColor(gray: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+
+        // White filled circle
+        ctx.setFillColor(gray: 1, alpha: 1)
+        ctx.fillEllipse(in: CGRect(x: 0, y: 0, width: size, height: size))
+
+        guard let data = ctx.data else { return nil }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r8Unorm,
+            width: size,
+            height: size,
+            mipmapped: false
+        )
+        descriptor.usage = [.shaderRead]
+        descriptor.storageMode = renderer.device.hasUnifiedMemory ? .shared : .managed
+        guard let texture = renderer.device.makeTexture(descriptor: descriptor) else { return nil }
+        texture.replace(
+            region: MTLRegionMake2D(0, 0, size, size),
+            mipmapLevel: 0,
+            withBytes: data,
+            bytesPerRow: size
+        )
+        closeCircleTexture = texture
+        return texture
+    }
+
+    /// Draws a macOS-style close button: red circle always, white × only on hover.
+    private func drawMacOSCloseButton(
         frame: NSRect,
-        bgColor: (Float, Float, Float),
-        bgAlpha: Float,
-        fgColor: (Float, Float, Float, Float),
+        isHovered: Bool,
         scaleFactor: Float,
-        viewportSize: SIMD2<Float>,
-        overlayVertices: inout [Float],
+        circleVertices: inout [Float],
         iconVertices: inout [Float]
     ) {
-        let x = Float(frame.origin.x) * scaleFactor
-        let y = Float(frame.origin.y) * scaleFactor
-        let size = Float(frame.width) * scaleFactor
+        let frameX = Float(frame.origin.x) * scaleFactor
+        let frameY = Float(frame.origin.y) * scaleFactor
+        let frameSize = Float(frame.width) * scaleFactor
+        let inset = max(1.0, round(Float(Self.closeButtonInsetPoints) * scaleFactor))
+        let x = round(frameX) + inset
+        let y = round(frameY) + inset
+        let size = max(1.0, round(frameSize) - inset * 2.0)
 
-        // Draw background quad
+        // Red circle — always visible, using the macOS stoplight color interpreted in Display P3
+        // and converted into the renderer's sRGB working space.
+        let circleAlpha: Float = 1.0
+        let circleColor = Self.macOSCloseButtonCircleColor()
         renderer.addQuadPublic(
-            to: &overlayVertices, x: x, y: y, w: size, h: size,
-            tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (bgColor.0, bgColor.1, bgColor.2, bgAlpha),
+            to: &circleVertices, x: x, y: y, w: size, h: size,
+            tx: 0, ty: 1, tw: 1, th: -1,
+            fg: (circleColor.r, circleColor.g, circleColor.b, circleAlpha),
             bg: (0, 0, 0, 0)
         )
 
-        // Draw × icon from texture
-        // Full UV (0,0)-(1,1), icon fills the entire texture. Y is flipped for Metal.
-        renderer.addQuadPublic(
-            to: &iconVertices, x: x, y: y, w: size, h: size,
-            tx: 0, ty: 1, tw: 1, th: -1,
-            fg: (fgColor.0, fgColor.1, fgColor.2, fgColor.3),
-            bg: (0, 0, 0, 0)
+        // × icon — only on hover, also converted from Display P3 into sRGB.
+        if isHovered {
+            let iconColor = Self.macOSCloseButtonIconColor()
+            renderer.addQuadPublic(
+                to: &iconVertices, x: x, y: y, w: size, h: size,
+                tx: 0, ty: 1, tw: 1, th: -1,
+                fg: (iconColor.r, iconColor.g, iconColor.b, 1),
+                bg: (0, 0, 0, 0)
+            )
+        }
+    }
+
+    static func macOSCloseButtonCircleColor() -> (r: Float, g: Float, b: Float) {
+        displayP3Color(red: 236.0 / 255.0, green: 103.0 / 255.0, blue: 101.0 / 255.0)
+    }
+
+    static func macOSCloseButtonIconColor() -> (r: Float, g: Float, b: Float) {
+        displayP3Color(red: 119.0 / 255.0, green: 52.0 / 255.0, blue: 50.0 / 255.0)
+    }
+
+    static func srgbColor(red: CGFloat, green: CGFloat, blue: CGFloat) -> (r: Float, g: Float, b: Float) {
+        convertedColorToSRGB(NSColor(srgbRed: red, green: green, blue: blue, alpha: 1.0))
+    }
+
+    static func displayP3Color(
+        red: CGFloat,
+        green: CGFloat,
+        blue: CGFloat
+    ) -> (r: Float, g: Float, b: Float) {
+        convertedColorToSRGB(NSColor(displayP3Red: red, green: green, blue: blue, alpha: 1.0))
+    }
+
+    private static func convertedColorToSRGB(_ color: NSColor) -> (r: Float, g: Float, b: Float) {
+        let converted = color.usingColorSpace(.sRGB) ?? color
+        return (
+            Float(converted.redComponent),
+            Float(converted.greenComponent),
+            Float(converted.blueComponent)
         )
     }
+
+    private static func withAlpha(
+        _ color: (r: Float, g: Float, b: Float),
+        _ alpha: Float
+    ) -> (Float, Float, Float, Float) {
+        (color.r, color.g, color.b, alpha)
+    }
+
+    private static func uiThumbnailTitleBarColor(alpha: Float) -> (Float, Float, Float, Float) {
+        withAlpha(srgbColor(red: 0.15, green: 0.15, blue: 0.15), alpha)
+    }
+
+    private static func uiActiveOutputBorderColor() -> (r: Float, g: Float, b: Float) {
+        srgbColor(red: 0.9, green: 0.2, blue: 0.15)
+    }
+
+    private static func uiSelectionBorderColor() -> (r: Float, g: Float, b: Float) {
+        srgbColor(red: 0.3, green: 0.6, blue: 1.0)
+    }
+
+    private static func uiNeutralBorderColor() -> (r: Float, g: Float, b: Float) {
+        srgbColor(red: 0.4, green: 0.4, blue: 0.4)
+    }
+
+    private static func uiSelectionTintColor(alpha: Float) -> (Float, Float, Float, Float) {
+        withAlpha(srgbColor(red: 0.15, green: 0.3, blue: 0.6), alpha)
+    }
+
+    private static func uiWorkspaceBackgroundColor(alpha: Float) -> (Float, Float, Float, Float) {
+        withAlpha(srgbColor(red: 0.07, green: 0.07, blue: 0.07), alpha)
+    }
+
+    private static func uiWorkspaceBorderColor(alpha: Float) -> (Float, Float, Float, Float) {
+        withAlpha(srgbColor(red: 0.28, green: 0.28, blue: 0.28), alpha)
+    }
+
+    private static func uiWorkspaceHeaderTextColor(alpha: Float) -> (Float, Float, Float, Float) {
+        withAlpha(srgbColor(red: 0.9, green: 0.9, blue: 0.9), alpha)
+    }
+
+    private static func uiTitleTextColor(alpha: Float) -> (Float, Float, Float, Float) {
+        withAlpha(srgbColor(red: 0.8, green: 0.8, blue: 0.8), alpha)
+    }
+
+    private static func uiSecondaryTitleTextColor(alpha: Float) -> (Float, Float, Float, Float) {
+        withAlpha(srgbColor(red: 0.55, green: 0.55, blue: 0.55), alpha)
+    }
+
+    private static func uiWorkspaceAddButtonBackgroundColor(alpha: Float) -> (Float, Float, Float, Float) {
+        withAlpha(srgbColor(red: 0.22, green: 0.22, blue: 0.22), alpha)
+    }
+
+    private static func uiWorkspaceAddButtonForegroundColor(alpha: Float) -> (Float, Float, Float, Float) {
+        withAlpha(srgbColor(red: 0.85, green: 0.85, blue: 0.85), alpha)
+    }
+
+    private static func uiFloatingAddWorkspaceBackgroundColor(alpha: Float) -> (Float, Float, Float, Float) {
+        withAlpha(srgbColor(red: 0.20, green: 0.24, blue: 0.20), alpha)
+    }
+
+    private static func uiFloatingAddWorkspaceForegroundColor(alpha: Float) -> (Float, Float, Float, Float) {
+        withAlpha(srgbColor(red: 0.85, green: 0.92, blue: 0.85), alpha)
+    }
+
 
     private func drawCloseButton(
         frame: NSRect,
         isHovered: Bool,
         scaleFactor: Float,
         viewportSize: SIMD2<Float>,
-        overlayVertices: inout [Float],
+        circleVertices: inout [Float],
         iconVertices: inout [Float]
     ) {
-        let alpha: Float = isHovered ? 0.9 : 0.7
-        let bgColor: (Float, Float, Float) = isHovered ? (0.8, 0.15, 0.15) : (0.6, 0.15, 0.15)
-        drawXCloseButton(
+        drawMacOSCloseButton(
             frame: frame,
-            bgColor: bgColor,
-            bgAlpha: alpha,
-            fgColor: (1, 1, 1, alpha),
+            isHovered: isHovered,
             scaleFactor: scaleFactor,
-            viewportSize: viewportSize,
-            overlayVertices: &overlayVertices,
+            circleVertices: &circleVertices,
             iconVertices: &iconVertices
         )
     }
@@ -2281,7 +2461,7 @@ extension IntegratedView: MTKViewDelegate {
         renderer.addQuadPublic(
             to: &vertices, x: x, y: y, w: size, h: size,
             tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (0.20, 0.24, 0.20, 0.80),
+            fg: Self.uiFloatingAddWorkspaceBackgroundColor(alpha: 0.80),
             bg: (0, 0, 0, 0)
         )
 
@@ -2295,7 +2475,7 @@ extension IntegratedView: MTKViewDelegate {
             x: cx - lineLen / 2, y: cy - lineW / 2,
             w: lineLen, h: lineW,
             tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (0.85, 0.92, 0.85, 1.0),
+            fg: Self.uiFloatingAddWorkspaceForegroundColor(alpha: 1.0),
             bg: (0, 0, 0, 0)
         )
         renderer.addQuadPublic(
@@ -2303,7 +2483,7 @@ extension IntegratedView: MTKViewDelegate {
             x: cx - lineW / 2, y: cy - lineLen / 2,
             w: lineW, h: lineLen,
             tx: 0, ty: 0, tw: 0, th: 0,
-            fg: (0.85, 0.92, 0.85, 1.0),
+            fg: Self.uiFloatingAddWorkspaceForegroundColor(alpha: 1.0),
             bg: (0, 0, 0, 0)
         )
         addWorkspaceButtonFrame = NSRect(x: bx, y: by, width: btnSize, height: btnSize)
@@ -2337,7 +2517,8 @@ extension IntegratedView: MTKViewDelegate {
         encoder: MTLRenderCommandEncoder,
         texture: MTLTexture?,
         viewportSize: SIMD2<Float>,
-        bufferSlot: MetalRenderer.ViewBufferSlot
+        bufferSlot: MetalRenderer.ViewBufferSlot,
+        samplerState: MTLSamplerState? = nil
     ) {
         guard !vertices.isEmpty,
               let pipeline = renderer.glyphPipeline,
@@ -2351,7 +2532,26 @@ extension IntegratedView: MTKViewDelegate {
         encoder.setVertexBuffer(buf, offset: 0, index: 0)
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalRenderer.MetalUniforms>.size, index: 1)
         encoder.setFragmentTexture(texture, index: 0)
-        encoder.setFragmentSamplerState(renderer.samplerState, index: 0)
+        encoder.setFragmentSamplerState(samplerState ?? renderer.samplerState, index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count / 12)
+    }
+
+    private func drawCircleVertices(
+        _ vertices: [Float],
+        encoder: MTLRenderCommandEncoder,
+        viewportSize: SIMD2<Float>,
+        bufferSlot: MetalRenderer.ViewBufferSlot
+    ) {
+        guard !vertices.isEmpty,
+              let pipeline = renderer.circlePipeline,
+              let buf = renderer.reusableBuffer(for: self, slot: bufferSlot, vertices: vertices) else {
+            return
+        }
+
+        var uniforms = MetalRenderer.MetalUniforms(viewportSize: viewportSize, cursorOpacity: 0, time: 0)
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setVertexBuffer(buf, offset: 0, index: 0)
+        encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalRenderer.MetalUniforms>.size, index: 1)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count / 12)
     }
 

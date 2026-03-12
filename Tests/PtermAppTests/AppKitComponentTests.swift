@@ -483,9 +483,9 @@ final class AppKitComponentTests: XCTestCase {
         )
         view.applyAppearanceSettings()
 
-        XCTAssertEqual(view.clearColor.red, Double(0x11) / 255.0, accuracy: 0.0001)
-        XCTAssertEqual(view.clearColor.green, Double(0x22) / 255.0, accuracy: 0.0001)
-        XCTAssertEqual(view.clearColor.blue, Double(0x33) / 255.0, accuracy: 0.0001)
+        XCTAssertEqual(view.clearColor.red, Double(MetalRenderer.linearizeSRGBComponent(Float(0x11) / 255.0)), accuracy: 0.0001)
+        XCTAssertEqual(view.clearColor.green, Double(MetalRenderer.linearizeSRGBComponent(Float(0x22) / 255.0)), accuracy: 0.0001)
+        XCTAssertEqual(view.clearColor.blue, Double(MetalRenderer.linearizeSRGBComponent(Float(0x33) / 255.0)), accuracy: 0.0001)
         XCTAssertEqual(view.clearColor.alpha, 0.4, accuracy: 0.0001)
         XCTAssertFalse(view.isOpaque)
     }
@@ -508,6 +508,36 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(view.layer?.isOpaque, true)
     }
 
+    func testTerminalViewUsesSRGBRenderTargetConfiguration() throws {
+        let renderer = try makeRendererOrSkip()
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+
+        XCTAssertEqual(view.colorPixelFormat, .bgra8Unorm_srgb)
+        let metalLayer = try XCTUnwrap(view.layer as? CAMetalLayer)
+        XCTAssertEqual(metalLayer.pixelFormat, .bgra8Unorm_srgb)
+        XCTAssertEqual(metalLayer.colorspace?.name as String?, CGColorSpace.sRGB as String)
+    }
+
+    func testMetalRendererTerminalClearColorLinearizesSRGBBackground() throws {
+        let renderer = try makeRendererOrSkip()
+        renderer.updateTerminalAppearance(
+            TerminalAppearanceConfiguration(
+                foreground: .defaultTerminalForeground,
+                background: RGBColor(red: 236, green: 103, blue: 101),
+                backgroundOpacity: 1.0
+            )
+        )
+
+        let expectedR = MetalRenderer.linearizeSRGBComponent(236.0 / 255.0)
+        let expectedG = MetalRenderer.linearizeSRGBComponent(103.0 / 255.0)
+        let expectedB = MetalRenderer.linearizeSRGBComponent(101.0 / 255.0)
+
+        XCTAssertEqual(renderer.terminalClearColor.red, Double(expectedR), accuracy: 0.0001)
+        XCTAssertEqual(renderer.terminalClearColor.green, Double(expectedG), accuracy: 0.0001)
+        XCTAssertEqual(renderer.terminalClearColor.blue, Double(expectedB), accuracy: 0.0001)
+        XCTAssertEqual(renderer.terminalClearColor.alpha, 1.0, accuracy: 0.0001)
+    }
+
     func testIntegratedViewApplyAppearanceSettingsUpdatesClearColor() throws {
         let renderer = try makeRendererOrSkip()
         let manager = TerminalManager(rows: 24, cols: 80, config: .default)
@@ -527,6 +557,44 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(view.clearColor.green, 0.0, accuracy: 0.0001)
         XCTAssertEqual(view.clearColor.blue, 0.0, accuracy: 0.0001)
         XCTAssertEqual(view.clearColor.alpha, 0.0, accuracy: 0.0001)
+    }
+
+    func testIntegratedViewUsesSRGBRenderTargetConfiguration() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), renderer: renderer, manager: manager)
+
+        XCTAssertEqual(view.colorPixelFormat, .bgra8Unorm_srgb)
+        let metalLayer = try XCTUnwrap(view.layer as? CAMetalLayer)
+        XCTAssertEqual(metalLayer.pixelFormat, .bgra8Unorm_srgb)
+        XCTAssertEqual(metalLayer.colorspace?.name as String?, CGColorSpace.sRGB as String)
+    }
+
+    func testIntegratedViewCloseButtonColorUsesDisplayP3ToSRGBConversion() {
+        let expectedCircle = NSColor(displayP3Red: 236.0 / 255.0, green: 103.0 / 255.0, blue: 101.0 / 255.0, alpha: 1.0)
+            .usingColorSpace(.sRGB) ?? .systemRed
+        let actualCircle = IntegratedView.macOSCloseButtonCircleColor()
+        XCTAssertEqual(actualCircle.r, Float(expectedCircle.redComponent), accuracy: 0.0001)
+        XCTAssertEqual(actualCircle.g, Float(expectedCircle.greenComponent), accuracy: 0.0001)
+        XCTAssertEqual(actualCircle.b, Float(expectedCircle.blueComponent), accuracy: 0.0001)
+
+        let expectedIcon = NSColor(displayP3Red: 119.0 / 255.0, green: 52.0 / 255.0, blue: 50.0 / 255.0, alpha: 1.0)
+            .usingColorSpace(.sRGB) ?? .black
+        let actualIcon = IntegratedView.macOSCloseButtonIconColor()
+        XCTAssertEqual(actualIcon.r, Float(expectedIcon.redComponent), accuracy: 0.0001)
+        XCTAssertEqual(actualIcon.g, Float(expectedIcon.greenComponent), accuracy: 0.0001)
+        XCTAssertEqual(actualIcon.b, Float(expectedIcon.blueComponent), accuracy: 0.0001)
+    }
+
+    func testIntegratedViewSRGBColorHelperPreservesSRGBComponents() {
+        let expected = NSColor(srgbRed: 0.20, green: 0.24, blue: 0.20, alpha: 1.0)
+            .usingColorSpace(.sRGB) ?? .black
+        let actual = IntegratedView.srgbColor(red: 0.20, green: 0.24, blue: 0.20)
+
+        XCTAssertEqual(actual.r, Float(expected.redComponent), accuracy: 0.0001)
+        XCTAssertEqual(actual.g, Float(expected.greenComponent), accuracy: 0.0001)
+        XCTAssertEqual(actual.b, Float(expected.blueComponent), accuracy: 0.0001)
     }
 
     func testTerminalViewStartsInDemandDrivenRenderingMode() throws {
@@ -582,6 +650,16 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(view.clearColor.alpha, 1.0, accuracy: 0.0001)
         XCTAssertTrue(view.isOpaque)
         XCTAssertEqual(view.layer?.isOpaque, true)
+    }
+
+    func testSplitRenderViewUsesSRGBRenderTargetConfiguration() throws {
+        let renderer = try makeRendererOrSkip()
+        let view = SplitRenderView(frame: NSRect(x: 0, y: 0, width: 480, height: 280), renderer: renderer)
+
+        XCTAssertEqual(view.colorPixelFormat, .bgra8Unorm_srgb)
+        let metalLayer = try XCTUnwrap(view.layer as? CAMetalLayer)
+        XCTAssertEqual(metalLayer.pixelFormat, .bgra8Unorm_srgb)
+        XCTAssertEqual(metalLayer.colorspace?.name as String?, CGColorSpace.sRGB as String)
     }
 
     func testSplitRenderViewStartsInDemandDrivenRenderingMode() throws {

@@ -29,12 +29,13 @@ final class SplitRenderView: MTKView {
         self.renderer = renderer
         super.init(frame: frame, device: renderer.device)
 
-        self.colorPixelFormat = .bgra8Unorm
+        self.colorPixelFormat = MetalRenderer.renderTargetPixelFormat
         self.clearColor = renderer.terminalClearColor
         self.isPaused = true
         self.enableSetNeedsDisplay = true
         self.preferredFramesPerSecond = 30
         self.wantsLayer = true
+        applyRenderTargetColorSpace()
         updateOpacityMode()
     }
 
@@ -84,6 +85,7 @@ final class SplitRenderView: MTKView {
     private func syncScaleFactor() {
         let newScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
         layer?.contentsScale = newScale
+        applyRenderTargetColorSpace()
         if newScale != renderer.glyphAtlas.scaleFactor {
             renderer.glyphAtlas.updateScaleFactor(newScale)
         }
@@ -97,6 +99,14 @@ final class SplitRenderView: MTKView {
     private func updateOpacityMode() {
         viewIsOpaque = clearColor.alpha >= 0.999
         layer?.isOpaque = viewIsOpaque
+        applyRenderTargetColorSpace()
+    }
+
+    private func applyRenderTargetColorSpace() {
+        guard let metalLayer = layer as? CAMetalLayer else { return }
+        metalLayer.colorspace = MetalRenderer.renderTargetColorSpace
+        metalLayer.pixelFormat = MetalRenderer.renderTargetPixelFormat
+        metalLayer.isOpaque = viewIsOpaque
     }
 }
 

@@ -99,12 +99,13 @@ final class TerminalView: MTKView, NSTextInputClient {
 
         self.delegate = self
         self.preferredFramesPerSecond = 30
-        self.colorPixelFormat = .bgra8Unorm
+        self.colorPixelFormat = MetalRenderer.renderTargetPixelFormat
         self.clearColor = renderer.terminalClearColor
         self.isPaused = true
         self.enableSetNeedsDisplay = true
         self.registerForDraggedTypes([.fileURL])
         self.wantsLayer = true
+        applyRenderTargetColorSpace()
         configureMarkedTextLayer()
         demandDrivenRendering = true
         updateOpacityMode()
@@ -190,12 +191,21 @@ final class TerminalView: MTKView, NSTextInputClient {
     private func updateOpacityMode() {
         viewIsOpaque = clearColor.alpha >= 0.999
         layer?.isOpaque = viewIsOpaque
+        applyRenderTargetColorSpace()
+    }
+
+    private func applyRenderTargetColorSpace() {
+        guard let metalLayer = layer as? CAMetalLayer else { return }
+        metalLayer.colorspace = MetalRenderer.renderTargetColorSpace
+        metalLayer.pixelFormat = MetalRenderer.renderTargetPixelFormat
+        metalLayer.isOpaque = viewIsOpaque
     }
 
     /// Synchronize the glyph atlas scale factor with the current display.
     private func syncScaleFactor() {
         guard let renderer = renderer else { return }
         let newScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        applyRenderTargetColorSpace()
         if newScale != renderer.glyphAtlas.scaleFactor {
             renderer.glyphAtlas.updateScaleFactor(newScale)
             updateTerminalSize()

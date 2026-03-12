@@ -111,3 +111,14 @@ fragment float4 cursor_fragment(
 fragment float4 overlay_fragment(VertexOut in [[stage_in]]) {
     return in.fgColor;
 }
+
+/// Fragment shader for anti-aliased circles rendered analytically from quad UVs.
+/// This avoids texture aliasing on external displays and across backing-scale changes.
+fragment float4 circle_fragment(VertexOut in [[stage_in]]) {
+    float2 centered = in.texCoord * 2.0 - 1.0;
+    float dist = length(centered);
+    float aa = max(fwidth(dist), 0.001);
+    constexpr float radius = 0.92;
+    float coverage = 1.0 - smoothstep(radius - aa, radius + aa, dist);
+    return float4(in.fgColor.rgb, in.fgColor.a * coverage);
+}
