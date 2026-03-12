@@ -2644,7 +2644,7 @@ extension IntegratedView: MTKViewDelegate {
             }
 
             let x = Float(index) * cellW
-            let glyphX = x + Float(glyph.bearingX) * scaleFactor * glyphScale
+            let glyphX = x + glyph.cellOffsetX * glyphScale
             let baselineScreenY = textY + cellH - Float(renderer.glyphAtlas.baseline) * scaleFactor * glyphScale
             let glyphY = baselineScreenY - glyph.baselineOffset * glyphScale
             let glyphW = Float(glyph.pixelWidth) * glyphScale

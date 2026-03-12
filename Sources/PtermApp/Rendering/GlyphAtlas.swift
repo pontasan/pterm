@@ -40,6 +40,15 @@ final class GlyphAtlas {
 
     /// Scale factor for Retina
     private(set) var scaleFactor: CGFloat
+    private var rasterScale: CGFloat {
+        max(scaleFactor, 2.0)
+    }
+    private var glyphPaddingPixels: Int {
+        max(2, Int(ceil(rasterScale * 0.5)))
+    }
+    var usesOversampledRasterizationForCurrentDisplay: Bool {
+        rasterScale > scaleFactor
+    }
 
     /// Metal device
     private let device: MTLDevice
@@ -50,10 +59,11 @@ final class GlyphAtlas {
         var textureY: Float     // Texture coordinate Y (0..1)
         var textureW: Float     // Texture width (0..1)
         var textureH: Float     // Texture height (0..1)
+        var cellOffsetX: Float  // Distance from terminal cell origin to bitmap left in display pixels
         var bearingX: Float     // Horizontal bearing (points)
-        var baselineOffset: Float // Distance from bitmap top to baseline (pixels, integer-snapped)
-        var pixelWidth: Int     // Pixel width of glyph image
-        var pixelHeight: Int    // Pixel height of glyph image
+        var baselineOffset: Float // Distance from bitmap top to baseline in display pixels
+        var pixelWidth: Int     // Display pixel width of glyph image
+        var pixelHeight: Int    // Display pixel height of glyph image
         var advance: Float      // Horizontal advance (points)
     }
 
@@ -80,7 +90,11 @@ final class GlyphAtlas {
         let leading = CTFontGetLeading(ctFont)
 
         cellHeight = ceil(ascent + descent + leading)
-        baseline = ceil(descent)
+        // Keep terminal rows aligned to shared font metrics, but don't push all
+        // leading above the baseline. Distributing half of the font leading
+        // below the baseline gives descenders a little more room and matches
+        // terminal-style line boxes better on low-DPI displays.
+        baseline = ceil(descent + (leading * 0.5))
 
         // Measure 'M' for cell width (monospace font)
         let mChar: [UniChar] = [0x4D] // 'M'
@@ -97,8 +111,8 @@ final class GlyphAtlas {
     private func createAtlasTexture() {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .r8Unorm,
-            width: atlasWidth * Int(scaleFactor),
-            height: atlasHeight * Int(scaleFactor),
+            width: atlasWidth * Int(rasterScale),
+            height: atlasHeight * Int(rasterScale),
             mipmapped: false
         )
         descriptor.usage = [.shaderRead]
@@ -157,15 +171,17 @@ final class GlyphAtlas {
         CTFontGetAdvancesForGlyphs(runFont, .horizontal, &glyph, &advance, 1)
 
         // Calculate pixel dimensions
-        let scale = scaleFactor
-        let pixelW = Int(ceil(boundingRect.width * scale)) + 2
-        let pixelH = Int(ceil(boundingRect.height * scale)) + 2
+        let scale = rasterScale
+        let displayScale = scaleFactor
+        let paddingPixels = glyphPaddingPixels
+        let pixelW = Int(ceil(boundingRect.width * scale)) + (paddingPixels * 2)
+        let pixelH = Int(ceil(cellHeight * scale)) + (paddingPixels * 2)
 
         guard pixelW > 0, pixelH > 0 else {
             // Space or zero-width glyph
             let info = GlyphInfo(
                 textureX: 0, textureY: 0, textureW: 0, textureH: 0,
-                bearingX: 0, baselineOffset: 0,
+                cellOffsetX: 0, bearingX: 0, baselineOffset: 0,
                 pixelWidth: 0, pixelHeight: 0,
                 advance: Float(advance.width)
             )
@@ -189,7 +205,7 @@ final class GlyphAtlas {
         }
 
         // Rasterize glyph to bitmap
-        let colorSpace = CGColorSpaceCreateDeviceGray()
+        let colorSpace = CGColorSpace(name: CGColorSpace.linearGray) ?? CGColorSpaceCreateDeviceGray()
         guard let context = CGContext(
             data: nil,
             width: pixelW,
@@ -200,6 +216,18 @@ final class GlyphAtlas {
             bitmapInfo: CGImageAlphaInfo.none.rawValue
         ) else { return nil }
 
+        // Terminal glyphs need stable grayscale coverage, especially when composited
+        // over translucent backgrounds on lower-DPI displays. Disable font smoothing
+        // and subpixel positioning so the atlas stores predictable monochrome coverage
+        // rather than display-specific LCD assumptions.
+        context.setAllowsAntialiasing(true)
+        context.setShouldAntialias(true)
+        context.setAllowsFontSmoothing(false)
+        context.setShouldSmoothFonts(false)
+        context.setAllowsFontSubpixelPositioning(false)
+        context.setShouldSubpixelPositionFonts(false)
+        context.setAllowsFontSubpixelQuantization(false)
+        context.setShouldSubpixelQuantizeFonts(false)
         context.scaleBy(x: scale, y: scale)
         context.setFillColor(gray: 0, alpha: 1)
         context.fill(CGRect(x: 0, y: 0, width: CGFloat(pixelW) / scale,
@@ -207,11 +235,16 @@ final class GlyphAtlas {
 
         // Draw glyph
         context.setFillColor(gray: 1, alpha: 1)
-        let drawX = -boundingRect.origin.x + 1.0 / scale
+        let padding = CGFloat(paddingPixels) / scale
+        let drawX = -boundingRect.origin.x + padding
         // Snap the baseline to an integer pixel boundary within the bitmap.
         // Without this, different glyphs have non-integer baseline offsets in
         // the bitmap, causing ±1px visual misalignment with nearest-neighbor sampling.
-        let drawY = ceil((-boundingRect.origin.y) * scale + 1.0) / scale
+        // Use the font's shared baseline within a fixed-height cell bitmap.
+        // This avoids glyph-specific top/bottom boxes leaking into terminal row
+        // placement, which is what causes letters like "m", "d", and "t" to
+        // drift relative to each other on 1x displays.
+        let drawY = ceil((baseline * scale) + CGFloat(paddingPixels)) / scale
 
         var position = CGPoint(x: drawX, y: drawY)
         CTFontDrawGlyphs(runFont, &glyph, &position, 1, context)
@@ -222,21 +255,31 @@ final class GlyphAtlas {
         texture?.replace(region: region, mipmapLevel: 0,
                         withBytes: data, bytesPerRow: pixelW)
 
-        // Baseline offset: distance from the top of the bitmap to the baseline (in pixels).
-        // drawY * scale is the baseline position from the bottom of the bitmap,
-        // which was snapped to an integer pixel above.
-        let baselineFromBottom = ceil((-boundingRect.origin.y) * scale + 1.0)
-        let baselineOffset = Float(pixelH) - Float(baselineFromBottom)
+        // Keep display metrics derived from the actual oversampled bitmap so the
+        // top/baseline relationship survives the downscale exactly.
+        let renderPixelWidth = max(1, Int(round(CGFloat(pixelW) * displayScale / scale)))
+        let renderPixelHeight = max(1, Int(round(CGFloat(pixelH) * displayScale / scale)))
+        let cellOffsetX = Float(
+            (((cellWidth - advance.width) * 0.5) + boundingRect.origin.x) * displayScale
+        )
+        // The baseline offset now comes from the shared cell baseline, not a
+        // glyph-specific bounding box. That keeps every ASCII glyph aligned to
+        // the same terminal row baseline across displays.
+        let baselineOffset = min(
+            Float(renderPixelHeight),
+            max(0, ((Float(pixelH) / Float(scale)) - Float(drawY)) * Float(displayScale))
+        )
 
         let info = GlyphInfo(
             textureX: Float(packX) / Float(atlasPixelW),
             textureY: Float(packY) / Float(atlasPixelH),
             textureW: Float(pixelW) / Float(atlasPixelW),
             textureH: Float(pixelH) / Float(atlasPixelH),
+            cellOffsetX: cellOffsetX,
             bearingX: Float(boundingRect.origin.x),
             baselineOffset: baselineOffset,
-            pixelWidth: pixelW,
-            pixelHeight: pixelH,
+            pixelWidth: renderPixelWidth,
+            pixelHeight: renderPixelHeight,
             advance: Float(advance.width)
         )
 

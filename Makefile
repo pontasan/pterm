@@ -1,11 +1,12 @@
 # pterm - macOS Terminal Emulator
 # Build system: SPM + xcrun metal + shell scripts
 
-.PHONY: build debug test clean bundle run shaders
+.PHONY: build debug test clean bundle run shaders package verify-bundle verify-signature
 
 # Output directories
 BUILD_DIR = .build
 APP_BUNDLE = $(BUILD_DIR)/pterm.app
+DIST_ZIP = $(BUILD_DIR)/pterm.zip
 SHADER_DIR = Sources/PtermApp/Rendering/Shaders
 METAL_TOOLCHAIN = TOOLCHAINS=Metal
 
@@ -52,6 +53,26 @@ bundle:
 		-o $(APP_BUNDLE)/Contents/Resources/default.metallib; \
 	echo "Bundle created at $(APP_BUNDLE)"
 
+# Create distributable zip from the bundled app
+package: build
+	@rm -f $(DIST_ZIP)
+	ditto -c -k --sequesterRsrc --keepParent $(APP_BUNDLE) $(DIST_ZIP)
+	@echo "Package created at $(DIST_ZIP)"
+
+# Verify bundle structure and embedded resources
+verify-bundle: build
+	@test -f $(APP_BUNDLE)/Contents/MacOS/PtermApp
+	@test -f $(APP_BUNDLE)/Contents/Info.plist
+	@test -f $(APP_BUNDLE)/Contents/Resources/default.metallib
+	@test -f $(APP_BUNDLE)/Contents/Resources/AppIcon.icns
+	@echo "Bundle structure verified."
+
+# Verify code signature when the app has been signed
+verify-signature:
+	codesign --verify --deep --strict --verbose=2 $(APP_BUNDLE)
+	spctl --assess --type execute --verbose=4 $(APP_BUNDLE)
+	@echo "Signature assessment completed."
+
 # Compile Metal shaders (requires Xcode.app)
 shaders:
 	@echo "Compiling Metal shaders..."
@@ -74,16 +95,27 @@ sign:
 		$(APP_BUNDLE)
 	@echo "Code signed."
 
-# Notarize (requires APPLE_ID and TEAM_ID)
-notarize: sign
-	@if [ -z "$(APPLE_ID)" ] || [ -z "$(TEAM_ID)" ]; then \
-		echo "Usage: make notarize IDENTITY='...' APPLE_ID='...' TEAM_ID='...'"; \
+# Notarize and staple.
+# Preferred:
+#   make notarize IDENTITY='Developer ID Application: ...' NOTARY_PROFILE='profile-name'
+# Alternative:
+#   make notarize IDENTITY='...' APPLE_ID='name@example.com' TEAM_ID='TEAMID' APPLE_APP_SPECIFIC_PASSWORD='xxxx-xxxx-xxxx-xxxx'
+notarize: sign package
+	@if [ -n "$(NOTARY_PROFILE)" ]; then \
+		xcrun notarytool submit $(DIST_ZIP) --keychain-profile "$(NOTARY_PROFILE)" --wait; \
+	elif [ -n "$(APPLE_ID)" ] && [ -n "$(TEAM_ID)" ] && [ -n "$(APPLE_APP_SPECIFIC_PASSWORD)" ]; then \
+		xcrun notarytool submit $(DIST_ZIP) \
+			--apple-id "$(APPLE_ID)" \
+			--team-id "$(TEAM_ID)" \
+			--password "$(APPLE_APP_SPECIFIC_PASSWORD)" \
+			--wait; \
+	else \
+		echo "Usage:"; \
+		echo "  make notarize IDENTITY='Developer ID Application: ...' NOTARY_PROFILE='profile-name'"; \
+		echo "or"; \
+		echo "  make notarize IDENTITY='...' APPLE_ID='name@example.com' TEAM_ID='TEAMID' APPLE_APP_SPECIFIC_PASSWORD='app-specific-password'"; \
 		exit 1; \
 	fi
-	ditto -c -k --keepParent $(APP_BUNDLE) $(BUILD_DIR)/pterm.zip
-	xcrun notarytool submit $(BUILD_DIR)/pterm.zip \
-		--apple-id "$(APPLE_ID)" \
-		--team-id "$(TEAM_ID)" \
-		--wait
 	xcrun stapler staple $(APP_BUNDLE)
+	@$(MAKE) verify-signature
 	@echo "Notarized and stapled."

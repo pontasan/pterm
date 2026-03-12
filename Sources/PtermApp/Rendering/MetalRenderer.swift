@@ -38,6 +38,10 @@ final class MetalRenderer {
         )
     }
 
+    private static func snapToPixel(_ value: Float) -> Float {
+        round(value)
+    }
+
     struct TerminalAppearance {
         var defaultForeground: (r: Float, g: Float, b: Float)
         var defaultBackground: (r: Float, g: Float, b: Float, a: Float)
@@ -73,6 +77,7 @@ final class MetalRenderer {
 
     /// Render pipeline for glyphs
     private(set) var glyphPipeline: MTLRenderPipelineState?
+    private(set) var lowDPIGlyphPipeline: MTLRenderPipelineState?
 
     /// Render pipeline for cursor
     private(set) var cursorPipeline: MTLRenderPipelineState?
@@ -276,6 +281,19 @@ final class MetalRenderer {
             desc.colorAttachments[0].sourceAlphaBlendFactor = .one
             desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
             glyphPipeline = try? device.makeRenderPipelineState(descriptor: desc)
+
+            if let lowDPIGlyphFragment = library.makeFunction(name: "lowdpi_glyph_fragment") {
+                let lowDPIDesc = MTLRenderPipelineDescriptor()
+                lowDPIDesc.vertexFunction = glyphVertex
+                lowDPIDesc.fragmentFunction = lowDPIGlyphFragment
+                lowDPIDesc.colorAttachments[0].pixelFormat = Self.renderTargetPixelFormat
+                lowDPIDesc.colorAttachments[0].isBlendingEnabled = true
+                lowDPIDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+                lowDPIDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+                lowDPIDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+                lowDPIDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+                lowDPIGlyphPipeline = try? device.makeRenderPipelineState(descriptor: lowDPIDesc)
+            }
         }
 
         // Cursor pipeline (with alpha blending)
@@ -346,6 +364,20 @@ final class MetalRenderer {
         thumbDesc.sAddressMode = .clampToEdge
         thumbDesc.tAddressMode = .clampToEdge
         thumbnailSampler = device.makeSamplerState(descriptor: thumbDesc)
+    }
+
+    private func glyphSamplerForCurrentOutput() -> MTLSamplerState? {
+        if glyphAtlas.scaleFactor <= 1.0 {
+            return thumbnailSampler ?? sampler
+        }
+        return sampler
+    }
+
+    private func glyphPipelineForCurrentOutput() -> MTLRenderPipelineState? {
+        if glyphAtlas.scaleFactor <= 1.0 {
+            return lowDPIGlyphPipeline ?? glyphPipeline
+        }
+        return glyphPipeline
     }
 
     // MARK: - Vertex Buffer Management
@@ -435,14 +467,14 @@ final class MetalRenderer {
         }
 
         // 2. Draw glyphs
-        if !vd.glyphVertices.isEmpty, let pipeline = glyphPipeline,
+        if !vd.glyphVertices.isEmpty, let pipeline = glyphPipelineForCurrentOutput(),
            let atlas = glyphAtlas.texture,
            let buf = updateVertexBuffer(&bs.glyphBuffer, vertices: vd.glyphVertices) {
             encoder.setRenderPipelineState(pipeline)
             encoder.setVertexBuffer(buf, offset: 0, index: 0)
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
             encoder.setFragmentTexture(atlas, index: 0)
-            encoder.setFragmentSamplerState(sampler, index: 0)
+            encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0,
                                   vertexCount: vd.glyphVertices.count / floatsPerVertex)
         }
@@ -666,13 +698,21 @@ final class MetalRenderer {
                    let glyph = glyphAtlas.glyphInfo(for: cell.codepoint),
                    glyph.pixelWidth > 0 {
 
-                    let glyphAdvance = max(0, glyph.advance * scaleFactor)
-                    let centeredOffset = max(0, (w - glyphAdvance) * 0.5)
-                    let glyphX = x + centeredOffset + Float(glyph.bearingX) * scaleFactor
+                    let rawGlyphX: Float
+                    if cell.width == 1 {
+                        rawGlyphX = x + glyph.cellOffsetX
+                    } else {
+                        let glyphAdvance = max(0, glyph.advance * scaleFactor)
+                        let centeredOffset = max(0, (w - glyphAdvance) * 0.5)
+                        rawGlyphX = x + centeredOffset + Float(glyph.bearingX) * scaleFactor
+                    }
                     // Position glyph so its baseline (at baselineOffset pixels from
                     // the bitmap top) aligns with the cell's baseline screen position.
                     let baselineScreenY = y + cellH - Float(glyphAtlas.baseline) * scaleFactor
-                    let glyphY = baselineScreenY - glyph.baselineOffset
+                    let rawGlyphY = baselineScreenY - glyph.baselineOffset
+                    let shouldSnapGlyphPosition = !glyphAtlas.usesOversampledRasterizationForCurrentDisplay
+                    let glyphX = shouldSnapGlyphPosition ? Self.snapToPixel(rawGlyphX) : rawGlyphX
+                    let glyphY = shouldSnapGlyphPosition ? Self.snapToPixel(rawGlyphY) : rawGlyphY
                     let glyphW = Float(glyph.pixelWidth)
                     let glyphH = Float(glyph.pixelHeight)
 
@@ -684,7 +724,7 @@ final class MetalRenderer {
                            bg: (0, 0, 0, 0))
 
                     if cell.attributes.bold {
-                        let boldOffset = max(1.0, scaleFactor) * 0.5
+                        let boldOffset = max(1.0, ceil(scaleFactor * 0.5))
                         addQuad(to: &vd.glyphVertices,
                                x: glyphX + boldOffset, y: glyphY, w: glyphW, h: glyphH,
                                tx: glyph.textureX, ty: glyph.textureY,
@@ -1142,7 +1182,7 @@ final class MetalRenderer {
                    let glyph = glyphAtlas.glyphInfo(for: cell.codepoint),
                    glyph.pixelWidth > 0 {
 
-                    let glyphFullX = fullX + Float(glyph.bearingX) * scaleFactor
+                    let glyphFullX = fullX + glyph.cellOffsetX
                     let baselineScreenY = fullY + fullH - Float(glyphAtlas.baseline) * scaleFactor
                     let glyphFullY = baselineScreenY - glyph.baselineOffset
                     let glyphFullW = Float(glyph.pixelWidth)
@@ -1224,7 +1264,7 @@ final class MetalRenderer {
         }
 
         // 2. Glyphs
-        if !vd.glyphVertices.isEmpty, let pipeline = glyphPipeline,
+        if !vd.glyphVertices.isEmpty, let pipeline = glyphPipelineForCurrentOutput(),
            let atlas = glyphAtlas.texture {
             let shifted = shiftedVertices(vd.glyphVertices, offsetX: offsetX, offsetY: offsetY)
             if let buf = makeTemporaryBuffer(vertices: shifted) {
@@ -1232,7 +1272,7 @@ final class MetalRenderer {
                 encoder.setVertexBuffer(buf, offset: 0, index: 0)
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
                 encoder.setFragmentTexture(atlas, index: 0)
-                encoder.setFragmentSamplerState(sampler, index: 0)
+                encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
                 encoder.drawPrimitives(type: .triangle, vertexStart: 0,
                                       vertexCount: vd.glyphVertices.count / floatsPerVertex)
             }

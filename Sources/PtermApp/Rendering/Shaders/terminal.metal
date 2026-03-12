@@ -85,6 +85,19 @@ fragment float4 glyph_fragment(
     return float4(in.fgColor.rgb, coverage * in.fgColor.a);
 }
 
+/// Low-DPI glyph fragment.
+/// External 1x displays benefit from slightly stronger coverage so stems don't
+/// wash out after bilinear downsampling from the oversampled atlas.
+fragment float4 lowdpi_glyph_fragment(
+    VertexOut in [[stage_in]],
+    texture2d<float> atlas [[texture(0)]],
+    sampler atlasSampler [[sampler(0)]]
+) {
+    float4 texColor = atlas.sample(atlasSampler, in.texCoord);
+    float coverage = pow(clamp(texColor.r, 0.0, 1.0), 0.88);
+    return float4(in.fgColor.rgb, coverage * in.fgColor.a);
+}
+
 // MARK: - Cursor
 
 /// Fragment shader for cursor with optional smooth blink.
