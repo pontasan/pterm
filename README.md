@@ -1,60 +1,60 @@
 # pterm
 
-Native macOS terminal app bundle and distribution workflow.
+A fast, secure, and memory-efficient terminal emulator for macOS.
 
-## Build
+![pterm demo](Resources/demo.gif)
 
-Debug app bundle:
+## Features
+
+- **Single window, multiple terminals** — Manage multiple shell sessions in one window with an integrated overview grid.
+- **Memory-controlled scrollback** — Unlike macOS Terminal, scrollback memory is capped and automatically rolled. No more runaway memory from `tail -F`.
+- **Metal-accelerated rendering** — GPU-rendered terminal with sRGB color management, glyph atlas caching, and offscreen thumbnail compositing.
+- **Shell flexibility** — Defaults to your system shell (typically zsh), with automatic fallback to bash and sh.
+- **Full IME support** — Japanese and other multi-byte input via macOS Input Methods with correct cursor positioning.
+- **Workspace management** — Organize terminals into named workspaces with persistent notes.
+- **Dark theme** — Black background, optimized for CLI tools like Claude Code.
+- **Code signed and notarized** — Distributed with Developer ID signature and Apple notarization for Gatekeeper compatibility.
+- **Zero external dependencies** — Built entirely on macOS system frameworks (AppKit, Metal, Security). No third-party libraries.
+
+## Requirements
+
+- macOS 26 (Tahoe) or later
+- Xcode Command Line Tools (for building from source)
+
+## Install
+
+Download the latest `pterm.zip` from [Releases](https://github.com/user/pterm/releases), unzip, and move `pterm.app` to `/Applications`.
+
+## Build from Source
+
+Debug build:
 
 ```bash
 make debug
+open .build/pterm.app
 ```
 
-Release app bundle:
+Release build:
 
 ```bash
 make build
 ```
 
-This produces:
-
-- `.build/pterm.app`
-
-## Local Verification
-
-Verify the bundle contains the expected executable and resources:
+Run tests:
 
 ```bash
-make verify-bundle
+make test
 ```
 
-Create a distributable zip:
+## Signing and Distribution
 
-```bash
-make package
-```
-
-This produces:
-
-- `.build/pterm.zip`
-
-## Signing
-
-Sign the release app with a Developer ID Application certificate:
+Sign with a Developer ID certificate:
 
 ```bash
 make sign IDENTITY='Developer ID Application: Your Name (TEAMID)'
 ```
 
-Verify the signature and Gatekeeper assessment:
-
-```bash
-make verify-signature
-```
-
-## Notarization
-
-Preferred workflow using a notarytool keychain profile:
+Build, sign, notarize, and package in one step:
 
 ```bash
 make notarize \
@@ -62,23 +62,12 @@ make notarize \
   NOTARY_PROFILE='your-notarytool-profile'
 ```
 
-Alternative workflow using explicit credentials:
+The notarized app is stapled and verified automatically. Distribute `.build/pterm.zip`.
 
-```bash
-make notarize \
-  IDENTITY='Developer ID Application: Your Name (TEAMID)' \
-  APPLE_ID='name@example.com' \
-  TEAM_ID='TEAMID' \
-  APPLE_APP_SPECIFIC_PASSWORD='app-specific-password'
-```
+## Development
 
-After notarization, the app is stapled and verified in place.
+This application was built with [Claude Code](https://claude.com/claude-code) and [Codex](https://openai.com/index/codex/).
 
-## Distribution Readiness
+## License
 
-For another person to launch the app normally on macOS without bypassing Gatekeeper, the expected sequence is:
-
-1. `make build`
-2. `make sign ...`
-3. `make notarize ...`
-4. distribute `.build/pterm.app` or `.build/pterm.zip`
+[MIT](LICENSE)
