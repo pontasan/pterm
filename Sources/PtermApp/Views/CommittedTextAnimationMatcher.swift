@@ -497,7 +497,7 @@ enum CommittedTextAnimationMatcher {
             let endIndex = baselineLine.index(baselineLine.startIndex, offsetBy: endOffset)
             let removed = String(baselineLine[startIndex..<endIndex])
             guard removed == intent.text else { continue }
-            let col = prefixCount
+            let col = displayColumnCount(ofPrefix: String(baselineLine[..<startIndex]))
             let lowerRowBonus = row * 8
             let originalRowBonus = row == intent.row ? 500 : 0
             let originalColPenalty = min(abs(col - intent.col), 40)
@@ -643,6 +643,12 @@ enum CommittedTextAnimationMatcher {
             count += 1
         }
         return count
+    }
+
+    private static func displayColumnCount(ofPrefix prefix: String) -> Int {
+        prefix.unicodeScalars.reduce(0) { partial, scalar in
+            partial + max(CharacterWidth.width(of: scalar.value), 1)
+        }
     }
 
     private static func cursorAdjacentInsertLocation(

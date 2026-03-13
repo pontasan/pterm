@@ -70,7 +70,6 @@ final class TerminalView: MTKView, NSTextInputClient {
         let row: Int
         let col: Int
         let columnWidth: Int
-        let recordedAt: CFTimeInterval
     }
 
     /// Terminal controller for this view
@@ -189,6 +188,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     var debugCommittedTextPreviewCount: Int { committedTextPreviews.count }
     var debugPendingCommittedTextIntentCount: Int { pendingCommittedTextIntents.count }
     var debugHasPendingIntentResolutionTimer: Bool { pendingIntentResolutionTimer != nil }
+    var debugLastPendingCommittedTextIntentText: String? { pendingCommittedTextIntents.last?.text }
 
     func debugSetSuppressInterpretKeyEvents(_ suppressed: Bool) {
         debugSuppressInterpretKeyEvents = suppressed
@@ -1494,7 +1494,7 @@ final class TerminalView: MTKView, NSTextInputClient {
             duration: duration,
             kind: kind
         ))
-        if kind == .fadeIn {
+        if kind == .fadeIn && !outputConfirmedInputAnimationsEnabled {
             recordRecentCommittedInsertion(text: text, row: row, col: col, columnWidth: columnWidth)
         } else {
             discardRecentCommittedInsertion(text: text, row: row, col: col, columnWidth: columnWidth)
@@ -1518,27 +1518,44 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     private func recordRecentCommittedInsertion(text: String, row: Int, col: Int, columnWidth: Int) {
-        let now = CACurrentMediaTime()
-        recentCommittedInsertions.append(
-            RecentCommittedInsertion(
-                text: text,
-                row: row,
-                col: col,
-                columnWidth: columnWidth,
-                recordedAt: now
-            )
-        )
+        recentCommittedInsertions.append(contentsOf: recentCommittedInsertionSegments(text: text, row: row, col: col))
         if recentCommittedInsertions.count > PreviewPolicy.maxCommittedTextPreviewCount {
             recentCommittedInsertions.removeFirst(recentCommittedInsertions.count - PreviewPolicy.maxCommittedTextPreviewCount)
         }
     }
 
     private func discardRecentCommittedInsertion(text: String, row: Int, col: Int, columnWidth: Int) {
-        if let index = recentCommittedInsertions.lastIndex(where: {
-            $0.text == text && $0.row == row && $0.col == col && $0.columnWidth == columnWidth
-        }) {
-            recentCommittedInsertions.remove(at: index)
+        let segments = recentCommittedInsertionSegments(text: text, row: row, col: col)
+        for segment in segments.reversed() {
+            if let index = recentCommittedInsertions.lastIndex(where: {
+                $0.text == segment.text &&
+                $0.row == segment.row &&
+                $0.col == segment.col &&
+                $0.columnWidth == segment.columnWidth
+            }) {
+                recentCommittedInsertions.remove(at: index)
+            }
         }
+    }
+
+    private func recentCommittedInsertionSegments(text: String, row: Int, col: Int) -> [RecentCommittedInsertion] {
+        var segments: [RecentCommittedInsertion] = []
+        segments.reserveCapacity(text.count)
+        var currentCol = col
+        for character in text {
+            let segmentText = String(character)
+            let segmentWidth = columnWidth(for: segmentText)
+            segments.append(
+                RecentCommittedInsertion(
+                    text: segmentText,
+                    row: row,
+                    col: currentCol,
+                    columnWidth: segmentWidth
+                )
+            )
+            currentCol += segmentWidth
+        }
+        return segments
     }
 
     private func showCommittedTextPreview(_ text: String) {
@@ -1565,6 +1582,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         }
         let cursor = controller.withModel { $0.cursor }
         let width = columnWidth(for: text)
+        recordRecentCommittedInsertion(text: text, row: cursor.row, col: cursor.col, columnWidth: width)
         enqueueCommittedTextIntent(
             kind: .insert,
             text: text,
@@ -1852,14 +1870,14 @@ extension TerminalView {
             text = String(describing: string)
         }
         guard !text.isEmpty else { return }
-        let shouldShowCommittedPreview = shouldAnimateCommittedTextPreview(for: text)
         pendingTextInputHandled = true
-        InputAnimationDiagnostics.log(
-            "insertText text=\(text.debugDescription) animate=\(shouldShowCommittedPreview) outputConfirmed=\(outputConfirmedInputAnimationsEnabled)"
-        )
         markedTextStorage = nil
         markedTextSelection = NSRange(location: NSNotFound, length: 0)
         destroyMarkedTextLayer()
+        let shouldShowCommittedPreview = shouldAnimateCommittedTextPreview(for: text)
+        InputAnimationDiagnostics.log(
+            "insertText text=\(text.debugDescription) animate=\(shouldShowCommittedPreview) outputConfirmed=\(outputConfirmedInputAnimationsEnabled)"
+        )
         if shouldShowCommittedPreview {
             if outputConfirmedInputAnimationsEnabled {
                 enqueueCommittedInsertIntentIfNeeded(for: text)

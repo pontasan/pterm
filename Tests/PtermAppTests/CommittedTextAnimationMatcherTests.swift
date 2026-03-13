@@ -829,6 +829,52 @@ final class CommittedTextAnimationMatcherTests: XCTestCase {
         )
     }
 
+    func testDeleteIntentMatchesWideCharacterOnChangedTUIRow() {
+        let baseline = snapshot(
+            rows: [
+                row("claude> ああ", cols: 24)
+            ],
+            cursorRow: 0,
+            cursorCol: 12
+        )
+        let current = snapshot(
+            rows: [
+                row("claude> あ", cols: 24)
+            ],
+            cursorRow: 0,
+            cursorCol: 10
+        )
+        let intent = CommittedTextAnimationIntent(
+            kind: .deleteBackward,
+            text: "あ",
+            row: 0,
+            col: 10,
+            columnWidth: 2,
+            cursorRow: 0,
+            cursorCol: 10,
+            capturedAt: 0,
+            expiresAt: 1,
+            baselineSnapshot: baseline
+        )
+
+        let evaluation = CommittedTextAnimationMatcher.evaluate(intent, currentSnapshot: current, now: 0.1)
+
+        XCTAssertEqual(
+            evaluation,
+            .matched(
+                CommittedTextAnimationMatch(
+                    text: "あ",
+                    row: 0,
+                    col: 10,
+                    columnWidth: 2,
+                    cursorRow: 0,
+                    cursorCol: 10,
+                    kind: .fadeOut
+                )
+            )
+        )
+    }
+
     private func snapshot(
         rows: [[TerminalViewportTextSnapshot.Cell]],
         cursorRow: Int,
@@ -845,11 +891,22 @@ final class CommittedTextAnimationMatcherTests: XCTestCase {
     }
 
     private func row(_ text: String, cols: Int) -> [TerminalViewportTextSnapshot.Cell] {
-        let scalars = Array(text)
-        return (0..<cols).map { index in
-            guard index < scalars.count else { return .empty }
-            return .scalar(scalars[index])
+        var cells: [TerminalViewportTextSnapshot.Cell] = []
+        cells.reserveCapacity(cols)
+        for character in text {
+            let scalar = character.unicodeScalars.first!.value
+            let width = max(CharacterWidth.width(of: scalar), 1)
+            cells.append(.init(codepoint: scalar, width: width, isWideContinuation: false))
+            if width > 1 {
+                for _ in 1..<width {
+                    cells.append(.init(codepoint: 0, width: 1, isWideContinuation: true))
+                }
+            }
         }
+        if cells.count < cols {
+            cells.append(contentsOf: Array(repeating: .empty, count: cols - cells.count))
+        }
+        return Array(cells.prefix(cols))
     }
 }
 

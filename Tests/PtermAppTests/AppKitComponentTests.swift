@@ -1745,6 +1745,135 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(view.debugPendingCommittedTextIntentCount, 1)
     }
 
+    func testTerminalViewKeyDownFallbackDeleteIntentUsesLastCharacterOfRecentMulticharInsertion() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 80,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = false
+
+        view.insertText("あああ", replacementRange: NSRange(location: NSNotFound, length: 0))
+        controller.withModel { model in
+            for col in 0..<model.cols {
+                model.grid.setCell(.empty, at: 0, col: col)
+            }
+            model.cursor.row = 0
+            model.cursor.col = 0
+        }
+
+        view.outputConfirmedInputAnimationsEnabled = true
+        view.debugSetSuppressInterpretKeyEvents(true)
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: String(UnicodeScalar(0x7F)!),
+            charactersIgnoringModifiers: String(UnicodeScalar(0x7F)!),
+            isARepeat: false,
+            keyCode: 51
+        ))
+
+        view.keyDown(with: event)
+
+        XCTAssertEqual(view.debugPendingCommittedTextIntentCount, 1)
+        XCTAssertEqual(view.debugLastPendingCommittedTextIntentText, "あ")
+    }
+
+    func testTerminalViewOutputConfirmedInsertSeedsRecentHistoryForLaterWideDelete() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 80,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = true
+
+        view.insertText("あああ", replacementRange: NSRange(location: NSNotFound, length: 0))
+        controller.withModel { model in
+            for col in 0..<model.cols {
+                model.grid.setCell(.empty, at: 0, col: col)
+            }
+            model.cursor.row = 0
+            model.cursor.col = 0
+        }
+
+        view.debugSetSuppressInterpretKeyEvents(true)
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: String(UnicodeScalar(0x7F)!),
+            charactersIgnoringModifiers: String(UnicodeScalar(0x7F)!),
+            isARepeat: false,
+            keyCode: 51
+        ))
+
+        view.keyDown(with: event)
+
+        XCTAssertEqual(view.debugPendingCommittedTextIntentCount, 2)
+        XCTAssertEqual(view.debugLastPendingCommittedTextIntentText, "あ")
+    }
+
+    func testTerminalViewOutputConfirmedIMECommitEnqueuesInsertIntentAfterUnmarking() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 80,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 160), renderer: renderer)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = true
+
+        view.setMarkedText("あああ", selectedRange: NSRange(location: 3, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(view.hasMarkedText())
+
+        view.insertText("あああ", replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertEqual(view.debugPendingCommittedTextIntentCount, 1)
+        XCTAssertEqual(view.debugLastPendingCommittedTextIntentText, "あああ")
+        XCTAssertFalse(view.hasMarkedText())
+    }
+
     func testTerminalViewUnmarkTextClearsIMEOverlayAndSelectionState() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(
