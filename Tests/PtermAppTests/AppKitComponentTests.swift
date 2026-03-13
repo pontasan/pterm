@@ -554,9 +554,13 @@ final class AppKitComponentTests: XCTestCase {
         let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
 
         XCTAssertEqual(view.colorPixelFormat, .bgra8Unorm_srgb)
+        XCTAssertTrue(view.framebufferOnly)
         let metalLayer = try XCTUnwrap(view.layer as? CAMetalLayer)
         XCTAssertEqual(metalLayer.pixelFormat, .bgra8Unorm_srgb)
         XCTAssertEqual(metalLayer.colorspace?.name as String?, CGColorSpace.sRGB as String)
+        if #available(macOS 10.13.2, *) {
+            XCTAssertEqual(metalLayer.maximumDrawableCount, 2)
+        }
     }
 
     func testMetalRendererTerminalClearColorLinearizesSRGBBackground() throws {
@@ -618,6 +622,17 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(size.height, 200, accuracy: 0.0001)
     }
 
+    func testTerminalViewImagePreviewWindowIsReleasedWhenPreviewHides() throws {
+        let renderer = try makeRendererOrSkip()
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 200), renderer: renderer)
+
+        view.debugInstallImagePreviewWindowForTesting()
+        XCTAssertTrue(view.hasActiveImagePreviewWindow)
+
+        view.debugReleaseImagePreviewWindowNow()
+        XCTAssertFalse(view.hasActiveImagePreviewWindow)
+    }
+
     func testIntegratedViewUsesSRGBRenderTargetConfiguration() throws {
         let renderer = try makeRendererOrSkip()
         let manager = TerminalManager(rows: 24, cols: 80, config: .default)
@@ -625,9 +640,233 @@ final class AppKitComponentTests: XCTestCase {
         let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), renderer: renderer, manager: manager)
 
         XCTAssertEqual(view.colorPixelFormat, .bgra8Unorm_srgb)
+        XCTAssertTrue(view.framebufferOnly)
         let metalLayer = try XCTUnwrap(view.layer as? CAMetalLayer)
         XCTAssertEqual(metalLayer.pixelFormat, .bgra8Unorm_srgb)
         XCTAssertEqual(metalLayer.colorspace?.name as String?, CGColorSpace.sRGB as String)
+        if #available(macOS 10.13.2, *) {
+            XCTAssertEqual(metalLayer.maximumDrawableCount, 2)
+        }
+    }
+
+    func testGlyphAtlasStartsAtSmallTextureAndGrowsOnlyWhenNeeded() throws {
+        let renderer = try makeRendererOrSkip()
+        let atlas = GlyphAtlas(
+            device: renderer.device,
+            fontSize: 11,
+            scaleFactor: 2.0,
+            initialAtlasDimension: 32,
+            maxAtlasDimension: 128,
+            prerasterizeASCII: false
+        )
+
+        XCTAssertEqual(atlas.atlasDimension, 32)
+        XCTAssertNil(atlas.texturePixelSize)
+
+        _ = atlas.glyphInfo(for: 65)
+
+        var codepoint: UInt32 = 0x80
+        while atlas.atlasDimension == 32 && codepoint < 0x400 {
+            _ = atlas.glyphInfo(for: codepoint)
+            codepoint += 1
+        }
+
+        XCTAssertGreaterThan(atlas.atlasDimension, 32)
+        XCTAssertNotNil(atlas.glyphCache[65])
+        XCTAssertEqual(
+            atlas.texturePixelSize?.width,
+            atlas.atlasDimension * Int(max(atlas.scaleFactor, 2.0))
+        )
+    }
+
+    func testGlyphAtlasGrowthUsesSmallerStepThanDoubling() throws {
+        let renderer = try makeRendererOrSkip()
+        let atlas = GlyphAtlas(
+            device: renderer.device,
+            fontSize: 11,
+            scaleFactor: 2.0,
+            initialAtlasDimension: 32,
+            maxAtlasDimension: 128,
+            prerasterizeASCII: false
+        )
+
+        var codepoint: UInt32 = 0x80
+        while atlas.atlasDimension == 32 && codepoint < 0x400 {
+            _ = atlas.glyphInfo(for: codepoint)
+            codepoint += 1
+        }
+
+        XCTAssertEqual(atlas.atlasDimension, 48)
+        XCTAssertEqual(atlas.texturePixelSize?.width, 96)
+        XCTAssertEqual(atlas.texturePixelSize?.height, 96)
+    }
+
+    func testGlyphAtlasResetToMinimumClearsCacheAndRestoresInitialTextureSize() throws {
+        let renderer = try makeRendererOrSkip()
+        let atlas = GlyphAtlas(
+            device: renderer.device,
+            fontSize: 11,
+            scaleFactor: 2.0,
+            initialAtlasDimension: 32,
+            maxAtlasDimension: 128,
+            prerasterizeASCII: false
+        )
+
+        var codepoint: UInt32 = 0x80
+        while atlas.atlasDimension == 32 && codepoint < 0x400 {
+            _ = atlas.glyphInfo(for: codepoint)
+            codepoint += 1
+        }
+        XCTAssertGreaterThan(atlas.atlasDimension, 32)
+        XCTAssertGreaterThan(atlas.glyphCache.count, 0)
+
+        atlas.resetToMinimum()
+
+        XCTAssertEqual(atlas.atlasDimension, 32)
+        XCTAssertNil(atlas.texturePixelSize)
+        XCTAssertEqual(atlas.glyphCache.count, 0)
+    }
+
+    func testGlyphAtlasDoesNotSeedASCIIByDefault() throws {
+        let renderer = try makeRendererOrSkip()
+        let atlas = GlyphAtlas(
+            device: renderer.device,
+            fontSize: 11,
+            scaleFactor: 2.0
+        )
+
+        XCTAssertEqual(atlas.glyphCache.count, 0)
+        XCTAssertNil(atlas.glyphCache[65])
+        XCTAssertNil(atlas.texturePixelSize)
+    }
+
+    func testGlyphAtlasAllocatesTextureOnlyWhenFirstGlyphIsRasterized() throws {
+        let renderer = try makeRendererOrSkip()
+        let atlas = GlyphAtlas(
+            device: renderer.device,
+            fontSize: 11,
+            scaleFactor: 2.0,
+            initialAtlasDimension: 32,
+            maxAtlasDimension: 128,
+            prerasterizeASCII: false
+        )
+
+        XCTAssertNil(atlas.texturePixelSize)
+
+        _ = atlas.glyphInfo(for: 65)
+
+        XCTAssertEqual(atlas.texturePixelSize?.width, 64)
+        XCTAssertEqual(atlas.texturePixelSize?.height, 64)
+    }
+
+    func testGlyphAtlasDefersCommandQueueAllocationUntilSynchronizationIsNeeded() throws {
+        let renderer = try makeRendererOrSkip()
+        let atlas = GlyphAtlas(
+            device: renderer.device,
+            fontSize: 11,
+            scaleFactor: 2.0,
+            initialAtlasDimension: 32,
+            maxAtlasDimension: 128,
+            prerasterizeASCII: false
+        )
+
+        XCTAssertFalse(atlas.debugHasCommandQueue)
+
+        _ = atlas.glyphInfo(for: 65)
+
+        if renderer.device.hasUnifiedMemory {
+            XCTAssertFalse(atlas.debugHasCommandQueue)
+        }
+    }
+
+    func testGlyphAtlasDefaultInitialAllocationUsesCompactTextureSize() throws {
+        let renderer = try makeRendererOrSkip()
+        let atlas = GlyphAtlas(
+            device: renderer.device,
+            fontSize: 11,
+            scaleFactor: 2.0
+        )
+
+        XCTAssertNil(atlas.texturePixelSize)
+
+        _ = atlas.glyphInfo(for: 65)
+
+        XCTAssertEqual(atlas.atlasDimension, 128)
+        XCTAssertEqual(atlas.texturePixelSize?.width, 256)
+        XCTAssertEqual(atlas.texturePixelSize?.height, 256)
+    }
+
+    func testGlyphAtlasPrerasterizedASCIICanBeDisabledAcrossRebuilds() throws {
+        let renderer = try makeRendererOrSkip()
+        let atlas = GlyphAtlas(
+            device: renderer.device,
+            fontSize: 11,
+            scaleFactor: 2.0,
+            prerasterizeASCII: false
+        )
+
+        _ = atlas.glyphInfo(for: 65)
+        XCTAssertNotNil(atlas.glyphCache[65])
+
+        atlas.updateScaleFactor(1.0)
+
+        XCTAssertEqual(Set(atlas.glyphCache.keys), [65])
+    }
+
+    func testGlyphAtlasIdleCompactionDropsUnusedGlyphsAndCanShrinkTexture() throws {
+        let renderer = try makeRendererOrSkip()
+        let atlas = GlyphAtlas(
+            device: renderer.device,
+            fontSize: 11,
+            scaleFactor: 2.0,
+            initialAtlasDimension: 32,
+            maxAtlasDimension: 128,
+            prerasterizeASCII: false
+        )
+
+        _ = atlas.glyphInfo(for: 65)
+        var codepoint: UInt32 = 0x80
+        while atlas.atlasDimension == 32 && codepoint < 0x400 {
+            _ = atlas.glyphInfo(for: codepoint)
+            codepoint += 1
+        }
+        let grownDimension = atlas.atlasDimension
+        let grownPixelSize = atlas.texturePixelSize
+        XCTAssertGreaterThan(grownDimension, 32)
+        XCTAssertGreaterThan(atlas.glyphCache.count, 1)
+
+        for _ in 0..<64 {
+            _ = atlas.glyphInfo(for: 65)
+        }
+        XCTAssertTrue(atlas.compactRetainingRecentlyUsedGlyphs(maximumInactiveGenerations: 8))
+
+        XCTAssertEqual(Set(atlas.glyphCache.keys), [65])
+        XCTAssertLessThan(atlas.atlasDimension, grownDimension)
+        XCTAssertLessThan(atlas.texturePixelSize?.width ?? .max, grownPixelSize?.width ?? .max)
+        XCTAssertLessThan(atlas.texturePixelSize?.height ?? .max, grownPixelSize?.height ?? .max)
+    }
+
+    func testGlyphAtlasCompactionRetainsMostRecentlyTouchedGlyph() throws {
+        let renderer = try makeRendererOrSkip()
+        let atlas = GlyphAtlas(
+            device: renderer.device,
+            fontSize: 11,
+            scaleFactor: 2.0,
+            initialAtlasDimension: 32,
+            maxAtlasDimension: 128,
+            prerasterizeASCII: false
+        )
+
+        _ = atlas.glyphInfo(for: 65)
+        _ = atlas.glyphInfo(for: 66)
+        XCTAssertEqual(Set(atlas.glyphCache.keys), [65, 66])
+
+        for _ in 0..<64 {
+            _ = atlas.glyphInfo(for: 66)
+        }
+
+        XCTAssertTrue(atlas.compactRetainingRecentlyUsedGlyphs(maximumInactiveGenerations: 8))
+        XCTAssertEqual(Set(atlas.glyphCache.keys), [66])
     }
 
     func testIntegratedViewCloseButtonColorUsesDisplayP3ToSRGBConversion() {
@@ -716,9 +955,13 @@ final class AppKitComponentTests: XCTestCase {
         let view = SplitRenderView(frame: NSRect(x: 0, y: 0, width: 480, height: 280), renderer: renderer)
 
         XCTAssertEqual(view.colorPixelFormat, .bgra8Unorm_srgb)
+        XCTAssertTrue(view.framebufferOnly)
         let metalLayer = try XCTUnwrap(view.layer as? CAMetalLayer)
         XCTAssertEqual(metalLayer.pixelFormat, .bgra8Unorm_srgb)
         XCTAssertEqual(metalLayer.colorspace?.name as String?, CGColorSpace.sRGB as String)
+        if #available(macOS 10.13.2, *) {
+            XCTAssertEqual(metalLayer.maximumDrawableCount, 2)
+        }
     }
 
     func testSplitRenderViewStartsInDemandDrivenRenderingMode() throws {
@@ -896,6 +1139,155 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertGreaterThan(textLayer?.frame.width ?? 0, 0)
     }
 
+    func testTerminalViewDoesNotCreateMarkedTextLayerUntilIMECompositionBegins() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        XCTAssertTrue(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.isEmpty ?? true)
+        XCTAssertFalse(view.debugHasMarkedTextStorage)
+
+        view.setMarkedText("かな", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertEqual(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.count, 1)
+        XCTAssertTrue(view.debugHasMarkedTextStorage)
+    }
+
+    func testTerminalViewReleasesMarkedTextStorageWhenCompositionEnds() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        XCTAssertFalse(view.debugHasMarkedTextStorage)
+        view.setMarkedText("かな", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(view.debugHasMarkedTextStorage)
+
+        view.unmarkText()
+        XCTAssertFalse(view.debugHasMarkedTextStorage)
+
+        view.setMarkedText("かな", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(view.debugHasMarkedTextStorage)
+        view.insertText("かな", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertFalse(view.debugHasMarkedTextStorage)
+    }
+
+    func testTerminalViewDefersKeyboardHandlerAllocationUntilInputHandlingBegins() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        XCTAssertFalse(view.debugHasKeyboardHandler)
+        view.doCommand(by: #selector(NSResponder.insertTab(_:)))
+        XCTAssertTrue(view.debugHasKeyboardHandler)
+    }
+
+    func testTerminalViewIdlePurgeReleasesKeyboardHandlerAndRecreatesItOnNextInput() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        view.doCommand(by: #selector(NSResponder.insertTab(_:)))
+        XCTAssertTrue(view.debugHasKeyboardHandler)
+
+        view.debugReleaseIdleBuffersNow()
+        XCTAssertFalse(view.debugHasKeyboardHandler)
+
+        view.doCommand(by: #selector(NSResponder.insertTab(_:)))
+        XCTAssertTrue(view.debugHasKeyboardHandler)
+    }
+
+    func testTerminalViewInactiveReleaseReleasesKeyboardHandler() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        view.doCommand(by: #selector(NSResponder.insertTab(_:)))
+        XCTAssertTrue(view.debugHasKeyboardHandler)
+
+        view.releaseInactiveRenderingResourcesNow()
+        XCTAssertFalse(view.debugHasKeyboardHandler)
+    }
+
     func testTerminalViewInsertTextClearsMarkedTextAndHidesIMEOverlay() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(
@@ -920,10 +1312,9 @@ final class AppKitComponentTests: XCTestCase {
         view.setMarkedText("かな", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
         view.insertText("仮名", replacementRange: NSRange(location: NSNotFound, length: 0))
 
-        let textLayer = view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first
         XCTAssertFalse(view.hasMarkedText())
         XCTAssertEqual(view.markedRange(), NSRange(location: NSNotFound, length: 0))
-        XCTAssertEqual(textLayer?.isHidden, true)
+        XCTAssertTrue(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.isEmpty ?? true)
     }
 
     func testTerminalViewUnmarkTextClearsIMEOverlayAndSelectionState() throws {
@@ -950,11 +1341,10 @@ final class AppKitComponentTests: XCTestCase {
         view.setMarkedText("未確定", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
         view.unmarkText()
 
-        let textLayer = view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first
         XCTAssertFalse(view.hasMarkedText())
         XCTAssertEqual(view.markedRange(), NSRange(location: NSNotFound, length: 0))
         XCTAssertEqual(view.selectedRange(), NSRange(location: 0, length: 0))
-        XCTAssertEqual(textLayer?.isHidden, true)
+        XCTAssertTrue(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.isEmpty ?? true)
     }
 
     func testTerminalViewAttributedSubstringReturnsRequestedMarkedTextSegment() throws {
@@ -1111,11 +1501,9 @@ final class AppKitComponentTests: XCTestCase {
         view.viewDidChangeBackingProperties()
         view.insertText("仮名", replacementRange: NSRange(location: NSNotFound, length: 0))
 
-        let textLayer = try XCTUnwrap(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first)
         XCTAssertFalse(view.hasMarkedText())
         XCTAssertEqual(renderer.glyphAtlas.scaleFactor, 2.0)
-        XCTAssertEqual(textLayer.contentsScale, 2.0)
-        XCTAssertTrue(textLayer.isHidden)
+        XCTAssertTrue(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.isEmpty ?? true)
     }
 
     func testTerminalViewUnmarkTextAfterDisplayScaleChangeClearsOverlayWhileKeepingUpdatedScale() throws {
@@ -1143,11 +1531,38 @@ final class AppKitComponentTests: XCTestCase {
         view.viewDidChangeBackingProperties()
         view.unmarkText()
 
-        let textLayer = try XCTUnwrap(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first)
         XCTAssertFalse(view.hasMarkedText())
         XCTAssertEqual(renderer.glyphAtlas.scaleFactor, 2.5)
-        XCTAssertEqual(textLayer.contentsScale, 2.5)
-        XCTAssertTrue(textLayer.isHidden)
+        XCTAssertTrue(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.isEmpty ?? true)
+    }
+
+    func testTerminalViewUnmarkTextReleasesMarkedTextLayerStorage() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        view.setMarkedText("未確定", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertEqual(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.count, 1)
+
+        view.unmarkText()
+
+        XCTAssertTrue(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.isEmpty ?? true)
     }
 
     func testTerminalViewAttributedSubstringAfterDisplayScaleChangePreservesMarkedTextRange() throws {
@@ -1296,6 +1711,8 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(allSubviews(in: view).contains { String(describing: type(of: $0)) == "SplitRenderView" })
         XCTAssertEqual(view.activeController?.id, controllers.first?.id)
         XCTAssertTrue(scrollViews.allSatisfy { $0.frame.width > 0 && $0.frame.height > 0 })
+        XCTAssertTrue(scrollViews.allSatisfy { $0.terminalView.renderingSuppressed })
+        XCTAssertTrue(scrollViews.allSatisfy { $0.terminalView.drawableSize == .zero })
     }
 
     func testSplitTerminalContainerUpdateControllersRebuildsSubviewCount() throws {
@@ -1334,6 +1751,166 @@ final class AppKitComponentTests: XCTestCase {
         let scrollViews = allSubviews(in: view).compactMap { $0 as? TerminalScrollView }
         XCTAssertEqual(scrollViews.count, 4)
         XCTAssertEqual(view.activeController?.id, replacement.first?.id)
+        XCTAssertTrue(scrollViews.allSatisfy { $0.terminalView.drawableSize == .zero })
+    }
+
+    func testTerminalViewSuppressedRenderingReleasesBuffersAndDrawableStorage() throws {
+        let renderer = try makeRendererOrSkip()
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 200), renderer: renderer)
+
+        view.syncScaleFactorIfNeeded()
+        XCTAssertGreaterThan(view.drawableSize.width, 0)
+
+        _ = renderer.reusableBuffer(
+            for: view,
+            slot: .overviewTextGlyph,
+            vertices: Array(repeating: 1, count: 256)
+        )
+        XCTAssertNotNil(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
+
+        view.renderingSuppressed = true
+
+        XCTAssertEqual(view.drawableSize, .zero)
+        XCTAssertNil(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
+        XCTAssertTrue(view.isPaused)
+        XCTAssertFalse(view.enableSetNeedsDisplay)
+
+        view.renderingSuppressed = false
+
+        XCTAssertGreaterThan(view.drawableSize.width, 0)
+        XCTAssertTrue(view.isPaused)
+        XCTAssertTrue(view.enableSetNeedsDisplay)
+    }
+
+    func testTerminalViewIdlePurgeReleasesReusableBuffersAfterRenderedFrame() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let controller = TerminalController(
+            rows: 6,
+            cols: 24,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/idle-terminal"
+        )
+        controller.withModel { model in
+            for (column, scalar) in "terminal idle purge".unicodeScalars.enumerated() {
+                model.grid.setCell(Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: column)
+            }
+        }
+
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 200), renderer: renderer)
+        view.terminalController = controller
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        window.makeKeyAndOrderFront(nil)
+        drainMainQueue(testCase: self)
+
+        renderFrame(for: view)
+
+        XCTAssertTrue(renderer.hasTerminalBuffers(for: view))
+        XCTAssertGreaterThan(renderer.terminalScrollbackScratchRowCapacity(for: view), 0)
+        XCTAssertGreaterThan(renderer.terminalSearchScratchRowCapacity(for: view), 0)
+
+        view.debugReleaseIdleBuffersNow()
+
+        XCTAssertFalse(renderer.hasTerminalBuffers(for: view))
+        XCTAssertEqual(view.drawableSize, .zero)
+        XCTAssertEqual(renderer.terminalScrollbackScratchRowCapacity(for: view), 0)
+        XCTAssertEqual(renderer.terminalSearchScratchRowCapacity(for: view), 0)
+        XCTAssertEqual(renderer.terminalScrollbackScratchBufferedCellCount(for: view), 0)
+
+        view.setNeedsDisplay(view.bounds)
+
+        XCTAssertGreaterThan(view.drawableSize.width, 0)
+        XCTAssertGreaterThan(view.drawableSize.height, 0)
+    }
+
+    func testTerminalViewInactiveReleaseDropsDrawableAndBuffersImmediately() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let controller = TerminalController(
+            rows: 6,
+            cols: 24,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/inactive-terminal"
+        )
+        controller.withModel { model in
+            for (column, scalar) in "inactive release".unicodeScalars.enumerated() {
+                model.grid.setCell(Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: column)
+            }
+        }
+
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 200), renderer: renderer)
+        view.terminalController = controller
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        window.makeKeyAndOrderFront(nil)
+        drainMainQueue(testCase: self)
+
+        renderFrame(for: view)
+        XCTAssertTrue(renderer.hasTerminalBuffers(for: view))
+        XCTAssertGreaterThan(view.drawableSize.width, 0)
+        XCTAssertGreaterThan(renderer.terminalScrollbackScratchRowCapacity(for: view), 0)
+        XCTAssertGreaterThan(renderer.terminalSearchScratchRowCapacity(for: view), 0)
+
+        view.releaseInactiveRenderingResourcesNow()
+
+        XCTAssertFalse(renderer.hasTerminalBuffers(for: view))
+        XCTAssertEqual(view.drawableSize, .zero)
+        XCTAssertEqual(renderer.terminalScrollbackScratchRowCapacity(for: view), 0)
+        XCTAssertEqual(renderer.terminalSearchScratchRowCapacity(for: view), 0)
+        XCTAssertEqual(renderer.terminalScrollbackScratchBufferedCellCount(for: view), 0)
+
+        view.setNeedsDisplay(view.bounds)
+        XCTAssertGreaterThan(view.drawableSize.width, 0)
+        XCTAssertGreaterThan(view.drawableSize.height, 0)
+    }
+
+    func testTerminalViewMemoryPressureCompactionReleasesReusableBuffersWithoutDiscardingVisibleDrawable() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let controller = TerminalController(
+            rows: 6,
+            cols: 24,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/memory-pressure"
+        )
+        controller.withModel { model in
+            for (column, scalar) in "memory pressure".unicodeScalars.enumerated() {
+                model.grid.setCell(Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: column)
+            }
+        }
+
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 180), renderer: renderer)
+        view.terminalController = controller
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        window.makeKeyAndOrderFront(nil)
+        drainMainQueue(testCase: self)
+
+        renderFrame(for: view)
+        let originalDrawableSize = view.drawableSize
+        XCTAssertTrue(renderer.hasTerminalBuffers(for: view))
+        XCTAssertGreaterThan(originalDrawableSize.width, 0)
+
+        view.compactForMemoryPressureNow()
+
+        XCTAssertFalse(renderer.hasTerminalBuffers(for: view))
+        XCTAssertEqual(view.drawableSize, originalDrawableSize)
     }
 
     func testSplitTerminalContainerFontChangeKeepsOverlayAndControllerCountStable() throws {
@@ -2207,6 +2784,47 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(view.enableSetNeedsDisplay)
     }
 
+    func testIntegratedViewDeinitReleasesRendererBuffers() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        weak var weakView: IntegratedView?
+
+        XCTAssertEqual(renderer.activeViewBufferCount, 0)
+
+        autoreleasepool {
+            let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+            defer { manager.stopAll(waitForExit: true) }
+            _ = try? manager.addTerminal(
+                initialDirectory: NSTemporaryDirectory(),
+                workspaceName: "WS",
+                fontName: renderer.glyphAtlas.fontName,
+                fontSize: Double(renderer.glyphAtlas.fontSize)
+            )
+
+            let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+            let contentView = NSView(frame: window.frame)
+            window.contentView = contentView
+
+            do {
+                let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+                weakView = view
+                contentView.addSubview(view)
+                let overlay = ScrollbarOverlayView(frame: view.frame)
+                overlay.documentView = ScrollDocumentView(frame: view.bounds)
+                overlay.contentView.postsBoundsChangedNotifications = true
+                view.companionScrollView = overlay
+
+                renderFrame(for: view)
+                XCTAssertGreaterThan(renderer.activeViewBufferCount, 0)
+            }
+
+            contentView.subviews.forEach { $0.removeFromSuperview() }
+        }
+
+        drainMainQueue(testCase: self)
+        XCTAssertNil(weakView)
+        XCTAssertEqual(renderer.activeViewBufferCount, 0)
+    }
+
     func testIntegratedViewCachesOnlyVisibleWorkspaceLayoutsForDrawing() throws {
         let renderer = try makeRendererWithPipelinesOrSkip()
         let manager = TerminalManager(rows: 24, cols: 80, config: .default)
@@ -2235,6 +2853,750 @@ final class AppKitComponentTests: XCTestCase {
         let visibleLayouts = reflectedVisibleWorkspaceLayouts(from: view)
         XCTAssertGreaterThan(allLayouts.count, visibleLayouts.count)
         XCTAssertTrue(visibleLayouts.allSatisfy { $0.frame.intersects(view.bounds) })
+    }
+
+    func testIntegratedViewPrunesOversizedTextVertexCache() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+
+        _ = renderer.reusableBuffer(
+            for: view,
+            slot: .overviewTextGlyph,
+            vertices: Array(repeating: 1, count: 4_096)
+        )
+        XCTAssertNotNil(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
+
+        view.debugPrimeTextVertexCache(texts: (0..<300).map { "Label-\($0)" })
+        XCTAssertGreaterThan(view.cachedTextVertexCount, 0)
+
+        view.terminalListDidChange()
+
+        XCTAssertLessThanOrEqual(view.cachedTextVertexCount, 256)
+        XCTAssertNil(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
+    }
+
+    func testIntegratedViewPrunesOversizedTextVertexCacheByByteBudget() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+
+        _ = renderer.reusableBuffer(
+            for: view,
+            slot: .overviewTextGlyph,
+            vertices: Array(repeating: 1, count: 4_096)
+        )
+        XCTAssertNotNil(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
+
+        view.debugInsertOversizedTextVertexCacheEntry(text: "huge-1", floatCount: 400_000)
+        view.debugInsertOversizedTextVertexCacheEntry(text: "huge-2", floatCount: 400_000)
+        let softByteLimit = IntegratedView.effectiveTextVertexSoftByteLimit(visibleTerminalCount: 0)
+        XCTAssertGreaterThan(view.cachedTextVertexBytes, softByteLimit)
+
+        view.terminalListDidChange()
+
+        XCTAssertLessThanOrEqual(view.cachedTextVertexBytes, softByteLimit)
+        XCTAssertNil(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
+    }
+
+    func testIntegratedViewPrunesThumbnailVertexCacheTowardVisibleTerminals() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        for index in 0..<80 {
+            _ = try manager.addTerminal(
+                initialDirectory: NSTemporaryDirectory(),
+                workspaceName: "WS-\(index)",
+                fontName: renderer.glyphAtlas.fontName,
+                fontSize: Double(renderer.glyphAtlas.fontSize)
+            )
+        }
+
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: view.frame)
+        window.contentView?.addSubview(view)
+        let overlay = ScrollbarOverlayView(frame: view.frame)
+        overlay.documentView = ScrollDocumentView(frame: view.bounds)
+        overlay.contentView.postsBoundsChangedNotifications = true
+        view.companionScrollView = overlay
+
+        renderFrame(for: view)
+        let visibleTerminalCount = reflectedVisibleWorkspaceLayouts(from: view).flatMap(\.terminals).count
+
+        _ = renderer.reusableBuffer(
+            for: view,
+            slot: .overviewThumbnailGlyph,
+            vertices: Array(repeating: 1, count: 4_096)
+        )
+        XCTAssertNotNil(renderer.bufferLength(for: view, slot: .overviewThumbnailGlyph))
+
+        view.debugPrimeThumbnailVertexCache(scaleFactor: 2.25)
+        let primedCount = view.cachedThumbnailVertexCount
+        XCTAssertGreaterThan(primedCount, 0)
+
+        view.terminalListDidChange()
+
+        XCTAssertLessThanOrEqual(view.cachedThumbnailVertexCount, primedCount)
+        XCTAssertLessThanOrEqual(
+            view.cachedThumbnailVertexCount,
+            IntegratedView.effectiveThumbnailVertexSoftLimit(preferredTerminalCount: visibleTerminalCount)
+        )
+        XCTAssertNil(renderer.bufferLength(for: view, slot: .overviewThumbnailGlyph))
+    }
+
+    func testIntegratedViewPrunesThumbnailVertexCacheByByteBudget() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        for index in 0..<40 {
+            _ = try manager.addTerminal(
+                initialDirectory: NSTemporaryDirectory(),
+                workspaceName: "WS-\(index)",
+                fontName: renderer.glyphAtlas.fontName,
+                fontSize: Double(renderer.glyphAtlas.fontSize)
+            )
+        }
+
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: view.frame)
+        window.contentView?.addSubview(view)
+        let overlay = ScrollbarOverlayView(frame: view.frame)
+        overlay.documentView = ScrollDocumentView(frame: view.bounds)
+        overlay.contentView.postsBoundsChangedNotifications = true
+        view.companionScrollView = overlay
+
+        renderFrame(for: view)
+
+        _ = renderer.reusableBuffer(
+            for: view,
+            slot: .overviewThumbnailGlyph,
+            vertices: Array(repeating: 1, count: 4_096)
+        )
+        XCTAssertNotNil(renderer.bufferLength(for: view, slot: .overviewThumbnailGlyph))
+
+        view.debugInsertOversizedThumbnailVertexCacheEntries(floatCountPerEntry: 120_000)
+        let softByteLimit = IntegratedView.effectiveThumbnailVertexSoftByteLimit(
+            preferredTerminalCount: reflectedVisibleWorkspaceLayouts(from: view).flatMap(\.terminals).count
+        )
+        XCTAssertGreaterThan(view.cachedThumbnailVertexBytes, softByteLimit)
+
+        view.terminalListDidChange()
+
+        XCTAssertLessThanOrEqual(view.cachedThumbnailVertexBytes, softByteLimit)
+        XCTAssertNil(renderer.bufferLength(for: view, slot: .overviewThumbnailGlyph))
+    }
+
+    func testIntegratedViewDynamicTextVertexByteBudgetScalesWithVisibleTerminalCount() {
+        XCTAssertEqual(IntegratedView.effectiveTextVertexSoftByteLimit(visibleTerminalCount: 0), 256 * 1024)
+        XCTAssertEqual(IntegratedView.effectiveTextVertexSoftByteLimit(visibleTerminalCount: 2), 256 * 1024)
+        XCTAssertEqual(IntegratedView.effectiveTextVertexSoftByteLimit(visibleTerminalCount: 16), 512 * 1024)
+        XCTAssertEqual(IntegratedView.effectiveTextVertexSoftByteLimit(visibleTerminalCount: 64), 2 * 1024 * 1024)
+        XCTAssertEqual(IntegratedView.effectiveTextVertexSoftByteLimit(visibleTerminalCount: 256), 2 * 1024 * 1024)
+    }
+
+    func testIntegratedViewTransientTextRenderingDoesNotPopulateTextVertexCache() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+
+        view.debugPrimeTextVertexCache(texts: ["Stable"])
+        let cachedCountBefore = view.cachedTextVertexCount
+        let cachedBytesBefore = view.cachedTextVertexBytes
+
+        let transientVertexCount = view.debugAppendTransientTextVertices(text: "CPU: 17.3%")
+
+        XCTAssertGreaterThan(transientVertexCount, 0)
+        XCTAssertEqual(view.cachedTextVertexCount, cachedCountBefore)
+        XCTAssertEqual(view.cachedTextVertexBytes, cachedBytesBefore)
+    }
+
+    func testIntegratedViewCachedTextVerticesDropMostReserveCapacitySlack() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+
+        view.debugPrimeTextVertexCache(texts: ["A reasonably long cacheable title string"])
+
+        XCTAssertGreaterThan(view.cachedTextVertexBytes, 0)
+        XCTAssertLessThanOrEqual(
+            view.cachedTextVertexStorageBytes - view.cachedTextVertexBytes,
+            128
+        )
+    }
+
+    func testIntegratedViewDynamicThumbnailVertexBudgetsScaleWithVisibleTerminalCount() {
+        XCTAssertEqual(IntegratedView.effectiveThumbnailVertexSoftLimit(preferredTerminalCount: 0), 8)
+        XCTAssertEqual(IntegratedView.effectiveThumbnailVertexSoftLimit(preferredTerminalCount: 3), 8)
+        XCTAssertEqual(IntegratedView.effectiveThumbnailVertexSoftLimit(preferredTerminalCount: 12), 24)
+
+        XCTAssertEqual(IntegratedView.effectiveThumbnailVertexSoftByteLimit(preferredTerminalCount: 0), 1 * 1024 * 1024)
+        XCTAssertEqual(IntegratedView.effectiveThumbnailVertexSoftByteLimit(preferredTerminalCount: 4), 1 * 1024 * 1024)
+        XCTAssertEqual(IntegratedView.effectiveThumbnailVertexSoftByteLimit(preferredTerminalCount: 16), 2 * 1024 * 1024)
+        XCTAssertEqual(IntegratedView.effectiveThumbnailVertexSoftByteLimit(preferredTerminalCount: 128), 12 * 1024 * 1024)
+    }
+
+    func testIntegratedViewTerminalListDidChangeWithNoTerminalsReleasesOverviewCachesAndBuffers() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+
+        view.debugPrimeTextVertexCache(texts: ["Alpha", "Beta", "Gamma"])
+        view.debugEnsureLayoutCache()
+        _ = renderer.reusableBuffer(
+            for: view,
+            slot: .overviewTextGlyph,
+            vertices: Array(repeating: 1, count: 512)
+        )
+        _ = renderer.reusableBuffer(
+            for: view,
+            slot: .overviewThumbnailGlyph,
+            vertices: Array(repeating: 1, count: 512)
+        )
+
+        XCTAssertGreaterThan(view.cachedTextVertexCount, 0)
+        XCTAssertNotNil(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
+        XCTAssertNotNil(renderer.bufferLength(for: view, slot: .overviewThumbnailGlyph))
+
+        view.terminalListDidChange()
+
+        XCTAssertEqual(view.cachedTextVertexCount, 0)
+        XCTAssertEqual(view.cachedThumbnailVertexCount, 0)
+        XCTAssertEqual(view.cachedWorkspaceLayoutCount, 0)
+        XCTAssertEqual(view.cachedFlattenedThumbnailCount, 0)
+        XCTAssertEqual(view.cachedVisibleWorkspaceLayoutCount, 0)
+        XCTAssertEqual(view.cachedVisibleThumbnailCount, 0)
+        XCTAssertNil(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
+        XCTAssertNil(renderer.bufferLength(for: view, slot: .overviewThumbnailGlyph))
+    }
+
+    func testIntegratedViewIdlePurgeReleasesOverviewReusableBuffersAfterRenderedFrame() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        _ = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            workspaceName: "WS",
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: view.frame)
+        window.contentView?.addSubview(view)
+        let overlay = ScrollbarOverlayView(frame: view.frame)
+        overlay.documentView = ScrollDocumentView(frame: view.bounds)
+        overlay.contentView.postsBoundsChangedNotifications = true
+        view.companionScrollView = overlay
+
+        renderFrame(for: view)
+
+        XCTAssertTrue(renderer.hasOverviewBuffers(for: view))
+        XCTAssertGreaterThan(view.cachedWorkspaceLayoutCount, 0)
+        XCTAssertGreaterThan(view.cachedFlattenedThumbnailCount, 0)
+        XCTAssertEqual(view.stagingVertexStorageBytes, 0)
+
+        view.debugReleaseIdleBuffersNow()
+
+        XCTAssertFalse(renderer.hasOverviewBuffers(for: view))
+        XCTAssertEqual(view.drawableSize, .zero)
+        XCTAssertEqual(view.stagingVertexStorageBytes, 0)
+        XCTAssertEqual(view.cachedWorkspaceLayoutCount, 0)
+        XCTAssertEqual(view.cachedFlattenedThumbnailCount, 0)
+        XCTAssertEqual(view.cachedVisibleWorkspaceLayoutCount, 0)
+        XCTAssertEqual(view.cachedVisibleThumbnailCount, 0)
+
+        view.setNeedsDisplay(view.bounds)
+        view.debugEnsureLayoutCache()
+
+        XCTAssertGreaterThan(view.drawableSize.width, 0)
+        XCTAssertGreaterThan(view.drawableSize.height, 0)
+        XCTAssertGreaterThan(view.cachedWorkspaceLayoutCount, 0)
+        XCTAssertGreaterThan(view.cachedFlattenedThumbnailCount, 0)
+    }
+
+    func testIntegratedViewRenderImmediatelyDropsTransientStagingVertices() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        _ = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            workspaceName: "WS",
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: view.frame)
+        window.contentView?.addSubview(view)
+        let overlay = ScrollbarOverlayView(frame: view.frame)
+        overlay.documentView = ScrollDocumentView(frame: view.bounds)
+        overlay.contentView.postsBoundsChangedNotifications = true
+        view.companionScrollView = overlay
+
+        renderFrame(for: view)
+
+        XCTAssertTrue(renderer.hasOverviewBuffers(for: view))
+        XCTAssertEqual(view.stagingVertexStorageBytes, 0)
+    }
+
+    func testIntegratedViewIdlePurgeDropsOversizedRebuildableCaches() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        _ = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            workspaceName: "WS",
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: view.frame)
+        window.contentView?.addSubview(view)
+        let overlay = ScrollbarOverlayView(frame: view.frame)
+        overlay.documentView = ScrollDocumentView(frame: view.bounds)
+        overlay.contentView.postsBoundsChangedNotifications = true
+        view.companionScrollView = overlay
+
+        renderFrame(for: view)
+        view.debugInsertOversizedTextVertexCacheEntry(text: "huge-1", floatCount: 400_000)
+        view.debugInsertOversizedThumbnailVertexCacheEntries(floatCountPerEntry: 300_000)
+        XCTAssertGreaterThan(view.cachedTextVertexBytes, 256 * 1024)
+        XCTAssertGreaterThan(view.cachedThumbnailVertexBytes, 1 * 1024 * 1024)
+
+        view.debugReleaseIdleBuffersNow()
+
+        XCTAssertEqual(view.cachedTextVertexCount, 0)
+        XCTAssertEqual(view.cachedThumbnailVertexCount, 0)
+        XCTAssertFalse(renderer.hasOverviewBuffers(for: view))
+        XCTAssertEqual(view.drawableSize, .zero)
+    }
+
+    func testIntegratedViewIdlePurgeClearsSmallRebuildableCachesToo() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        _ = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            workspaceName: "WS",
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: view.frame)
+        window.contentView?.addSubview(view)
+        let overlay = ScrollbarOverlayView(frame: view.frame)
+        overlay.documentView = ScrollDocumentView(frame: view.bounds)
+        overlay.contentView.postsBoundsChangedNotifications = true
+        view.companionScrollView = overlay
+
+        renderFrame(for: view)
+        view.debugPrimeTextVertexCache(texts: ["Alpha", "Beta"])
+        view.debugPrimeThumbnailVertexCache(scaleFactor: 2.25)
+        view.debugEnsureLayoutCache()
+        view.debugInstallTooltipWindowForTesting()
+        view.debugPrimeCloseTexturesForTesting()
+        view.debugSeedCPUStatusCache(controllerID: manager.terminals[0].id)
+        XCTAssertGreaterThan(view.cachedTextVertexCount, 0)
+        XCTAssertGreaterThan(view.cachedThumbnailVertexCount, 0)
+        XCTAssertGreaterThan(view.cachedCPUStatusCount, 0)
+        XCTAssertGreaterThan(view.stagingVertexStorageBytes, 0)
+        XCTAssertGreaterThan(view.cachedWorkspaceLayoutCount, 0)
+        XCTAssertGreaterThan(view.cachedFlattenedThumbnailCount, 0)
+        XCTAssertTrue(view.hasTooltipWindow)
+        XCTAssertTrue(view.hasCloseTextures)
+
+        view.debugReleaseIdleBuffersNow()
+
+        XCTAssertEqual(view.cachedTextVertexCount, 0)
+        XCTAssertEqual(view.cachedThumbnailVertexCount, 0)
+        XCTAssertEqual(view.cachedCPUStatusCount, 0)
+        XCTAssertEqual(view.cachedWorkspaceLayoutCount, 0)
+        XCTAssertEqual(view.cachedFlattenedThumbnailCount, 0)
+        XCTAssertFalse(renderer.hasOverviewBuffers(for: view))
+        XCTAssertEqual(view.drawableSize, .zero)
+        XCTAssertFalse(view.hasTooltipWindow)
+        XCTAssertFalse(view.hasCloseTextures)
+    }
+
+    func testIntegratedViewInactiveReleaseDropsDrawableAndOverviewBuffersImmediately() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let controller = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            workspaceName: "WS",
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: view.frame)
+        window.contentView?.addSubview(view)
+        let overlay = ScrollbarOverlayView(frame: view.frame)
+        overlay.documentView = ScrollDocumentView(frame: view.bounds)
+        overlay.contentView.postsBoundsChangedNotifications = true
+        view.companionScrollView = overlay
+
+        XCTAssertTrue(view.setTerminalOutputActive(controller.id, isActive: true))
+        renderFrame(for: view)
+
+        XCTAssertTrue(renderer.hasOverviewBuffers(for: view))
+        XCTAssertGreaterThan(view.drawableSize.width, 0)
+        XCTAssertGreaterThan(view.stagingVertexStorageBytes, 0)
+        XCTAssertGreaterThan(view.cachedWorkspaceLayoutCount, 0)
+        XCTAssertGreaterThan(view.cachedFlattenedThumbnailCount, 0)
+
+        view.releaseInactiveRenderingResourcesNow()
+
+        XCTAssertFalse(renderer.hasOverviewBuffers(for: view))
+        XCTAssertEqual(view.drawableSize, .zero)
+        XCTAssertEqual(view.stagingVertexStorageBytes, 0)
+        XCTAssertEqual(view.cachedWorkspaceLayoutCount, 0)
+        XCTAssertEqual(view.cachedFlattenedThumbnailCount, 0)
+
+        view.setNeedsDisplay(view.bounds)
+        view.debugEnsureLayoutCache()
+        XCTAssertGreaterThan(view.drawableSize.width, 0)
+        XCTAssertGreaterThan(view.drawableSize.height, 0)
+        XCTAssertGreaterThan(view.cachedWorkspaceLayoutCount, 0)
+        XCTAssertGreaterThan(view.cachedFlattenedThumbnailCount, 0)
+    }
+
+    func testIntegratedViewInactiveReleaseClearsRebuildableCaches() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        _ = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            workspaceName: "WS",
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: view.frame)
+        window.contentView?.addSubview(view)
+        let overlay = ScrollbarOverlayView(frame: view.frame)
+        overlay.documentView = ScrollDocumentView(frame: view.bounds)
+        overlay.contentView.postsBoundsChangedNotifications = true
+        view.companionScrollView = overlay
+
+        renderFrame(for: view)
+        view.debugPrimeTextVertexCache(texts: ["Alpha", "Beta", "Gamma"])
+        view.debugPrimeThumbnailVertexCache(scaleFactor: 2.25)
+        view.debugEnsureLayoutCache()
+        view.debugInstallTooltipWindowForTesting()
+        view.debugPrimeCloseTexturesForTesting()
+        view.debugSeedCPUStatusCache(controllerID: manager.terminals[0].id, text: "CPU: 21.5%")
+        XCTAssertGreaterThan(view.cachedTextVertexCount, 0)
+        XCTAssertGreaterThan(view.cachedThumbnailVertexCount, 0)
+        XCTAssertGreaterThan(view.cachedCPUStatusCount, 0)
+        XCTAssertGreaterThan(view.stagingVertexStorageBytes, 0)
+        XCTAssertGreaterThan(view.cachedWorkspaceLayoutCount, 0)
+        XCTAssertGreaterThan(view.cachedFlattenedThumbnailCount, 0)
+        XCTAssertTrue(view.hasTooltipWindow)
+        XCTAssertTrue(view.hasCloseTextures)
+
+        view.releaseInactiveRenderingResourcesNow()
+
+        XCTAssertEqual(view.cachedTextVertexCount, 0)
+        XCTAssertEqual(view.cachedThumbnailVertexCount, 0)
+        XCTAssertEqual(view.cachedCPUStatusCount, 0)
+        XCTAssertEqual(view.cachedWorkspaceLayoutCount, 0)
+        XCTAssertEqual(view.cachedFlattenedThumbnailCount, 0)
+        XCTAssertFalse(renderer.hasOverviewBuffers(for: view))
+        XCTAssertEqual(view.drawableSize, .zero)
+        XCTAssertFalse(view.hasTooltipWindow)
+        XCTAssertFalse(view.hasCloseTextures)
+    }
+
+    func testIntegratedViewMemoryPressureCompactionReleasesOverviewBuffersWithoutDiscardingVisibleDrawable() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let controller = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            workspaceName: "WS",
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: view.frame)
+        window.contentView?.addSubview(view)
+        let overlay = ScrollbarOverlayView(frame: view.frame)
+        overlay.documentView = ScrollDocumentView(frame: view.bounds)
+        overlay.contentView.postsBoundsChangedNotifications = true
+        view.companionScrollView = overlay
+
+        XCTAssertTrue(view.setTerminalOutputActive(controller.id, isActive: true))
+        renderFrame(for: view)
+        let originalDrawableSize = view.drawableSize
+        view.debugInstallTooltipWindowForTesting()
+        view.debugPrimeCloseTexturesForTesting()
+        view.debugSeedCPUStatusCache(controllerID: controller.id, text: "CPU: 9.4%")
+        XCTAssertTrue(renderer.hasOverviewBuffers(for: view))
+        XCTAssertGreaterThan(originalDrawableSize.width, 0)
+        XCTAssertGreaterThan(view.cachedCPUStatusCount, 0)
+        XCTAssertGreaterThan(view.stagingVertexStorageBytes, 0)
+        XCTAssertGreaterThan(view.cachedWorkspaceLayoutCount, 0)
+        XCTAssertGreaterThan(view.cachedFlattenedThumbnailCount, 0)
+        XCTAssertTrue(view.hasTooltipWindow)
+        XCTAssertTrue(view.hasCloseTextures)
+
+        view.compactForMemoryPressureNow()
+
+        XCTAssertFalse(renderer.hasOverviewBuffers(for: view))
+        XCTAssertEqual(view.drawableSize, originalDrawableSize)
+        XCTAssertEqual(view.cachedCPUStatusCount, 0)
+        XCTAssertEqual(view.stagingVertexStorageBytes, 0)
+        XCTAssertEqual(view.cachedWorkspaceLayoutCount, 0)
+        XCTAssertEqual(view.cachedFlattenedThumbnailCount, 0)
+        XCTAssertFalse(view.hasTooltipWindow)
+        XCTAssertFalse(view.hasCloseTextures)
+    }
+
+    func testIntegratedViewCPUStatusCacheDoesNotRetainNilEntries() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let controller = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            workspaceName: "WS",
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+        XCTAssertEqual(view.cachedCPUStatusCount, 0)
+
+        view.debugSeedCPUStatusCache(controllerID: controller.id, text: nil)
+
+        XCTAssertEqual(view.cachedCPUStatusCount, 0)
+    }
+
+    func testIntegratedViewCPUStatusCacheRemovesExistingEntryWhenTextBecomesNil() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let controller = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            workspaceName: "WS",
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+        view.debugSeedCPUStatusCache(controllerID: controller.id, text: "CPU: 13.7%")
+        XCTAssertEqual(view.cachedCPUStatusCount, 1)
+
+        view.debugSeedCPUStatusCache(controllerID: controller.id, text: nil)
+
+        XCTAssertEqual(view.cachedCPUStatusCount, 0)
+    }
+
+    func testSplitRenderViewIdlePurgeReleasesDrawableStorageAndRestoresOnRequestRender() throws {
+        let renderer = try makeRendererOrSkip()
+        let splitRenderView = SplitRenderView(frame: NSRect(x: 0, y: 0, width: 320, height: 200), renderer: renderer)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(splitRenderView)
+        window.makeKeyAndOrderFront(nil)
+        drainMainQueue(testCase: self)
+
+        splitRenderView.syncScaleFactorIfNeeded()
+        XCTAssertGreaterThan(splitRenderView.drawableSize.width, 0)
+
+        splitRenderView.debugReleaseIdleBuffersNow()
+
+        XCTAssertEqual(splitRenderView.drawableSize, .zero)
+
+        splitRenderView.requestRender()
+
+        XCTAssertGreaterThan(splitRenderView.drawableSize.width, 0)
+        XCTAssertGreaterThan(splitRenderView.drawableSize.height, 0)
+    }
+
+    func testSplitTerminalContainerInactiveReleaseDropsChildAndOverlayDrawables() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let controllers = (0..<2).map { index in
+            TerminalController(
+                rows: 4,
+                cols: 12,
+                termEnv: "xterm-256color",
+                textEncoding: .utf8,
+                scrollbackInitialCapacity: 4096,
+                scrollbackMaxCapacity: 4096,
+                fontName: "Menlo",
+                fontSize: 13,
+                initialDirectory: "/tmp/inactive-split-\(index)"
+            )
+        }
+        let container = SplitTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 420, height: 260), renderer: renderer, controllers: controllers)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 320))
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(container)
+        window.makeKeyAndOrderFront(nil)
+        container.layoutSubtreeIfNeeded()
+        drainMainQueue(testCase: self)
+
+        guard let splitRenderView = allSubviews(in: container).compactMap({ $0 as? SplitRenderView }).first else {
+            XCTFail("SplitRenderView missing")
+            return
+        }
+        let terminalViews = allSubviews(in: container).compactMap { $0 as? TerminalView }
+
+        splitRenderView.requestRender()
+        for terminalView in terminalViews {
+            terminalView.setNeedsDisplay(terminalView.bounds)
+        }
+
+        XCTAssertTrue(terminalViews.allSatisfy { $0.drawableSize == .zero || $0.drawableSize.width > 0 })
+        XCTAssertGreaterThan(splitRenderView.drawableSize.width, 0)
+
+        container.releaseInactiveRenderingResourcesNow()
+
+        XCTAssertTrue(terminalViews.allSatisfy { $0.drawableSize == .zero })
+        XCTAssertEqual(splitRenderView.drawableSize, .zero)
+
+        container.requestRender()
+        XCTAssertGreaterThan(splitRenderView.drawableSize.width, 0)
+        XCTAssertGreaterThan(splitRenderView.drawableSize.height, 0)
+    }
+
+    func testSplitTerminalContainerMemoryPressureCompactionReleasesOverlayBuffersWhileKeepingVisibleDrawable() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let controllers = (0..<2).map { index in
+            TerminalController(
+                rows: 4,
+                cols: 12,
+                termEnv: "xterm-256color",
+                textEncoding: .utf8,
+                scrollbackInitialCapacity: 4096,
+                scrollbackMaxCapacity: 4096,
+                fontName: "Menlo",
+                fontSize: 13,
+                initialDirectory: "/tmp/memory-pressure-split-\(index)"
+            )
+        }
+        let container = SplitTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 420, height: 260), renderer: renderer, controllers: controllers)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 320))
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(container)
+        window.makeKeyAndOrderFront(nil)
+        container.layoutSubtreeIfNeeded()
+        drainMainQueue(testCase: self)
+
+        guard let splitRenderView = allSubviews(in: container).compactMap({ $0 as? SplitRenderView }).first else {
+            XCTFail("SplitRenderView missing")
+            return
+        }
+
+        renderFrame(for: splitRenderView)
+        let originalDrawableSize = splitRenderView.drawableSize
+        XCTAssertGreaterThan(originalDrawableSize.width, 0)
+
+        container.compactForMemoryPressureNow()
+
+        XCTAssertEqual(splitRenderView.drawableSize, originalDrawableSize)
+    }
+
+    func testReusableOverviewBufferShrinksAfterLargePeakUsageDrops() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+
+        _ = renderer.reusableBuffer(
+            for: view,
+            slot: .overviewTextGlyph,
+            vertices: Array(repeating: 1, count: 100_000)
+        )
+        let largeLength = try XCTUnwrap(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
+
+        _ = renderer.reusableBuffer(
+            for: view,
+            slot: .overviewTextGlyph,
+            vertices: Array(repeating: 1, count: 128)
+        )
+        let smallLength = try XCTUnwrap(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
+
+        XCTAssertLessThan(smallLength, largeLength)
+        XCTAssertGreaterThanOrEqual(smallLength, 128 * MemoryLayout<Float>.size)
+    }
+
+    func testReusableOverviewBufferUsesBoundedHeadroomInsteadOfLargePeakSlack() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+
+        let requiredFloats = 1_024
+        let requiredBytes = requiredFloats * MemoryLayout<Float>.size
+        _ = renderer.reusableBuffer(
+            for: view,
+            slot: .overviewTextGlyph,
+            vertices: Array(repeating: 1, count: requiredFloats)
+        )
+        let length = try XCTUnwrap(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
+        let expectedAlignedLength = 8 * 1024
+
+        XCTAssertGreaterThanOrEqual(length, requiredBytes)
+        XCTAssertEqual(length, expectedAlignedLength)
+        XCTAssertLessThan(length, requiredBytes * 5)
+    }
+
+    func testReusableOverviewBufferCapsHeadroomForLargePayloads() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+
+        let requiredFloats = 300_000
+        let requiredBytes = requiredFloats * MemoryLayout<Float>.size
+        _ = renderer.reusableBuffer(
+            for: view,
+            slot: .overviewThumbnailGlyph,
+            vertices: Array(repeating: 1, count: requiredFloats)
+        )
+        let length = try XCTUnwrap(renderer.bufferLength(for: view, slot: .overviewThumbnailGlyph))
+
+        XCTAssertGreaterThanOrEqual(length, requiredBytes)
+        XCTAssertLessThanOrEqual(length, requiredBytes + (64 * 1024) + (4 * 1024))
+    }
+
+    func testReusableOverviewBufferReleasesStorageWhenVertexPayloadBecomesEmpty() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 360, height: 220), renderer: renderer, manager: manager)
+
+        _ = renderer.reusableBuffer(
+            for: view,
+            slot: .overviewThumbnailGlyph,
+            vertices: Array(repeating: 1, count: 256)
+        )
+        XCTAssertNotNil(renderer.bufferLength(for: view, slot: .overviewThumbnailGlyph))
+
+        _ = renderer.reusableBuffer(for: view, slot: .overviewThumbnailGlyph, vertices: [])
+
+        XCTAssertNil(renderer.bufferLength(for: view, slot: .overviewThumbnailGlyph))
     }
 
     func testIntegratedViewTerminalListDidChangeRefreshesCachedLayoutsImmediatelyAfterAdd() throws {
@@ -2441,9 +3803,7 @@ final class AppKitComponentTests: XCTestCase {
         terminalView.viewDidChangeBackingProperties()
         terminalView.unmarkText()
 
-        let markedLayer = try XCTUnwrap(terminalView.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first)
-        XCTAssertEqual(markedLayer.contentsScale, 2.0)
-        XCTAssertTrue(markedLayer.isHidden)
+        XCTAssertTrue(terminalView.layer?.sublayers?.compactMap { $0 as? CATextLayer }.isEmpty ?? true)
         XCTAssertEqual(renderer.glyphAtlas.scaleFactor, 2.0)
     }
 
@@ -2668,6 +4028,37 @@ final class AppKitComponentTests: XCTestCase {
 
         XCTAssertEqual(selectedID, second.id)
         XCTAssertTrue(view.selectedTerminals.isEmpty)
+    }
+
+    func testIntegratedViewThumbnailClickWorksBeforeFirstRenderedFrame() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let terminal = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), fontName: "Menlo", fontSize: 13)
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), renderer: renderer, manager: manager)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 540),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        window.makeKeyAndOrderFront(nil)
+
+        view.debugEnsureLayoutCache()
+        let layout = try XCTUnwrap(reflectedWorkspaceLayouts(from: view).first?.terminals.first(where: { $0.controllerID == terminal.id }))
+        let clickPoint = layout.thumbnail.center
+        view.debugReleaseLayoutStorageForTesting()
+        XCTAssertEqual(view.cachedWorkspaceLayoutCount, 0)
+
+        var selectedID: UUID?
+        view.onSelectTerminal = { selectedID = $0.id }
+        let down = try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: clickPoint, in: view, window: window))
+        let up = try XCTUnwrap(makeMouseEvent(type: .leftMouseUp, point: clickPoint, in: view, window: window))
+        view.mouseDown(with: down)
+        view.mouseUp(with: up)
+
+        XCTAssertEqual(selectedID, terminal.id)
+        XCTAssertGreaterThan(view.cachedWorkspaceLayoutCount, 0)
     }
 
     func testIntegratedViewTitleBarSingleClickDoesNotInvokeSelectCallback() throws {

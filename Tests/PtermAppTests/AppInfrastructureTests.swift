@@ -5,6 +5,51 @@ import XCTest
 @testable import PtermApp
 
 final class AppInfrastructureTests: XCTestCase {
+    func testInitialLaunchDispositionRestoresSessionWithoutForcingIntegratedView() {
+        let focusedID = UUID()
+        let session = PersistedSessionState(
+            windowFrame: PersistedWindowFrame(frame: .init(x: 10, y: 20, width: 800, height: 600)),
+            focusedTerminalID: focusedID,
+            presentedMode: .focused,
+            splitTerminalIDs: [],
+            workspaceNames: ["Work"],
+            terminals: [
+                PersistedTerminalState(
+                    id: focusedID,
+                    workspaceName: "Work",
+                    titleOverride: nil,
+                    currentDirectory: NSHomeDirectory(),
+                    settings: nil
+                )
+            ]
+        )
+
+        let disposition = AppDelegate.initialLaunchDisposition(
+            restoredSession: session,
+            bootstrappedConfiguredWorkspaces: true
+        )
+
+        XCTAssertEqual(disposition, .restoreSession(session))
+    }
+
+    func testInitialLaunchDispositionShowsIntegratedForConfiguredWorkspacesWithoutSession() {
+        let disposition = AppDelegate.initialLaunchDisposition(
+            restoredSession: nil,
+            bootstrappedConfiguredWorkspaces: true
+        )
+
+        XCTAssertEqual(disposition, .showIntegrated)
+    }
+
+    func testInitialLaunchDispositionCreatesSingleTerminalWhenNoSessionOrConfiguredWorkspacesExist() {
+        let disposition = AppDelegate.initialLaunchDisposition(
+            restoredSession: nil,
+            bootstrappedConfiguredWorkspaces: false
+        )
+
+        XCTAssertEqual(disposition, .createInitialTerminalAndShowIntegrated)
+    }
+
     func testTerminalListReconciliationKeepsIntegratedPresentationWhenLastTerminalRemoved() {
         let result = AppDelegate.reconcilePresentationAfterTerminalListChange(
             currentPresentation: .integrated,
@@ -268,6 +313,18 @@ final class AppInfrastructureTests: XCTestCase {
         coordinator.schedule()
         coordinator.cancel()
         RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+    }
+
+    func testMemoryPressureCoordinatorInvokesHandlerWhenSimulated() {
+        var invocationCount = 0
+        let coordinator = MemoryPressureCoordinator(installSystemSource: false) {
+            invocationCount += 1
+        }
+
+        coordinator.simulateMemoryPressureForTesting()
+        coordinator.simulateMemoryPressureForTesting()
+
+        XCTAssertEqual(invocationCount, 2)
     }
 
     func testSessionStoreReturnsNoneWhenNoSessionExistsAndCreatesCrashMarker() throws {
@@ -1188,6 +1245,63 @@ final class AppInfrastructureTests: XCTestCase {
         monitor.stop()
     }
 
+    func testProcessMetricsMonitorStartsWithoutDescendantScratchAllocation() {
+        let monitor = ProcessMetricsMonitor(interval: 60)
+
+        XCTAssertEqual(monitor.debugDescendantQueueScratchCapacity, 0)
+        XCTAssertEqual(monitor.debugDescendantResultScratchCapacity, 0)
+        XCTAssertEqual(monitor.debugChildPIDBufferScratchCapacity, 0)
+    }
+
+    @MainActor
+    func testProcessMetricsMonitorStopReleasesDescendantScratchStorage() {
+        let monitor = ProcessMetricsMonitor(interval: 60)
+        monitor.debugPrimeDescendantScratch(queueCount: 8, resultCount: 16, childCount: 32)
+
+        XCTAssertGreaterThan(monitor.debugDescendantQueueScratchCapacity, 0)
+        XCTAssertGreaterThan(monitor.debugDescendantResultScratchCapacity, 0)
+        XCTAssertGreaterThan(monitor.debugChildPIDBufferScratchCapacity, 0)
+
+        monitor.stop()
+
+        XCTAssertEqual(monitor.debugDescendantQueueScratchCapacity, 0)
+        XCTAssertEqual(monitor.debugDescendantResultScratchCapacity, 0)
+        XCTAssertEqual(monitor.debugChildPIDBufferScratchCapacity, 0)
+    }
+
+    func testProcessMetricsMonitorStopReleasesLastSampleHistoryToo() {
+        let monitor = ProcessMetricsMonitor(interval: 60)
+        monitor.debugPrimeLastSamples([11, 22, 33])
+
+        XCTAssertEqual(monitor.debugLastSampleCount, 3)
+
+        monitor.stop()
+
+        XCTAssertEqual(monitor.debugLastSampleCount, 0)
+    }
+
+    func testProcessMetricsMonitorCompactsOversizedDescendantScratchAfterPeakUsageDrops() {
+        let monitor = ProcessMetricsMonitor(interval: 60)
+        monitor.debugPrimeDescendantScratch(queueCount: 512, resultCount: 1024, childCount: 2048)
+
+        let initialQueueCapacity = monitor.debugDescendantQueueScratchCapacity
+        let initialResultCapacity = monitor.debugDescendantResultScratchCapacity
+        let initialChildCapacity = monitor.debugChildPIDBufferScratchCapacity
+        XCTAssertGreaterThan(initialQueueCapacity, 64)
+        XCTAssertGreaterThan(initialResultCapacity, 64)
+        XCTAssertGreaterThan(initialChildCapacity, 64)
+
+        monitor.debugCompactDescendantScratchForTesting(
+            retainingQueueCount: 4,
+            resultCount: 8,
+            childCount: 16
+        )
+
+        XCTAssertLessThan(monitor.debugDescendantQueueScratchCapacity, initialQueueCapacity)
+        XCTAssertLessThan(monitor.debugDescendantResultScratchCapacity, initialResultCapacity)
+        XCTAssertLessThan(monitor.debugChildPIDBufferScratchCapacity, initialChildCapacity)
+    }
+
     func testProcessMetricsMonitorConvertsAbsoluteTicksUsingMachTimebase() {
         let monitor = ProcessMetricsMonitor(interval: 60)
         var timebase = mach_timebase_info_data_t()
@@ -1231,6 +1345,26 @@ final class AppInfrastructureTests: XCTestCase {
             wait(for: [expectation], timeout: 1.0)
             monitor.stop()
         }
+    }
+
+    func testPTYStartsWithoutReadBufferAllocation() {
+        let pty = PTY()
+        XCTAssertEqual(pty.debugReadBufferCapacity, 0)
+    }
+
+    func testPTYReadBufferCanBePrimedAndReleasedAfterIdleShrink() {
+        let pty = PTY()
+        pty.debugPrimeReadBufferCapacity(32 * 1024)
+        XCTAssertEqual(pty.debugReadBufferCapacity, 32 * 1024)
+
+        pty.debugShrinkIdleReadBufferNow()
+        XCTAssertEqual(pty.debugReadBufferCapacity, 0)
+    }
+
+    func testPTYPrimeReadBufferUsesMinimumCapacityFloor() {
+        let pty = PTY()
+        pty.debugPrimeReadBufferCapacity(128)
+        XCTAssertEqual(pty.debugReadBufferCapacity, 4096)
     }
 }
 

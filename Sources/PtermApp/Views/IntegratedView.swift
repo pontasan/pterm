@@ -90,6 +90,14 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private struct CachedTextVertices {
         let vertices: [Float]
         let width: Float
+
+        var byteCount: Int {
+            vertices.count * MemoryLayout<Float>.stride
+        }
+
+        var storageByteCount: Int {
+            vertices.capacity * MemoryLayout<Float>.stride
+        }
     }
 
     private struct ThumbnailVertexCacheKey: Hashable {
@@ -190,6 +198,14 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private struct CachedThumbnailVertices {
         let bgVertices: [Float]
         let glyphVertices: [Float]
+
+        var byteCount: Int {
+            (bgVertices.count + glyphVertices.count) * MemoryLayout<Float>.stride
+        }
+
+        var storageByteCount: Int {
+            (bgVertices.capacity + glyphVertices.capacity) * MemoryLayout<Float>.stride
+        }
     }
 
     private struct CachedCPUStatus {
@@ -286,6 +302,9 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private var tooltipLabel: NSTextField?
     private var currentTooltipText: String?
 
+    var hasTooltipWindow: Bool { tooltipWindow != nil }
+    var hasCloseTextures: Bool { closeIconTexture != nil || closeCircleTexture != nil }
+
     /// Tracking area for mouse hover (close buttons, etc.)
     private var trackingArea: NSTrackingArea?
 
@@ -343,7 +362,17 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private var textAtlasSignature: TextAtlasSignature?
     private var thumbnailVertexCache: [ThumbnailVertexCacheKey: CachedThumbnailVertices] = [:]
     private var cachedCPUStatusByTerminalID: [UUID: CachedCPUStatus] = [:]
+    private var stagingPreContentOverlayVertices: [Float] = []
+    private var stagingPostContentOverlayVertices: [Float] = []
+    private var stagingThumbnailBgVertices: [Float] = []
+    private var stagingThumbnailGlyphVertices: [Float] = []
+    private var stagingAtlasGlyphVertices: [Float] = []
+    private var stagingIconVertices: [Float] = []
+    private var stagingCircleVertices: [Float] = []
+    private var thumbnailCacheBuildBgScratch: [Float] = []
+    private var thumbnailCacheBuildGlyphScratch: [Float] = []
     private var scrollInteractionTimer: Timer?
+    private var idleBufferReleaseTimer: Timer?
     private var isOverviewScrolling = false
 
     /// Layout constants
@@ -366,6 +395,176 @@ final class IntegratedView: MTKView, NSDraggingSource {
         static let thumbnailMaxWidth: CGFloat = 320
     }
 
+    private struct CachePolicy {
+        static let textVertexSoftLimit = 256
+        static let textVertexSoftByteLimit = 2 * 1024 * 1024
+        static let textVertexMinimumSoftByteLimit = 256 * 1024
+        static let textVertexBytesPerVisibleTerminal = 32 * 1024
+        static let textVertexIdleByteLimit = 256 * 1024
+        static let thumbnailVertexFloor = 8
+        static let thumbnailVertexPerPreferredTerminal = 2
+        static let thumbnailVertexSoftByteLimit = 12 * 1024 * 1024
+        static let thumbnailVertexMinimumSoftByteLimit = 1 * 1024 * 1024
+        static let thumbnailVertexBytesPerPreferredTerminal = 128 * 1024
+        static let thumbnailVertexIdleByteLimit = 1 * 1024 * 1024
+    }
+
+    static func effectiveTextVertexSoftByteLimit(visibleTerminalCount: Int) -> Int {
+        let dynamicBudget = max(
+            CachePolicy.textVertexMinimumSoftByteLimit,
+            max(visibleTerminalCount, 1) * CachePolicy.textVertexBytesPerVisibleTerminal
+        )
+        return min(CachePolicy.textVertexSoftByteLimit, dynamicBudget)
+    }
+
+    static func effectiveThumbnailVertexSoftLimit(preferredTerminalCount: Int) -> Int {
+        max(
+            CachePolicy.thumbnailVertexFloor,
+            preferredTerminalCount * CachePolicy.thumbnailVertexPerPreferredTerminal
+        )
+    }
+
+    static func effectiveThumbnailVertexSoftByteLimit(preferredTerminalCount: Int) -> Int {
+        let dynamicBudget = max(
+            CachePolicy.thumbnailVertexMinimumSoftByteLimit,
+            max(preferredTerminalCount, 1) * CachePolicy.thumbnailVertexBytesPerPreferredTerminal
+        )
+        return min(CachePolicy.thumbnailVertexSoftByteLimit, dynamicBudget)
+    }
+
+    var cachedTextVertexCount: Int { textVertexCache.count }
+    var cachedThumbnailVertexCount: Int { thumbnailVertexCache.count }
+    var cachedCPUStatusCount: Int { cachedCPUStatusByTerminalID.count }
+    var cachedTextVertexBytes: Int { textVertexCache.values.reduce(0) { $0 + $1.byteCount } }
+    var cachedThumbnailVertexBytes: Int { thumbnailVertexCache.values.reduce(0) { $0 + $1.byteCount } }
+    var cachedTextVertexStorageBytes: Int { textVertexCache.values.reduce(0) { $0 + $1.storageByteCount } }
+    var cachedThumbnailVertexStorageBytes: Int { thumbnailVertexCache.values.reduce(0) { $0 + $1.storageByteCount } }
+    var cachedWorkspaceLayoutCount: Int { cachedWorkspaceLayouts.count }
+    var cachedFlattenedThumbnailCount: Int { cachedFlattenedThumbnails.count }
+    var cachedVisibleWorkspaceLayoutCount: Int { cachedVisibleWorkspaceLayouts.count }
+    var cachedVisibleThumbnailCount: Int { cachedVisibleThumbnails.count }
+    var stagingVertexStorageBytes: Int {
+        [
+            stagingPreContentOverlayVertices,
+            stagingPostContentOverlayVertices,
+            stagingThumbnailBgVertices,
+            stagingThumbnailGlyphVertices,
+            stagingAtlasGlyphVertices,
+            stagingIconVertices,
+            stagingCircleVertices,
+            thumbnailCacheBuildBgScratch,
+            thumbnailCacheBuildGlyphScratch
+        ].reduce(0) { partial, vertices in
+            partial + vertices.capacity * MemoryLayout<Float>.stride
+        }
+    }
+
+    func debugPrimeTextVertexCache(texts: [String], scaleFactor: Float = 2.0) {
+        for text in texts {
+            _ = cachedTextVertices(
+                for: text,
+                scaleFactor: scaleFactor,
+                glyphScale: 0.8,
+                color: Self.uiSecondaryTitleTextColor(alpha: 1.0)
+            )
+        }
+    }
+
+    func debugAppendTransientTextVertices(
+        text: String,
+        scaleFactor: Float = 2.0,
+        glyphScale: Float = 0.8,
+        color: (Float, Float, Float, Float)? = nil
+    ) -> Int {
+        var vertices: [Float] = []
+        appendTextVertices(
+            text: text,
+            scaleFactor: scaleFactor,
+            glyphScale: glyphScale,
+            color: color ?? Self.uiSecondaryTitleTextColor(alpha: 1.0),
+            originX: 0,
+            originY: 0,
+            useCache: false,
+            to: &vertices
+        )
+        return vertices.count
+    }
+
+    func debugSeedCPUStatusCache(
+        controllerID: UUID,
+        pid: pid_t = 1,
+        shellPID: pid_t = 1,
+        text: String? = "CPU: 17.3%"
+    ) {
+        cacheCPUStatus(
+            controllerID: controllerID,
+            pid: pid,
+            shellPID: shellPID,
+            text: text
+        )
+    }
+
+    func debugPrimeThumbnailVertexCache(scaleFactor: Float = 2.0) {
+        updateLayoutCacheIfNeeded()
+        for layout in cachedFlattenedThumbnails {
+            _ = cachedThumbnailVertices(
+                for: layout.controller,
+                thumbnailSize: layout.thumbnail.size,
+                scaleFactor: scaleFactor
+            )
+        }
+    }
+
+    func debugEnsureLayoutCache() {
+        updateLayoutCacheIfNeeded()
+    }
+
+    func debugReleaseLayoutStorageForTesting() {
+        releaseLayoutStorage()
+    }
+
+    func debugInstallTooltipWindowForTesting() {
+        showTooltip("Test", at: NSPoint(x: 8, y: 8))
+    }
+
+    func debugPrimeCloseTexturesForTesting() {
+        _ = ensureCloseIconTexture()
+        _ = ensureCloseCircleTexture()
+    }
+
+    func debugInsertOversizedTextVertexCacheEntry(text: String, floatCount: Int) {
+        let key = TextVertexCacheKey(
+            text: text,
+            glyphScaleBits: Float(1).bitPattern,
+            colorBits: (Float(1).bitPattern, Float(1).bitPattern, Float(1).bitPattern, Float(1).bitPattern)
+        )
+        textVertexCache[key] = CachedTextVertices(vertices: Array(repeating: 1, count: floatCount), width: 0)
+    }
+
+    func debugInsertOversizedThumbnailVertexCacheEntries(floatCountPerEntry: Int) {
+        updateLayoutCacheIfNeeded()
+        for layout in cachedFlattenedThumbnails {
+            let controller = layout.controller
+            let key = ThumbnailVertexCacheKey(
+                controllerID: controller.id,
+                rows: 24,
+                cols: 80,
+                scrollbackRowCount: 0,
+                scrollOffset: 0,
+                contentVersion: controller.thumbnailContentVersion,
+                fontName: renderer.glyphAtlas.fontName,
+                fontSize: renderer.glyphAtlas.fontSize,
+                glyphScale: 1,
+                thumbnailSize: layout.thumbnail.size,
+                terminalAppearance: renderer.terminalAppearance
+            )
+            thumbnailVertexCache[key] = CachedThumbnailVertices(
+                bgVertices: Array(repeating: 1, count: floatCountPerEntry / 2),
+                glyphVertices: Array(repeating: 1, count: floatCountPerEntry / 2)
+            )
+        }
+    }
+
     // MARK: - Initialization
 
     init(frame: NSRect, renderer: MetalRenderer, manager: TerminalManager) {
@@ -378,6 +577,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         self.preferredFramesPerSecond = 12
         self.colorPixelFormat = MetalRenderer.renderTargetPixelFormat
         self.clearColor = Self.overviewBackgroundClearColor()
+        self.framebufferOnly = true
         self.isPaused = true
         self.enableSetNeedsDisplay = true
         self.wantsLayer = true
@@ -399,6 +599,9 @@ final class IntegratedView: MTKView, NSDraggingSource {
             NotificationCenter.default.removeObserver(companionScrollObserver)
         }
         scrollInteractionTimer?.invalidate()
+        idleBufferReleaseTimer?.invalidate()
+        releaseStagingVertexStorage()
+        renderer.removeBuffers(for: self)
     }
 
     override var isOpaque: Bool { false }
@@ -427,9 +630,66 @@ final class IntegratedView: MTKView, NSDraggingSource {
         setNeedsDisplay(bounds)
     }
 
+    private func scheduleIdleBufferRelease() {
+        idleBufferReleaseTimer?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
+            self?.releaseIdleReusableBuffersNow()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        idleBufferReleaseTimer = timer
+    }
+
+    private func releaseIdleReusableBuffersNow() {
+        guard activeOutputTerminals.isEmpty, !isOverviewScrolling else { return }
+        purgeRebuildableCachesIfNeeded(force: false)
+        releaseLayoutStorage()
+        releaseStagingVertexStorage()
+        releaseAuxiliaryOverviewResources()
+        renderer.releaseOverviewBuffers(for: self)
+        _ = renderer.compactIdleGlyphAtlas()
+        drawableSize = .zero
+    }
+
+    func debugReleaseIdleBuffersNow() {
+        releaseIdleReusableBuffersNow()
+    }
+
+    func releaseInactiveRenderingResourcesNow() {
+        idleBufferReleaseTimer?.invalidate()
+        idleBufferReleaseTimer = nil
+        purgeRebuildableCachesIfNeeded(force: true)
+        releaseLayoutStorage()
+        releaseStagingVertexStorage()
+        releaseAuxiliaryOverviewResources()
+        renderer.releaseOverviewBuffers(for: self)
+        _ = renderer.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
+        drawableSize = .zero
+    }
+
+    func compactForMemoryPressureNow() {
+        idleBufferReleaseTimer?.invalidate()
+        idleBufferReleaseTimer = nil
+        purgeRebuildableCachesIfNeeded(force: true)
+        releaseLayoutStorage()
+        releaseStagingVertexStorage()
+        releaseAuxiliaryOverviewResources()
+        renderer.releaseOverviewBuffers(for: self)
+        _ = renderer.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
+    }
+
     func terminalListDidChange() {
+        idleBufferReleaseTimer?.invalidate()
+        idleBufferReleaseTimer = nil
         let activeTerminalIDs = Set(manager.terminals.map(\.id))
         selectedTerminals.formIntersection(activeTerminalIDs)
+        if activeTerminalIDs.isEmpty {
+            cachedCPUStatusByTerminalID.removeAll()
+            textVertexCache.removeAll()
+            thumbnailVertexCache.removeAll()
+            releaseLayoutStorage()
+            releaseStagingVertexStorage()
+            renderer.releaseOverviewBuffers(for: self)
+        }
         invalidateLayoutCache()
         updateLayoutCacheIfNeeded()
         syncCompanionDocumentView()
@@ -445,9 +705,18 @@ final class IntegratedView: MTKView, NSDraggingSource {
         }
         // Ensure drawable matches Retina pixel dimensions
         let expectedSize = CGSize(width: bounds.width * newScale, height: bounds.height * newScale)
-        if abs(drawableSize.width - expectedSize.width) > 1 || abs(drawableSize.height - expectedSize.height) > 1 {
+        if drawableSize != .zero,
+           (abs(drawableSize.width - expectedSize.width) > 1 || abs(drawableSize.height - expectedSize.height) > 1) {
             drawableSize = expectedSize
         }
+    }
+
+    private func ensureDrawableStorageAllocatedIfNeeded() {
+        guard drawableSize == .zero else { return }
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        let expectedSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        guard expectedSize.width > 0, expectedSize.height > 0 else { return }
+        drawableSize = expectedSize
     }
 
     private func applyRenderTargetColorSpace() {
@@ -455,6 +724,9 @@ final class IntegratedView: MTKView, NSDraggingSource {
         metalLayer.colorspace = MetalRenderer.renderTargetColorSpace
         metalLayer.pixelFormat = MetalRenderer.renderTargetPixelFormat
         metalLayer.isOpaque = false
+        if #available(macOS 10.13.2, *) {
+            metalLayer.maximumDrawableCount = 2
+        }
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -465,6 +737,11 @@ final class IntegratedView: MTKView, NSDraggingSource {
     override func setBoundsSize(_ newSize: NSSize) {
         super.setBoundsSize(newSize)
         invalidateLayoutCache()
+    }
+
+    override func setNeedsDisplay(_ invalidRect: NSRect) {
+        ensureDrawableStorageAllocatedIfNeeded()
+        super.setNeedsDisplay(invalidRect)
     }
 
     // MARK: - Tracking Area
@@ -714,18 +991,111 @@ final class IntegratedView: MTKView, NSDraggingSource {
         cachedVisibleThumbnails = []
     }
 
-    private func pruneThumbnailVertexCache(activeTerminalIDs: Set<UUID>) {
+    private func pruneThumbnailVertexCache(activeTerminalIDs: Set<UUID>, preferredTerminalIDs: Set<UUID>) {
         guard !thumbnailVertexCache.isEmpty else { return }
+        let originalCount = thumbnailVertexCache.count
         thumbnailVertexCache = thumbnailVertexCache.filter { activeTerminalIDs.contains($0.key.controllerID) }
-        let softLimit = max(96, activeTerminalIDs.count * 4)
-        if thumbnailVertexCache.count > softLimit {
-            thumbnailVertexCache.removeAll(keepingCapacity: true)
+        let softLimit = Self.effectiveThumbnailVertexSoftLimit(preferredTerminalCount: preferredTerminalIDs.count)
+        let softByteLimit = Self.effectiveThumbnailVertexSoftByteLimit(preferredTerminalCount: preferredTerminalIDs.count)
+        if thumbnailVertexCache.count > softLimit || cachedThumbnailVertexBytes > softByteLimit {
+            thumbnailVertexCache = thumbnailVertexCache.filter { preferredTerminalIDs.contains($0.key.controllerID) }
+        }
+        if thumbnailVertexCache.count > softLimit || cachedThumbnailVertexBytes > softByteLimit {
+            thumbnailVertexCache.removeAll()
+        }
+        if thumbnailVertexCache.count < originalCount {
+            renderer.releaseOverviewBuffers(for: self)
         }
     }
 
     private func pruneCPUStatusCache(activeTerminalIDs: Set<UUID>) {
         guard !cachedCPUStatusByTerminalID.isEmpty else { return }
         cachedCPUStatusByTerminalID = cachedCPUStatusByTerminalID.filter { activeTerminalIDs.contains($0.key) }
+    }
+
+    private func cacheCPUStatus(
+        controllerID: UUID,
+        pid: pid_t,
+        shellPID: pid_t,
+        text: String?
+    ) {
+        guard let text else {
+            cachedCPUStatusByTerminalID.removeValue(forKey: controllerID)
+            return
+        }
+        cachedCPUStatusByTerminalID[controllerID] = CachedCPUStatus(pid: pid, shellPID: shellPID, text: text)
+    }
+
+    private func pruneTextVertexCacheIfNeeded() {
+        let visibleTerminalCount = cachedVisibleThumbnails.count
+        let softByteLimit = Self.effectiveTextVertexSoftByteLimit(visibleTerminalCount: visibleTerminalCount)
+        guard textVertexCache.count > CachePolicy.textVertexSoftLimit ||
+                cachedTextVertexBytes > softByteLimit else { return }
+        textVertexCache.removeAll()
+        renderer.releaseOverviewBuffers(for: self)
+    }
+
+    private func purgeRebuildableCachesIfNeeded(force: Bool) {
+        let activeTerminalIDs = Set(manager.terminals.map(\.id))
+        pruneCPUStatusCache(activeTerminalIDs: activeTerminalIDs)
+
+        if force || !cachedCPUStatusByTerminalID.isEmpty {
+            cachedCPUStatusByTerminalID.removeAll()
+        }
+
+        if force || !textVertexCache.isEmpty {
+            textVertexCache.removeAll()
+        }
+
+        if force || !thumbnailVertexCache.isEmpty {
+            thumbnailVertexCache.removeAll()
+        }
+    }
+
+    private func releaseLayoutStorage() {
+        cachedLayoutGeometryKey = nil
+        cachedLayoutScrollOffset = nil
+        cachedBaseWorkspaceLayouts = []
+        cachedBaseFlattenedThumbnails = []
+        cachedWorkspaceLayouts = []
+        cachedVisibleWorkspaceLayouts = []
+        cachedFlattenedThumbnails = []
+        cachedVisibleThumbnails = []
+    }
+
+    private func releaseStagingVertexStorage() {
+        stagingPreContentOverlayVertices = []
+        stagingPostContentOverlayVertices = []
+        stagingThumbnailBgVertices = []
+        stagingThumbnailGlyphVertices = []
+        stagingAtlasGlyphVertices = []
+        stagingIconVertices = []
+        stagingCircleVertices = []
+        thumbnailCacheBuildBgScratch = []
+        thumbnailCacheBuildGlyphScratch = []
+    }
+
+    private func releaseAuxiliaryOverviewResources() {
+        hideTooltip()
+        closeIconTexture = nil
+        closeCircleTexture = nil
+    }
+
+    private func trimStagingVertexStorageAfterDraw() {
+        if activeOutputTerminals.isEmpty && !isOverviewScrolling {
+            releaseStagingVertexStorage()
+            return
+        }
+
+        stagingPreContentOverlayVertices.removeAll(keepingCapacity: true)
+        stagingPostContentOverlayVertices.removeAll(keepingCapacity: true)
+        stagingThumbnailBgVertices.removeAll(keepingCapacity: true)
+        stagingThumbnailGlyphVertices.removeAll(keepingCapacity: true)
+        stagingAtlasGlyphVertices.removeAll(keepingCapacity: true)
+        stagingIconVertices.removeAll(keepingCapacity: true)
+        stagingCircleVertices.removeAll(keepingCapacity: true)
+        thumbnailCacheBuildBgScratch.removeAll(keepingCapacity: true)
+        thumbnailCacheBuildGlyphScratch.removeAll(keepingCapacity: true)
     }
 
     private func beginOverviewScrollInteraction() {
@@ -752,13 +1122,13 @@ final class IntegratedView: MTKView, NSDraggingSource {
         )
         guard textAtlasSignature != signature else { return }
         textAtlasSignature = signature
-        textVertexCache.removeAll(keepingCapacity: true)
+        textVertexCache.removeAll()
+        renderer.releaseOverviewBuffers(for: self)
     }
 
     private func updateLayoutCacheIfNeeded() {
         let terminals = manager.terminals
         let activeTerminalIDs = Set(terminals.map(\.id))
-        pruneThumbnailVertexCache(activeTerminalIDs: activeTerminalIDs)
         pruneCPUStatusCache(activeTerminalIDs: activeTerminalIDs)
         let workspaceNames = terminals.map {
             let trimmed = $0.sessionSnapshot.workspaceName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -794,6 +1164,21 @@ final class IntegratedView: MTKView, NSDraggingSource {
         cachedVisibleThumbnails = cachedVisibleWorkspaceLayouts.flatMap { workspace in
             workspace.terminals.filter { $0.title.union($0.thumbnail).intersects(bounds) }
         }
+        let preferredTerminalIDs = Set(
+            cachedVisibleThumbnails.map(\.controller.id)
+        )
+        .union(activeOutputTerminals)
+        .union(selectedTerminals)
+        .union(hoveredCloseID.map { [$0] } ?? [])
+        .union(hoveredIndex.flatMap { index in
+            guard index < cachedFlattenedThumbnails.count else { return nil }
+            return [cachedFlattenedThumbnails[index].controller.id]
+        } ?? [])
+        pruneThumbnailVertexCache(
+            activeTerminalIDs: activeTerminalIDs,
+            preferredTerminalIDs: preferredTerminalIDs
+        )
+        pruneTextVertexCacheIfNeeded()
     }
 
     private func translatedWorkspaceLayout(_ layout: WorkspaceLayout, yOffset: CGFloat) -> WorkspaceLayout {
@@ -841,6 +1226,14 @@ final class IntegratedView: MTKView, NSDraggingSource {
         }
     }
 
+    private func tightlyPackedVertices(_ vertices: [Float]) -> [Float] {
+        guard !vertices.isEmpty else { return [] }
+        var packed: [Float] = []
+        packed.reserveCapacity(vertices.count)
+        packed.append(contentsOf: vertices)
+        return packed
+    }
+
     private func cachedThumbnailVertices(
         for controller: TerminalController,
         thumbnailSize: NSSize,
@@ -865,19 +1258,26 @@ final class IntegratedView: MTKView, NSDraggingSource {
                 return cached
             }
 
-            var bgVertices: [Float] = []
-            var glyphVertices: [Float] = []
+            thumbnailCacheBuildBgScratch.removeAll(keepingCapacity: true)
+            thumbnailCacheBuildGlyphScratch.removeAll(keepingCapacity: true)
             renderer.appendThumbnailVertexData(
                 model: model,
                 scrollback: scrollback,
                 scrollOffset: scrollOffset,
                 thumbnailRect: NSRect(origin: .zero, size: thumbnailSize),
                 scaleFactor: scaleFactor,
-                bgVertices: &bgVertices,
-                glyphVertices: &glyphVertices
+                bgVertices: &thumbnailCacheBuildBgScratch,
+                glyphVertices: &thumbnailCacheBuildGlyphScratch
             )
-            let cached = CachedThumbnailVertices(bgVertices: bgVertices, glyphVertices: glyphVertices)
+            let cached = CachedThumbnailVertices(
+                bgVertices: tightlyPackedVertices(thumbnailCacheBuildBgScratch),
+                glyphVertices: tightlyPackedVertices(thumbnailCacheBuildGlyphScratch)
+            )
             thumbnailVertexCache[key] = cached
+            pruneThumbnailVertexCache(
+                activeTerminalIDs: Set(manager.terminals.map(\.id)),
+                preferredTerminalIDs: Set(cachedVisibleThumbnails.map(\.controller.id))
+            )
             return cached
         }
     }
@@ -950,6 +1350,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     // MARK: - Mouse Events
 
     override func mouseDown(with event: NSEvent) {
+        prepareLayoutForInteractionIfNeeded()
         let point = convert(event.locationInWindow, from: nil)
         mouseDownPoint = point
         mouseDownTerminal = nil
@@ -1044,6 +1445,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
 
     override func mouseUp(with event: NSEvent) {
+        prepareLayoutForInteractionIfNeeded()
         defer {
             mouseDownTerminal = nil
             mouseDownPoint = nil
@@ -1106,7 +1508,14 @@ final class IntegratedView: MTKView, NSDraggingSource {
         }
     }
 
+    private func prepareLayoutForInteractionIfNeeded() {
+        syncScrollOffsetFromCompanionScrollView()
+        updateLayoutCacheIfNeeded()
+        syncCompanionDocumentView()
+    }
+
     override func mouseDragged(with event: NSEvent) {
+        prepareLayoutForInteractionIfNeeded()
         guard let origin = mouseDownPoint else { return }
         let point = convert(event.locationInWindow, from: nil)
         guard hypot(point.x - origin.x, point.y - origin.y) > 6 else { return }
@@ -1154,6 +1563,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
 
     override func mouseMoved(with event: NSEvent) {
+        prepareLayoutForInteractionIfNeeded()
         if isOverviewScrolling { return }
         let point = convert(event.locationInWindow, from: nil)
         let newHoveredIndex = thumbnailOrTitleIndex(at: point)
@@ -1282,6 +1692,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     private func hideTooltip() {
         tooltipWindow?.orderOut(nil)
+        tooltipLabel = nil
+        tooltipWindow = nil
         currentTooltipText = nil
     }
 
@@ -1609,22 +2021,22 @@ extension IntegratedView: MTKViewDelegate {
 
         let drawableSize = view.drawableSize
         let viewportSize = SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height))
-        var preContentOverlayVertices: [Float] = []
-        var postContentOverlayVertices: [Float] = []
-        var thumbnailBgVertices: [Float] = []
-        var thumbnailGlyphVertices: [Float] = []
-        var atlasGlyphVertices: [Float] = []
-        var iconVertices: [Float] = []
-        var circleVertices: [Float] = []
+        stagingPreContentOverlayVertices.removeAll(keepingCapacity: true)
+        stagingPostContentOverlayVertices.removeAll(keepingCapacity: true)
+        stagingThumbnailBgVertices.removeAll(keepingCapacity: true)
+        stagingThumbnailGlyphVertices.removeAll(keepingCapacity: true)
+        stagingAtlasGlyphVertices.removeAll(keepingCapacity: true)
+        stagingIconVertices.removeAll(keepingCapacity: true)
+        stagingCircleVertices.removeAll(keepingCapacity: true)
         var currentOverviewFontName = renderer.glyphAtlas.fontName
         var currentOverviewFontSize = renderer.glyphAtlas.fontSize
-        preContentOverlayVertices.reserveCapacity(max(256, cachedVisibleWorkspaceLayouts.count * 120 + cachedVisibleThumbnails.count * 120))
-        postContentOverlayVertices.reserveCapacity(max(256, cachedVisibleWorkspaceLayouts.count * 96 + cachedVisibleThumbnails.count * 96))
-        thumbnailBgVertices.reserveCapacity(max(256, cachedVisibleThumbnails.count * 512))
-        thumbnailGlyphVertices.reserveCapacity(max(256, cachedVisibleThumbnails.count * 768))
-        atlasGlyphVertices.reserveCapacity(max(256, cachedVisibleWorkspaceLayouts.count * 384 + cachedVisibleThumbnails.count * 512))
-        iconVertices.reserveCapacity(max(128, cachedVisibleThumbnails.count * 72))
-        circleVertices.reserveCapacity(max(128, cachedVisibleThumbnails.count * 72))
+        stagingPreContentOverlayVertices.reserveCapacity(max(256, cachedVisibleWorkspaceLayouts.count * 120 + cachedVisibleThumbnails.count * 120))
+        stagingPostContentOverlayVertices.reserveCapacity(max(256, cachedVisibleWorkspaceLayouts.count * 96 + cachedVisibleThumbnails.count * 96))
+        stagingThumbnailBgVertices.reserveCapacity(max(256, cachedVisibleThumbnails.count * 512))
+        stagingThumbnailGlyphVertices.reserveCapacity(max(256, cachedVisibleThumbnails.count * 768))
+        stagingAtlasGlyphVertices.reserveCapacity(max(256, cachedVisibleWorkspaceLayouts.count * 384 + cachedVisibleThumbnails.count * 512))
+        stagingIconVertices.reserveCapacity(max(128, cachedVisibleThumbnails.count * 72))
+        stagingCircleVertices.reserveCapacity(max(128, cachedVisibleThumbnails.count * 72))
 
         // Render workspace backgrounds (even when empty)
         for workspace in cachedVisibleWorkspaceLayouts {
@@ -1632,10 +2044,10 @@ extension IntegratedView: MTKViewDelegate {
                 workspace: workspace,
                 scaleFactor: sf,
                 viewportSize: viewportSize,
-                overlayVertices: &preContentOverlayVertices,
-                glyphVertices: &atlasGlyphVertices,
-                circleVertices: &circleVertices,
-                iconVertices: &iconVertices
+                overlayVertices: &stagingPreContentOverlayVertices,
+                glyphVertices: &stagingAtlasGlyphVertices,
+                circleVertices: &stagingCircleVertices,
+                iconVertices: &stagingIconVertices
             )
         }
 
@@ -1648,10 +2060,10 @@ extension IntegratedView: MTKViewDelegate {
                 flushOverviewContentBatch(
                     encoder: encoder,
                     viewportSize: viewportSize,
-                    preContentOverlayVertices: &preContentOverlayVertices,
-                    thumbnailBgVertices: &thumbnailBgVertices,
-                    thumbnailGlyphVertices: &thumbnailGlyphVertices,
-                    atlasGlyphVertices: &atlasGlyphVertices
+                    preContentOverlayVertices: &stagingPreContentOverlayVertices,
+                    thumbnailBgVertices: &stagingThumbnailBgVertices,
+                    thumbnailGlyphVertices: &stagingThumbnailGlyphVertices,
+                    atlasGlyphVertices: &stagingAtlasGlyphVertices
                 )
                 renderer.updateFont(name: fontSettings.name, size: CGFloat(fontSettings.size))
                 currentOverviewFontName = renderer.glyphAtlas.fontName
@@ -1675,7 +2087,7 @@ extension IntegratedView: MTKViewDelegate {
                 time: time,
                 scaleFactor: sf,
                 viewportSize: viewportSize,
-                vertices: &preContentOverlayVertices
+                vertices: &stagingPreContentOverlayVertices
             )
 
             let cachedThumbnailVertices = cachedThumbnailVertices(
@@ -1687,13 +2099,13 @@ extension IntegratedView: MTKViewDelegate {
                 from: cachedThumbnailVertices.bgVertices,
                 dx: Float(frame.thumbnail.origin.x) * sf,
                 dy: Float(frame.thumbnail.origin.y) * sf,
-                to: &thumbnailBgVertices
+                to: &stagingThumbnailBgVertices
             )
             appendTranslatedVertices(
                 from: cachedThumbnailVertices.glyphVertices,
                 dx: Float(frame.thumbnail.origin.x) * sf,
                 dy: Float(frame.thumbnail.origin.y) * sf,
-                to: &thumbnailGlyphVertices
+                to: &stagingThumbnailGlyphVertices
             )
 
             // Draw title text
@@ -1705,7 +2117,7 @@ extension IntegratedView: MTKViewDelegate {
                 frame: frame.title,
                 scaleFactor: sf,
                 viewportSize: viewportSize,
-                glyphVertices: &atlasGlyphVertices
+                glyphVertices: &stagingAtlasGlyphVertices
             )
 
             // Draw close button
@@ -1715,18 +2127,18 @@ extension IntegratedView: MTKViewDelegate {
                 isHovered: isCloseHovered,
                 scaleFactor: sf,
                 viewportSize: viewportSize,
-                circleVertices: &circleVertices,
-                iconVertices: &iconVertices
+                circleVertices: &stagingCircleVertices,
+                iconVertices: &stagingIconVertices
             )
         }
 
         flushOverviewContentBatch(
             encoder: encoder,
             viewportSize: viewportSize,
-            preContentOverlayVertices: &preContentOverlayVertices,
-            thumbnailBgVertices: &thumbnailBgVertices,
-            thumbnailGlyphVertices: &thumbnailGlyphVertices,
-            atlasGlyphVertices: &atlasGlyphVertices
+            preContentOverlayVertices: &stagingPreContentOverlayVertices,
+            thumbnailBgVertices: &stagingThumbnailBgVertices,
+            thumbnailGlyphVertices: &stagingThumbnailGlyphVertices,
+            atlasGlyphVertices: &stagingAtlasGlyphVertices
         )
 
         // Draw "Select All" / "Deselect" buttons (on top of thumbnails, only when Shift is held)
@@ -1739,8 +2151,8 @@ extension IntegratedView: MTKViewDelegate {
                     viewportSize: viewportSize,
                     bgColor: (0.15, 0.30, 0.55, 0.9),
                     fgColor: (0.9, 0.9, 0.9, 1.0),
-                    overlayVertices: &postContentOverlayVertices,
-                    glyphVertices: &atlasGlyphVertices
+                    overlayVertices: &stagingPostContentOverlayVertices,
+                    glyphVertices: &stagingAtlasGlyphVertices
                 )
                 let hasSelection = workspace.terminals.contains { selectedTerminals.contains($0.controller.id) }
                 if hasSelection {
@@ -1751,8 +2163,8 @@ extension IntegratedView: MTKViewDelegate {
                         viewportSize: viewportSize,
                         bgColor: (0.35, 0.20, 0.15, 0.9),
                         fgColor: (0.9, 0.9, 0.9, 1.0),
-                        overlayVertices: &postContentOverlayVertices,
-                        glyphVertices: &atlasGlyphVertices
+                        overlayVertices: &stagingPostContentOverlayVertices,
+                        glyphVertices: &stagingAtlasGlyphVertices
                     )
                 }
             }
@@ -1762,38 +2174,38 @@ extension IntegratedView: MTKViewDelegate {
         drawAddWorkspaceButton(
             scaleFactor: sf,
             viewportSize: viewportSize,
-            vertices: &postContentOverlayVertices
+            vertices: &stagingPostContentOverlayVertices
         )
 
         // Draw drag drop indicators
         drawDropIndicators(
             scaleFactor: sf,
             viewportSize: viewportSize,
-            vertices: &postContentOverlayVertices
+            vertices: &stagingPostContentOverlayVertices
         )
 
         drawVertices(
-            postContentOverlayVertices,
+            stagingPostContentOverlayVertices,
             encoder: encoder,
             pipeline: renderer.overlayPipeline,
             viewportSize: viewportSize,
             bufferSlot: .overviewPostOverlay
         )
         drawGlyphVertices(
-            atlasGlyphVertices,
+            stagingAtlasGlyphVertices,
             encoder: encoder,
             texture: renderer.glyphAtlas.texture,
             viewportSize: viewportSize,
             bufferSlot: .overviewTextGlyph
         )
         drawCircleVertices(
-            circleVertices,
+            stagingCircleVertices,
             encoder: encoder,
             viewportSize: viewportSize,
             bufferSlot: .overviewCircleGlyph
         )
         drawGlyphVertices(
-            iconVertices,
+            stagingIconVertices,
             encoder: encoder,
             texture: ensureCloseIconTexture(),
             viewportSize: viewportSize,
@@ -1804,6 +2216,8 @@ extension IntegratedView: MTKViewDelegate {
         encoder.endEncoding()
         commandBuffer.present(drawable)
         commandBuffer.commit()
+        trimStagingVertexStorageAfterDraw()
+        scheduleIdleBufferRelease()
     }
 
     private func flushOverviewContentBatch(
@@ -2081,14 +2495,14 @@ extension IntegratedView: MTKViewDelegate {
             cpuStatusText = (cached?.pid == pid && cached?.shellPID == shellPID) ? cached?.text : nil
         } else if let usage = cpuUsageProvider?(pid), usage >= 0 {
             let text = String(format: "CPU: %.1f%%", usage)
-            cachedCPUStatusByTerminalID[controllerID] = CachedCPUStatus(pid: pid, shellPID: shellPID, text: text)
+            cacheCPUStatus(controllerID: controllerID, pid: pid, shellPID: shellPID, text: text)
             cpuStatusText = text
         } else if pid != shellPID {
             let text = "CPU: N/A"
-            cachedCPUStatusByTerminalID[controllerID] = CachedCPUStatus(pid: pid, shellPID: shellPID, text: text)
+            cacheCPUStatus(controllerID: controllerID, pid: pid, shellPID: shellPID, text: text)
             cpuStatusText = text
         } else {
-            cachedCPUStatusByTerminalID[controllerID] = CachedCPUStatus(pid: pid, shellPID: shellPID, text: nil)
+            cacheCPUStatus(controllerID: controllerID, pid: pid, shellPID: shellPID, text: nil)
             cpuStatusText = nil
         }
 
@@ -2098,6 +2512,7 @@ extension IntegratedView: MTKViewDelegate {
                 frame: frame,
                 scaleFactor: scaleFactor,
                 viewportSize: viewportSize,
+                useCache: false,
                 glyphVertices: &glyphVertices
             )
         }
@@ -2110,10 +2525,17 @@ extension IntegratedView: MTKViewDelegate {
         viewportSize: SIMD2<Float>,
         color: (Float, Float, Float, Float) = IntegratedView.uiSecondaryTitleTextColor(alpha: 1.0),
         alignment: NSTextAlignment = .right,
+        useCache: Bool = true,
         glyphVertices: inout [Float]
     ) {
         let thumbGlyphScale: Float = 0.8
-        let cached = cachedTextVertices(for: text, scaleFactor: scaleFactor, glyphScale: thumbGlyphScale, color: color)
+        let cached = textVertices(
+            for: text,
+            scaleFactor: scaleFactor,
+            glyphScale: thumbGlyphScale,
+            color: color,
+            useCache: useCache
+        )
         let startX: Float
         if alignment == .left {
             startX = Float(frame.minX) * scaleFactor
@@ -2643,6 +3065,24 @@ extension IntegratedView: MTKViewDelegate {
             return cached
         }
 
+        let cached = makeTextVertices(
+            for: text,
+            scaleFactor: scaleFactor,
+            glyphScale: glyphScale,
+            color: color
+        )
+        textVertexCache[key] = cached
+        pruneTextVertexCacheIfNeeded()
+        return cached
+    }
+
+    private func makeTextVertices(
+        for text: String,
+        scaleFactor: Float,
+        glyphScale: Float,
+        color: (Float, Float, Float, Float)
+    ) -> CachedTextVertices {
+
         let chars = Array(text.unicodeScalars)
         let cellW = Float(renderer.glyphAtlas.cellWidth) * scaleFactor * glyphScale
         let cellH = Float(renderer.glyphAtlas.cellHeight) * scaleFactor * glyphScale
@@ -2675,9 +3115,10 @@ extension IntegratedView: MTKViewDelegate {
             )
         }
 
-        let cached = CachedTextVertices(vertices: vertices, width: Float(chars.count) * cellW)
-        textVertexCache[key] = cached
-        return cached
+        return CachedTextVertices(
+            vertices: tightlyPackedVertices(vertices),
+            width: Float(chars.count) * cellW
+        )
     }
 
     private func appendTextVertices(
@@ -2687,10 +3128,30 @@ extension IntegratedView: MTKViewDelegate {
         color: (Float, Float, Float, Float),
         originX: Float,
         originY: Float,
+        useCache: Bool = true,
         to target: inout [Float]
     ) {
-        let cached = cachedTextVertices(for: text, scaleFactor: scaleFactor, glyphScale: glyphScale, color: color)
+        let cached = textVertices(
+            for: text,
+            scaleFactor: scaleFactor,
+            glyphScale: glyphScale,
+            color: color,
+            useCache: useCache
+        )
         appendTranslatedVertices(cached.vertices, dx: originX, dy: originY, to: &target)
+    }
+
+    private func textVertices(
+        for text: String,
+        scaleFactor: Float,
+        glyphScale: Float,
+        color: (Float, Float, Float, Float),
+        useCache: Bool
+    ) -> CachedTextVertices {
+        if useCache {
+            return cachedTextVertices(for: text, scaleFactor: scaleFactor, glyphScale: glyphScale, color: color)
+        }
+        return makeTextVertices(for: text, scaleFactor: scaleFactor, glyphScale: glyphScale, color: color)
     }
 
     private func appendTranslatedVertices(_ source: [Float], dx: Float, dy: Float, to target: inout [Float]) {

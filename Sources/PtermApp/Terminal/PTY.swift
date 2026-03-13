@@ -15,6 +15,11 @@ enum PTYError: Error {
 /// Thread safety: All access to masterFD and isRunning is protected by fdLock
 /// to prevent data races between the GCD read source and stop()/write() calls.
 final class PTY {
+    private enum ReadBufferPolicy {
+        static let minimumCapacity = 4096
+        static let preferredCapacity = 16384
+    }
+
     /// File descriptor of the PTY master side
     private var masterFD: Int32 = -1
 
@@ -38,6 +43,10 @@ final class PTY {
     /// Signals that the child process has fully exited and been reaped.
     private let exitSemaphore = DispatchSemaphore(value: 0)
 
+    /// Reusable read buffer to avoid allocating a fresh 16KB array on every PTY event.
+    private var readBuffer: [UInt8] = []
+    private let readBufferLock = NSLock()
+
     /// Callback invoked when data is available from the PTY
     var onOutput: ((Data) -> Void)?
 
@@ -50,6 +59,23 @@ final class PTY {
 
     deinit {
         stop()
+    }
+
+    var debugReadBufferCapacity: Int {
+        readBufferLock.lock()
+        defer { readBufferLock.unlock() }
+        return readBuffer.count
+    }
+
+    func debugPrimeReadBufferCapacity(_ capacity: Int) {
+        readBufferLock.lock()
+        defer { readBufferLock.unlock() }
+        let normalized = max(ReadBufferPolicy.minimumCapacity, capacity)
+        readBuffer = [UInt8](repeating: 0, count: normalized)
+    }
+
+    func debugShrinkIdleReadBufferNow() {
+        shrinkIdleReadBufferIfNeeded()
     }
 
     /// Start the PTY with the specified terminal size.
@@ -141,6 +167,7 @@ final class PTY {
         // Cancel dispatch source first to prevent further read events
         readSource?.cancel()
         readSource = nil
+        releaseReadBuffer()
 
         // Close FD under lock — single close site prevents double-close
         fdLock.lock()
@@ -291,20 +318,51 @@ final class PTY {
 
         guard fd >= 0 else { return }
 
-        var buffer = [UInt8](repeating: 0, count: 16384)
+        var buffer = preparedReadBuffer()
         let bytesRead = read(fd, &buffer, buffer.count)
+        storeReadBuffer(buffer)
 
         if bytesRead > 0 {
             let data = Data(buffer[0..<bytesRead])
             onOutput?(data)
+            shrinkIdleReadBufferIfNeeded()
         } else if bytesRead == 0 || (bytesRead < 0 && errno != EAGAIN) {
             fdLock.lock()
             _isRunning = false
             fdLock.unlock()
+            releaseReadBuffer()
             DispatchQueue.main.async { [weak self] in
                 self?.onExit?()
             }
         }
+    }
+
+    private func preparedReadBuffer() -> [UInt8] {
+        readBufferLock.lock()
+        defer { readBufferLock.unlock() }
+        if readBuffer.isEmpty {
+            readBuffer = [UInt8](repeating: 0, count: ReadBufferPolicy.preferredCapacity)
+        }
+        return readBuffer
+    }
+
+    private func storeReadBuffer(_ buffer: [UInt8]) {
+        readBufferLock.lock()
+        readBuffer = buffer
+        readBufferLock.unlock()
+    }
+
+    private func shrinkIdleReadBufferIfNeeded() {
+        readBufferLock.lock()
+        defer { readBufferLock.unlock() }
+        guard !readBuffer.isEmpty else { return }
+        readBuffer.removeAll(keepingCapacity: false)
+    }
+
+    private func releaseReadBuffer() {
+        readBufferLock.lock()
+        readBuffer.removeAll(keepingCapacity: false)
+        readBufferLock.unlock()
     }
 
     private func monitorChildExit() {

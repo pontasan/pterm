@@ -115,8 +115,6 @@ final class SplitTerminalContainerView: NSView {
             // Also make the CAMetalLayer invisible so it doesn't interfere
             // with Window Server compositing of the overlay SplitRenderView.
             scrollView.terminalView.renderingSuppressed = true
-            scrollView.terminalView.isPaused = true
-            scrollView.terminalView.enableSetNeedsDisplay = false
             scrollView.terminalView.alphaValue = 0
             scrollView.terminalView.imagePreviewURLProvider = imagePreviewURLProvider
             scrollView.terminalView.terminalController = controller
@@ -215,6 +213,20 @@ final class SplitTerminalContainerView: NSView {
 
     func requestRender() {
         splitRenderView?.requestRender()
+    }
+
+    func releaseInactiveRenderingResourcesNow() {
+        for scrollView in scrollViews {
+            scrollView.terminalView.releaseInactiveRenderingResourcesNow()
+        }
+        splitRenderView?.releaseInactiveRenderingResourcesNow()
+    }
+
+    func compactForMemoryPressureNow() {
+        for scrollView in scrollViews {
+            scrollView.terminalView.compactForMemoryPressureNow()
+        }
+        splitRenderView?.compactForMemoryPressureNow()
     }
 
     func syncScaleFactorIfNeeded() {

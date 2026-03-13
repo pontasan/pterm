@@ -24,6 +24,7 @@
 /* Maximum number of rows the index can track */
 #define RING_BUFFER_MAX_ROWS (1 << 20)  /* ~1M rows */
 #define RING_BUFFER_MIN_ROWS 16
+#define RING_BUFFER_INITIAL_ROW_SOFT_LIMIT 64
 
 /* Row metadata stored in the index */
 typedef struct {
@@ -128,6 +129,9 @@ size_t ring_buffer_capacity(const RingBuffer *rb);
 
 /* Get the number of bytes currently used. */
 size_t ring_buffer_bytes_used(const RingBuffer *rb);
+
+/* Compact underutilized data/index capacity back toward current usage. */
+bool ring_buffer_compact(RingBuffer *rb);
 
 /* Clear all data and zero the data buffer to prevent data recovery. */
 void ring_buffer_clear(RingBuffer *rb);

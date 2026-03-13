@@ -45,8 +45,8 @@ final class TerminalModel {
     /// Window title
     private(set) var title: String = ""
 
-    /// Tab stops
-    private var tabStops: Set<Int> = []
+    /// Tab stops stored as a compact bitset to keep per-terminal overhead low.
+    private var tabStopWords: [UInt64] = []
 
     /// G0/G1 character set designations and the currently invoked set.
     private var g0Charset: DesignatedCharacterSet = .ascii
@@ -107,10 +107,60 @@ final class TerminalModel {
     // MARK: - Tab Stops
 
     private func initTabStops() {
-        tabStops.removeAll()
+        tabStopWords = Array(repeating: 0, count: Self.tabStopWordCount(for: max(cols, 0)))
         for col in stride(from: 0, to: cols, by: 8) {
-            tabStops.insert(col)
+            setTabStopBit(at: col, enabled: true)
         }
+    }
+
+    private func setTabStop(at column: Int) {
+        guard column >= 0 else { return }
+        ensureTabStopCapacity(for: column)
+        setTabStopBit(at: column, enabled: true)
+    }
+
+    private func nextTabStop(after column: Int) -> Int? {
+        guard column + 1 < cols else { return nil }
+        for idx in (column + 1)..<cols where isTabStopSet(at: idx) {
+            return idx
+        }
+        return nil
+    }
+
+    private static func tabStopWordCount(for columns: Int) -> Int {
+        max(1, (max(columns, 0) + 63) / 64)
+    }
+
+    private static func tabStopBitLocation(for column: Int) -> (word: Int, bit: UInt64) {
+        let word = column / 64
+        let bit = UInt64(1) << UInt64(column % 64)
+        return (word, bit)
+    }
+
+    private func ensureTabStopCapacity(for column: Int) {
+        let requiredColumns = max(column + 1, cols)
+        let requiredWordCount = Self.tabStopWordCount(for: requiredColumns)
+        if requiredWordCount > tabStopWords.count {
+            tabStopWords.append(contentsOf: repeatElement(0, count: requiredWordCount - tabStopWords.count))
+        }
+    }
+
+    private func setTabStopBit(at column: Int, enabled: Bool) {
+        guard column >= 0 else { return }
+        ensureTabStopCapacity(for: column)
+        let location = Self.tabStopBitLocation(for: column)
+        if enabled {
+            tabStopWords[location.word] |= location.bit
+        } else {
+            tabStopWords[location.word] &= ~location.bit
+        }
+    }
+
+    private func isTabStopSet(at column: Int) -> Bool {
+        guard column >= 0 else { return false }
+        let location = Self.tabStopBitLocation(for: column)
+        guard location.word < tabStopWords.count else { return false }
+        return (tabStopWords[location.word] & location.bit) != 0
     }
 
     // MARK: - VT Parser Action Handling
@@ -222,7 +272,7 @@ final class TerminalModel {
             }
 
         case 0x09: // HT (Horizontal Tab)
-            let nextTab = tabStops.sorted().first(where: { $0 > cursor.col }) ?? (cols - 1)
+            let nextTab = nextTabStop(after: cursor.col) ?? (cols - 1)
             cursor.col = min(nextTab, cols - 1)
             cursor.pendingWrap = false
 
@@ -737,7 +787,7 @@ final class TerminalModel {
             lineFeed()
 
         case 0x48: // HTS - Horizontal Tab Set
-            tabStops.insert(cursor.col)
+            setTabStop(at: cursor.col)
 
         case 0x4D: // RI - Reverse Index (move cursor up, scroll if at top)
             if cursor.row == grid.scrollTop {

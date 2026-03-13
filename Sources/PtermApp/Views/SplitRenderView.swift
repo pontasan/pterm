@@ -24,6 +24,7 @@ final class SplitRenderView: MTKView {
     /// Closure to compute border config for a TerminalView each frame.
     var borderConfigProvider: ((TerminalView) -> MetalRenderer.BorderConfig?)?
     private var viewIsOpaque = false
+    private var idleBufferReleaseTimer: Timer?
 
     init(frame: NSRect, renderer: MetalRenderer) {
         self.renderer = renderer
@@ -31,6 +32,7 @@ final class SplitRenderView: MTKView {
 
         self.colorPixelFormat = MetalRenderer.renderTargetPixelFormat
         self.clearColor = renderer.terminalClearColor
+        self.framebufferOnly = true
         self.isPaused = true
         self.enableSetNeedsDisplay = true
         self.preferredFramesPerSecond = 30
@@ -47,6 +49,7 @@ final class SplitRenderView: MTKView {
     override var isOpaque: Bool { viewIsOpaque }
 
     deinit {
+        idleBufferReleaseTimer?.invalidate()
         renderer.removeBuffers(for: self)
     }
 
@@ -79,7 +82,53 @@ final class SplitRenderView: MTKView {
     }
 
     func requestRender() {
+        idleBufferReleaseTimer?.invalidate()
+        idleBufferReleaseTimer = nil
+        ensureDrawableStorageAllocatedIfNeeded()
         setNeedsDisplay(bounds)
+        scheduleIdleBufferRelease()
+    }
+
+    private func scheduleIdleBufferRelease() {
+        idleBufferReleaseTimer?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
+            self?.releaseIdleReusableBuffersNow()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        idleBufferReleaseTimer = timer
+    }
+
+    private func releaseIdleReusableBuffersNow() {
+        renderer.releaseSplitBuffers(for: self)
+        _ = renderer.compactIdleGlyphAtlas()
+        drawableSize = .zero
+    }
+
+    func debugReleaseIdleBuffersNow() {
+        releaseIdleReusableBuffersNow()
+    }
+
+    func releaseInactiveRenderingResourcesNow() {
+        idleBufferReleaseTimer?.invalidate()
+        idleBufferReleaseTimer = nil
+        renderer.releaseSplitBuffers(for: self)
+        _ = renderer.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
+        drawableSize = .zero
+    }
+
+    func compactForMemoryPressureNow() {
+        idleBufferReleaseTimer?.invalidate()
+        idleBufferReleaseTimer = nil
+        renderer.releaseSplitBuffers(for: self)
+        _ = renderer.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
+    }
+
+    private func ensureDrawableStorageAllocatedIfNeeded() {
+        guard drawableSize == .zero else { return }
+        let newScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        let expectedSize = CGSize(width: bounds.width * newScale, height: bounds.height * newScale)
+        guard expectedSize.width > 0, expectedSize.height > 0 else { return }
+        drawableSize = expectedSize
     }
 
     private func syncScaleFactor() {
@@ -90,7 +139,8 @@ final class SplitRenderView: MTKView {
             renderer.glyphAtlas.updateScaleFactor(newScale)
         }
         let expectedSize = CGSize(width: bounds.width * newScale, height: bounds.height * newScale)
-        if abs(drawableSize.width - expectedSize.width) > 1 || abs(drawableSize.height - expectedSize.height) > 1 {
+        if drawableSize != .zero,
+           (abs(drawableSize.width - expectedSize.width) > 1 || abs(drawableSize.height - expectedSize.height) > 1) {
             drawableSize = expectedSize
         }
         setNeedsDisplay(bounds)
@@ -107,6 +157,9 @@ final class SplitRenderView: MTKView {
         metalLayer.colorspace = MetalRenderer.renderTargetColorSpace
         metalLayer.pixelFormat = MetalRenderer.renderTargetPixelFormat
         metalLayer.isOpaque = viewIsOpaque
+        if #available(macOS 10.13.2, *) {
+            metalLayer.maximumDrawableCount = 2
+        }
     }
 }
 
@@ -118,6 +171,8 @@ extension SplitRenderView: MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        idleBufferReleaseTimer?.invalidate()
+        idleBufferReleaseTimer = nil
         guard !cellRefs.isEmpty,
               let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor,
@@ -171,5 +226,6 @@ extension SplitRenderView: MTKViewDelegate {
         encoder.endEncoding()
         commandBuffer.present(drawable)
         commandBuffer.commit()
+        scheduleIdleBufferRelease()
     }
 }

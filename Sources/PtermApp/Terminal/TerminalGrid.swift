@@ -14,9 +14,13 @@ final class TerminalGrid {
     /// Cell storage: row-major order
     private var cells: [Cell]
 
-    /// Per-row wrap flag. `true` means this row is a continuation of the
-    /// previous logical line (soft wrap), `false` means a new logical line.
-    private(set) var lineWrapped: [Bool]
+    /// Per-row wrap flags packed into 64-bit words.
+    private var lineWrappedWords: [UInt64]
+
+    /// Snapshot of per-row wrap flags for local transforms and tests.
+    var lineWrapped: [Bool] {
+        (0..<rows).map(isWrapped)
+    }
 
     /// Scroll region top (inclusive, 0-based)
     var scrollTop: Int = 0
@@ -29,7 +33,7 @@ final class TerminalGrid {
         self.cols = cols
         self.scrollBottom = rows - 1
         self.cells = Array(repeating: Cell.empty, count: rows * cols)
-        self.lineWrapped = Array(repeating: false, count: rows)
+        self.lineWrappedWords = Array(repeating: 0, count: Self.wrapWordCount(for: rows))
     }
 
     // MARK: - Cell Access
@@ -53,13 +57,19 @@ final class TerminalGrid {
     /// Mark a row as a soft-wrapped continuation of the previous row.
     func setWrapped(_ row: Int, _ wrapped: Bool) {
         guard row >= 0, row < rows else { return }
-        lineWrapped[row] = wrapped
+        let (wordIndex, bitMask) = Self.wrapBitLocation(for: row)
+        if wrapped {
+            lineWrappedWords[wordIndex] |= bitMask
+        } else {
+            lineWrappedWords[wordIndex] &= ~bitMask
+        }
     }
 
     /// Check if a row is soft-wrapped.
     func isWrapped(_ row: Int) -> Bool {
         guard row >= 0, row < rows else { return false }
-        return lineWrapped[row]
+        let (wordIndex, bitMask) = Self.wrapBitLocation(for: row)
+        return (lineWrappedWords[wordIndex] & bitMask) != 0
     }
 
     // MARK: - Line Operations
@@ -78,14 +88,14 @@ final class TerminalGrid {
     func clearRow(_ row: Int) {
         clearCells(row: row, fromCol: 0, toCol: cols - 1)
         if row >= 0 && row < rows {
-            lineWrapped[row] = false
+            setWrapped(row, false)
         }
     }
 
     /// Clear entire grid.
     func clearAll() {
         cells = Array(repeating: Cell.empty, count: rows * cols)
-        lineWrapped = Array(repeating: false, count: rows)
+        resetWrapStorage(for: rows)
     }
 
     // MARK: - Scrolling
@@ -111,7 +121,7 @@ final class TerminalGrid {
             let dstOffset = row * cols
             cells.replaceSubrange(dstOffset..<(dstOffset + cols),
                                   with: cells[srcOffset..<(srcOffset + cols)])
-            lineWrapped[row] = lineWrapped[row + count]
+            setWrapped(row, isWrapped(row + count))
         }
 
         // Clear newly exposed lines at bottom
@@ -141,7 +151,7 @@ final class TerminalGrid {
             let dstOffset = row * cols
             cells.replaceSubrange(dstOffset..<(dstOffset + cols),
                                   with: cells[srcOffset..<(srcOffset + cols)])
-            lineWrapped[row] = lineWrapped[row - count]
+            setWrapped(row, isWrapped(row - count))
         }
 
         // Clear newly exposed lines at top
@@ -241,7 +251,7 @@ final class TerminalGrid {
         self.rows = newRows
         self.cols = newCols
         self.cells = newCells
-        self.lineWrapped = newWrapped
+        self.setWrappedFlags(newWrapped)
         self.scrollTop = 0
         self.scrollBottom = newRows - 1
 
@@ -263,26 +273,27 @@ final class TerminalGrid {
                 for i in 0..<scrollAmount {
                     let start = i * cols
                     let rowCells = Array(cells[start..<(start + cols)])
-                    trimmedRows.append(TrimmedRow(cells: rowCells, isWrapped: lineWrapped[i]))
+                    trimmedRows.append(TrimmedRow(cells: rowCells, isWrapped: isWrapped(i)))
                 }
                 cells.removeFirst(scrollAmount * cols)
-                lineWrapped.removeFirst(scrollAmount)
+                var newWrapped = wrappedFlagsArray(startingAt: scrollAmount, count: rows - scrollAmount)
                 cells.append(contentsOf:
                     Array(repeating: Cell.empty, count: scrollAmount * cols))
-                lineWrapped.append(contentsOf:
-                    Array(repeating: false, count: scrollAmount))
+                newWrapped.append(contentsOf: Array(repeating: false, count: scrollAmount))
+                setWrappedFlags(newWrapped)
                 newCursorRow -= scrollAmount
             }
             // Trim to newRows
             cells = Array(cells.prefix(newRows * cols))
-            lineWrapped = Array(lineWrapped.prefix(newRows))
+            setWrappedFlags(wrappedFlagsArray(startingAt: 0, count: newRows))
         } else if newRows > rows {
             // Growing: add empty rows at bottom
             let padRows = newRows - rows
             cells.append(contentsOf:
                 Array(repeating: Cell.empty, count: padRows * cols))
-            lineWrapped.append(contentsOf:
-                Array(repeating: false, count: padRows))
+            var newWrapped = wrappedFlagsArray(startingAt: 0, count: rows)
+            newWrapped.append(contentsOf: Array(repeating: false, count: padRows))
+            setWrappedFlags(newWrapped)
         }
 
         self.rows = newRows
@@ -305,7 +316,7 @@ final class TerminalGrid {
             let offset = row * cols
             let rowCells = Array(cells[offset..<(offset + cols)])
 
-            if row == 0 || !lineWrapped[row] {
+            if row == 0 || !isWrapped(row) {
                 // Start of a new logical line
                 if row > 0 {
                     logicalLines.append(currentLine)
@@ -329,7 +340,7 @@ final class TerminalGrid {
         var rowInLogical = 0
 
         for row in 0..<rows {
-            if row > 0 && !lineWrapped[row] {
+            if row > 0 && !isWrapped(row) {
                 logicalIdx += 1
                 rowInLogical = 0
             }
@@ -421,5 +432,37 @@ final class TerminalGrid {
         for c in (cols - shift)..<cols {
             cells[offset + c] = Cell.empty
         }
+    }
+
+    // MARK: - Wrap Storage
+
+    private static func wrapWordCount(for rows: Int) -> Int {
+        max(0, (rows + 63) / 64)
+    }
+
+    private static func wrapBitLocation(for row: Int) -> (wordIndex: Int, bitMask: UInt64) {
+        (row / 64, UInt64(1) << UInt64(row % 64))
+    }
+
+    private func resetWrapStorage(for rows: Int) {
+        lineWrappedWords = Array(repeating: 0, count: Self.wrapWordCount(for: rows))
+    }
+
+    private func setWrappedFlags(_ wrappedFlags: [Bool]) {
+        lineWrappedWords = Array(repeating: 0, count: Self.wrapWordCount(for: wrappedFlags.count))
+        for (row, wrapped) in wrappedFlags.enumerated() where wrapped {
+            let (wordIndex, bitMask) = Self.wrapBitLocation(for: row)
+            lineWrappedWords[wordIndex] |= bitMask
+        }
+    }
+
+    private func wrappedFlagsArray(startingAt startRow: Int, count: Int) -> [Bool] {
+        guard count > 0 else { return [] }
+        var wrappedFlags: [Bool] = []
+        wrappedFlags.reserveCapacity(count)
+        for row in startRow..<(startRow + count) {
+            wrappedFlags.append(isWrapped(row))
+        }
+        return wrappedFlags
     }
 }

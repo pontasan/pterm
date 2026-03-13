@@ -837,6 +837,41 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(harness.model.cursor.col, 9)
     }
 
+    func testTerminalModelResizeReinitializesDefaultTabStops() {
+        let harness = TerminalModelHarness(rows: 1, cols: 12)
+        harness.model.resize(newRows: 1, newCols: 24)
+
+        harness.feed("A")
+        harness.feed(codepoints: [0x09])
+
+        XCTAssertEqual(harness.model.cursor.col, 8)
+
+        harness.feed(codepoints: [0x09])
+        XCTAssertEqual(harness.model.cursor.col, 16)
+    }
+
+    func testTerminalModelTabStopsWorkAcrossBitsetWordBoundary() {
+        let harness = TerminalModelHarness(rows: 1, cols: 80)
+        harness.feed("\u{1B}[65G") // move to col 64 (1-based)
+
+        harness.feed(codepoints: [0x09]) // default next tab stop at 72
+        XCTAssertEqual(harness.model.cursor.col, 72)
+
+        harness.feed("\u{1B}[66G") // move to col 65
+        harness.feed("\u{1B}H") // HTS at col 65
+        harness.feed("\r")
+
+        harness.feed(codepoints: [0x09])
+        XCTAssertEqual(harness.model.cursor.col, 8)
+
+        harness.feed(codepoints: [0x09])
+        XCTAssertEqual(harness.model.cursor.col, 16)
+
+        harness.feed("\u{1B}[65G")
+        harness.feed(codepoints: [0x09])
+        XCTAssertEqual(harness.model.cursor.col, 65)
+    }
+
     func testTerminalModelTabClearsPendingWrapWithoutAdvancingRow() {
         let harness = TerminalModelHarness(rows: 2, cols: 3)
         harness.feed("ABC")

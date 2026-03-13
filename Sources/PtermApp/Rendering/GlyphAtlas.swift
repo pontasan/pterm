@@ -12,17 +12,20 @@ final class GlyphAtlas {
     /// Metal texture containing rasterized glyphs
     private(set) var texture: MTLTexture?
 
-    /// Atlas dimensions
-    private let atlasWidth: Int = 2048
-    private let atlasHeight: Int = 2048
+    /// Atlas dimensions (terminal points, before Retina scaling).
+    private let initialAtlasDimension: Int
+    private let maxAtlasDimension: Int
+    private(set) var atlasDimension: Int
 
     /// Current packing position
     private var packX: Int = 0
     private var packY: Int = 0
     private var rowHeight: Int = 0
 
-    /// Glyph metrics cache
+    /// Glyph metrics cache. Last-access tracking lives inside GlyphInfo so the
+    /// atlas does not pay for a second dictionary keyed by the same codepoints.
     private(set) var glyphCache: [UInt32: GlyphInfo] = [:]
+    private var accessGeneration: UInt64 = 0
 
     /// Font reference
     private var ctFont: CTFont
@@ -32,6 +35,9 @@ final class GlyphAtlas {
 
     /// Current font name
     private(set) var fontName: String
+
+    /// Whether the atlas should eagerly seed printable ASCII.
+    private let prerasterizeASCII: Bool
 
     /// Cell dimensions derived from font metrics
     private(set) var cellWidth: CGFloat = 0
@@ -52,7 +58,16 @@ final class GlyphAtlas {
 
     /// Metal device
     private let device: MTLDevice
-    private let commandQueue: MTLCommandQueue?
+    private var commandQueue: MTLCommandQueue?
+
+    var texturePixelSize: (width: Int, height: Int)? {
+        guard let texture else { return nil }
+        return (texture.width, texture.height)
+    }
+
+    var debugHasCommandQueue: Bool {
+        commandQueue != nil
+    }
 
     struct GlyphInfo {
         var textureX: Float     // Texture coordinate X (0..1)
@@ -65,21 +80,34 @@ final class GlyphAtlas {
         var pixelWidth: Int     // Display pixel width of glyph image
         var pixelHeight: Int    // Display pixel height of glyph image
         var advance: Float      // Horizontal advance (points)
+        var lastAccessGeneration: UInt64
     }
 
-    init(device: MTLDevice, fontSize: CGFloat, scaleFactor: CGFloat) {
+    init(
+        device: MTLDevice,
+        fontSize: CGFloat,
+        scaleFactor: CGFloat,
+        initialAtlasDimension: Int = 128,
+        maxAtlasDimension: Int = 2048,
+        prerasterizeASCII: Bool = false
+    ) {
         self.device = device
-        self.commandQueue = device.makeCommandQueue()
+        self.commandQueue = nil
         self.scaleFactor = scaleFactor
         self.fontSize = fontSize
+        self.initialAtlasDimension = initialAtlasDimension
+        self.maxAtlasDimension = maxAtlasDimension
+        self.atlasDimension = initialAtlasDimension
+        self.prerasterizeASCII = prerasterizeASCII
 
         let defaultFont = Self.makeTerminalFont(size: fontSize)
         self.ctFont = defaultFont
         self.fontName = CTFontCopyPostScriptName(self.ctFont) as String
 
         calculateCellMetrics()
-        createAtlasTexture()
-        prerasterizeASCII()
+        if prerasterizeASCII {
+            rebuildAtlas()
+        }
     }
 
     // MARK: - Font Metrics
@@ -111,8 +139,8 @@ final class GlyphAtlas {
     private func createAtlasTexture() {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .r8Unorm,
-            width: atlasWidth * Int(rasterScale),
-            height: atlasHeight * Int(rasterScale),
+            width: atlasDimension * Int(rasterScale),
+            height: atlasDimension * Int(rasterScale),
             mipmapped: false
         )
         descriptor.usage = [.shaderRead]
@@ -123,29 +151,27 @@ final class GlyphAtlas {
         texture = device.makeTexture(descriptor: descriptor)
     }
 
-    // MARK: - Rasterization
-
-    private func prerasterizeASCII() {
-        // Pre-rasterize printable ASCII (32-126) for fast startup
-        for cp in UInt32(32)...UInt32(126) {
-            _ = rasterizeGlyph(codepoint: cp)
-        }
-
-        // Sync texture to GPU (only needed for managed storage)
-        syncTextureToGPU()
+    private func ensureAtlasTexture() {
+        guard texture == nil else { return }
+        createAtlasTexture()
     }
+
+    // MARK: - Rasterization
 
     /// Get glyph info for a codepoint, rasterizing if not cached.
     func glyphInfo(for codepoint: UInt32) -> GlyphInfo? {
-        if let cached = glyphCache[codepoint] {
+        accessGeneration &+= 1
+        if var cached = glyphCache[codepoint] {
+            cached.lastAccessGeneration = accessGeneration
+            glyphCache[codepoint] = cached
             return cached
         }
-        return rasterizeGlyph(codepoint: codepoint)
+        return rasterizeGlyph(codepoint: codepoint, allowAtlasGrowth: true)
     }
 
     /// Rasterize a single glyph and add it to the atlas.
     @discardableResult
-    private func rasterizeGlyph(codepoint: UInt32) -> GlyphInfo? {
+    private func rasterizeGlyph(codepoint: UInt32, allowAtlasGrowth: Bool) -> GlyphInfo? {
         guard let scalar = Unicode.Scalar(codepoint) else { return nil }
 
         // Get glyph from Core Text (handles font fallback for CJK automatically)
@@ -183,15 +209,16 @@ final class GlyphAtlas {
                 textureX: 0, textureY: 0, textureW: 0, textureH: 0,
                 cellOffsetX: 0, bearingX: 0, baselineOffset: 0,
                 pixelWidth: 0, pixelHeight: 0,
-                advance: Float(advance.width)
+                advance: Float(advance.width),
+                lastAccessGeneration: accessGeneration
             )
             glyphCache[codepoint] = info
             return info
         }
 
         // Check if we need to advance to next row in atlas
-        let atlasPixelW = atlasWidth * Int(scale)
-        let atlasPixelH = atlasHeight * Int(scale)
+        let atlasPixelW = atlasDimension * Int(scale)
+        let atlasPixelH = atlasDimension * Int(scale)
 
         if packX + pixelW > atlasPixelW {
             packX = 0
@@ -200,8 +227,10 @@ final class GlyphAtlas {
         }
 
         if packY + pixelH > atlasPixelH {
-            // Atlas is full - in production, would create a new atlas page
-            return nil
+            guard allowAtlasGrowth, growAtlasAndRepack(adding: codepoint) else {
+                return nil
+            }
+            return glyphCache[codepoint]
         }
 
         // Rasterize glyph to bitmap
@@ -251,6 +280,7 @@ final class GlyphAtlas {
 
         // Upload to atlas texture
         guard let data = context.data else { return nil }
+        ensureAtlasTexture()
         let region = MTLRegionMake2D(packX, packY, pixelW, pixelH)
         texture?.replace(region: region, mipmapLevel: 0,
                         withBytes: data, bytesPerRow: pixelW)
@@ -280,7 +310,8 @@ final class GlyphAtlas {
             baselineOffset: baselineOffset,
             pixelWidth: renderPixelWidth,
             pixelHeight: renderPixelHeight,
-            advance: Float(advance.width)
+            advance: Float(advance.width),
+            lastAccessGeneration: accessGeneration
         )
 
         glyphCache[codepoint] = info
@@ -296,6 +327,9 @@ final class GlyphAtlas {
     /// No-op for shared storage (Apple Silicon unified memory).
     private func syncTextureToGPU() {
         guard let texture = texture, texture.storageMode == .managed else { return }
+        if commandQueue == nil {
+            commandQueue = device.makeCommandQueue()
+        }
         guard let cmdBuf = commandQueue?.makeCommandBuffer(),
               let blit = cmdBuf.makeBlitCommandEncoder() else { return }
         blit.synchronize(resource: texture)
@@ -324,14 +358,91 @@ final class GlyphAtlas {
         rebuildAtlas()
     }
 
+    func resetToMinimum() {
+        glyphCache.removeAll()
+        packX = 0
+        packY = 0
+        rowHeight = 0
+        atlasDimension = initialAtlasDimension
+        calculateCellMetrics()
+        texture = nil
+    }
+
+    @discardableResult
+    func compactRetainingRecentlyUsedGlyphs(maximumInactiveGenerations: UInt64 = 4096) -> Bool {
+        guard !glyphCache.isEmpty else {
+            if atlasDimension > initialAtlasDimension {
+                resetToMinimum()
+                return true
+            }
+            return false
+        }
+
+        let currentGeneration = accessGeneration
+        let retained = glyphCache.compactMap { entry -> UInt32? in
+            let (codepoint, info) = entry
+            guard currentGeneration &- info.lastAccessGeneration <= maximumInactiveGenerations else {
+                return nil
+            }
+            return codepoint
+        }
+
+        guard retained.count < glyphCache.count || atlasDimension > initialAtlasDimension else {
+            return false
+        }
+
+        rebuildAtlasRetaining(Set(retained), resetToInitialSize: true)
+        return true
+    }
+
     private func rebuildAtlas() {
+        rebuildAtlasRetaining(currentGlyphSet().union(prerasterizedASCIISet()),
+                              resetToInitialSize: true)
+    }
+
+    private func rebuildAtlas(preserving additionalCodepoints: [UInt32], resetToInitialSize: Bool = false) {
+        rebuildAtlasRetaining(currentGlyphSet().union(additionalCodepoints).union(prerasterizedASCIISet()),
+                              resetToInitialSize: resetToInitialSize)
+    }
+
+    private func rebuildAtlasRetaining(_ required: Set<UInt32>, resetToInitialSize: Bool) {
+        if resetToInitialSize {
+            atlasDimension = initialAtlasDimension
+        }
         glyphCache.removeAll()
         packX = 0
         packY = 0
         rowHeight = 0
         calculateCellMetrics()
-        createAtlasTexture()
-        prerasterizeASCII()
+        texture = nil
+        guard !required.isEmpty else { return }
+        for codepoint in required.sorted() {
+            _ = rasterizeGlyph(codepoint: codepoint, allowAtlasGrowth: true)
+        }
+        syncTextureToGPU()
+    }
+
+    private func currentGlyphSet() -> Set<UInt32> {
+        Set(glyphCache.keys)
+    }
+
+    private func prerasterizedASCIISet() -> Set<UInt32> {
+        guard prerasterizeASCII else { return [] }
+        return Set(UInt32(32)...UInt32(126))
+    }
+
+    private func nextAtlasDimension(after current: Int) -> Int {
+        guard current < maxAtlasDimension else { return maxAtlasDimension }
+        let grown = Int(ceil(CGFloat(current) * 1.5))
+        let minimumStep = max(current + 1, grown)
+        return min(maxAtlasDimension, minimumStep)
+    }
+
+    private func growAtlasAndRepack(adding codepoint: UInt32) -> Bool {
+        guard atlasDimension < maxAtlasDimension else { return false }
+        atlasDimension = nextAtlasDimension(after: atlasDimension)
+        rebuildAtlas(preserving: [codepoint], resetToInitialSize: false)
+        return glyphCache[codepoint] != nil
     }
 
     private static func makeTerminalFont(name: String? = nil, size: CGFloat) -> CTFont {

@@ -123,6 +123,46 @@ final class TextModelTests: XCTestCase {
         XCTAssertEqual(Array(output.prefix(count)), [0xFFFD])
     }
 
+    func testTerminalTextDecoderStartsWithoutReusableDecodeBufferAllocation() {
+        let decoder = TerminalTextDecoder(encoding: .utf8)
+        XCTAssertEqual(decoder.debugDecodeBufferCapacity, 0)
+    }
+
+    func testTerminalTextDecoderReusableDecodeBufferGrowsOnlyWhenNeeded() {
+        let decoder = TerminalTextDecoder(encoding: .utf8)
+        decoder.debugPrimeDecodeBufferCapacity(32)
+        XCTAssertEqual(decoder.debugDecodeBufferCapacity, 256)
+
+        decoder.debugPrimeDecodeBufferCapacity(2048)
+        XCTAssertGreaterThanOrEqual(decoder.debugDecodeBufferCapacity, 2048)
+    }
+
+    func testTerminalTextDecoderIdleShrinkReleasesReusableDecodeBufferCompletely() {
+        let decoder = TerminalTextDecoder(encoding: .utf8)
+        decoder.debugPrimeDecodeBufferCapacity(4096)
+        XCTAssertGreaterThanOrEqual(decoder.debugDecodeBufferCapacity, 4096)
+
+        decoder.debugShrinkDecodeBufferIfIdle(requiredCount: 0)
+        XCTAssertEqual(decoder.debugDecodeBufferCapacity, 0)
+    }
+
+    func testTerminalTextDecoderResetReleasesBOMProbeStorage() {
+        let decoder = TerminalTextDecoder(encoding: .utf16)
+        decoder.debugPrimeBOMProbeCapacity(32)
+        XCTAssertGreaterThan(decoder.debugBOMProbeCapacity, 0)
+
+        decoder.reset()
+
+        XCTAssertEqual(decoder.debugBOMProbeCapacity, 0)
+    }
+
+    func testTerminalTextDecoderAutoDetectedBOMReleasesProbeStorageImmediately() {
+        let decoder = TerminalTextDecoder(encoding: .utf16)
+
+        XCTAssertEqual(decoder.decode(Data([0xFF, 0xFE, 0x41, 0x00])), "A")
+        XCTAssertEqual(decoder.debugBOMProbeCapacity, 0)
+    }
+
     func testTerminalGridResizeRowsOnlyReturnsTrimmedRows() {
         let grid = TerminalGrid(rows: 3, cols: 4)
         grid.setCell(Cell(codepoint: 0x41, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 0)
@@ -136,6 +176,24 @@ final class TextModelTests: XCTestCase {
         XCTAssertEqual(result.cursorRow, 1)
         XCTAssertEqual(grid.rows, 2)
         XCTAssertEqual(grid.cols, 4)
+    }
+
+    func testTerminalGridResizeRowsOnlyPreservesRemainingWrapFlagsAcrossShrinkAndGrow() {
+        let grid = TerminalGrid(rows: 4, cols: 3)
+        grid.setWrapped(1, true)
+        grid.setWrapped(2, true)
+
+        _ = grid.resize(newRows: 3, newCols: 3, cursorRow: 3, cursorCol: 0)
+        XCTAssertTrue(grid.isWrapped(0))
+        XCTAssertTrue(grid.isWrapped(1))
+        XCTAssertFalse(grid.isWrapped(2))
+
+        _ = grid.resize(newRows: 5, newCols: 3, cursorRow: 2, cursorCol: 0)
+        XCTAssertTrue(grid.isWrapped(0))
+        XCTAssertTrue(grid.isWrapped(1))
+        XCTAssertFalse(grid.isWrapped(2))
+        XCTAssertFalse(grid.isWrapped(3))
+        XCTAssertFalse(grid.isWrapped(4))
     }
 
     func testTerminalGridScrollUpWithinCustomScrollRegion() {
@@ -250,6 +308,43 @@ final class TextModelTests: XCTestCase {
         XCTAssertEqual(grid.cell(at: 1, col: 2).codepoint, 0x46)
         XCTAssertTrue(grid.isWrapped(1))
         XCTAssertFalse(grid.isWrapped(0))
+    }
+
+    func testTerminalGridWrapFlagsWorkAcrossBitsetWordBoundary() {
+        let grid = TerminalGrid(rows: 130, cols: 2)
+        grid.setWrapped(0, true)
+        grid.setWrapped(63, true)
+        grid.setWrapped(64, true)
+        grid.setWrapped(129, true)
+
+        XCTAssertTrue(grid.isWrapped(0))
+        XCTAssertTrue(grid.isWrapped(63))
+        XCTAssertTrue(grid.isWrapped(64))
+        XCTAssertTrue(grid.isWrapped(129))
+        XCTAssertFalse(grid.isWrapped(1))
+        XCTAssertFalse(grid.isWrapped(65))
+    }
+
+    func testTerminalGridScrollOperationsPreserveWrapFlagsAcrossBitsetWordBoundary() {
+        let grid = TerminalGrid(rows: 66, cols: 1)
+        for row in 0..<66 {
+            grid.setCell(
+                Cell(codepoint: UInt32(65 + (row % 26)), attributes: .default, width: 1, isWideContinuation: false),
+                at: row,
+                col: 0
+            )
+        }
+        grid.setWrapped(63, true)
+        grid.setWrapped(64, true)
+
+        grid.scrollUp()
+        XCTAssertTrue(grid.isWrapped(62))
+        XCTAssertTrue(grid.isWrapped(63))
+
+        grid.scrollDown()
+        XCTAssertFalse(grid.isWrapped(0))
+        XCTAssertTrue(grid.isWrapped(63))
+        XCTAssertTrue(grid.isWrapped(64))
     }
 
     func testTerminalSelectionExtractsNormalSelectionAcrossWrappedLinesWithoutExtraNewline() {
@@ -391,6 +486,200 @@ final class TextModelTests: XCTestCase {
         XCTAssertTrue(buffer.isRowWrapped(at: 0))
     }
 
+    func testScrollbackBufferCompactDefaultRowsFitMoreHistoryWithinSameCapacity() throws {
+        let buffer = ScrollbackBuffer(initialCapacity: 80, maxCapacity: 80)
+        let row = ArraySlice("abcd".unicodeScalars.map {
+            Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+        })
+
+        for _ in 0..<4 {
+            buffer.appendRow(row, isWrapped: false)
+        }
+
+        XCTAssertEqual(buffer.rowCount, 4)
+        let firstRow = try XCTUnwrap(buffer.getRow(at: 0))
+        XCTAssertEqual(
+            String(firstRow.compactMap { Unicode.Scalar($0.codepoint).map(Character.init) }),
+            "abcd"
+        )
+    }
+
+    func testScrollbackBufferCompactDefaultRowsTrimTrailingDefaultBlanksAndRoundTripOriginalWidth() throws {
+        let buffer = ScrollbackBuffer(initialCapacity: 128, maxCapacity: 128)
+        let row: ArraySlice<Cell> = [
+            Cell(codepoint: 0x61, attributes: .default, width: 1, isWideContinuation: false),
+            Cell(codepoint: 0x62, attributes: .default, width: 1, isWideContinuation: false),
+            .empty,
+            .empty
+        ][0...3]
+
+        buffer.appendRow(row, isWrapped: false)
+
+        let restored = try XCTUnwrap(buffer.getRow(at: 0))
+        XCTAssertEqual(restored.count, 4)
+        XCTAssertEqual(restored[0].codepoint, 0x61)
+        XCTAssertEqual(restored[1].codepoint, 0x62)
+        XCTAssertEqual(restored[2].codepoint, Cell.empty.codepoint)
+        XCTAssertEqual(restored[2].attributes, .default)
+        XCTAssertEqual(restored[2].width, Cell.empty.width)
+        XCTAssertFalse(restored[2].isWideContinuation)
+        XCTAssertEqual(restored[3].codepoint, Cell.empty.codepoint)
+        XCTAssertEqual(restored[3].attributes, .default)
+        XCTAssertEqual(restored[3].width, Cell.empty.width)
+        XCTAssertFalse(restored[3].isWideContinuation)
+    }
+
+    func testScrollbackBufferPreservesStyledRowsWithLegacyEncoding() throws {
+        let buffer = ScrollbackBuffer(initialCapacity: 256, maxCapacity: 256)
+        let styledRow: ArraySlice<Cell> = [
+            Cell(
+                codepoint: 0x41,
+                attributes: CellAttributes(
+                    foreground: .indexed(196),
+                    background: .rgb(1, 2, 3),
+                    bold: true,
+                    italic: true,
+                    underline: true,
+                    strikethrough: false,
+                    inverse: false,
+                    hidden: false,
+                    dim: false,
+                    blink: false
+                ),
+                width: 1,
+                isWideContinuation: false
+            ),
+            Cell(
+                codepoint: 0x4E2D,
+                attributes: .default,
+                width: 2,
+                isWideContinuation: false
+            )
+        ][0...1]
+
+        buffer.appendRow(styledRow, isWrapped: true)
+
+        let row = try XCTUnwrap(buffer.getRow(at: 0))
+        XCTAssertEqual(row.count, 2)
+        XCTAssertEqual(row[0].codepoint, 0x41)
+        XCTAssertEqual(row[0].attributes.foreground, .indexed(196))
+        XCTAssertEqual(row[0].attributes.background, .rgb(1, 2, 3))
+        XCTAssertTrue(row[0].attributes.bold)
+        XCTAssertTrue(row[0].attributes.italic)
+        XCTAssertTrue(row[0].attributes.underline)
+        XCTAssertEqual(row[1].codepoint, 0x4E2D)
+        XCTAssertEqual(row[1].width, 2)
+        XCTAssertTrue(buffer.isRowWrapped(at: 0))
+    }
+
+    func testScrollbackBufferCompactUniformAttributeRowsFitMoreHistoryWithinSameCapacity() throws {
+        let buffer = ScrollbackBuffer(initialCapacity: 120, maxCapacity: 120)
+        let sharedAttributes = CellAttributes(
+            foreground: .indexed(196),
+            background: .default,
+            bold: true,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            inverse: false,
+            hidden: false,
+            dim: false,
+            blink: false
+        )
+        let row = ArraySlice("abcd".unicodeScalars.map {
+            Cell(codepoint: $0.value, attributes: sharedAttributes, width: 1, isWideContinuation: false)
+        })
+
+        for _ in 0..<4 {
+            buffer.appendRow(row, isWrapped: false)
+        }
+
+        XCTAssertEqual(buffer.rowCount, 4)
+        let firstRow = try XCTUnwrap(buffer.getRow(at: 0))
+        XCTAssertEqual(firstRow.count, 4)
+        XCTAssertEqual(firstRow[0].attributes.foreground, .indexed(196))
+        XCTAssertTrue(firstRow[0].attributes.bold)
+    }
+
+    func testScrollbackBufferCompactUniformRowsTrimTrailingBlankCellsAndRestoreSharedAttributes() throws {
+        let buffer = ScrollbackBuffer(initialCapacity: 128, maxCapacity: 128)
+        let sharedAttributes = CellAttributes(
+            foreground: .indexed(34),
+            background: .rgb(1, 2, 3),
+            bold: false,
+            italic: true,
+            underline: false,
+            strikethrough: false,
+            inverse: false,
+            hidden: false,
+            dim: false,
+            blink: false
+        )
+        let blank = Cell(codepoint: 0x20, attributes: sharedAttributes, width: 1, isWideContinuation: false)
+        let row: ArraySlice<Cell> = [
+            Cell(codepoint: 0x61, attributes: sharedAttributes, width: 1, isWideContinuation: false),
+            blank,
+            blank
+        ][0...2]
+
+        buffer.appendRow(row, isWrapped: false)
+
+        let restored = try XCTUnwrap(buffer.getRow(at: 0))
+        XCTAssertEqual(restored.count, 3)
+        XCTAssertEqual(restored[0].codepoint, 0x61)
+        XCTAssertEqual(restored[1].codepoint, blank.codepoint)
+        XCTAssertEqual(restored[1].attributes, sharedAttributes)
+        XCTAssertEqual(restored[1].width, blank.width)
+        XCTAssertFalse(restored[1].isWideContinuation)
+        XCTAssertEqual(restored[2].codepoint, blank.codepoint)
+        XCTAssertEqual(restored[2].attributes, sharedAttributes)
+        XCTAssertEqual(restored[2].width, blank.width)
+        XCTAssertFalse(restored[2].isWideContinuation)
+    }
+
+    func testScrollbackBufferCanDecodeRowIntoReusableDestinationBuffer() throws {
+        let buffer = ScrollbackBuffer(initialCapacity: 128, maxCapacity: 128)
+        let row: ArraySlice<Cell> = [
+            Cell(codepoint: 0x41, attributes: .default, width: 1, isWideContinuation: false),
+            Cell(codepoint: 0x42, attributes: .default, width: 1, isWideContinuation: false)
+        ][0...1]
+
+        buffer.appendRow(row, isWrapped: false)
+
+        var destination = [Cell]()
+        destination.reserveCapacity(8)
+        destination.append(Cell.empty)
+
+        XCTAssertTrue(buffer.getRow(at: 0, into: &destination))
+        XCTAssertEqual(destination.map(\.codepoint), [0x41, 0x42])
+        XCTAssertGreaterThanOrEqual(destination.capacity, 8)
+    }
+
+    func testScrollbackBufferTrimmedCompactRowsFitMoreHistoryWithinSameCapacity() throws {
+        let buffer = ScrollbackBuffer(initialCapacity: 64, maxCapacity: 64)
+        let row: ArraySlice<Cell> = [
+            Cell(codepoint: 0x61, attributes: .default, width: 1, isWideContinuation: false),
+            .empty,
+            .empty,
+            .empty
+        ][0...3]
+
+        for _ in 0..<6 {
+            buffer.appendRow(row, isWrapped: false)
+        }
+
+        XCTAssertEqual(buffer.rowCount, 6)
+        let restored = try XCTUnwrap(buffer.getRow(at: 0))
+        XCTAssertEqual(restored.count, 4)
+        XCTAssertEqual(restored[0].codepoint, 0x61)
+        for index in 1...3 {
+            XCTAssertEqual(restored[index].codepoint, Cell.empty.codepoint)
+            XCTAssertEqual(restored[index].attributes, .default)
+            XCTAssertEqual(restored[index].width, Cell.empty.width)
+            XCTAssertFalse(restored[index].isWideContinuation)
+        }
+    }
+
     func testScrollbackBufferPersistentStoreCanBeDiscarded() throws {
         try withTemporaryDirectory { directory in
             let backingFile = directory.appendingPathComponent("scrollback.bin")
@@ -407,5 +696,110 @@ final class TextModelTests: XCTestCase {
 
             XCTAssertFalse(FileManager.default.fileExists(atPath: backingFile.path))
         }
+    }
+
+    func testScrollbackBufferClearReleasesOversizedSerializationBuffer() throws {
+        let buffer = ScrollbackBuffer(initialCapacity: 1024, maxCapacity: 1024)
+        let longRow = ArraySlice((0..<400).map { index in
+            Cell(
+                codepoint: 0x61,
+                attributes: .init(
+                    foreground: .default,
+                    background: .indexed(UInt8(index % 200)),
+                    bold: false,
+                    italic: false,
+                    underline: index.isMultiple(of: 2),
+                    strikethrough: false,
+                    inverse: false,
+                    hidden: false,
+                    dim: false,
+                    blink: false
+                ),
+                width: 1,
+                isWideContinuation: false
+            )
+        })
+
+        buffer.appendRow(longRow, isWrapped: false)
+        XCTAssertGreaterThan(buffer.serializationBufferCapacity, 0)
+
+        buffer.clear()
+
+        XCTAssertEqual(buffer.serializationBufferCapacity, 0)
+        XCTAssertEqual(buffer.rowCount, 0)
+    }
+
+    func testScrollbackBufferIdleCompactionReleasesSerializationScratchCompletely() throws {
+        let buffer = ScrollbackBuffer(initialCapacity: 8192, maxCapacity: 8192)
+        let longRow = ArraySlice((0..<300).map { index in
+            Cell(
+                codepoint: 0x41,
+                attributes: .init(
+                    foreground: .indexed(UInt8(index % 16)),
+                    background: .rgb(UInt8(index % 255), 2, 3),
+                    bold: index.isMultiple(of: 3),
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
+                    inverse: false,
+                    hidden: false,
+                    dim: false,
+                    blink: false
+                ),
+                width: 1,
+                isWideContinuation: false
+            )
+        })
+        let shortRow = ArraySlice("ok".unicodeScalars.map {
+            Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+        })
+
+        buffer.appendRow(longRow, isWrapped: false)
+        let peakScratch = buffer.serializationBufferCapacity
+        XCTAssertGreaterThan(peakScratch, 4 * 1024)
+
+        buffer.appendRow(shortRow, isWrapped: false)
+
+        _ = buffer.compactIfUnderutilized()
+        XCTAssertEqual(buffer.serializationBufferCapacity, 0)
+        XCTAssertEqual(buffer.rowCount, 2)
+        XCTAssertEqual(try XCTUnwrap(buffer.getRow(at: 1)).map(\.codepoint), [0x6F, 0x6B])
+    }
+
+    func testScrollbackBufferAppendPathShrinksOversizedSerializationScratchForSmallRows() {
+        let buffer = ScrollbackBuffer(initialCapacity: 8192, maxCapacity: 8192)
+        let largeRow = ArraySlice((0..<300).map { index in
+            Cell(
+                codepoint: 0x41,
+                attributes: .init(
+                    foreground: .indexed(UInt8(index % 16)),
+                    background: .rgb(UInt8(index % 255), 2, 3),
+                    bold: index.isMultiple(of: 3),
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
+                    inverse: false,
+                    hidden: false,
+                    dim: false,
+                    blink: false
+                ),
+                width: 1,
+                isWideContinuation: false
+            )
+        })
+        let shortRow = ArraySlice("ok".unicodeScalars.map {
+            Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+        })
+
+        buffer.appendRow(largeRow, isWrapped: false)
+        let peakScratch = buffer.serializationBufferCapacity
+        XCTAssertGreaterThan(peakScratch, 4 * 1024)
+
+        buffer.appendRow(shortRow, isWrapped: false)
+
+        XCTAssertEqual(buffer.serializationBufferCapacity, 4 * 1024)
+        XCTAssertLessThan(buffer.serializationBufferCapacity, peakScratch)
+        XCTAssertEqual(buffer.rowCount, 2)
+        XCTAssertEqual(buffer.getRow(at: 1)?.map(\.codepoint), [0x6F, 0x6B])
     }
 }

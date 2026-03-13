@@ -60,7 +60,7 @@ final class MetalRenderer {
         var overlayVertices: [Float] = []
     }
 
-    private struct SearchMatchSpan {
+    struct SearchMatchSpan {
         let start: Int
         let end: Int
         let isCurrent: Bool
@@ -121,6 +121,9 @@ final class MetalRenderer {
         var overviewCircleGlyphBuffer: MTLBuffer?
         var overviewThumbnailBgBuffer: MTLBuffer?
         var overviewThumbnailGlyphBuffer: MTLBuffer?
+        var terminalScrollbackRowsScratch: [[Cell]] = []
+        var terminalScrollbackRowHasData: [Bool] = []
+        var terminalSearchMatchesScratch: [[SearchMatchSpan]] = []
     }
 
     enum ViewBufferSlot {
@@ -142,6 +145,48 @@ final class MetalRenderer {
     /// Keyed by view's ObjectIdentifier to give each MTKView its own buffers.
     private var viewBuffers: [ObjectIdentifier: ViewBufferSet] = [:]
 
+    var activeViewBufferCount: Int {
+        viewBuffers.count
+    }
+
+    func bufferLength(for view: MTKView, slot: ViewBufferSlot) -> Int? {
+        let bs = viewBuffers[ObjectIdentifier(view)]
+        switch slot {
+        case .overviewPreOverlay:
+            return bs?.overviewPreOverlayBuffer?.length
+        case .overviewPostOverlay:
+            return bs?.overviewPostOverlayBuffer?.length
+        case .overviewTextGlyph:
+            return bs?.overviewTextGlyphBuffer?.length
+        case .overviewIconGlyph:
+            return bs?.overviewIconGlyphBuffer?.length
+        case .overviewCircleGlyph:
+            return bs?.overviewCircleGlyphBuffer?.length
+        case .overviewThumbnailBg:
+            return bs?.overviewThumbnailBgBuffer?.length
+        case .overviewThumbnailGlyph:
+            return bs?.overviewThumbnailGlyphBuffer?.length
+        }
+    }
+
+    func terminalScrollbackScratchRowCapacity(for view: MTKView) -> Int {
+        viewBuffers[ObjectIdentifier(view)]?.terminalScrollbackRowsScratch.count ?? 0
+    }
+
+    func terminalScrollbackScratchBufferedCellCount(for view: MTKView) -> Int {
+        guard let bufferSet = viewBuffers[ObjectIdentifier(view)] else { return 0 }
+        return zip(bufferSet.terminalScrollbackRowsScratch, bufferSet.terminalScrollbackRowHasData)
+            .reduce(into: 0) { partialResult, pair in
+                if pair.1 {
+                    partialResult += pair.0.count
+                }
+            }
+    }
+
+    func terminalSearchScratchRowCapacity(for view: MTKView) -> Int {
+        viewBuffers[ObjectIdentifier(view)]?.terminalSearchMatchesScratch.count ?? 0
+    }
+
     private func bufferSet(for view: MTKView) -> ViewBufferSet {
         let key = ObjectIdentifier(view)
         if let existing = viewBuffers[key] { return existing }
@@ -153,6 +198,106 @@ final class MetalRenderer {
     /// Remove buffer set when a view is deallocated.
     func removeBuffers(for view: MTKView) {
         viewBuffers.removeValue(forKey: ObjectIdentifier(view))
+    }
+
+    private func pruneEmptyBufferSet(for view: MTKView) {
+        let key = ObjectIdentifier(view)
+        guard let bufferSet = viewBuffers[key] else { return }
+        let allBuffers: [MTLBuffer?] = [
+            bufferSet.bgBuffer,
+            bufferSet.glyphBuffer,
+            bufferSet.cursorBuffer,
+            bufferSet.overlayBuffer,
+            bufferSet.borderBuffer,
+            bufferSet.splitBgBuffer,
+            bufferSet.splitGlyphBuffer,
+            bufferSet.splitCursorBuffer,
+            bufferSet.splitOverlayBuffer,
+            bufferSet.splitBorderBuffer,
+            bufferSet.overviewPreOverlayBuffer,
+            bufferSet.overviewPostOverlayBuffer,
+            bufferSet.overviewTextGlyphBuffer,
+            bufferSet.overviewIconGlyphBuffer,
+            bufferSet.overviewCircleGlyphBuffer,
+            bufferSet.overviewThumbnailBgBuffer,
+            bufferSet.overviewThumbnailGlyphBuffer,
+        ]
+        if allBuffers.allSatisfy({ $0 == nil }) {
+            viewBuffers.removeValue(forKey: key)
+        }
+    }
+
+    func releaseTerminalBuffers(for view: MTKView) {
+        guard let bufferSet = viewBuffers[ObjectIdentifier(view)] else { return }
+        bufferSet.bgBuffer = nil
+        bufferSet.glyphBuffer = nil
+        bufferSet.cursorBuffer = nil
+        bufferSet.overlayBuffer = nil
+        bufferSet.borderBuffer = nil
+        bufferSet.terminalScrollbackRowsScratch.removeAll(keepingCapacity: false)
+        bufferSet.terminalScrollbackRowHasData.removeAll(keepingCapacity: false)
+        bufferSet.terminalSearchMatchesScratch.removeAll(keepingCapacity: false)
+        pruneEmptyBufferSet(for: view)
+    }
+
+    func releaseSplitBuffers(for view: MTKView) {
+        guard let bufferSet = viewBuffers[ObjectIdentifier(view)] else { return }
+        bufferSet.splitBgBuffer = nil
+        bufferSet.splitGlyphBuffer = nil
+        bufferSet.splitCursorBuffer = nil
+        bufferSet.splitOverlayBuffer = nil
+        bufferSet.splitBorderBuffer = nil
+        bufferSet.terminalScrollbackRowsScratch.removeAll(keepingCapacity: false)
+        bufferSet.terminalScrollbackRowHasData.removeAll(keepingCapacity: false)
+        bufferSet.terminalSearchMatchesScratch.removeAll(keepingCapacity: false)
+        pruneEmptyBufferSet(for: view)
+    }
+
+    func releaseOverviewBuffers(for view: MTKView) {
+        guard let bufferSet = viewBuffers[ObjectIdentifier(view)] else { return }
+        bufferSet.overviewPreOverlayBuffer = nil
+        bufferSet.overviewPostOverlayBuffer = nil
+        bufferSet.overviewTextGlyphBuffer = nil
+        bufferSet.overviewIconGlyphBuffer = nil
+        bufferSet.overviewCircleGlyphBuffer = nil
+        bufferSet.overviewThumbnailBgBuffer = nil
+        bufferSet.overviewThumbnailGlyphBuffer = nil
+        pruneEmptyBufferSet(for: view)
+    }
+
+    func hasTerminalBuffers(for view: MTKView) -> Bool {
+        guard let bufferSet = viewBuffers[ObjectIdentifier(view)] else { return false }
+        return [
+            bufferSet.bgBuffer,
+            bufferSet.glyphBuffer,
+            bufferSet.cursorBuffer,
+            bufferSet.overlayBuffer,
+            bufferSet.borderBuffer,
+        ].contains(where: { $0 != nil })
+    }
+
+    func hasSplitBuffers(for view: MTKView) -> Bool {
+        guard let bufferSet = viewBuffers[ObjectIdentifier(view)] else { return false }
+        return [
+            bufferSet.splitBgBuffer,
+            bufferSet.splitGlyphBuffer,
+            bufferSet.splitCursorBuffer,
+            bufferSet.splitOverlayBuffer,
+            bufferSet.splitBorderBuffer,
+        ].contains(where: { $0 != nil })
+    }
+
+    func hasOverviewBuffers(for view: MTKView) -> Bool {
+        guard let bufferSet = viewBuffers[ObjectIdentifier(view)] else { return false }
+        return [
+            bufferSet.overviewPreOverlayBuffer,
+            bufferSet.overviewPostOverlayBuffer,
+            bufferSet.overviewTextGlyphBuffer,
+            bufferSet.overviewIconGlyphBuffer,
+            bufferSet.overviewCircleGlyphBuffer,
+            bufferSet.overviewThumbnailBgBuffer,
+            bufferSet.overviewThumbnailGlyphBuffer,
+        ].contains(where: { $0 != nil })
     }
 
     /// Animation start time
@@ -236,6 +381,13 @@ final class MetalRenderer {
                 Float(appearance.background.blue) / 255.0,
                 Float(appearance.normalizedBackgroundOpacity)
             )
+        )
+    }
+
+    @discardableResult
+    func compactIdleGlyphAtlas(maximumInactiveGenerations: UInt64 = 4096) -> Bool {
+        glyphAtlas.compactRetainingRecentlyUsedGlyphs(
+            maximumInactiveGenerations: maximumInactiveGenerations
         )
     }
 
@@ -386,16 +538,37 @@ final class MetalRenderer {
     /// Reuses the existing buffer if it has sufficient capacity.
     private func updateVertexBuffer(_ buffer: inout MTLBuffer?, vertices: [Float]) -> MTLBuffer? {
         let byteCount = vertices.count * MemoryLayout<Float>.size
-        guard byteCount > 0 else { return nil }
+        guard byteCount > 0 else {
+            buffer = nil
+            return nil
+        }
 
-        if buffer == nil || buffer!.length < byteCount {
-            // Allocate with 50% headroom to reduce reallocations
-            let allocSize = byteCount + byteCount / 2
+        if shouldReallocateBuffer(buffer, requiredByteCount: byteCount) {
+            let allocSize = normalizedReusableBufferSize(requiredByteCount: byteCount)
             buffer = device.makeBuffer(length: allocSize, options: .storageModeShared)
         }
 
         buffer?.contents().copyMemory(from: vertices, byteCount: byteCount)
         return buffer
+    }
+
+    private func normalizedReusableBufferSize(requiredByteCount: Int) -> Int {
+        let minimumSize = 4 * 1024
+        let alignment = 4 * 1024
+        let headroom = min(max(requiredByteCount / 8, 1024), 64 * 1024)
+        let target = max(requiredByteCount + headroom, minimumSize)
+        let remainder = target % alignment
+        if remainder == 0 { return target }
+        return target + (alignment - remainder)
+    }
+
+    private func shouldReallocateBuffer(_ buffer: MTLBuffer?, requiredByteCount: Int) -> Bool {
+        guard let buffer else { return true }
+        if buffer.length < requiredByteCount { return true }
+        // If the existing shared buffer is vastly larger than the current frame
+        // payload, drop it so short-lived peaks do not become permanent RSS.
+        let shrinkThreshold = max(normalizedReusableBufferSize(requiredByteCount: requiredByteCount) * 2, 32 * 1024)
+        return buffer.length > shrinkThreshold
     }
 
     // MARK: - Rendering
@@ -442,19 +615,20 @@ final class MetalRenderer {
         renderPassDescriptor.colorAttachments[0].loadAction = .clear
         renderPassDescriptor.colorAttachments[0].clearColor = terminalClearColor
 
+        // Use per-view resources to avoid conflicts when multiple MTKViews share this renderer.
+        let bs = bufferSet(for: view)
+
         // Build vertex data using the atlas's scale factor.
         let sf = Float(glyphAtlas.scaleFactor)
         let vd = buildVertexData(model: model, scrollback: scrollback, scrollOffset: scrollOffset,
                                  selection: selection, searchHighlight: searchHighlight,
-                                 linkUnderline: linkUnderline, scaleFactor: sf)
+                                 linkUnderline: linkUnderline, scaleFactor: sf,
+                                 bufferSet: bs)
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(
             descriptor: renderPassDescriptor) else {
             return
         }
-
-        // Use per-view buffer set to avoid conflicts when multiple MTKViews share this renderer.
-        let bs = bufferSet(for: view)
 
         // 1. Draw backgrounds
         if !vd.bgVertices.isEmpty, let pipeline = bgPipeline,
@@ -535,7 +709,8 @@ final class MetalRenderer {
                                   scrollOffset: Int, selection: TerminalSelection?,
                                   searchHighlight: SearchHighlight? = nil,
                                   linkUnderline: LinkUnderline? = nil,
-                                  scaleFactor: Float) -> VertexData {
+                                  scaleFactor: Float,
+                                  bufferSet: ViewBufferSet) -> VertexData {
         var vd = VertexData()
 
         let cellW = Float(glyphAtlas.cellWidth) * scaleFactor
@@ -556,13 +731,16 @@ final class MetalRenderer {
 
         // Pre-fetch scrollback rows that are visible in the viewport.
         // Each row is fetched once and reused for all columns.
-        var scrollbackRows = Array<[Cell]?>(repeating: nil, count: viewRows)
+        prepareTerminalScrollbackRowsScratch(in: bufferSet, rowCount: viewRows)
         if scrollOffset > 0 {
             let firstAbsolute = max(0, sbCount - scrollOffset)
             for viewRow in 0..<viewRows {
                 let absRow = firstAbsolute + viewRow
                 if absRow >= 0 && absRow < sbCount {
-                    scrollbackRows[viewRow] = scrollback.getRow(at: absRow)
+                    bufferSet.terminalScrollbackRowHasData[viewRow] = scrollback.getRow(
+                        at: absRow,
+                        into: &bufferSet.terminalScrollbackRowsScratch[viewRow]
+                    )
                 }
             }
         }
@@ -570,12 +748,12 @@ final class MetalRenderer {
         let firstAbsolute = scrollOffset > 0 ? max(0, sbCount - scrollOffset) : sbCount
 
         // Build per-visible-row search match lists once so we can walk them linearly.
-        var searchMatchesByVisibleRow = Array<[SearchMatchSpan]>(repeating: [], count: viewRows)
+        prepareTerminalSearchMatchesScratch(in: bufferSet, rowCount: viewRows)
         if let sh = searchHighlight {
             for (i, match) in sh.matches.enumerated() {
                 let visibleRow = match.absoluteRow - firstAbsolute
                 guard visibleRow >= 0, visibleRow < viewRows else { continue }
-                searchMatchesByVisibleRow[visibleRow].append(
+                bufferSet.terminalSearchMatchesScratch[visibleRow].append(
                     SearchMatchSpan(start: match.startCol, end: match.endCol, isCurrent: sh.currentIndex == i)
                 )
             }
@@ -584,10 +762,12 @@ final class MetalRenderer {
         for row in 0..<viewRows {
             let absoluteRow = firstAbsolute + row
             let isScrollbackRow = absoluteRow < sbCount
-            let scrollbackRow = isScrollbackRow ? scrollbackRows[row] : nil
+            let scrollbackRow: [Cell]? = isScrollbackRow && bufferSet.terminalScrollbackRowHasData[row]
+                ? bufferSet.terminalScrollbackRowsScratch[row]
+                : nil
             let gridRow = isScrollbackRow ? -1 : absoluteRow - sbCount
 
-            let rowMatches = searchMatchesByVisibleRow[row]
+            let rowMatches = bufferSet.terminalSearchMatchesScratch[row]
             var currentMatchIndex = 0
             let selectedColumnRange: ClosedRange<Int>? = {
                 guard let selection else { return nil }
@@ -1226,7 +1406,8 @@ final class MetalRenderer {
         // Build vertex data at full size (positions relative to (0,0))
         let vd = buildVertexData(model: model, scrollback: scrollback, scrollOffset: scrollOffset,
                                  selection: selection, searchHighlight: searchHighlight,
-                                 linkUnderline: linkUnderline, scaleFactor: scaleFactor)
+                                 linkUnderline: linkUnderline, scaleFactor: scaleFactor,
+                                 bufferSet: bufferSet(for: view))
         // Pixel offset for this cell
         let offsetX = Float(cellRect.origin.x) * scaleFactor
         let offsetY = Float(cellRect.origin.y) * scaleFactor
@@ -1347,5 +1528,27 @@ final class MetalRenderer {
             }
         }
         return shifted
+    }
+
+    private func prepareTerminalScrollbackRowsScratch(in bufferSet: ViewBufferSet, rowCount: Int) {
+        if bufferSet.terminalScrollbackRowsScratch.count != rowCount {
+            bufferSet.terminalScrollbackRowsScratch = Array(repeating: [], count: rowCount)
+            bufferSet.terminalScrollbackRowHasData = Array(repeating: false, count: rowCount)
+            return
+        }
+        for index in 0..<rowCount {
+            bufferSet.terminalScrollbackRowsScratch[index].removeAll(keepingCapacity: true)
+            bufferSet.terminalScrollbackRowHasData[index] = false
+        }
+    }
+
+    private func prepareTerminalSearchMatchesScratch(in bufferSet: ViewBufferSet, rowCount: Int) {
+        if bufferSet.terminalSearchMatchesScratch.count != rowCount {
+            bufferSet.terminalSearchMatchesScratch = Array(repeating: [], count: rowCount)
+            return
+        }
+        for index in 0..<rowCount {
+            bufferSet.terminalSearchMatchesScratch[index].removeAll(keepingCapacity: true)
+        }
     }
 }

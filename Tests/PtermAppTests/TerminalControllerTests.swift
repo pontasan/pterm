@@ -1,9 +1,47 @@
 import AppKit
 import XCTest
 @preconcurrency @testable import PtermApp
+import PtermCore
 
 @MainActor
 final class TerminalControllerTests: XCTestCase {
+    private func initialRowIndexCapacity(for initialCapacity: Int) -> Int {
+        let targetRowBytes = 128
+        let computed = (initialCapacity + (targetRowBytes - 1)) / targetRowBytes
+        return min(max(computed, 16), 64)
+    }
+
+    private func seedOversizedScrollbackFile(path: String, initialCapacity: Int, maxCapacity: Int, codepoint: UInt32) {
+        let rb = ring_buffer_create_mmap_sized(path, initialCapacity, maxCapacity)
+        XCTAssertNotNil(rb)
+        defer { ring_buffer_destroy(rb) }
+
+        let initialRowCapacity = initialRowIndexCapacity(for: initialCapacity)
+        let serializedCellRow: [UInt8] = [
+            UInt8(codepoint & 0xFF), UInt8((codepoint >> 8) & 0xFF), UInt8((codepoint >> 16) & 0xFF), UInt8((codepoint >> 24) & 0xFF),
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+            0, 1, 0, 0
+        ]
+        for _ in 0..<(Int(initialRowCapacity) + 8) {
+            serializedCellRow.withUnsafeBufferPointer { pointer in
+                XCTAssertGreaterThanOrEqual(ring_buffer_append_row(rb, pointer.baseAddress, UInt32(pointer.count), false), 0)
+            }
+        }
+
+        for (index, byte) in serializedCellRow.enumerated() {
+            rb!.pointee.data[index] = byte
+        }
+        rb!.pointee.write_offset = serializedCellRow.count
+        rb!.pointee.bytes_used = serializedCellRow.count
+        rb!.pointee.row_count = 1
+        rb!.pointee.row_head = 0
+        rb!.pointee.row_tail = 1
+        rb!.pointee.rows[0].offset = 0
+        rb!.pointee.rows[0].length = UInt32(serializedCellRow.count)
+        rb!.pointee.rows[0].flags = 0
+    }
+
     private func makeController(
         rows: Int = 3,
         cols: Int = 8,
@@ -28,6 +66,117 @@ final class TerminalControllerTests: XCTestCase {
             workspaceName: workspaceName,
             scrollbackPersistencePath: scrollbackPersistencePath
         )
+    }
+
+    func testTerminalControllerStartsWithoutDecodeBufferAllocation() {
+        let controller = makeController()
+
+        XCTAssertEqual(controller.debugCodepointBufferCapacity, 0)
+    }
+
+    func testTerminalControllerStartsWithoutTextExtractionScratchAllocation() {
+        let controller = makeController()
+
+        XCTAssertEqual(controller.debugTextExtractionScratchCapacity, 0)
+    }
+
+    func testTerminalControllerStartsWithoutSearchScratchAllocation() {
+        let controller = makeController()
+
+        XCTAssertEqual(controller.debugSearchScratchCapacity, 0)
+    }
+
+    func testTerminalControllerDecodeBufferGrowsOnlyWhenNeeded() {
+        let controller = makeController()
+
+        controller.debugPrimeCodepointBufferCapacity(3000)
+
+        XCTAssertGreaterThanOrEqual(controller.debugCodepointBufferCapacity, 3000)
+    }
+
+    func testDebugCompactScrollbackReleasesOversizedDecodeBufferCompletelyWhenIdle() {
+        let controller = makeController()
+        controller.debugPrimeCodepointBufferCapacity(8192)
+        XCTAssertGreaterThanOrEqual(controller.debugCodepointBufferCapacity, 8192)
+
+        _ = controller.debugCompactScrollbackNow()
+
+        XCTAssertEqual(controller.debugCodepointBufferCapacity, 0)
+    }
+
+    func testTextExtractionScratchAllocatesOnlyWhenAllTextOrSearchNeedsItAndReleasesOnIdleCompaction() {
+        let controller = makeController(rows: 3, cols: 4)
+        controller.scrollback.appendRow(ArraySlice([
+            Cell(codepoint: 65, attributes: .default, width: 1, isWideContinuation: false),
+            Cell(codepoint: 66, attributes: .default, width: 1, isWideContinuation: false),
+        ]), isWrapped: false)
+        controller.withViewport { model, _, _ in
+            model.grid.setCell(Cell(codepoint: 67, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 0)
+            model.grid.setCell(Cell(codepoint: 68, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 1)
+        }
+
+        XCTAssertEqual(controller.debugTextExtractionScratchCapacity, 0)
+
+        XCTAssertFalse(controller.allText().isEmpty)
+        XCTAssertGreaterThanOrEqual(controller.debugTextExtractionScratchCapacity, 6)
+
+        XCTAssertFalse(controller.findMatches(for: "ab").isEmpty)
+        XCTAssertGreaterThanOrEqual(controller.debugTextExtractionScratchCapacity, 6)
+
+        _ = controller.debugCompactScrollbackNow()
+
+        XCTAssertEqual(controller.debugTextExtractionScratchCapacity, 0)
+    }
+
+    func testSearchScratchAllocatesOnlyWhenFindMatchesNeedsItAndReleasesOnIdleCompaction() {
+        let controller = makeController(rows: 2, cols: 4)
+        controller.scrollback.appendRow(ArraySlice([
+            Cell(codepoint: 65, attributes: .default, width: 1, isWideContinuation: false),
+            Cell(codepoint: 66, attributes: .default, width: 1, isWideContinuation: false),
+            Cell(codepoint: 67, attributes: .default, width: 1, isWideContinuation: false),
+            Cell(codepoint: 68, attributes: .default, width: 1, isWideContinuation: false),
+        ]), isWrapped: false)
+
+        XCTAssertEqual(controller.debugSearchScratchCapacity, 0)
+
+        let matches = controller.findMatches(for: "bc")
+        XCTAssertEqual(matches, [.init(absoluteRow: 0, startCol: 1, endCol: 2)])
+        XCTAssertGreaterThanOrEqual(controller.debugSearchScratchCapacity, 4)
+
+        _ = controller.debugCompactScrollbackNow()
+
+        XCTAssertEqual(controller.debugSearchScratchCapacity, 0)
+    }
+
+    func testStopReleasesControllerScratchImmediately() {
+        let controller = makeController(rows: 2, cols: 4)
+
+        controller.debugPrimeCodepointBufferCapacity(4096)
+        _ = controller.findMatches(for: "x")
+
+        XCTAssertGreaterThanOrEqual(controller.debugCodepointBufferCapacity, 4096)
+        XCTAssertGreaterThanOrEqual(controller.debugSearchScratchCapacity, 0)
+
+        controller.stop()
+
+        XCTAssertEqual(controller.debugCodepointBufferCapacity, 0)
+        XCTAssertEqual(controller.debugTextExtractionScratchCapacity, 0)
+        XCTAssertEqual(controller.debugSearchScratchCapacity, 0)
+    }
+
+    func testInitiateShutdownReleasesControllerScratchImmediately() {
+        let controller = makeController(rows: 2, cols: 4)
+
+        controller.debugPrimeCodepointBufferCapacity(2048)
+        _ = controller.allText()
+
+        XCTAssertGreaterThanOrEqual(controller.debugCodepointBufferCapacity, 2048)
+
+        controller.initiateShutdown()
+
+        XCTAssertEqual(controller.debugCodepointBufferCapacity, 0)
+        XCTAssertEqual(controller.debugTextExtractionScratchCapacity, 0)
+        XCTAssertEqual(controller.debugSearchScratchCapacity, 0)
     }
 
     func testTitleTracksDirectoryUntilCustomTitleOverridesIt() {
@@ -185,6 +334,26 @@ final class TerminalControllerTests: XCTestCase {
             controller = nil
 
             XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+        }
+    }
+
+    func testDebugCompactScrollbackShrinksOversizedPersistentBufferWithoutDataLoss() throws {
+        try withTemporaryDirectory { directory in
+            let path = directory.appendingPathComponent("scrollback.bin").path
+            seedOversizedScrollbackFile(path: path, initialCapacity: 16, maxCapacity: 256, codepoint: 77)
+
+            let controller = makeController(
+                scrollbackPersistencePath: path,
+                scrollbackInitialCapacity: 16,
+                scrollbackMaxCapacity: 256
+            )
+
+            XCTAssertGreaterThan(controller.scrollback.capacity, 16)
+            XCTAssertTrue(controller.debugCompactScrollbackNow())
+            XCTAssertEqual(controller.scrollback.capacity, 128)
+            XCTAssertEqual(controller.scrollback.rowIndexCapacity, 16)
+            XCTAssertEqual(controller.scrollback.rowCount, 1)
+            XCTAssertEqual(controller.scrollback.getRow(at: 0)?.first?.codepoint, 77)
         }
     }
 
@@ -768,7 +937,23 @@ final class TerminalControllerTests: XCTestCase {
         let appendedRows = ["old0", "old1", "keep8", "keep9"]
         for value in appendedRows {
             controller.scrollback.appendRow(ArraySlice(value.unicodeScalars.map {
-                Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+                Cell(
+                    codepoint: $0.value,
+                    attributes: CellAttributes(
+                        foreground: .indexed(2),
+                        background: .default,
+                        bold: false,
+                        italic: false,
+                        underline: false,
+                        strikethrough: false,
+                        inverse: false,
+                        hidden: false,
+                        dim: false,
+                        blink: false
+                    ),
+                    width: 1,
+                    isWideContinuation: false
+                )
             }), isWrapped: false)
         }
 
@@ -914,5 +1099,27 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(size.0, 8)
         XCTAssertGreaterThanOrEqual(size.1, 40)
         XCTAssertFalse(controller.allText().isEmpty)
+    }
+
+    func testTerminalControllerAllTextReserveCapacityUsesBoundedHeuristic() {
+        XCTAssertEqual(
+            TerminalController.debugSuggestedAllTextReserveCapacity(totalRows: 8, cols: 80),
+            640
+        )
+        XCTAssertEqual(
+            TerminalController.debugSuggestedAllTextReserveCapacity(totalRows: 100_000, cols: 200),
+            64 * 1024
+        )
+    }
+
+    func testTerminalControllerSearchReserveCapacityUsesBoundedHeuristic() {
+        XCTAssertEqual(
+            TerminalController.debugSuggestedSearchReserveCapacity(scrollbackRows: 8),
+            16
+        )
+        XCTAssertEqual(
+            TerminalController.debugSuggestedSearchReserveCapacity(scrollbackRows: 100_000),
+            4 * 1024
+        )
     }
 }

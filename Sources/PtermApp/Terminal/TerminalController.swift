@@ -106,14 +106,22 @@ final class TerminalController {
 
     /// Coalesces bursty PTY-driven callbacks onto a single main-queue hop.
     private let callbackLock = NSLock()
+    private let extractionScratchLock = NSLock()
     private var mainCallbacksScheduled = false
     private var pendingNeedsDisplay = false
     private var pendingOutputActivity = false
     private var pendingStateChange = false
     private var renderContentVersion: UInt64 = 0
+    private let scrollbackCompactionLock = NSLock()
+    private var pendingScrollbackCompaction: DispatchWorkItem?
 
-    /// Decode buffer for UTF-8 -> codepoints
-    private var codepointBuffer = [UInt32](repeating: 0, count: 16384)
+    /// Decode buffer for UTF-8 -> codepoints.
+    /// Starts empty and grows on demand so idle terminals do not pay a
+    /// per-controller fixed 64KB tax.
+    private var codepointBuffer: [UInt32] = []
+    private var textExtractionGridRowBuffer: [Cell] = []
+    private var textExtractionScrollbackRowBuffer: [Cell] = []
+    private var searchColumnBuffer: [Int] = []
 
     private let termEnv: String
     private let textEncoding: TerminalTextEncoding
@@ -125,6 +133,10 @@ final class TerminalController {
     private var suppressScrollbackClear = false
     private var isShuttingDown = false
     var auditLogger: TerminalAuditLogger?
+
+    private static let minimumCodepointBufferCapacity = 1024
+    private static let maxAllTextReserveCapacity = 64 * 1024
+    private static let maxSearchReserveCapacity = 4 * 1024
 
     var persistedSettings: PersistedTerminalSettings {
         PersistedTerminalSettings(
@@ -143,6 +155,22 @@ final class TerminalController {
     var thumbnailContentVersion: UInt64 {
         callbackLock.withLock {
             renderContentVersion
+        }
+    }
+
+    var debugCodepointBufferCapacity: Int {
+        lock.withReadLock { codepointBuffer.count }
+    }
+
+    var debugTextExtractionScratchCapacity: Int {
+        extractionScratchLock.withLock {
+            textExtractionGridRowBuffer.count + textExtractionScrollbackRowBuffer.count
+        }
+    }
+
+    var debugSearchScratchCapacity: Int {
+        extractionScratchLock.withLock {
+            searchColumnBuffer.count
         }
     }
 
@@ -188,6 +216,7 @@ final class TerminalController {
     }
 
     deinit {
+        cancelPendingScrollbackCompaction()
         pty.stop()
         vt_parser_destroy(&parser)
     }
@@ -272,13 +301,19 @@ final class TerminalController {
     }
 
     func stop(waitForExit: Bool = false) {
-        lock.withWriteLock { isShuttingDown = true }
+        lock.withWriteLock {
+            isShuttingDown = true
+            releaseScratchStorageNow()
+        }
         pty.stop(waitForExit: waitForExit)
     }
 
     /// Send SIGTERM and close PTY without blocking. Call awaitExit() later.
     func initiateShutdown() {
-        lock.withWriteLock { isShuttingDown = true }
+        lock.withWriteLock {
+            isShuttingDown = true
+            releaseScratchStorageNow()
+        }
         pty.initiateShutdown()
     }
 
@@ -303,6 +338,7 @@ final class TerminalController {
     }
 
     func clearScrollback() {
+        cancelPendingScrollbackCompaction()
         lock.withWriteLock {
             scrollback.clear()
             scrollOffset = 0
@@ -398,6 +434,7 @@ final class TerminalController {
     /// The entire decode + parse pipeline runs under lock to ensure
     /// decoder and parser state are never accessed concurrently.
     private func handlePTYOutput(_ data: Data) {
+        cancelPendingScrollbackCompaction()
         auditLogger?.recordOutput(data)
         var clearedScrollback = false
         data.withUnsafeBytes { rawPtr in
@@ -407,6 +444,7 @@ final class TerminalController {
             let count = rawPtr.count
 
             lock.withWriteLock {
+                ensureCodepointBufferCapacity(requiredCount: count)
                 let cpCount = textDecoder.decode(
                     UnsafeBufferPointer(start: ptr, count: count),
                     into: &codepointBuffer
@@ -436,6 +474,7 @@ final class TerminalController {
             outputActivity: true,
             stateChange: clearedScrollback
         )
+        scheduleScrollbackCompaction()
     }
 
     // MARK: - Resize
@@ -536,45 +575,48 @@ final class TerminalController {
             let totalRows = scrollback.rowCount + model.rows
             guard totalRows > 0 else { return "" }
 
-            var result = ""
-            result.reserveCapacity(max(totalRows * max(model.cols, 1), model.cols))
-            var gridRowBuffer: [Cell] = []
-            gridRowBuffer.reserveCapacity(model.cols)
+            return extractionScratchLock.withLock {
+                var result = ""
+                result.reserveCapacity(Self.suggestedAllTextReserveCapacity(totalRows: totalRows, cols: model.cols))
+                textExtractionGridRowBuffer.reserveCapacity(model.cols)
+                textExtractionScrollbackRowBuffer.reserveCapacity(model.cols)
 
-            for absoluteRow in 0..<totalRows {
-                let isScrollbackRow = absoluteRow < scrollback.rowCount
-                let cells: [Cell]
-                if isScrollbackRow {
-                    cells = scrollback.getRow(at: absoluteRow) ?? []
-                } else {
-                    let gridRow = absoluteRow - scrollback.rowCount
-                    gridRowBuffer.removeAll(keepingCapacity: true)
-                    for col in 0..<model.cols {
-                        gridRowBuffer.append(model.grid.cell(at: gridRow, col: col))
-                    }
-                    cells = gridRowBuffer
-                }
-
-                Self.appendCells(in: cells, from: 0, through: max(model.cols - 1, 0), to: &result)
-
-                if absoluteRow < totalRows - 1 {
-                    Self.trimTrailingSpaces(from: &result)
-                    let nextIsWrapped: Bool
-                    if absoluteRow + 1 < scrollback.rowCount {
-                        nextIsWrapped = scrollback.isRowWrapped(at: absoluteRow + 1)
-                    } else if absoluteRow + 1 < totalRows {
-                        let nextGridRow = absoluteRow + 1 - scrollback.rowCount
-                        nextIsWrapped = model.grid.isWrapped(nextGridRow)
+                for absoluteRow in 0..<totalRows {
+                    let isScrollbackRow = absoluteRow < scrollback.rowCount
+                    let cells: [Cell]
+                    if isScrollbackRow {
+                        _ = scrollback.getRow(at: absoluteRow, into: &textExtractionScrollbackRowBuffer)
+                        cells = textExtractionScrollbackRowBuffer
                     } else {
-                        nextIsWrapped = false
+                        let gridRow = absoluteRow - scrollback.rowCount
+                        textExtractionGridRowBuffer.removeAll(keepingCapacity: true)
+                        for col in 0..<model.cols {
+                            textExtractionGridRowBuffer.append(model.grid.cell(at: gridRow, col: col))
+                        }
+                        cells = textExtractionGridRowBuffer
                     }
-                    if !nextIsWrapped {
-                        result.append("\n")
+
+                    Self.appendCells(in: cells, from: 0, through: max(model.cols - 1, 0), to: &result)
+
+                    if absoluteRow < totalRows - 1 {
+                        Self.trimTrailingSpaces(from: &result)
+                        let nextIsWrapped: Bool
+                        if absoluteRow + 1 < scrollback.rowCount {
+                            nextIsWrapped = scrollback.isRowWrapped(at: absoluteRow + 1)
+                        } else if absoluteRow + 1 < totalRows {
+                            let nextGridRow = absoluteRow + 1 - scrollback.rowCount
+                            nextIsWrapped = model.grid.isWrapped(nextGridRow)
+                        } else {
+                            nextIsWrapped = false
+                        }
+                        if !nextIsWrapped {
+                            result.append("\n")
+                        }
                     }
                 }
-            }
 
-            return result
+                return result
+            }
         }
     }
 
@@ -583,25 +625,40 @@ final class TerminalController {
         guard !needle.isEmpty else { return [] }
 
         return lock.withReadLock {
-            var matches: [SearchMatch] = []
-            matches.reserveCapacity(max(16, scrollback.rowCount / 4))
-            for row in 0..<scrollback.rowCount {
-                if let cells = scrollback.getRow(at: row) {
-                    Self.appendMatches(in: cells, row: row, query: needle, to: &matches)
+            extractionScratchLock.withLock {
+                var matches: [SearchMatch] = []
+                matches.reserveCapacity(Self.suggestedSearchReserveCapacity(scrollbackRows: scrollback.rowCount))
+                textExtractionScrollbackRowBuffer.reserveCapacity(model.cols)
+                searchColumnBuffer.reserveCapacity(model.cols)
+                for row in 0..<scrollback.rowCount {
+                    if scrollback.getRow(at: row, into: &textExtractionScrollbackRowBuffer) {
+                        Self.appendMatches(
+                            in: textExtractionScrollbackRowBuffer,
+                            row: row,
+                            query: needle,
+                            columnsBuffer: &searchColumnBuffer,
+                            to: &matches
+                        )
+                    }
                 }
-            }
 
-            var cells: [Cell] = []
-            cells.reserveCapacity(model.cols)
-            for row in 0..<model.rows {
-                cells.removeAll(keepingCapacity: true)
-                for col in 0..<model.cols {
-                    cells.append(model.grid.cell(at: row, col: col))
+                textExtractionGridRowBuffer.reserveCapacity(model.cols)
+                for row in 0..<model.rows {
+                    textExtractionGridRowBuffer.removeAll(keepingCapacity: true)
+                    for col in 0..<model.cols {
+                        textExtractionGridRowBuffer.append(model.grid.cell(at: row, col: col))
+                    }
+                    Self.appendMatches(
+                        in: textExtractionGridRowBuffer,
+                        row: scrollback.rowCount + row,
+                        query: needle,
+                        columnsBuffer: &searchColumnBuffer,
+                        to: &matches
+                    )
                 }
-                Self.appendMatches(in: cells, row: scrollback.rowCount + row, query: needle, to: &matches)
-            }
 
-            return matches
+                return matches
+            }
         }
     }
 
@@ -777,6 +834,79 @@ final class TerminalController {
         }
     }
 
+    private func scheduleScrollbackCompaction() {
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.performIdleScrollbackCompaction()
+        }
+
+        scrollbackCompactionLock.withLock {
+            pendingScrollbackCompaction?.cancel()
+            pendingScrollbackCompaction = workItem
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
+    }
+
+    private func cancelPendingScrollbackCompaction() {
+        scrollbackCompactionLock.withLock {
+            pendingScrollbackCompaction?.cancel()
+            pendingScrollbackCompaction = nil
+        }
+    }
+
+    @discardableResult
+    private func performIdleScrollbackCompaction() -> Bool {
+        scrollbackCompactionLock.withLock {
+            pendingScrollbackCompaction = nil
+        }
+        return lock.withWriteLock {
+            let didCompact = scrollback.compactIfUnderutilized()
+            shrinkIdleCodepointBufferIfNeeded()
+            shrinkIdleExtractionScratchIfNeeded()
+            return didCompact
+        }
+    }
+
+    @discardableResult
+    func debugCompactScrollbackNow() -> Bool {
+        cancelPendingScrollbackCompaction()
+        return performIdleScrollbackCompaction()
+    }
+
+    func debugPrimeCodepointBufferCapacity(_ requiredCount: Int) {
+        lock.withWriteLock {
+            ensureCodepointBufferCapacity(requiredCount: requiredCount)
+        }
+    }
+
+    private func ensureCodepointBufferCapacity(requiredCount: Int) {
+        guard requiredCount > codepointBuffer.count else { return }
+        let minimum = max(Self.minimumCodepointBufferCapacity, requiredCount)
+        var newCapacity = max(1, codepointBuffer.count)
+        while newCapacity < minimum {
+            newCapacity <<= 1
+        }
+        codepointBuffer = [UInt32](repeating: 0, count: newCapacity)
+    }
+
+    private func shrinkIdleCodepointBufferIfNeeded() {
+        guard !codepointBuffer.isEmpty else { return }
+        codepointBuffer.removeAll(keepingCapacity: false)
+    }
+
+    private func shrinkIdleExtractionScratchIfNeeded() {
+        extractionScratchLock.withLock {
+            textExtractionGridRowBuffer.removeAll(keepingCapacity: false)
+            textExtractionScrollbackRowBuffer.removeAll(keepingCapacity: false)
+            searchColumnBuffer.removeAll(keepingCapacity: false)
+        }
+    }
+
+    private func releaseScratchStorageNow() {
+        codepointBuffer.removeAll(keepingCapacity: false)
+        shrinkIdleExtractionScratchIfNeeded()
+    }
+
     private static func extractText(selection: TerminalSelection, rows: [ViewportRow], cols: Int) -> String {
         guard !selection.isEmpty, !rows.isEmpty else { return "" }
         let start = selection.start
@@ -844,6 +974,15 @@ final class TerminalController {
         }
     }
 
+    private static func suggestedAllTextReserveCapacity(totalRows: Int, cols: Int) -> Int {
+        let estimated = max(totalRows * max(cols, 1), cols)
+        return min(maxAllTextReserveCapacity, estimated)
+    }
+
+    private static func suggestedSearchReserveCapacity(scrollbackRows: Int) -> Int {
+        min(maxSearchReserveCapacity, max(16, scrollbackRows / 4))
+    }
+
     private static func displayDirectoryName(for path: String) -> String {
         let expanded = (path as NSString).expandingTildeInPath
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -855,20 +994,27 @@ final class TerminalController {
 
     private static func findMatches(in cells: [Cell], row: Int, query: String) -> [SearchMatch] {
         var results: [SearchMatch] = []
-        appendMatches(in: cells, row: row, query: query, to: &results)
+        var columnsBuffer: [Int] = []
+        appendMatches(in: cells, row: row, query: query, columnsBuffer: &columnsBuffer, to: &results)
         return results
     }
 
-    private static func appendMatches(in cells: [Cell], row: Int, query: String, to results: inout [SearchMatch]) {
+    private static func appendMatches(
+        in cells: [Cell],
+        row: Int,
+        query: String,
+        columnsBuffer: inout [Int],
+        to results: inout [SearchMatch]
+    ) {
         var text = ""
-        var columns: [Int] = []
         text.reserveCapacity(cells.count)
-        columns.reserveCapacity(cells.count)
+        columnsBuffer.removeAll(keepingCapacity: true)
+        columnsBuffer.reserveCapacity(cells.count)
         for (index, cell) in cells.enumerated() {
             if cell.isWideContinuation { continue }
             if let scalar = Unicode.Scalar(cell.codepoint) {
                 text.append(Character(scalar))
-                columns.append(index)
+                columnsBuffer.append(index)
             }
         }
 
@@ -879,10 +1025,10 @@ final class TerminalController {
         while let range = haystack.range(of: query, range: start..<haystack.endIndex) {
             let startOffset = haystack.distance(from: haystack.startIndex, to: range.lowerBound)
             let endOffset = haystack.distance(from: haystack.startIndex, to: range.upperBound) - 1
-            if startOffset < columns.count, endOffset < columns.count {
+            if startOffset < columnsBuffer.count, endOffset < columnsBuffer.count {
                 results.append(SearchMatch(absoluteRow: row,
-                                           startCol: columns[startOffset],
-                                           endCol: columns[endOffset]))
+                                           startCol: columnsBuffer[startOffset],
+                                           endCol: columnsBuffer[endOffset]))
             }
             start = range.upperBound
         }
@@ -904,6 +1050,14 @@ final class TerminalController {
         }
 
         return (text, colToChar, charToCol)
+    }
+
+    static func debugSuggestedAllTextReserveCapacity(totalRows: Int, cols: Int) -> Int {
+        suggestedAllTextReserveCapacity(totalRows: totalRows, cols: cols)
+    }
+
+    static func debugSuggestedSearchReserveCapacity(scrollbackRows: Int) -> Int {
+        suggestedSearchReserveCapacity(scrollbackRows: scrollbackRows)
     }
 
     private static let imagePlaceholderRegex = try! NSRegularExpression(pattern: #"\[Image #([0-9]+)\]"#)

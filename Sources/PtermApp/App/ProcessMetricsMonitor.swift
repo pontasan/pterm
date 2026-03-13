@@ -19,6 +19,9 @@ final class ProcessMetricsMonitor {
 
     private var timer: Timer?
     private var lastSamples: [pid_t: CPUSample] = [:]
+    private var descendantQueueScratch: [pid_t] = []
+    private var descendantResultScratch: [pid_t] = []
+    private var childPIDBufferScratch: [pid_t] = []
     private let interval: TimeInterval
     private let timebaseNumer: Double
     private let timebaseDenom: Double
@@ -44,6 +47,34 @@ final class ProcessMetricsMonitor {
     func stop() {
         timer?.invalidate()
         timer = nil
+        lastSamples.removeAll(keepingCapacity: false)
+        releaseScratchStorage()
+    }
+
+    var debugLastSampleCount: Int { lastSamples.count }
+    var debugDescendantQueueScratchCapacity: Int { descendantQueueScratch.capacity }
+    var debugDescendantResultScratchCapacity: Int { descendantResultScratch.capacity }
+    var debugChildPIDBufferScratchCapacity: Int { childPIDBufferScratch.capacity }
+
+    func debugPrimeDescendantScratch(queueCount: Int, resultCount: Int, childCount: Int) {
+        descendantQueueScratch = Array(repeating: 1, count: queueCount)
+        descendantResultScratch = Array(repeating: 1, count: resultCount)
+        childPIDBufferScratch = Array(repeating: 1, count: childCount)
+    }
+
+    func debugPrimeLastSamples(_ pids: [pid_t], timestamp: TimeInterval = 1.0) {
+        lastSamples = Dictionary(uniqueKeysWithValues: pids.map { ($0, CPUSample(totalTime: 1, timestamp: timestamp)) })
+    }
+
+    func debugCompactDescendantScratchForTesting(
+        retainingQueueCount queueCount: Int,
+        resultCount: Int,
+        childCount: Int
+    ) {
+        descendantQueueScratch = Array(descendantQueueScratch.prefix(min(queueCount, descendantQueueScratch.count)))
+        descendantResultScratch = Array(descendantResultScratch.prefix(min(resultCount, descendantResultScratch.count)))
+        childPIDBufferScratch = Array(childPIDBufferScratch.prefix(min(childCount, childPIDBufferScratch.count)))
+        compactScratchStorageIfOversized()
     }
 
     private func sample(pids: [pid_t]) {
@@ -98,6 +129,11 @@ final class ProcessMetricsMonitor {
         }
 
         lastSamples = nextSamples
+        if pids.isEmpty {
+            releaseScratchStorage()
+        } else {
+            compactScratchStorageIfOversized()
+        }
         onUpdate?(Snapshot(
             cpuUsageByPID: usage,
             appMemoryBytes: currentProcessResidentMemory(),
@@ -139,24 +175,55 @@ final class ProcessMetricsMonitor {
     }
 
     private func collectDescendants(of rootPID: pid_t) -> [pid_t] {
-        var result: [pid_t] = []
-        var queue: [pid_t] = [rootPID]
-        while !queue.isEmpty {
-            let parent = queue.removeFirst()
+        descendantResultScratch.removeAll(keepingCapacity: true)
+        descendantQueueScratch.removeAll(keepingCapacity: true)
+        descendantQueueScratch.append(rootPID)
+
+        var queueIndex = 0
+        while queueIndex < descendantQueueScratch.count {
+            let parent = descendantQueueScratch[queueIndex]
+            queueIndex += 1
             let count = proc_listchildpids(parent, nil, 0)
             guard count > 0 else { continue }
-            var childPIDs = [pid_t](repeating: 0, count: Int(count))
-            let actual = proc_listchildpids(parent, &childPIDs, count * Int32(MemoryLayout<pid_t>.stride))
+            let childCapacity = Int(count)
+            if childPIDBufferScratch.count != childCapacity {
+                childPIDBufferScratch = [pid_t](repeating: 0, count: childCapacity)
+            } else {
+                childPIDBufferScratch.replaceSubrange(0..<childCapacity, with: repeatElement(0, count: childCapacity))
+            }
+            let actual = proc_listchildpids(
+                parent,
+                &childPIDBufferScratch,
+                count * Int32(MemoryLayout<pid_t>.stride)
+            )
             let childCount = Int(actual) / MemoryLayout<pid_t>.stride
             for i in 0..<childCount {
-                let child = childPIDs[i]
+                let child = childPIDBufferScratch[i]
                 if child > 0 {
-                    result.append(child)
-                    queue.append(child)
+                    descendantResultScratch.append(child)
+                    descendantQueueScratch.append(child)
                 }
             }
         }
-        return result
+        return descendantResultScratch
+    }
+
+    private func releaseScratchStorage() {
+        descendantQueueScratch = []
+        descendantResultScratch = []
+        childPIDBufferScratch = []
+    }
+
+    private func compactScratchStorageIfOversized() {
+        compact(&descendantQueueScratch)
+        compact(&descendantResultScratch)
+        compact(&childPIDBufferScratch)
+    }
+
+    private func compact(_ scratch: inout [pid_t]) {
+        let usedCount = scratch.count
+        guard scratch.capacity > max(64, usedCount * 4) else { return }
+        scratch = Array(scratch)
     }
 
     private func processCurrentDirectory(pid: pid_t) -> String? {

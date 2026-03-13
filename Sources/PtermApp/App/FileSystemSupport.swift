@@ -135,6 +135,38 @@ final class DebouncedActionCoordinator {
     }
 }
 
+final class MemoryPressureCoordinator {
+    private let handler: () -> Void
+    private let source: DispatchSourceMemoryPressure?
+
+    init(
+        queue: DispatchQueue = .main,
+        installSystemSource: Bool = true,
+        handler: @escaping () -> Void
+    ) {
+        self.handler = handler
+        if installSystemSource {
+            let source = DispatchSource.makeMemoryPressureSource(
+                eventMask: [.warning, .critical],
+                queue: queue
+            )
+            source.setEventHandler(handler: handler)
+            source.resume()
+            self.source = source
+        } else {
+            self.source = nil
+        }
+    }
+
+    deinit {
+        source?.cancel()
+    }
+
+    func simulateMemoryPressureForTesting() {
+        handler()
+    }
+}
+
 enum FileNameSanitizer {
     static func sanitize(_ value: String, fallback: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)

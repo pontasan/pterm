@@ -54,7 +54,12 @@ final class TerminalView: MTKView, NSTextInputClient {
     /// When true, this view's own draw() does nothing. An external SplitRenderView
     /// handles all rendering into a single MTKView to avoid macOS CAMetalLayer
     /// compositing issues with multiple Metal layers in one window.
-    var renderingSuppressed: Bool = false
+    var renderingSuppressed: Bool = false {
+        didSet {
+            guard renderingSuppressed != oldValue else { return }
+            updateSuppressedRenderingState()
+        }
+    }
 
     /// Border configuration for split-view focus indication (drawn within Metal pipeline).
     var borderConfig: MetalRenderer.BorderConfig?
@@ -82,8 +87,9 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var pressedMouseButton: Int?
     private var windowObservers: [NSObjectProtocol] = []
     private var cursorBlinkTimer: Timer?
-    private let markedTextLayer = CATextLayer()
-    private var markedTextStorage = NSMutableAttributedString()
+    private var idleBufferReleaseTimer: Timer?
+    private var markedTextLayer: CATextLayer?
+    private var markedTextStorage: NSMutableAttributedString?
     private var markedTextSelection = NSRange(location: NSNotFound, length: 0)
     private var pendingTextInputHandled = false
     private var scrollerSyncPending = true
@@ -94,6 +100,27 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var hoveredImagePlaceholder: TerminalController.DetectedImagePlaceholder?
     private var imagePreviewWindow: NSWindow?
     private var imagePreviewView: NSImageView?
+
+    var hasActiveImagePreviewWindow: Bool { imagePreviewWindow != nil }
+    var debugHasKeyboardHandler: Bool { keyboardHandler != nil }
+    var debugHasMarkedTextStorage: Bool { markedTextStorage != nil }
+
+    func debugInstallImagePreviewWindowForTesting() {
+        guard imagePreviewWindow == nil else { return }
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 32, height: 32),
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        let imageView = NSImageView(frame: window.frame)
+        imagePreviewWindow = window
+        imagePreviewView = imageView
+    }
+
+    func debugReleaseImagePreviewWindowNow() {
+        hideImagePreview()
+    }
 
     // MARK: - Initialization
 
@@ -106,12 +133,13 @@ final class TerminalView: MTKView, NSTextInputClient {
         self.preferredFramesPerSecond = 30
         self.colorPixelFormat = MetalRenderer.renderTargetPixelFormat
         self.clearColor = renderer.terminalClearColor
+        self.framebufferOnly = true
+        self.autoResizeDrawable = false
         self.isPaused = true
         self.enableSetNeedsDisplay = true
         self.registerForDraggedTypes([.fileURL])
         self.wantsLayer = true
         applyRenderTargetColorSpace()
-        configureMarkedTextLayer()
         demandDrivenRendering = true
         updateOpacityMode()
 
@@ -204,6 +232,49 @@ final class TerminalView: MTKView, NSTextInputClient {
         metalLayer.colorspace = MetalRenderer.renderTargetColorSpace
         metalLayer.pixelFormat = MetalRenderer.renderTargetPixelFormat
         metalLayer.isOpaque = viewIsOpaque
+        if #available(macOS 10.13.2, *) {
+            metalLayer.maximumDrawableCount = 2
+        }
+    }
+
+    private func expectedDrawableSize(for scale: CGFloat) -> CGSize {
+        guard !renderingSuppressed, bounds.width > 0, bounds.height > 0 else { return .zero }
+        return CGSize(width: bounds.width * scale, height: bounds.height * scale)
+    }
+
+    private func ensureDrawableStorageAllocatedIfNeeded() {
+        guard !renderingSuppressed else { return }
+        guard drawableSize == .zero else { return }
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        let expectedSize = expectedDrawableSize(for: scale)
+        guard expectedSize.width > 0, expectedSize.height > 0 else { return }
+        drawableSize = expectedSize
+    }
+
+    private func updateSuppressedRenderingState() {
+        guard let renderer else { return }
+        idleBufferReleaseTimer?.invalidate()
+        idleBufferReleaseTimer = nil
+        if renderingSuppressed {
+            cursorBlinkTimer?.invalidate()
+            cursorBlinkTimer = nil
+            isPaused = true
+            enableSetNeedsDisplay = false
+            drawableSize = .zero
+            renderer.removeBuffers(for: self)
+            return
+        }
+
+        isPaused = demandDrivenRendering
+        enableSetNeedsDisplay = demandDrivenRendering
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        let expectedSize = expectedDrawableSize(for: scale)
+        if abs(drawableSize.width - expectedSize.width) > 1 || abs(drawableSize.height - expectedSize.height) > 1 {
+            drawableSize = expectedSize
+        }
+        syncScaleFactor()
+        requestDisplayUpdate()
+        updateCursorBlinkTimer()
     }
 
     /// Synchronize the glyph atlas scale factor with the current display.
@@ -215,16 +286,63 @@ final class TerminalView: MTKView, NSTextInputClient {
             renderer.glyphAtlas.updateScaleFactor(newScale)
             updateTerminalSize()
         }
+        let expectedSize = expectedDrawableSize(for: newScale)
+        if abs(drawableSize.width - expectedSize.width) > 1 || abs(drawableSize.height - expectedSize.height) > 1 {
+            drawableSize = expectedSize
+        }
         updateMarkedTextOverlay()
-        requestDisplayUpdate()
+        if !renderingSuppressed {
+            requestDisplayUpdate()
+        }
+    }
+
+    private func scheduleIdleBufferRelease() {
+        guard demandDrivenRendering, !renderingSuppressed else { return }
+        idleBufferReleaseTimer?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
+            self?.releaseIdleReusableBuffersNow()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        idleBufferReleaseTimer = timer
+    }
+
+    private func releaseIdleReusableBuffersNow() {
+        guard demandDrivenRendering, !renderingSuppressed else { return }
+        renderer?.releaseTerminalBuffers(for: self)
+        _ = renderer?.compactIdleGlyphAtlas()
+        keyboardHandler = nil
+        guard cursorBlinkTimer == nil else { return }
+        drawableSize = .zero
+    }
+
+    func debugReleaseIdleBuffersNow() {
+        releaseIdleReusableBuffersNow()
+    }
+
+    func releaseInactiveRenderingResourcesNow() {
+        idleBufferReleaseTimer?.invalidate()
+        idleBufferReleaseTimer = nil
+        renderer?.releaseTerminalBuffers(for: self)
+        _ = renderer?.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
+        keyboardHandler = nil
+        cursorBlinkTimer?.invalidate()
+        cursorBlinkTimer = nil
+        drawableSize = .zero
+    }
+
+    func compactForMemoryPressureNow() {
+        idleBufferReleaseTimer?.invalidate()
+        idleBufferReleaseTimer = nil
+        renderer?.releaseTerminalBuffers(for: self)
+        _ = renderer?.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
+        keyboardHandler = nil
     }
 
     // MARK: - Setup
 
     private func setupController() {
         guard let controller = terminalController else { return }
-
-        keyboardHandler = KeyboardHandler(controller: controller)
+        keyboardHandler = nil
 
         controller.onNeedsDisplay = { [weak self] in
             self?.requestDisplayUpdate()
@@ -242,6 +360,7 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     deinit {
         cursorBlinkTimer?.invalidate()
+        idleBufferReleaseTimer?.invalidate()
         removeWindowObservers()
         hideImagePreview()
         renderer?.removeBuffers(for: self)
@@ -279,19 +398,46 @@ final class TerminalView: MTKView, NSTextInputClient {
         windowObservers.removeAll(keepingCapacity: true)
     }
 
+    private func ensureKeyboardHandler() -> KeyboardHandler? {
+        if let keyboardHandler {
+            return keyboardHandler
+        }
+        guard let controller = terminalController else { return nil }
+        let handler = KeyboardHandler(controller: controller)
+        keyboardHandler = handler
+        return handler
+    }
+
     private func configureMarkedTextLayer() {
-        markedTextLayer.isHidden = true
-        markedTextLayer.alignmentMode = .left
-        markedTextLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
-        layer?.addSublayer(markedTextLayer)
+        guard markedTextLayer == nil else { return }
+        let textLayer = CATextLayer()
+        textLayer.isHidden = true
+        textLayer.alignmentMode = .left
+        textLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
+        layer?.addSublayer(textLayer)
+        markedTextLayer = textLayer
+    }
+
+    private func destroyMarkedTextLayer() {
+        markedTextLayer?.removeFromSuperlayer()
+        markedTextLayer = nil
     }
 
     private func requestDisplayUpdate() {
-        setNeedsDisplay(bounds)
+        idleBufferReleaseTimer?.invalidate()
+        idleBufferReleaseTimer = nil
         if renderingSuppressed,
            let splitContainer = enclosingScrollView?.superview as? SplitTerminalContainerView {
             splitContainer.requestRender()
+            return
         }
+        ensureDrawableStorageAllocatedIfNeeded()
+        setNeedsDisplay(bounds)
+    }
+
+    override func setNeedsDisplay(_ invalidRect: NSRect) {
+        ensureDrawableStorageAllocatedIfNeeded()
+        super.setNeedsDisplay(invalidRect)
     }
 
     private func updateCursorBlinkTimer() {
@@ -347,7 +493,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         if event.modifierFlags.contains(.control) {
             terminalController?.scrollToBottom()
             clearSelection()
-            keyboardHandler?.handleKeyDown(event: event)
+            ensureKeyboardHandler()?.handleKeyDown(event: event)
             return
         }
 
@@ -357,7 +503,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         pendingTextInputHandled = false
         interpretKeyEvents([event])
         if !pendingTextInputHandled && !hasMarkedText() {
-            keyboardHandler?.handleKeyDown(event: event)
+            ensureKeyboardHandler()?.handleKeyDown(event: event)
         }
     }
 
@@ -880,8 +1026,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     func cutMarkedText() -> String? {
-        guard hasMarkedText() else { return nil }
-        let text = markedTextStorage.string
+        guard let text = markedTextStorage?.string, !text.isEmpty else { return nil }
         unmarkText()
         pendingTextInputHandled = true
         return text
@@ -1045,6 +1190,8 @@ final class TerminalView: MTKView, NSTextInputClient {
     private func hideImagePreview() {
         hoveredImagePlaceholder = nil
         imagePreviewWindow?.orderOut(nil)
+        imagePreviewView = nil
+        imagePreviewWindow = nil
     }
 
     private func currentCursorRect() -> NSRect {
@@ -1062,11 +1209,14 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     private func updateMarkedTextOverlay() {
-        guard !markedTextStorage.string.isEmpty,
+        guard let markedTextStorage,
+              !markedTextStorage.string.isEmpty,
               let renderer = renderer else {
-            markedTextLayer.isHidden = true
+            destroyMarkedTextLayer()
             return
         }
+        configureMarkedTextLayer()
+        guard let markedTextLayer else { return }
 
         let font = NSFont(name: renderer.glyphAtlas.fontName, size: renderer.glyphAtlas.fontSize)
             ?? NSFont.monospacedSystemFont(ofSize: renderer.glyphAtlas.fontSize, weight: .regular)
@@ -1117,6 +1267,7 @@ extension TerminalView: MTKViewDelegate {
                           searchHighlight: highlight, linkUnderline: linkUL,
                           borderConfig: border, in: view)
         }
+        scheduleIdleBufferRelease()
 
         if scrollerSyncPending {
             (enclosingScrollView as? TerminalScrollView)?.syncScroller()
@@ -1140,9 +1291,9 @@ extension TerminalView {
         }
         guard !text.isEmpty else { return }
         pendingTextInputHandled = true
-        markedTextStorage = NSMutableAttributedString()
+        markedTextStorage = nil
         markedTextSelection = NSRange(location: NSNotFound, length: 0)
-        markedTextLayer.isHidden = true
+        destroyMarkedTextLayer()
         controller.sendInput(text)
     }
 
@@ -1162,9 +1313,8 @@ extension TerminalView {
     }
 
     func unmarkText() {
-        markedTextStorage = NSMutableAttributedString()
+        markedTextStorage = nil
         markedTextSelection = NSRange(location: NSNotFound, length: 0)
-        markedTextLayer.isHidden = true
         updateMarkedTextOverlay()
     }
 
@@ -1173,15 +1323,18 @@ extension TerminalView {
     }
 
     func markedRange() -> NSRange {
-        markedTextStorage.length == 0 ? NSRange(location: NSNotFound, length: 0) : NSRange(location: 0, length: markedTextStorage.length)
+        guard let markedTextStorage, markedTextStorage.length > 0 else {
+            return NSRange(location: NSNotFound, length: 0)
+        }
+        return NSRange(location: 0, length: markedTextStorage.length)
     }
 
     func hasMarkedText() -> Bool {
-        markedTextStorage.length > 0
+        (markedTextStorage?.length ?? 0) > 0
     }
 
     func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
-        guard hasMarkedText() else {
+        guard let markedTextStorage, hasMarkedText() else {
             actualRange?.pointee = NSRange(location: NSNotFound, length: 0)
             return nil
         }
@@ -1208,7 +1361,7 @@ extension TerminalView {
     }
 
     override func doCommand(by selector: Selector) {
-        pendingTextInputHandled = keyboardHandler?.handleCommand(selector: selector) ?? false
+        pendingTextInputHandled = ensureKeyboardHandler()?.handleCommand(selector: selector) ?? false
     }
 }
 

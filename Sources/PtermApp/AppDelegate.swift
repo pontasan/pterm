@@ -91,6 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastMemoryByPID: [pid_t: UInt64] = [:]
     private var lastAppMemoryBytes: UInt64 = 0
     private let sessionPersistenceQueue = DispatchQueue(label: SessionPersistence.queueLabel, qos: .utility)
+    private var memoryPressureCoordinator: MemoryPressureCoordinator?
     private lazy var sessionPersistenceCoordinator = DebouncedActionCoordinator(
         debounceInterval: SessionPersistence.debounceInterval,
         scheduleQueue: .main
@@ -148,6 +149,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case split([UUID])
     }
 
+    enum InitialLaunchDisposition: Equatable {
+        case restoreSession(PersistedSessionState)
+        case showIntegrated
+        case createInitialTerminalAndShowIntegrated
+    }
+
     static func shouldUseTranslucentWindowMaterial(
         isIntegratedViewVisible: Bool,
         terminalBackgroundOpacity: Double
@@ -175,6 +182,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return .integrated
         }
+    }
+
+    static func initialLaunchDisposition(
+        restoredSession: PersistedSessionState?,
+        bootstrappedConfiguredWorkspaces: Bool
+    ) -> InitialLaunchDisposition {
+        if let restoredSession {
+            return .restoreSession(restoredSession)
+        }
+        if bootstrappedConfiguredWorkspaces {
+            return .showIntegrated
+        }
+        return .createInitialTerminalAndShowIntegrated
     }
 
     static func newTerminalShortcutContext(
@@ -220,6 +240,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: SingleInstanceLock.activationNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidResignActive(_:)),
+            name: NSApplication.didResignActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidBecomeActive(_:)),
+            name: NSApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidHide(_:)),
+            name: NSApplication.didHideNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidUnhide(_:)),
+            name: NSApplication.didUnhideNotification,
+            object: nil
+        )
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
             selector: #selector(workspaceDidWake(_:)),
@@ -240,6 +284,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         self.renderer = renderer
         renderer.updateTerminalAppearance(config.terminalAppearance)
+        memoryPressureCoordinator = MemoryPressureCoordinator { [weak self] in
+            self?.handleMemoryPressure()
+        }
 
         // Load Metal shaders
         loadShaders()
@@ -293,52 +340,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let cols = max(1, Int((contentBounds.width - pad) / renderer.glyphAtlas.cellWidth))
         let rows = max(1, Int((contentBounds.height - pad) / renderer.glyphAtlas.cellHeight))
         manager = TerminalManager(rows: rows, cols: cols, config: config)
-
-        // Create integrated view
-        let iv = IntegratedView(frame: contentBounds, renderer: renderer, manager: manager)
-        iv.autoresizingMask = [.width, .height]
-        iv.shortcutConfiguration = config.shortcuts
-        iv.onSelectTerminal = { [weak self] controller in
-            self?.switchToFocused(controller)
-        }
-        iv.onAddWorkspace = { [weak self] in
-            self?.promptCreateWorkspace()
-        }
-        iv.onAddTerminalToWorkspace = { [weak self] workspace in
-            self?.addNewTerminal(workspaceName: workspace, startAsynchronously: true)
-        }
-        iv.onRemoveWorkspace = { [weak self] workspace in
-            self?.confirmAndRemoveWorkspace(named: workspace)
-        }
-        iv.onRemoveTerminal = { [weak self] controller in
-            self?.confirmAndRemoveTerminal(controller)
-        }
-        iv.onRenameWorkspace = { [weak self] oldName, newName in
-            self?.renameWorkspace(from: oldName, to: newName)
-        }
-        iv.onMoveTerminalToWorkspace = { [weak self] controller, workspace in
-            self?.moveTerminal(controller, toWorkspace: workspace)
-        }
-        iv.onRenameTerminalTitle = { [weak self] controller, title in
-            self?.renameTerminalTitle(controller, title: title)
-        }
-        iv.onMultiSelect = { [weak self] controllers in
-            self?.switchToSplit(controllers)
-        }
-        iv.onReorderTerminal = { [weak self] controller, workspace, index in
-            self?.reorderTerminal(controller, toWorkspace: workspace, atIndex: index)
-        }
-        iv.onReorderWorkspace = { [weak self] name, index in
-            self?.reorderWorkspace(name, toIndex: index)
-        }
-        iv.cpuUsageProvider = { [weak self] pid in
-            self?.cpuUsageByPID[pid]
-        }
-        integratedView = iv
-        syncIntegratedWorkspaceNames()
-        contentHostView().addSubview(iv)
-        applyAppearanceSettingsToVisibleViews()
-        setupScrollbarOverlay(for: iv)
         isWindowLayoutReady = true
         synchronizeWindowLayout(shouldPersistSession: false)
 
@@ -347,12 +348,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.handleTerminalListChanged()
         }
 
-        if let restoredSession {
-            restoreSession(restoredSession)
-        } else if bootstrapConfiguredWorkspaces() {
-            switchToIntegrated()
+        let bootstrappedConfiguredWorkspaces: Bool
+        if restoredSession == nil {
+            bootstrappedConfiguredWorkspaces = bootstrapConfiguredWorkspaces()
         } else {
-            addNewTerminal()
+            bootstrappedConfiguredWorkspaces = false
+        }
+        switch Self.initialLaunchDisposition(
+            restoredSession: restoredSession,
+            bootstrappedConfiguredWorkspaces: bootstrappedConfiguredWorkspaces
+        ) {
+        case .restoreSession(let restoredSession):
+            restoreSession(restoredSession)
+        case .showIntegrated:
+            switchToIntegrated()
+        case .createInitialTerminalAndShowIntegrated:
+            _ = addNewTerminal()
+            switchToIntegrated()
         }
 
         // Show window
@@ -529,6 +541,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             integratedView?.terminalListDidChange()
         }
 
+        if manager.terminals.isEmpty {
+            renderer.glyphAtlas.resetToMinimum()
+            applyAppearanceSettingsToVisibleViews()
+        }
+
         updateWindowTitle()
         requestSessionPersist()
     }
@@ -539,9 +556,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyRendererSettings(for: controller)
 
         // Remove integrated view
+        integratedView?.releaseInactiveRenderingResourcesNow()
         integratedView?.removeFromSuperview()
+        integratedView = nil
         scrollbarOverlay?.removeFromSuperview()
         scrollbarOverlay = nil
+        splitContainerView?.releaseInactiveRenderingResourcesNow()
         splitContainerView?.removeFromSuperview()
         splitContainerView = nil
 
@@ -590,9 +610,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        integratedView?.releaseInactiveRenderingResourcesNow()
         integratedView?.removeFromSuperview()
+        integratedView = nil
         scrollbarOverlay?.removeFromSuperview()
         scrollbarOverlay = nil
+        terminalView?.releaseInactiveRenderingResourcesNow()
         terminalScrollView?.removeFromSuperview()
         terminalScrollView = nil
         terminalView = nil
@@ -637,8 +660,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func switchToIntegrated() {
         // Remove focused terminal scroll view
+        terminalView?.releaseInactiveRenderingResourcesNow()
         terminalScrollView?.removeFromSuperview()
         terminalScrollView = nil
+        splitContainerView?.releaseInactiveRenderingResourcesNow()
         splitContainerView?.removeFromSuperview()
         splitContainerView = nil
         scrollbarOverlay?.removeFromSuperview()
@@ -653,46 +678,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let existing = integratedView {
             iv = existing
         } else {
-            iv = IntegratedView(frame: availableContentFrame(),
-                                renderer: renderer, manager: manager)
-            iv.autoresizingMask = [.width, .height]
-            iv.shortcutConfiguration = config.shortcuts
-            iv.onSelectTerminal = { [weak self] controller in
-                self?.switchToFocused(controller)
-            }
-            iv.onAddWorkspace = { [weak self] in
-                self?.promptCreateWorkspace()
-            }
-            iv.onAddTerminalToWorkspace = { [weak self] workspace in
-                self?.addNewTerminal(workspaceName: workspace, startAsynchronously: true)
-            }
-            iv.onRemoveWorkspace = { [weak self] workspace in
-                self?.confirmAndRemoveWorkspace(named: workspace)
-            }
-            iv.onRemoveTerminal = { [weak self] controller in
-                self?.confirmAndRemoveTerminal(controller)
-            }
-            iv.onRenameWorkspace = { [weak self] oldName, newName in
-                self?.renameWorkspace(from: oldName, to: newName)
-            }
-            iv.onMoveTerminalToWorkspace = { [weak self] controller, workspace in
-                self?.moveTerminal(controller, toWorkspace: workspace)
-            }
-            iv.onRenameTerminalTitle = { [weak self] controller, title in
-                self?.renameTerminalTitle(controller, title: title)
-            }
-            iv.onMultiSelect = { [weak self] controllers in
-                self?.switchToSplit(controllers)
-            }
-            iv.onReorderTerminal = { [weak self] controller, workspace, index in
-                self?.reorderTerminal(controller, toWorkspace: workspace, atIndex: index)
-            }
-            iv.onReorderWorkspace = { [weak self] name, index in
-                self?.reorderWorkspace(name, toIndex: index)
-            }
-            iv.cpuUsageProvider = { [weak self] pid in
-                self?.cpuUsageByPID[pid]
-            }
+            iv = makeIntegratedView(frame: availableContentFrame())
             integratedView = iv
         }
 
@@ -710,6 +696,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         updateWindowTitle()
         requestSessionPersist()
+    }
+
+    private func makeIntegratedView(frame: NSRect) -> IntegratedView {
+        let iv = IntegratedView(frame: frame, renderer: renderer, manager: manager)
+        iv.autoresizingMask = [.width, .height]
+        iv.shortcutConfiguration = config.shortcuts
+        iv.onSelectTerminal = { [weak self] controller in
+            self?.switchToFocused(controller)
+        }
+        iv.onAddWorkspace = { [weak self] in
+            self?.promptCreateWorkspace()
+        }
+        iv.onAddTerminalToWorkspace = { [weak self] workspace in
+            self?.addNewTerminal(workspaceName: workspace, startAsynchronously: true)
+        }
+        iv.onRemoveWorkspace = { [weak self] workspace in
+            self?.confirmAndRemoveWorkspace(named: workspace)
+        }
+        iv.onRemoveTerminal = { [weak self] controller in
+            self?.confirmAndRemoveTerminal(controller)
+        }
+        iv.onRenameWorkspace = { [weak self] oldName, newName in
+            self?.renameWorkspace(from: oldName, to: newName)
+        }
+        iv.onMoveTerminalToWorkspace = { [weak self] controller, workspace in
+            self?.moveTerminal(controller, toWorkspace: workspace)
+        }
+        iv.onRenameTerminalTitle = { [weak self] controller, title in
+            self?.renameTerminalTitle(controller, title: title)
+        }
+        iv.onMultiSelect = { [weak self] controllers in
+            self?.switchToSplit(controllers)
+        }
+        iv.onReorderTerminal = { [weak self] controller, workspace, index in
+            self?.reorderTerminal(controller, toWorkspace: workspace, atIndex: index)
+        }
+        iv.onReorderWorkspace = { [weak self] name, index in
+            self?.reorderWorkspace(name, toIndex: index)
+        }
+        iv.cpuUsageProvider = { [weak self] pid in
+            self?.cpuUsageByPID[pid]
+        }
+        return iv
     }
 
     private func applyRendererSettings(for controller: TerminalController) {
@@ -2224,8 +2253,32 @@ extension AppDelegate: NSWindowDelegate {
         syncVisibleRenderScaleFactors()
     }
 
+    func windowDidMiniaturize(_ notification: Notification) {
+        releaseInactiveRenderingResourcesNow()
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        restoreVisibleRenderingResourcesIfNeeded()
+    }
+
     @objc private func workspaceDidWake(_ notification: Notification) {
         syncVisibleRenderScaleFactors()
+    }
+
+    @objc func applicationDidResignActive(_ notification: Notification) {
+        releaseInactiveRenderingResourcesNow()
+    }
+
+    @objc func applicationDidBecomeActive(_ notification: Notification) {
+        restoreVisibleRenderingResourcesIfNeeded()
+    }
+
+    @objc func applicationDidHide(_ notification: Notification) {
+        releaseInactiveRenderingResourcesNow()
+    }
+
+    @objc func applicationDidUnhide(_ notification: Notification) {
+        restoreVisibleRenderingResourcesIfNeeded()
     }
 
     private func syncVisibleRenderScaleFactors() {
@@ -2233,6 +2286,45 @@ extension AppDelegate: NSWindowDelegate {
         integratedView?.syncScaleFactorIfNeeded()
         terminalView?.syncScaleFactorIfNeeded()
         splitContainerView?.syncScaleFactorIfNeeded()
+    }
+
+    private func releaseInactiveRenderingResourcesNow() {
+        guard renderer != nil, manager != nil else { return }
+        integratedView?.releaseInactiveRenderingResourcesNow()
+        terminalView?.releaseInactiveRenderingResourcesNow()
+        splitContainerView?.releaseInactiveRenderingResourcesNow()
+        for terminal in manager.terminals {
+            _ = terminal.debugCompactScrollbackNow()
+        }
+        _ = renderer.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
+    }
+
+    private func compactForMemoryPressureNow() {
+        guard renderer != nil, manager != nil else { return }
+        integratedView?.compactForMemoryPressureNow()
+        terminalView?.compactForMemoryPressureNow()
+        splitContainerView?.compactForMemoryPressureNow()
+        for terminal in manager.terminals {
+            _ = terminal.debugCompactScrollbackNow()
+        }
+        _ = renderer.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
+    }
+
+    private func handleMemoryPressure() {
+        if NSApplication.shared.isActive, !NSApplication.shared.isHidden, !(window?.isMiniaturized ?? false) {
+            compactForMemoryPressureNow()
+            restoreVisibleRenderingResourcesIfNeeded()
+        } else {
+            releaseInactiveRenderingResourcesNow()
+        }
+    }
+
+    private func restoreVisibleRenderingResourcesIfNeeded() {
+        guard renderer != nil else { return }
+        syncVisibleRenderScaleFactors()
+        integratedView?.setNeedsDisplay(integratedView?.bounds ?? .zero)
+        terminalView?.setNeedsDisplay(terminalView?.bounds ?? .zero)
+        splitContainerView?.requestRender()
     }
 
     private func configureWindowAppearance() {

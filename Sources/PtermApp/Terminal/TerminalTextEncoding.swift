@@ -39,12 +39,7 @@ enum TerminalTextEncoding: String {
 
     func decode(_ data: Data) -> String? {
         let decoder = TerminalTextDecoder(encoding: self)
-        var output = [UInt32](repeating: 0, count: max(data.count, 1))
-        let count = data.withUnsafeBytes { rawBuffer in
-            let bytes = rawBuffer.bindMemory(to: UInt8.self)
-            return decoder.decode(bytes, into: &output)
-        }
-        return Self.string(from: output[0..<count])
+        return decoder.decode(data)
     }
 
     static func string<S: Sequence>(from codepoints: S) -> String? where S.Element == UInt32 {
@@ -61,6 +56,10 @@ enum TerminalTextEncoding: String {
 }
 
 final class TerminalTextDecoder {
+    private enum DecodeBufferPolicy {
+        static let minimumCapacity = 256
+    }
+
     private enum UTF16Endianness {
         case little
         case big
@@ -72,6 +71,7 @@ final class TerminalTextDecoder {
     private var pendingHighSurrogate: UInt16?
     private var detectedEndianness: UTF16Endianness?
     private var bomProbe: [UInt8] = []
+    private var decodeBuffer: [UInt32] = []
 
     init(encoding: TerminalTextEncoding) {
         self.encoding = encoding
@@ -82,7 +82,7 @@ final class TerminalTextDecoder {
         utf8_decoder_init(&utf8Decoder, true)
         pendingByte = nil
         pendingHighSurrogate = nil
-        bomProbe.removeAll(keepingCapacity: true)
+        bomProbe.removeAll(keepingCapacity: false)
         switch encoding {
         case .utf8:
             detectedEndianness = nil
@@ -93,6 +93,57 @@ final class TerminalTextDecoder {
         case .utf16BigEndian:
             detectedEndianness = .big
         }
+    }
+
+    var debugDecodeBufferCapacity: Int {
+        decodeBuffer.count
+    }
+
+    var debugBOMProbeCapacity: Int {
+        bomProbe.count
+    }
+
+    func decode(_ data: Data) -> String? {
+        ensureDecodeBufferCapacity(requiredCount: max(data.count, 1))
+        let count = data.withUnsafeBytes { rawBuffer in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            return decode(bytes, into: &decodeBuffer)
+        }
+        shrinkIdleDecodeBufferIfNeeded(requiredCount: count)
+        return TerminalTextEncoding.string(from: decodeBuffer[0..<count])
+    }
+
+    func debugPrimeDecodeBufferCapacity(_ requiredCount: Int) {
+        ensureDecodeBufferCapacity(requiredCount: requiredCount)
+    }
+
+    func debugShrinkDecodeBufferIfIdle(requiredCount: Int = 0) {
+        shrinkIdleDecodeBufferIfNeeded(requiredCount: requiredCount)
+    }
+
+    func debugPrimeBOMProbeCapacity(_ byteCount: Int) {
+        bomProbe = [UInt8](repeating: 0, count: byteCount)
+    }
+
+    private func ensureDecodeBufferCapacity(requiredCount: Int) {
+        let normalizedCount = max(DecodeBufferPolicy.minimumCapacity, requiredCount)
+        guard decodeBuffer.count < normalizedCount else { return }
+        var newCapacity = max(DecodeBufferPolicy.minimumCapacity, decodeBuffer.count)
+        while newCapacity < normalizedCount {
+            newCapacity = max(newCapacity * 2, normalizedCount)
+        }
+        decodeBuffer = [UInt32](repeating: 0, count: newCapacity)
+    }
+
+    private func shrinkIdleDecodeBufferIfNeeded(requiredCount: Int) {
+        guard requiredCount > 0 else {
+            guard !decodeBuffer.isEmpty else { return }
+            decodeBuffer.removeAll(keepingCapacity: false)
+            return
+        }
+        let target = max(DecodeBufferPolicy.minimumCapacity, requiredCount)
+        guard decodeBuffer.count > target * 2 else { return }
+        decodeBuffer = [UInt32](repeating: 0, count: target)
     }
 
     func decode(_ input: UnsafeBufferPointer<UInt8>, into output: inout [UInt32]) -> Int {
@@ -130,19 +181,19 @@ final class TerminalTextDecoder {
 
                 if bomProbe[0] == 0xFF && bomProbe[1] == 0xFE {
                     detectedEndianness = .little
-                    bomProbe.removeAll(keepingCapacity: true)
+                    bomProbe.removeAll(keepingCapacity: false)
                     continue
                 }
 
                 if bomProbe[0] == 0xFE && bomProbe[1] == 0xFF {
                     detectedEndianness = .big
-                    bomProbe.removeAll(keepingCapacity: true)
+                    bomProbe.removeAll(keepingCapacity: false)
                     continue
                 }
 
                 detectedEndianness = .little
                 let codeUnit = makeCodeUnit(first: bomProbe[0], second: bomProbe[1], endianness: .little)
-                bomProbe.removeAll(keepingCapacity: true)
+                bomProbe.removeAll(keepingCapacity: false)
                 append(codeUnit: codeUnit, appendCodepoint: appendCodepoint)
                 continue
             }
