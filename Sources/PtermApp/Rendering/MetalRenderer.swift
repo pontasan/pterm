@@ -87,6 +87,7 @@ final class MetalRenderer {
 
     /// Render pipeline for analytic circles
     private(set) var circlePipeline: MTLRenderPipelineState?
+    private(set) var texturePipeline: MTLRenderPipelineState?
 
     /// Glyph atlas
     let glyphAtlas: GlyphAtlas
@@ -121,6 +122,7 @@ final class MetalRenderer {
         var overviewCircleGlyphBuffer: MTLBuffer?
         var overviewThumbnailBgBuffer: MTLBuffer?
         var overviewThumbnailGlyphBuffer: MTLBuffer?
+        var overviewThumbnailSurfaceBuffer: MTLBuffer?
         var terminalScrollbackRowsScratch: [[Cell]] = []
         var terminalScrollbackRowHasData: [Bool] = []
         var terminalSearchMatchesScratch: [[SearchMatchSpan]] = []
@@ -134,6 +136,7 @@ final class MetalRenderer {
         case overviewCircleGlyph
         case overviewThumbnailBg
         case overviewThumbnailGlyph
+        case overviewThumbnailSurface
     }
 
     /// Border configuration for split-view rendering.
@@ -166,6 +169,8 @@ final class MetalRenderer {
             return bs?.overviewThumbnailBgBuffer?.length
         case .overviewThumbnailGlyph:
             return bs?.overviewThumbnailGlyphBuffer?.length
+        case .overviewThumbnailSurface:
+            return bs?.overviewThumbnailSurfaceBuffer?.length
         }
     }
 
@@ -221,6 +226,7 @@ final class MetalRenderer {
             bufferSet.overviewCircleGlyphBuffer,
             bufferSet.overviewThumbnailBgBuffer,
             bufferSet.overviewThumbnailGlyphBuffer,
+            bufferSet.overviewThumbnailSurfaceBuffer,
         ]
         if allBuffers.allSatisfy({ $0 == nil }) {
             viewBuffers.removeValue(forKey: key)
@@ -262,6 +268,7 @@ final class MetalRenderer {
         bufferSet.overviewCircleGlyphBuffer = nil
         bufferSet.overviewThumbnailBgBuffer = nil
         bufferSet.overviewThumbnailGlyphBuffer = nil
+        bufferSet.overviewThumbnailSurfaceBuffer = nil
         pruneEmptyBufferSet(for: view)
     }
 
@@ -297,6 +304,7 @@ final class MetalRenderer {
             bufferSet.overviewCircleGlyphBuffer,
             bufferSet.overviewThumbnailBgBuffer,
             bufferSet.overviewThumbnailGlyphBuffer,
+            bufferSet.overviewThumbnailSurfaceBuffer,
         ].contains(where: { $0 != nil })
     }
 
@@ -461,6 +469,20 @@ final class MetalRenderer {
             desc.colorAttachments[0].sourceAlphaBlendFactor = .one
             desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
             cursorPipeline = try? device.makeRenderPipelineState(descriptor: desc)
+        }
+
+        if let textureVertex = library.makeFunction(name: "glyph_vertex"),
+           let textureFragment = library.makeFunction(name: "texture_fragment") {
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction = textureVertex
+            desc.fragmentFunction = textureFragment
+            desc.colorAttachments[0].pixelFormat = Self.renderTargetPixelFormat
+            desc.colorAttachments[0].isBlendingEnabled = true
+            desc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            desc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            desc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            texturePipeline = try? device.makeRenderPipelineState(descriptor: desc)
         }
 
         // Overlay pipeline (alpha blending, pass-through fragment)
@@ -1163,7 +1185,55 @@ final class MetalRenderer {
             return updateVertexBuffer(&bs.overviewThumbnailBgBuffer, vertices: vertices)
         case .overviewThumbnailGlyph:
             return updateVertexBuffer(&bs.overviewThumbnailGlyphBuffer, vertices: vertices)
+        case .overviewThumbnailSurface:
+            return updateVertexBuffer(&bs.overviewThumbnailSurfaceBuffer, vertices: vertices)
         }
+    }
+
+    func makeOverviewThumbnailTexture(size: CGSize, scaleFactor: Float) -> MTLTexture? {
+        let width = max(1, Int(ceil(size.width * CGFloat(scaleFactor))))
+        let height = max(1, Int(ceil(size.height * CGFloat(scaleFactor))))
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: Self.renderTargetPixelFormat,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .private
+        return device.makeTexture(descriptor: descriptor)
+    }
+
+    func renderThumbnailToTexture(
+        model: TerminalModel,
+        scrollback: ScrollbackBuffer,
+        scrollOffset: Int,
+        texture: MTLTexture,
+        thumbnailSize: NSSize,
+        scaleFactor: Float,
+        commandBuffer: MTLCommandBuffer
+    ) {
+        let renderPassDescriptor = MTLRenderPassDescriptor()
+        renderPassDescriptor.colorAttachments[0].texture = texture
+        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].storeAction = .store
+        renderPassDescriptor.colorAttachments[0].clearColor = terminalClearColor
+
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+            return
+        }
+
+        renderThumbnail(
+            model: model,
+            scrollback: scrollback,
+            scrollOffset: scrollOffset,
+            encoder: encoder,
+            viewportSize: SIMD2<Float>(Float(texture.width), Float(texture.height)),
+            thumbnailRect: NSRect(origin: .zero, size: thumbnailSize),
+            scaleFactor: scaleFactor
+        )
+
+        encoder.endEncoding()
     }
 
     private func updateShiftedVertexBuffer(
@@ -1243,14 +1313,14 @@ final class MetalRenderer {
         }
 
         // Draw thumbnail glyphs (linear filtering for scaled-down text)
-        if !thumbGlyphVertices.isEmpty, let pipeline = glyphPipeline,
+        if !thumbGlyphVertices.isEmpty, let pipeline = glyphPipelineForCurrentOutput(),
            let atlas = glyphAtlas.texture,
            let buf = makeTemporaryBuffer(vertices: thumbGlyphVertices) {
             encoder.setRenderPipelineState(pipeline)
             encoder.setVertexBuffer(buf, offset: 0, index: 0)
             encoder.setVertexBytes(&thumbUniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
             encoder.setFragmentTexture(atlas, index: 0)
-            encoder.setFragmentSamplerState(thumbnailSampler, index: 0)
+            encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0,
                                   vertexCount: thumbGlyphVertices.count / floatsPerVertex)
         }

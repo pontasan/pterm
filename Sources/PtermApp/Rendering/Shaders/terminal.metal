@@ -98,6 +98,19 @@ fragment float4 lowdpi_glyph_fragment(
     return float4(in.fgColor.rgb, coverage * in.fgColor.a);
 }
 
+/// Fragment shader for compositing pre-rendered RGBA thumbnail surfaces.
+fragment float4 texture_fragment(
+    VertexOut in [[stage_in]],
+    texture2d<float> sourceTexture [[texture(0)]],
+    sampler sourceSampler [[sampler(0)]]
+) {
+    float4 sampleColor = sourceTexture.sample(sourceSampler, in.texCoord);
+    if (sampleColor.a <= 0.0001) {
+        return float4(0.0);
+    }
+    return float4(sampleColor.rgb / sampleColor.a, sampleColor.a);
+}
+
 // MARK: - Cursor
 
 /// Fragment shader for cursor with optional smooth blink.

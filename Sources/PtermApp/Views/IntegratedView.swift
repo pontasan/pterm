@@ -100,8 +100,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         }
     }
 
-    private struct ThumbnailVertexCacheKey: Hashable {
-        let controllerID: UUID
+    private struct ThumbnailSurfaceSignature: Hashable {
         let rows: Int
         let cols: Int
         let scrollbackRowCount: Int
@@ -116,7 +115,6 @@ final class IntegratedView: MTKView, NSDraggingSource {
         let defaultBackgroundBits: (UInt32, UInt32, UInt32, UInt32)
 
         init(
-            controllerID: UUID,
             rows: Int,
             cols: Int,
             scrollbackRowCount: Int,
@@ -128,7 +126,6 @@ final class IntegratedView: MTKView, NSDraggingSource {
             thumbnailSize: NSSize,
             terminalAppearance: MetalRenderer.TerminalAppearance
         ) {
-            self.controllerID = controllerID
             self.rows = rows
             self.cols = cols
             self.scrollbackRowCount = scrollbackRowCount
@@ -152,9 +149,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
             )
         }
 
-        static func == (lhs: ThumbnailVertexCacheKey, rhs: ThumbnailVertexCacheKey) -> Bool {
-            lhs.controllerID == rhs.controllerID &&
-                lhs.rows == rhs.rows &&
+        static func == (lhs: ThumbnailSurfaceSignature, rhs: ThumbnailSurfaceSignature) -> Bool {
+            lhs.rows == rhs.rows &&
                 lhs.cols == rhs.cols &&
                 lhs.scrollbackRowCount == rhs.scrollbackRowCount &&
                 lhs.scrollOffset == rhs.scrollOffset &&
@@ -174,7 +170,6 @@ final class IntegratedView: MTKView, NSDraggingSource {
         }
 
         func hash(into hasher: inout Hasher) {
-            hasher.combine(controllerID)
             hasher.combine(rows)
             hasher.combine(cols)
             hasher.combine(scrollbackRowCount)
@@ -195,16 +190,12 @@ final class IntegratedView: MTKView, NSDraggingSource {
         }
     }
 
-    private struct CachedThumbnailVertices {
-        let bgVertices: [Float]
-        let glyphVertices: [Float]
+    private struct CachedThumbnailSurface {
+        let signature: ThumbnailSurfaceSignature
+        let texture: MTLTexture
 
         var byteCount: Int {
-            (bgVertices.count + glyphVertices.count) * MemoryLayout<Float>.stride
-        }
-
-        var storageByteCount: Int {
-            (bgVertices.capacity + glyphVertices.capacity) * MemoryLayout<Float>.stride
+            texture.width * texture.height * 4
         }
     }
 
@@ -268,6 +259,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     /// Terminals that are actively producing output (border pulses red).
     private(set) var activeOutputTerminals: Set<UUID> = [] {
         didSet {
+            guard oldValue != activeOutputTerminals else { return }
             updateRenderLoopState()
             setNeedsDisplay(bounds)
         }
@@ -281,6 +273,21 @@ final class IntegratedView: MTKView, NSDraggingSource {
         }
         return activeOutputTerminals.remove(terminalID) != nil
     }
+
+    func noteTerminalOutputActivity(_ terminalID: UUID) {
+        thumbnailSurfaceCache.removeValue(forKey: terminalID)
+        let inserted = setTerminalOutputActive(terminalID, isActive: true)
+        scheduleOverviewContentRedraw(forceImmediate: inserted)
+    }
+
+    func noteTerminalContentActivity(_ terminalID: UUID) {
+        thumbnailSurfaceCache.removeValue(forKey: terminalID)
+        scheduleOverviewContentRedraw(forceImmediate: false)
+    }
+
+    var debugHasOutputPulseTimer: Bool { outputPulseTimer != nil }
+    var debugHasOutputContentRedrawTimer: Bool { outputContentRedrawTimer != nil }
+
     var shortcutConfiguration: ShortcutConfiguration = .default
     var explicitWorkspaceNames: [String] = [] {
         didSet {
@@ -360,7 +367,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private var cachedVisibleThumbnails: [ThumbnailLayout] = []
     private var textVertexCache: [TextVertexCacheKey: CachedTextVertices] = [:]
     private var textAtlasSignature: TextAtlasSignature?
-    private var thumbnailVertexCache: [ThumbnailVertexCacheKey: CachedThumbnailVertices] = [:]
+    private var thumbnailSurfaceCache: [UUID: CachedThumbnailSurface] = [:]
     private var cachedCPUStatusByTerminalID: [UUID: CachedCPUStatus] = [:]
     private var stagingPreContentOverlayVertices: [Float] = []
     private var stagingPostContentOverlayVertices: [Float] = []
@@ -373,6 +380,10 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private var thumbnailCacheBuildGlyphScratch: [Float] = []
     private var scrollInteractionTimer: Timer?
     private var idleBufferReleaseTimer: Timer?
+    private var outputPulseTimer: Timer?
+    private var outputContentRedrawTimer: Timer?
+    private var lastOutputContentRedrawTime: CFTimeInterval = 0
+    private var overviewOutputDisplayRequestCount = 0
     private var isOverviewScrolling = false
 
     /// Layout constants
@@ -432,17 +443,63 @@ final class IntegratedView: MTKView, NSDraggingSource {
         return min(CachePolicy.thumbnailVertexSoftByteLimit, dynamicBudget)
     }
 
+    static func effectiveOutputContentRedrawInterval(visibleTerminalCount: Int) -> TimeInterval {
+        let clampedVisibleCount = max(1, visibleTerminalCount)
+        let scaledInterval = 0.25 + Double(clampedVisibleCount - 1) * 0.15
+        return min(1.0, max(0.25, scaledInterval))
+    }
+
     var cachedTextVertexCount: Int { textVertexCache.count }
-    var cachedThumbnailVertexCount: Int { thumbnailVertexCache.count }
+    var cachedThumbnailVertexCount: Int { thumbnailSurfaceCache.count }
+    func debugHasThumbnailSurfaceCacheEntry(for controllerID: UUID) -> Bool {
+        thumbnailSurfaceCache[controllerID] != nil
+    }
+    func debugCachedThumbnailSurfaceOpaquePixelCount(for controllerID: UUID) -> Int? {
+        guard let texture = thumbnailSurfaceCache[controllerID]?.texture else { return nil }
+        return debugOpaquePixelCount(in: texture)
+    }
+    func debugCachedThumbnailSurfaceMaximumAlpha(for controllerID: UUID) -> UInt8? {
+        guard let cached = thumbnailSurfaceCache[controllerID] else { return nil }
+        let scaleFactor = Float(renderer.glyphAtlas.scaleFactor)
+        let thumbnailSize = NSSize(
+            width: Double(bitPattern: cached.signature.thumbnailWidthBits),
+            height: Double(bitPattern: cached.signature.thumbnailHeightBits)
+        )
+        guard let readableTexture = makeReadableOverviewThumbnailTexture(size: thumbnailSize, scaleFactor: scaleFactor),
+              let commandBuffer = renderer.commandQueue.makeCommandBuffer() else {
+            return nil
+        }
+        if let blit = commandBuffer.makeBlitCommandEncoder() {
+            blit.copy(
+                from: cached.texture,
+                sourceSlice: 0,
+                sourceLevel: 0,
+                sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                sourceSize: MTLSize(width: cached.texture.width, height: cached.texture.height, depth: 1),
+                to: readableTexture,
+                destinationSlice: 0,
+                destinationLevel: 0,
+                destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+            )
+            blit.endEncoding()
+        }
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        return debugMaximumAlpha(in: readableTexture)
+    }
     var cachedCPUStatusCount: Int { cachedCPUStatusByTerminalID.count }
     var cachedTextVertexBytes: Int { textVertexCache.values.reduce(0) { $0 + $1.byteCount } }
-    var cachedThumbnailVertexBytes: Int { thumbnailVertexCache.values.reduce(0) { $0 + $1.byteCount } }
+    var cachedThumbnailVertexBytes: Int { thumbnailSurfaceCache.values.reduce(0) { $0 + $1.byteCount } }
+    func debugCachedThumbnailSurfaceContentVersion(for controllerID: UUID) -> UInt64? {
+        thumbnailSurfaceCache[controllerID]?.signature.contentVersion
+    }
     var cachedTextVertexStorageBytes: Int { textVertexCache.values.reduce(0) { $0 + $1.storageByteCount } }
-    var cachedThumbnailVertexStorageBytes: Int { thumbnailVertexCache.values.reduce(0) { $0 + $1.storageByteCount } }
+    var cachedThumbnailVertexStorageBytes: Int { cachedThumbnailVertexBytes }
     var cachedWorkspaceLayoutCount: Int { cachedWorkspaceLayouts.count }
     var cachedFlattenedThumbnailCount: Int { cachedFlattenedThumbnails.count }
     var cachedVisibleWorkspaceLayoutCount: Int { cachedVisibleWorkspaceLayouts.count }
     var cachedVisibleThumbnailCount: Int { cachedVisibleThumbnails.count }
+    var debugOverviewOutputDisplayRequestCount: Int { overviewOutputDisplayRequestCount }
     var stagingVertexStorageBytes: Int {
         [
             stagingPreContentOverlayVertices,
@@ -507,12 +564,201 @@ final class IntegratedView: MTKView, NSDraggingSource {
     func debugPrimeThumbnailVertexCache(scaleFactor: Float = 2.0) {
         updateLayoutCacheIfNeeded()
         for layout in cachedFlattenedThumbnails {
-            _ = cachedThumbnailVertices(
+            _ = thumbnailSurface(
                 for: layout.controller,
                 thumbnailSize: layout.thumbnail.size,
-                scaleFactor: scaleFactor
+                scaleFactor: scaleFactor,
+                commandBuffer: nil
             )
         }
+    }
+
+    func debugSeedThumbnailSurfaceCacheForTesting(controllerID: UUID) {
+        guard let texture = renderer.makeOverviewThumbnailTexture(size: NSSize(width: 8, height: 8), scaleFactor: 1.0) else {
+            return
+        }
+        let signature = ThumbnailSurfaceSignature(
+            rows: 1,
+            cols: 1,
+            scrollbackRowCount: 0,
+            scrollOffset: 0,
+            contentVersion: 0,
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize),
+            glyphScale: 1.0,
+            thumbnailSize: NSSize(width: 8, height: 8),
+            terminalAppearance: renderer.terminalAppearance
+        )
+        thumbnailSurfaceCache[controllerID] = CachedThumbnailSurface(signature: signature, texture: texture)
+    }
+
+    func debugRenderedThumbnailOpaquePixelCount(for controllerID: UUID) -> Int? {
+        updateLayoutCacheIfNeeded()
+        guard let layout = cachedFlattenedThumbnails.first(where: { $0.controller.id == controllerID }) else {
+            return nil
+        }
+        let scaleFactor = Float(renderer.glyphAtlas.scaleFactor)
+        guard let commandBuffer = renderer.commandQueue.makeCommandBuffer(),
+              let renderTexture = renderer.makeOverviewThumbnailTexture(size: layout.thumbnail.size, scaleFactor: scaleFactor),
+              let readableTexture = makeReadableOverviewThumbnailTexture(size: layout.thumbnail.size, scaleFactor: scaleFactor) else {
+            return nil
+        }
+        _ = layout.controller.withViewport { model, scrollback, scrollOffset in
+            renderer.renderThumbnailToTexture(
+                model: model,
+                scrollback: scrollback,
+                scrollOffset: scrollOffset,
+                texture: renderTexture,
+                thumbnailSize: layout.thumbnail.size,
+                scaleFactor: scaleFactor,
+                commandBuffer: commandBuffer
+            )
+        }
+        if let blit = commandBuffer.makeBlitCommandEncoder() {
+            blit.copy(
+                from: renderTexture,
+                sourceSlice: 0,
+                sourceLevel: 0,
+                sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                sourceSize: MTLSize(width: renderTexture.width, height: renderTexture.height, depth: 1),
+                to: readableTexture,
+                destinationSlice: 0,
+                destinationLevel: 0,
+                destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+            )
+            blit.endEncoding()
+        }
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        return debugOpaquePixelCount(in: readableTexture)
+    }
+
+    func debugRenderedThumbnailMaximumAlpha(for controllerID: UUID) -> UInt8? {
+        updateLayoutCacheIfNeeded()
+        guard let layout = cachedFlattenedThumbnails.first(where: { $0.controller.id == controllerID }) else {
+            return nil
+        }
+        let scaleFactor = Float(renderer.glyphAtlas.scaleFactor)
+        guard let commandBuffer = renderer.commandQueue.makeCommandBuffer(),
+              let readableTexture = makeReadableOverviewThumbnailTexture(size: layout.thumbnail.size, scaleFactor: scaleFactor) else {
+            return nil
+        }
+        layout.controller.withViewport { model, scrollback, scrollOffset in
+            renderer.renderThumbnailToTexture(
+                model: model,
+                scrollback: scrollback,
+                scrollOffset: scrollOffset,
+                texture: readableTexture,
+                thumbnailSize: layout.thumbnail.size,
+                scaleFactor: scaleFactor,
+                commandBuffer: commandBuffer
+            )
+        }
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        return debugMaximumAlpha(in: readableTexture)
+    }
+
+    func debugThumbnailVertexCounts(for controllerID: UUID) -> (background: Int, glyph: Int)? {
+        updateLayoutCacheIfNeeded()
+        guard let layout = cachedFlattenedThumbnails.first(where: { $0.controller.id == controllerID }) else {
+            return nil
+        }
+        let scaleFactor = Float(renderer.glyphAtlas.scaleFactor)
+        return layout.controller.withViewport { model, scrollback, scrollOffset in
+            var bgVertices: [Float] = []
+            var glyphVertices: [Float] = []
+            renderer.appendThumbnailVertexData(
+                model: model,
+                scrollback: scrollback,
+                scrollOffset: scrollOffset,
+                thumbnailRect: layout.thumbnail,
+                scaleFactor: scaleFactor,
+                bgVertices: &bgVertices,
+                glyphVertices: &glyphVertices
+            )
+            return (
+                background: bgVertices.count / 12,
+                glyph: glyphVertices.count / 12
+            )
+        }
+    }
+
+    func debugThumbnailGlyphBounds(for controllerID: UUID) -> (minX: Float, minY: Float, maxX: Float, maxY: Float)? {
+        debugThumbnailVertexBounds(for: controllerID, includeGlyphs: true)
+    }
+
+    func debugThumbnailBackgroundBounds(for controllerID: UUID) -> (minX: Float, minY: Float, maxX: Float, maxY: Float)? {
+        debugThumbnailVertexBounds(for: controllerID, includeGlyphs: false)
+    }
+
+    private func debugThumbnailVertexBounds(for controllerID: UUID, includeGlyphs: Bool) -> (minX: Float, minY: Float, maxX: Float, maxY: Float)? {
+        updateLayoutCacheIfNeeded()
+        guard let layout = cachedFlattenedThumbnails.first(where: { $0.controller.id == controllerID }) else {
+            return nil
+        }
+        let scaleFactor = Float(renderer.glyphAtlas.scaleFactor)
+        return layout.controller.withViewport { model, scrollback, scrollOffset in
+            var bgVertices: [Float] = []
+            var glyphVertices: [Float] = []
+            renderer.appendThumbnailVertexData(
+                model: model,
+                scrollback: scrollback,
+                scrollOffset: scrollOffset,
+                thumbnailRect: NSRect(origin: .zero, size: layout.thumbnail.size),
+                scaleFactor: scaleFactor,
+                bgVertices: &bgVertices,
+                glyphVertices: &glyphVertices
+            )
+            let vertices = includeGlyphs ? glyphVertices : bgVertices
+            guard !vertices.isEmpty else { return nil }
+            var minX = Float.greatestFiniteMagnitude
+            var minY = Float.greatestFiniteMagnitude
+            var maxX = -Float.greatestFiniteMagnitude
+            var maxY = -Float.greatestFiniteMagnitude
+            var index = 0
+            while index < vertices.count {
+                let x = vertices[index]
+                let y = vertices[index + 1]
+                minX = min(minX, x)
+                minY = min(minY, y)
+                maxX = max(maxX, x)
+                maxY = max(maxY, y)
+                index += 12
+            }
+            return (minX, minY, maxX, maxY)
+        }
+    }
+
+    func debugThumbnailLayout(for controllerID: UUID) -> NSSize? {
+        updateLayoutCacheIfNeeded()
+        return cachedFlattenedThumbnails.first(where: { $0.controller.id == controllerID })?.thumbnail.size
+    }
+
+    func debugRenderedOverviewOpaquePixelCount(in rect: NSRect) -> Int? {
+        syncScaleFactorIfNeeded()
+        let drawableSize = self.drawableSize
+        guard drawableSize.width > 0,
+              drawableSize.height > 0,
+              let texture = makeReadableOverviewTexture(drawableSize: drawableSize),
+              let commandBuffer = renderer.commandQueue.makeCommandBuffer() else {
+            return nil
+        }
+
+        let renderPassDescriptor = MTLRenderPassDescriptor()
+        renderPassDescriptor.colorAttachments[0].texture = texture
+        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].storeAction = .store
+
+        renderOverviewScene(
+            renderPassDescriptor: renderPassDescriptor,
+            commandBuffer: commandBuffer,
+            drawableSize: drawableSize
+        )
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        return debugOpaquePixelCount(in: texture, clippedTo: rect, scaleFactor: Float(renderer.glyphAtlas.scaleFactor))
     }
 
     func debugEnsureLayoutCache() {
@@ -525,6 +771,91 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     func debugInstallTooltipWindowForTesting() {
         showTooltip("Test", at: NSPoint(x: 8, y: 8))
+    }
+
+    private func makeReadableOverviewThumbnailTexture(size: NSSize, scaleFactor: Float) -> MTLTexture? {
+        let width = max(1, Int(ceil(size.width * CGFloat(scaleFactor))))
+        let height = max(1, Int(ceil(size.height * CGFloat(scaleFactor))))
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: MetalRenderer.renderTargetPixelFormat,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        descriptor.storageMode = .shared
+        descriptor.usage = [.renderTarget, .shaderRead]
+        return renderer.device.makeTexture(descriptor: descriptor)
+    }
+
+    private func makeReadableOverviewTexture(drawableSize: CGSize) -> MTLTexture? {
+        let width = max(1, Int(drawableSize.width))
+        let height = max(1, Int(drawableSize.height))
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: MetalRenderer.renderTargetPixelFormat,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        descriptor.storageMode = .shared
+        descriptor.usage = [.renderTarget, .shaderRead]
+        return renderer.device.makeTexture(descriptor: descriptor)
+    }
+
+    private func debugOpaquePixelCount(in texture: MTLTexture) -> Int? {
+        debugOpaquePixelCount(in: texture, clippedTo: nil, scaleFactor: 1.0)
+    }
+
+    private func debugOpaquePixelCount(in texture: MTLTexture, clippedTo rect: NSRect?, scaleFactor: Float) -> Int? {
+        let bytesPerRow = texture.width * 4
+        var bytes = [UInt8](repeating: 0, count: bytesPerRow * texture.height)
+        texture.getBytes(
+            &bytes,
+            bytesPerRow: bytesPerRow,
+            from: MTLRegionMake2D(0, 0, texture.width, texture.height),
+            mipmapLevel: 0
+        )
+        var opaquePixels = 0
+        let clippedRect: NSRect
+        if let rect {
+            clippedRect = rect
+        } else {
+            clippedRect = NSRect(x: 0, y: 0, width: CGFloat(texture.width) / CGFloat(scaleFactor), height: CGFloat(texture.height) / CGFloat(scaleFactor))
+        }
+        let startX = max(0, Int(floor(clippedRect.minX * CGFloat(scaleFactor))))
+        let endX = min(texture.width, Int(ceil(clippedRect.maxX * CGFloat(scaleFactor))))
+        let startY = max(0, Int(floor(clippedRect.minY * CGFloat(scaleFactor))))
+        let endY = min(texture.height, Int(ceil(clippedRect.maxY * CGFloat(scaleFactor))))
+        guard startX < endX, startY < endY else { return 0 }
+
+        for y in startY..<endY {
+            var index = y * bytesPerRow + startX * 4 + 3
+            let rowEnd = y * bytesPerRow + endX * 4
+            while index < rowEnd {
+                if bytes[index] > 8 {
+                    opaquePixels += 1
+                }
+                index += 4
+            }
+        }
+        return opaquePixels
+    }
+
+    private func debugMaximumAlpha(in texture: MTLTexture) -> UInt8? {
+        let bytesPerRow = texture.width * 4
+        var bytes = [UInt8](repeating: 0, count: bytesPerRow * texture.height)
+        texture.getBytes(
+            &bytes,
+            bytesPerRow: bytesPerRow,
+            from: MTLRegionMake2D(0, 0, texture.width, texture.height),
+            mipmapLevel: 0
+        )
+        var maximum: UInt8 = 0
+        var index = 3
+        while index < bytes.count {
+            maximum = max(maximum, bytes[index])
+            index += 4
+        }
+        return maximum
     }
 
     func debugPrimeCloseTexturesForTesting() {
@@ -545,8 +876,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         updateLayoutCacheIfNeeded()
         for layout in cachedFlattenedThumbnails {
             let controller = layout.controller
-            let key = ThumbnailVertexCacheKey(
-                controllerID: controller.id,
+            let signature = ThumbnailSurfaceSignature(
                 rows: 24,
                 cols: 80,
                 scrollbackRowCount: 0,
@@ -558,10 +888,18 @@ final class IntegratedView: MTKView, NSDraggingSource {
                 thumbnailSize: layout.thumbnail.size,
                 terminalAppearance: renderer.terminalAppearance
             )
-            thumbnailVertexCache[key] = CachedThumbnailVertices(
-                bgVertices: Array(repeating: 1, count: floatCountPerEntry / 2),
-                glyphVertices: Array(repeating: 1, count: floatCountPerEntry / 2)
+            let pixels = max(1, floatCountPerEntry / 16)
+            let side = max(1, Int(ceil(sqrt(Double(pixels)))))
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: MetalRenderer.renderTargetPixelFormat,
+                width: side,
+                height: side,
+                mipmapped: false
             )
+            descriptor.usage = [.shaderRead, .renderTarget]
+            descriptor.storageMode = .private
+            let texture = renderer.device.makeTexture(descriptor: descriptor)!
+            thumbnailSurfaceCache[controller.id] = CachedThumbnailSurface(signature: signature, texture: texture)
         }
     }
 
@@ -600,6 +938,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
         }
         scrollInteractionTimer?.invalidate()
         idleBufferReleaseTimer?.invalidate()
+        outputPulseTimer?.invalidate()
+        outputContentRedrawTimer?.invalidate()
         releaseStagingVertexStorage()
         renderer.removeBuffers(for: self)
     }
@@ -685,7 +1025,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         if activeTerminalIDs.isEmpty {
             cachedCPUStatusByTerminalID.removeAll()
             textVertexCache.removeAll()
-            thumbnailVertexCache.removeAll()
+            thumbnailSurfaceCache.removeAll()
             releaseLayoutStorage()
             releaseStagingVertexStorage()
             renderer.releaseOverviewBuffers(for: self)
@@ -992,18 +1332,18 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
 
     private func pruneThumbnailVertexCache(activeTerminalIDs: Set<UUID>, preferredTerminalIDs: Set<UUID>) {
-        guard !thumbnailVertexCache.isEmpty else { return }
-        let originalCount = thumbnailVertexCache.count
-        thumbnailVertexCache = thumbnailVertexCache.filter { activeTerminalIDs.contains($0.key.controllerID) }
+        guard !thumbnailSurfaceCache.isEmpty else { return }
+        let originalCount = thumbnailSurfaceCache.count
+        thumbnailSurfaceCache = thumbnailSurfaceCache.filter { activeTerminalIDs.contains($0.key) }
         let softLimit = Self.effectiveThumbnailVertexSoftLimit(preferredTerminalCount: preferredTerminalIDs.count)
         let softByteLimit = Self.effectiveThumbnailVertexSoftByteLimit(preferredTerminalCount: preferredTerminalIDs.count)
-        if thumbnailVertexCache.count > softLimit || cachedThumbnailVertexBytes > softByteLimit {
-            thumbnailVertexCache = thumbnailVertexCache.filter { preferredTerminalIDs.contains($0.key.controllerID) }
+        if thumbnailSurfaceCache.count > softLimit || cachedThumbnailVertexBytes > softByteLimit {
+            thumbnailSurfaceCache = thumbnailSurfaceCache.filter { preferredTerminalIDs.contains($0.key) }
         }
-        if thumbnailVertexCache.count > softLimit || cachedThumbnailVertexBytes > softByteLimit {
-            thumbnailVertexCache.removeAll()
+        if thumbnailSurfaceCache.count > softLimit || cachedThumbnailVertexBytes > softByteLimit {
+            thumbnailSurfaceCache.removeAll()
         }
-        if thumbnailVertexCache.count < originalCount {
+        if thumbnailSurfaceCache.count < originalCount {
             renderer.releaseOverviewBuffers(for: self)
         }
     }
@@ -1047,8 +1387,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
             textVertexCache.removeAll()
         }
 
-        if force || !thumbnailVertexCache.isEmpty {
-            thumbnailVertexCache.removeAll()
+        if force || !thumbnailSurfaceCache.isEmpty {
+            thumbnailSurfaceCache.removeAll()
         }
     }
 
@@ -1089,7 +1429,6 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
         stagingPreContentOverlayVertices.removeAll(keepingCapacity: true)
         stagingPostContentOverlayVertices.removeAll(keepingCapacity: true)
-        stagingThumbnailBgVertices.removeAll(keepingCapacity: true)
         stagingThumbnailGlyphVertices.removeAll(keepingCapacity: true)
         stagingAtlasGlyphVertices.removeAll(keepingCapacity: true)
         stagingIconVertices.removeAll(keepingCapacity: true)
@@ -1204,45 +1543,15 @@ final class IntegratedView: MTKView, NSDraggingSource {
         )
     }
 
-    private func appendTranslatedVertices(
-        from source: [Float],
-        dx: Float,
-        dy: Float,
-        to destination: inout [Float]
-    ) {
-        guard !source.isEmpty else { return }
-        destination.reserveCapacity(destination.count + source.count)
-        let stride = 12
-        source.withUnsafeBufferPointer { buffer in
-            var index = 0
-            while index < buffer.count {
-                destination.append(buffer[index] + dx)
-                destination.append(buffer[index + 1] + dy)
-                for component in 2..<stride {
-                    destination.append(buffer[index + component])
-                }
-                index += stride
-            }
-        }
-    }
-
-    private func tightlyPackedVertices(_ vertices: [Float]) -> [Float] {
-        guard !vertices.isEmpty else { return [] }
-        var packed: [Float] = []
-        packed.reserveCapacity(vertices.count)
-        packed.append(contentsOf: vertices)
-        return packed
-    }
-
-    private func cachedThumbnailVertices(
+    private func thumbnailSurface(
         for controller: TerminalController,
         thumbnailSize: NSSize,
-        scaleFactor: Float
-    ) -> CachedThumbnailVertices {
+        scaleFactor: Float,
+        commandBuffer: MTLCommandBuffer?
+    ) -> CachedThumbnailSurface? {
         let fontSettings = controller.persistedFontSettings
         return controller.withViewport { model, scrollback, scrollOffset in
-            let key = ThumbnailVertexCacheKey(
-                controllerID: controller.id,
+            let signature = ThumbnailSurfaceSignature(
                 rows: model.rows,
                 cols: model.cols,
                 scrollbackRowCount: scrollback.rowCount,
@@ -1254,26 +1563,26 @@ final class IntegratedView: MTKView, NSDraggingSource {
                 thumbnailSize: thumbnailSize,
                 terminalAppearance: renderer.terminalAppearance
             )
-            if let cached = thumbnailVertexCache[key] {
+            if let cached = thumbnailSurfaceCache[controller.id], cached.signature == signature {
                 return cached
             }
-
-            thumbnailCacheBuildBgScratch.removeAll(keepingCapacity: true)
-            thumbnailCacheBuildGlyphScratch.removeAll(keepingCapacity: true)
-            renderer.appendThumbnailVertexData(
+            guard let commandBuffer else {
+                return thumbnailSurfaceCache[controller.id]
+            }
+            let texture = thumbnailSurfaceCache[controller.id]?.texture
+                ?? renderer.makeOverviewThumbnailTexture(size: thumbnailSize, scaleFactor: scaleFactor)
+            guard let texture else { return nil }
+            renderer.renderThumbnailToTexture(
                 model: model,
                 scrollback: scrollback,
                 scrollOffset: scrollOffset,
-                thumbnailRect: NSRect(origin: .zero, size: thumbnailSize),
+                texture: texture,
+                thumbnailSize: thumbnailSize,
                 scaleFactor: scaleFactor,
-                bgVertices: &thumbnailCacheBuildBgScratch,
-                glyphVertices: &thumbnailCacheBuildGlyphScratch
+                commandBuffer: commandBuffer
             )
-            let cached = CachedThumbnailVertices(
-                bgVertices: tightlyPackedVertices(thumbnailCacheBuildBgScratch),
-                glyphVertices: tightlyPackedVertices(thumbnailCacheBuildGlyphScratch)
-            )
-            thumbnailVertexCache[key] = cached
+            let cached = CachedThumbnailSurface(signature: signature, texture: texture)
+            thumbnailSurfaceCache[controller.id] = cached
             pruneThumbnailVertexCache(
                 activeTerminalIDs: Set(manager.terminals.map(\.id)),
                 preferredTerminalIDs: Set(cachedVisibleThumbnails.map(\.controller.id))
@@ -2005,6 +2314,23 @@ extension IntegratedView: MTKViewDelegate {
             return
         }
 
+        renderOverviewScene(
+            renderPassDescriptor: renderPassDescriptor,
+            commandBuffer: commandBuffer,
+            drawableSize: view.drawableSize
+        )
+
+        commandBuffer.present(drawable)
+        commandBuffer.commit()
+        trimStagingVertexStorageAfterDraw()
+        scheduleIdleBufferRelease()
+    }
+
+    private func renderOverviewScene(
+        renderPassDescriptor: MTLRenderPassDescriptor,
+        commandBuffer: MTLCommandBuffer,
+        drawableSize: CGSize
+    ) {
         let sf = Float(renderer.glyphAtlas.scaleFactor)
         let time = Float(CACurrentMediaTime())
         syncScrollOffsetFromCompanionScrollView()
@@ -2014,12 +2340,6 @@ extension IntegratedView: MTKViewDelegate {
 
         renderPassDescriptor.colorAttachments[0].clearColor = Self.overviewBackgroundClearColor()
 
-        guard let encoder = commandBuffer.makeRenderCommandEncoder(
-            descriptor: renderPassDescriptor) else {
-            return
-        }
-
-        let drawableSize = view.drawableSize
         let viewportSize = SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height))
         stagingPreContentOverlayVertices.removeAll(keepingCapacity: true)
         stagingPostContentOverlayVertices.removeAll(keepingCapacity: true)
@@ -2032,11 +2352,36 @@ extension IntegratedView: MTKViewDelegate {
         var currentOverviewFontSize = renderer.glyphAtlas.fontSize
         stagingPreContentOverlayVertices.reserveCapacity(max(256, cachedVisibleWorkspaceLayouts.count * 120 + cachedVisibleThumbnails.count * 120))
         stagingPostContentOverlayVertices.reserveCapacity(max(256, cachedVisibleWorkspaceLayouts.count * 96 + cachedVisibleThumbnails.count * 96))
-        stagingThumbnailBgVertices.reserveCapacity(max(256, cachedVisibleThumbnails.count * 512))
-        stagingThumbnailGlyphVertices.reserveCapacity(max(256, cachedVisibleThumbnails.count * 768))
         stagingAtlasGlyphVertices.reserveCapacity(max(256, cachedVisibleWorkspaceLayouts.count * 384 + cachedVisibleThumbnails.count * 512))
         stagingIconVertices.reserveCapacity(max(128, cachedVisibleThumbnails.count * 72))
         stagingCircleVertices.reserveCapacity(max(128, cachedVisibleThumbnails.count * 72))
+        var thumbnailSurfacesForFrame: [UUID: CachedThumbnailSurface] = [:]
+        thumbnailSurfacesForFrame.reserveCapacity(cachedVisibleThumbnails.count)
+
+        for frame in cachedVisibleThumbnails {
+            let controller = frame.controller
+            let fontSettings = controller.persistedFontSettings
+            if currentOverviewFontName != fontSettings.name ||
+                abs(Double(currentOverviewFontSize) - fontSettings.size) > 0.001 {
+                renderer.updateFont(name: fontSettings.name, size: CGFloat(fontSettings.size))
+                currentOverviewFontName = renderer.glyphAtlas.fontName
+                currentOverviewFontSize = renderer.glyphAtlas.fontSize
+                invalidateTextVertexCacheIfNeeded()
+            }
+            if let surface = thumbnailSurface(
+                for: controller,
+                thumbnailSize: frame.thumbnail.size,
+                scaleFactor: sf,
+                commandBuffer: commandBuffer
+            ) {
+                thumbnailSurfacesForFrame[controller.id] = surface
+            }
+        }
+
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(
+            descriptor: renderPassDescriptor) else {
+            return
+        }
 
         // Render workspace backgrounds (even when empty)
         for workspace in cachedVisibleWorkspaceLayouts {
@@ -2061,8 +2406,6 @@ extension IntegratedView: MTKViewDelegate {
                     encoder: encoder,
                     viewportSize: viewportSize,
                     preContentOverlayVertices: &stagingPreContentOverlayVertices,
-                    thumbnailBgVertices: &stagingThumbnailBgVertices,
-                    thumbnailGlyphVertices: &stagingThumbnailGlyphVertices,
                     atlasGlyphVertices: &stagingAtlasGlyphVertices
                 )
                 renderer.updateFont(name: fontSettings.name, size: CGFloat(fontSettings.size))
@@ -2090,23 +2433,21 @@ extension IntegratedView: MTKViewDelegate {
                 vertices: &stagingPreContentOverlayVertices
             )
 
-            let cachedThumbnailVertices = cachedThumbnailVertices(
-                for: controller,
-                thumbnailSize: frame.thumbnail.size,
-                scaleFactor: sf
-            )
-            appendTranslatedVertices(
-                from: cachedThumbnailVertices.bgVertices,
-                dx: Float(frame.thumbnail.origin.x) * sf,
-                dy: Float(frame.thumbnail.origin.y) * sf,
-                to: &stagingThumbnailBgVertices
-            )
-            appendTranslatedVertices(
-                from: cachedThumbnailVertices.glyphVertices,
-                dx: Float(frame.thumbnail.origin.x) * sf,
-                dy: Float(frame.thumbnail.origin.y) * sf,
-                to: &stagingThumbnailGlyphVertices
-            )
+            if let cachedThumbnailSurface = thumbnailSurfacesForFrame[controller.id]
+                ?? thumbnailSurface(
+                    for: controller,
+                    thumbnailSize: frame.thumbnail.size,
+                    scaleFactor: sf,
+                    commandBuffer: nil
+                ) {
+                drawThumbnailSurface(
+                    frame: frame.thumbnail,
+                    texture: cachedThumbnailSurface.texture,
+                    scaleFactor: sf,
+                    encoder: encoder,
+                    viewportSize: viewportSize
+                )
+            }
 
             // Draw title text
             drawTitle(
@@ -2136,8 +2477,6 @@ extension IntegratedView: MTKViewDelegate {
             encoder: encoder,
             viewportSize: viewportSize,
             preContentOverlayVertices: &stagingPreContentOverlayVertices,
-            thumbnailBgVertices: &stagingThumbnailBgVertices,
-            thumbnailGlyphVertices: &stagingThumbnailGlyphVertices,
             atlasGlyphVertices: &stagingAtlasGlyphVertices
         )
 
@@ -2214,18 +2553,12 @@ extension IntegratedView: MTKViewDelegate {
         )
 
         encoder.endEncoding()
-        commandBuffer.present(drawable)
-        commandBuffer.commit()
-        trimStagingVertexStorageAfterDraw()
-        scheduleIdleBufferRelease()
     }
 
     private func flushOverviewContentBatch(
         encoder: MTLRenderCommandEncoder,
         viewportSize: SIMD2<Float>,
         preContentOverlayVertices: inout [Float],
-        thumbnailBgVertices: inout [Float],
-        thumbnailGlyphVertices: inout [Float],
         atlasGlyphVertices: inout [Float]
     ) {
         drawVertices(
@@ -2235,12 +2568,6 @@ extension IntegratedView: MTKViewDelegate {
             viewportSize: viewportSize,
             bufferSlot: .overviewPreOverlay
         )
-        drawThumbnailContentVertices(
-            bgVertices: thumbnailBgVertices,
-            glyphVertices: thumbnailGlyphVertices,
-            encoder: encoder,
-            viewportSize: viewportSize
-        )
         drawGlyphVertices(
             atlasGlyphVertices,
             encoder: encoder,
@@ -2249,20 +2576,63 @@ extension IntegratedView: MTKViewDelegate {
             bufferSlot: .overviewTextGlyph
         )
         preContentOverlayVertices.removeAll(keepingCapacity: true)
-        thumbnailBgVertices.removeAll(keepingCapacity: true)
-        thumbnailGlyphVertices.removeAll(keepingCapacity: true)
         atlasGlyphVertices.removeAll(keepingCapacity: true)
     }
 
     private func updateRenderLoopState() {
         let isDragging = dragAutoScrollTimer != nil || dragInsertionIndicator != nil || dragWorkspaceIndicator != nil
-        let shouldAnimate = isDragging || (!isOverviewScrolling && !activeOutputTerminals.isEmpty)
-        preferredFramesPerSecond = isDragging ? 30 : 8
+        let shouldAnimate = isDragging
+        preferredFramesPerSecond = isDragging ? 30 : 12
         isPaused = !shouldAnimate
         enableSetNeedsDisplay = !shouldAnimate
+        updateOutputPulseTimer(isDragging: isDragging)
         if !shouldAnimate {
             setNeedsDisplay(bounds)
         }
+    }
+
+    private func updateOutputPulseTimer(isDragging: Bool) {
+        if isDragging || isOverviewScrolling || activeOutputTerminals.isEmpty {
+            outputPulseTimer?.invalidate()
+            outputPulseTimer = nil
+            return
+        }
+        guard outputPulseTimer == nil else { return }
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.requestOverviewOutputDisplay()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        outputPulseTimer = timer
+    }
+
+    private func requestOverviewOutputDisplay() {
+        ensureDrawableStorageAllocatedIfNeeded()
+        overviewOutputDisplayRequestCount += 1
+        setNeedsDisplay(bounds)
+    }
+
+    private func scheduleOverviewContentRedraw(forceImmediate: Bool = false) {
+        let now = CACurrentMediaTime()
+        let visibleTerminalCount = cachedVisibleThumbnails.isEmpty ? manager.terminals.count : cachedVisibleThumbnails.count
+        let minimumInterval = Self.effectiveOutputContentRedrawInterval(visibleTerminalCount: visibleTerminalCount)
+        if forceImmediate || now - lastOutputContentRedrawTime >= minimumInterval {
+            outputContentRedrawTimer?.invalidate()
+            outputContentRedrawTimer = nil
+            lastOutputContentRedrawTime = now
+            requestOverviewOutputDisplay()
+            return
+        }
+        guard outputContentRedrawTimer == nil else { return }
+        let remaining = minimumInterval - (now - lastOutputContentRedrawTime)
+        let timer = Timer.scheduledTimer(withTimeInterval: remaining, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.outputContentRedrawTimer?.invalidate()
+            self.outputContentRedrawTimer = nil
+            self.lastOutputContentRedrawTime = CACurrentMediaTime()
+            self.requestOverviewOutputDisplay()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        outputContentRedrawTimer = timer
     }
 
     private func updateCompanionScrollObservation(oldValue: NSScrollView?, newValue: NSScrollView?) {
@@ -2992,34 +3362,51 @@ extension IntegratedView: MTKViewDelegate {
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count / 12)
     }
 
-    private func drawThumbnailContentVertices(
-        bgVertices: [Float],
-        glyphVertices: [Float],
+    private func drawThumbnailSurface(
+        frame: NSRect,
+        texture: MTLTexture,
+        scaleFactor: Float,
         encoder: MTLRenderCommandEncoder,
         viewportSize: SIMD2<Float>
     ) {
-        if !bgVertices.isEmpty,
-           let pipeline = renderer.bgPipeline,
-           let buf = renderer.reusableBuffer(for: self, slot: .overviewThumbnailBg, vertices: bgVertices) {
-            var uniforms = MetalRenderer.MetalUniforms(viewportSize: viewportSize, cursorOpacity: 0, time: 0)
-            encoder.setRenderPipelineState(pipeline)
-            encoder.setVertexBuffer(buf, offset: 0, index: 0)
-            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalRenderer.MetalUniforms>.size, index: 1)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: bgVertices.count / 12)
+        guard let pipeline = renderer.texturePipeline else { return }
+        var vertices: [Float] = []
+        vertices.reserveCapacity(72)
+        let x = round(Float(frame.origin.x) * scaleFactor)
+        let y = round(Float(frame.origin.y) * scaleFactor)
+        let w = round(Float(frame.width) * scaleFactor)
+        let h = round(Float(frame.height) * scaleFactor)
+        renderer.addQuadPublic(
+            to: &vertices,
+            x: x,
+            y: y,
+            w: w,
+            h: h,
+            tx: 0,
+            ty: 0,
+            tw: 1,
+            th: 1,
+            fg: (1, 1, 1, 1),
+            bg: (0, 0, 0, 0)
+        )
+        // We draw many thumbnail surfaces in one overview pass. Reusing the same
+        // per-view buffer slot here would overwrite vertex data before the GPU
+        // consumes earlier draw calls, producing blank or stale thumbnails.
+        guard let buf = renderer.makeTemporaryBuffer(vertices: vertices) else {
+            return
         }
+        var uniforms = MetalRenderer.MetalUniforms(viewportSize: viewportSize, cursorOpacity: 0, time: 0)
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setVertexBuffer(buf, offset: 0, index: 0)
+        encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalRenderer.MetalUniforms>.size, index: 1)
+        encoder.setFragmentTexture(texture, index: 0)
+        encoder.setFragmentSamplerState(renderer.samplerState, index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count / 12)
+    }
 
-        if !glyphVertices.isEmpty,
-           let pipeline = renderer.glyphPipeline,
-           let atlas = renderer.glyphAtlas.texture,
-           let buf = renderer.reusableBuffer(for: self, slot: .overviewThumbnailGlyph, vertices: glyphVertices) {
-            var uniforms = MetalRenderer.MetalUniforms(viewportSize: viewportSize, cursorOpacity: 0, time: 0)
-            encoder.setRenderPipelineState(pipeline)
-            encoder.setVertexBuffer(buf, offset: 0, index: 0)
-            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalRenderer.MetalUniforms>.size, index: 1)
-            encoder.setFragmentTexture(atlas, index: 0)
-            encoder.setFragmentSamplerState(renderer.thumbnailSamplerState, index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: glyphVertices.count / 12)
-        }
+    private func tightlyPackedVertices(_ vertices: [Float]) -> [Float] {
+        guard !vertices.isEmpty else { return [] }
+        return vertices.withUnsafeBufferPointer { Array($0) }
     }
 
     private func drawDropIndicators(
@@ -3116,7 +3503,7 @@ extension IntegratedView: MTKViewDelegate {
         }
 
         return CachedTextVertices(
-            vertices: tightlyPackedVertices(vertices),
+            vertices: Array(vertices),
             width: Float(chars.count) * cellW
         )
     }

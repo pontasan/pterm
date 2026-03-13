@@ -1363,12 +1363,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Always track last output time (needed to detect when terminal becomes idle)
             self.lastOutputTimes[controller.id] = now
             self.ensureOutputIdleTimer()
+            self.integratedView?.noteTerminalContentActivity(controller.id)
             // Suppress indicator briefly after window resize (SIGWINCH)
             if now.timeIntervalSince(self.lastResizeTime) < 1.0 { return }
             // Only show indicator for terminals that have been idle at least once.
             // This prevents the initial shell startup output from triggering the indicator.
             guard self.terminalsEverIdle.contains(controller.id) else { return }
-            _ = self.integratedView?.setTerminalOutputActive(controller.id, isActive: true)
+            self.integratedView?.noteTerminalOutputActivity(controller.id)
         }
         if config.audit.enabled {
             let logger = TerminalAuditLogger(
