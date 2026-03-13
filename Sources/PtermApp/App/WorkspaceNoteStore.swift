@@ -23,6 +23,10 @@ final class AppNoteStore {
         self.fileManager = fileManager
     }
 
+    func hasStoredNote() -> Bool {
+        fileManager.fileExists(atPath: noteURL.path)
+    }
+
     func loadNote() throws -> String? {
         let url = noteURL
         guard fileManager.fileExists(atPath: url.path) else {
@@ -44,6 +48,20 @@ final class AppNoteStore {
         let key = try loadOrCreateKey()
         let ciphertext = try encrypt(Data(note.utf8), using: key)
         try AtomicFileWriter.write(ciphertext, to: noteURL, permissions: 0o600)
+    }
+
+    func exportNoteForTransfer(authorizationPassword: String) throws -> String? {
+        guard !authorizationPassword.isEmpty else {
+            throw AppNoteError.passwordRequired
+        }
+        return try loadNote()
+    }
+
+    func importTransferredNote(_ note: String, authorizationPassword: String) throws {
+        guard !authorizationPassword.isEmpty else {
+            throw AppNoteError.passwordRequired
+        }
+        try saveNote(note)
     }
 
     func exportEncryptionKey() throws -> Data {
@@ -197,4 +215,5 @@ enum AppNoteError: Error {
     case invalidFormat
     case invalidKeyLength
     case randomFailure
+    case passwordRequired
 }

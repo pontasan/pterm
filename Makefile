@@ -53,8 +53,8 @@ bundle:
 		-o $(APP_BUNDLE)/Contents/Resources/default.metallib; \
 	echo "Bundle created at $(APP_BUNDLE)"
 
-# Create distributable zip from the bundled app
-package: build
+# Create distributable zip from the bundled app (use 'make build' first)
+package:
 	@rm -f $(DIST_ZIP)
 	ditto -c -k --sequesterRsrc --keepParent $(APP_BUNDLE) $(DIST_ZIP)
 	@echo "Package created at $(DIST_ZIP)"
@@ -92,6 +92,7 @@ sign:
 	codesign --deep --force --verify --verbose \
 		--sign "$(IDENTITY)" \
 		--options runtime \
+		--timestamp \
 		$(APP_BUNDLE)
 	@echo "Code signed."
 
@@ -100,7 +101,7 @@ sign:
 #   make notarize IDENTITY='Developer ID Application: ...' NOTARY_PROFILE='profile-name'
 # Alternative:
 #   make notarize IDENTITY='...' APPLE_ID='name@example.com' TEAM_ID='TEAMID' APPLE_APP_SPECIFIC_PASSWORD='xxxx-xxxx-xxxx-xxxx'
-notarize: sign package
+notarize: build sign package
 	@if [ -n "$(NOTARY_PROFILE)" ]; then \
 		xcrun notarytool submit $(DIST_ZIP) --keychain-profile "$(NOTARY_PROFILE)" --wait; \
 	elif [ -n "$(APPLE_ID)" ] && [ -n "$(TEAM_ID)" ] && [ -n "$(APPLE_APP_SPECIFIC_PASSWORD)" ]; then \

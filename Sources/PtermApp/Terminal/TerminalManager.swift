@@ -67,6 +67,7 @@ final class TerminalManager {
             cols: fullCols,
             termEnv: config.term,
             textEncoding: textEncoding ?? config.textEncoding,
+            shellLaunchOrder: config.shellLaunch.launchOrder,
             scrollbackInitialCapacity: config.memoryInitial,
             scrollbackMaxCapacity: config.memoryMax,
             fontName: fontName,

@@ -6,6 +6,7 @@ final class TerminalManagerIntegrationTests: XCTestCase {
         let config = PtermConfig(
             term: "xterm-256color",
             textEncoding: .utf16,
+            shellLaunch: .default,
             fontName: nil,
             fontSize: nil,
             terminalAppearance: .default,

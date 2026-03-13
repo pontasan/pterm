@@ -227,6 +227,53 @@ final class AppKitComponentTests: XCTestCase {
         }
     }
 
+    func testSettingsWindowGeneralSectionShowsLaunchShellListWithDefaultOrder() throws {
+        try withTemporaryHomeDirectory { _ in
+            PtermDirectories.ensureDirectories()
+            try? FileManager.default.removeItem(at: PtermDirectories.config)
+            let controller = SettingsWindowController()
+            let tableView = try XCTUnwrap(
+                allSubviews(in: controller.window?.contentView)
+                    .compactMap { $0 as? NSTableView }
+                    .first(where: { $0.identifier?.rawValue == "launchShellsTable" })
+            )
+
+            let rows = (0..<tableView.numberOfRows).compactMap { row -> String? in
+                let cell = controller.tableView(tableView, viewFor: tableView.tableColumns.first, row: row) as? NSTableCellView
+                return cell?.textField?.stringValue
+            }
+            XCTAssertEqual(rows, ShellLaunchConfiguration.default.launchOrder)
+        }
+    }
+
+    func testSettingsWindowPersistsLaunchShellOrderEdits() throws {
+        try withTemporaryHomeDirectory { _ in
+            PtermDirectories.ensureDirectories()
+            let controller = SettingsWindowController()
+            let tableView = try XCTUnwrap(
+                allSubviews(in: controller.window?.contentView)
+                    .compactMap { $0 as? NSTableView }
+                    .first(where: { $0.identifier?.rawValue == "launchShellsTable" })
+            )
+
+            let addButton = try XCTUnwrap(
+                allSubviews(in: controller.window?.contentView)
+                    .compactMap { $0 as? NSButton }
+                    .first(where: { $0.identifier?.rawValue == "launchShellAddButton" })
+            )
+            addButton.performClick(nil)
+
+            let editedField = try XCTUnwrap(
+                (controller.tableView(tableView, viewFor: tableView.tableColumns.first, row: 0) as? NSTableCellView)?.textField
+            )
+            editedField.stringValue = "/bin/customsh"
+            controller.controlTextDidEndEditing(Notification(name: NSControl.textDidEndEditingNotification, object: editedField))
+
+            let loaded = PtermConfigStore.load()
+            XCTAssertEqual(loaded.shellLaunch.launchOrder, ["/bin/customsh", "/bin/bash", "/bin/sh"])
+        }
+    }
+
     func testSettingsWindowGeneralSectionShowsFactoryResetButton() throws {
         try withIsolatedSettingsController { controller in
             let buttons = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }
@@ -435,6 +482,10 @@ final class AppKitComponentTests: XCTestCase {
                 "text_encoding": "utf-16",
                 "memory_max": 12345678,
                 "memory_initial": 2345678,
+                "shells": [
+                    "launch_order": ["/bin/bash", "/bin/sh"],
+                    "preserved_shell_key": "keep"
+                ],
                 "font": ["name": "Menlo", "size": 17],
                 "appearance": [
                     "terminal_foreground_color": "#123456",
@@ -492,6 +543,10 @@ final class AppKitComponentTests: XCTestCase {
             XCTAssertNil(session["scroll_buffer_persistence"])
             XCTAssertEqual(session["preserved_session_key"] as? String, "keep")
 
+            let shells = try XCTUnwrap(root["shells"] as? [String: Any])
+            XCTAssertNil(shells["launch_order"])
+            XCTAssertEqual(shells["preserved_shell_key"] as? String, "keep")
+
             let security = try XCTUnwrap(root["security"] as? [String: Any])
             XCTAssertNil(security["osc52_clipboard_read"])
             XCTAssertNil(security["paste_confirmation"])
@@ -506,6 +561,7 @@ final class AppKitComponentTests: XCTestCase {
             let loaded = PtermConfigStore.load()
             XCTAssertEqual(loaded.term, PtermConfig.default.term)
             XCTAssertEqual(loaded.textEncoding, PtermConfig.default.textEncoding)
+            XCTAssertEqual(loaded.shellLaunch, PtermConfig.default.shellLaunch)
             XCTAssertEqual(loaded.memoryMax, PtermConfig.default.memoryMax)
             XCTAssertEqual(loaded.terminalAppearance, PtermConfig.default.terminalAppearance)
         }
@@ -1341,6 +1397,91 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertFalse(view.hasMarkedText())
         XCTAssertEqual(view.markedRange(), NSRange(location: NSNotFound, length: 0))
         XCTAssertTrue(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.isEmpty ?? true)
+    }
+
+    func testTerminalViewPlainInsertTextShowsTransientCommittedTextPreview() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        view.insertText("abc", replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertTrue(view.debugHasCommittedTextPreview)
+    }
+
+    func testTerminalViewDeleteBackwardShowsTransientFadeOutPreview() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        controller.withModel { model in
+            model.grid.setCell(Cell(codepoint: 65, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 0)
+            model.cursor.row = 0
+            model.cursor.col = 1
+        }
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        view.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+
+        XCTAssertTrue(view.debugHasCommittedTextPreview)
+    }
+
+    func testTerminalViewCommittedTextPreviewQueueCapsAtThirtyEntries() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 80,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        for _ in 0..<40 {
+            view.insertText("a", replacementRange: NSRange(location: NSNotFound, length: 0))
+        }
+
+        XCTAssertEqual(view.debugCommittedTextPreviewCount, 30)
     }
 
     func testTerminalViewUnmarkTextClearsIMEOverlayAndSelectionState() throws {
@@ -3112,6 +3253,7 @@ final class AppKitComponentTests: XCTestCase {
         let config = PtermConfig(
             term: PtermConfig.default.term,
             textEncoding: PtermConfig.default.textEncoding,
+            shellLaunch: PtermConfig.default.shellLaunch,
             fontName: PtermConfig.default.fontName,
             fontSize: PtermConfig.default.fontSize,
             terminalAppearance: TerminalAppearanceConfiguration(
@@ -3193,6 +3335,7 @@ final class AppKitComponentTests: XCTestCase {
         let config = PtermConfig(
             term: PtermConfig.default.term,
             textEncoding: PtermConfig.default.textEncoding,
+            shellLaunch: PtermConfig.default.shellLaunch,
             fontName: PtermConfig.default.fontName,
             fontSize: PtermConfig.default.fontSize,
             terminalAppearance: TerminalAppearanceConfiguration(

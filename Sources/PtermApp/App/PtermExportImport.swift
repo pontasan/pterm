@@ -1,5 +1,4 @@
 import AppKit
-import CommonCrypto
 import Foundation
 
 enum PtermExportImportError: Error {
@@ -7,7 +6,6 @@ enum PtermExportImportError: Error {
     case invalidArchive
     case unsafeArchiveEntry(String)
     case commandFailed(String)
-    case invalidKeyEnvelope
 }
 
 final class PtermExportImportManager {
@@ -16,12 +14,8 @@ final class PtermExportImportManager {
         let overwrittenItems: [String]
     }
 
-    private enum KeyEnvelope {
-        static let magic = "PTE1".data(using: .utf8)!
-        static let saltLength = 16
-        static let ivLength = kCCBlockSizeAES128
-        static let keyLength = 32
-        static let rounds: UInt32 = 100_000
+    private enum TransferFile {
+        static let note = "note.txt"
     }
 
     private let noteStore: AppNoteStore
@@ -64,13 +58,13 @@ final class PtermExportImportManager {
         try copyDirectoryIfExists(sessionsURL, to: staging.appendingPathComponent("sessions"))
         try copyDirectoryIfExists(workspacesURL, to: staging.appendingPathComponent("workspaces"))
         try copyDirectoryIfExists(auditURL, to: staging.appendingPathComponent("audit"))
-
-        let noteKey = try noteStore.exportEncryptionKey()
-        guard noteKey.count == KeyEnvelope.keyLength else {
-            throw PtermExportImportError.invalidKeyEnvelope
+        if let note = try noteStore.exportNoteForTransfer(authorizationPassword: password) {
+            try AtomicFileWriter.write(
+                Data(note.utf8),
+                to: staging.appendingPathComponent(TransferFile.note),
+                permissions: 0o600
+            )
         }
-        let envelope = try encryptKeyEnvelope(key: noteKey, password: password)
-        try AtomicFileWriter.write(envelope, to: staging.appendingPathComponent("keys.enc"), permissions: 0o600)
 
         if fileManager.fileExists(atPath: destination.path) {
             try fileManager.removeItem(at: destination)
@@ -94,9 +88,7 @@ final class PtermExportImportManager {
             throw PtermExportImportError.invalidArchive
         }
         try validateExtractedArchive(root: extractedRoot)
-        let envelopeURL = extractedRoot.appendingPathComponent("keys.enc")
-        let envelope = try Data(contentsOf: envelopeURL)
-        let noteKey = try decryptKeyEnvelope(envelope, password: password)
+        let importedNote = try plaintextNote(in: extractedRoot)
 
         let replacements: [(source: URL, destination: URL)] = [
             (extractedRoot.appendingPathComponent("config.json"), configURL),
@@ -121,7 +113,9 @@ final class PtermExportImportManager {
                 }
             }
             try normalizeImportedPermissions(for: replacements.map(\.destination))
-            try noteStore.importEncryptionKey(noteKey)
+            if let importedNote {
+                try noteStore.importTransferredNote(importedNote, authorizationPassword: password)
+            }
         } catch {
             for created in createdDestinations.reversed() {
                 try? fileManager.removeItem(at: created)
@@ -149,20 +143,25 @@ final class PtermExportImportManager {
             ("config.json", extractedRoot.appendingPathComponent("config.json"), configURL),
             ("sessions/", extractedRoot.appendingPathComponent("sessions"), sessionsURL),
             ("workspaces/", extractedRoot.appendingPathComponent("workspaces"), workspacesURL),
-            ("audit/", extractedRoot.appendingPathComponent("audit"), auditURL),
-            ("keys.enc", extractedRoot.appendingPathComponent("keys.enc"), URL(fileURLWithPath: "/dev/null"))
+            ("audit/", extractedRoot.appendingPathComponent("audit"), auditURL)
         ]
 
-        let included: [String] = candidates.compactMap { candidate -> String? in
+        var included: [String] = candidates.compactMap { candidate -> String? in
             fileManager.fileExists(atPath: candidate.archived.path) ? candidate.label : nil
         }
-        let overwritten: [String] = candidates.compactMap { candidate -> String? in
-            guard candidate.label != "keys.enc",
-                  fileManager.fileExists(atPath: candidate.archived.path),
+        var overwritten: [String] = candidates.compactMap { candidate -> String? in
+            guard fileManager.fileExists(atPath: candidate.archived.path),
                   fileManager.fileExists(atPath: candidate.destination.path) else {
                 return nil
             }
             return candidate.label
+        }
+        let archivedNoteURL = extractedRoot.appendingPathComponent(TransferFile.note)
+        if fileManager.fileExists(atPath: archivedNoteURL.path) {
+            included.append(TransferFile.note)
+            if noteStore.hasStoredNote() {
+                overwritten.append(TransferFile.note)
+            }
         }
 
         return ImportPreview(includedItems: included, overwrittenItems: overwritten)
@@ -238,90 +237,16 @@ final class PtermExportImportManager {
         }
     }
 
-    private func encryptKeyEnvelope(key: Data, password: String) throws -> Data {
-        var salt = Data(count: KeyEnvelope.saltLength)
-        var iv = Data(count: KeyEnvelope.ivLength)
-        let saltStatus = salt.withUnsafeMutableBytes {
-            SecRandomCopyBytes(kSecRandomDefault, KeyEnvelope.saltLength, $0.baseAddress!)
+    private func plaintextNote(in root: URL) throws -> String? {
+        let noteURL = root.appendingPathComponent(TransferFile.note)
+        guard fileManager.fileExists(atPath: noteURL.path) else {
+            return nil
         }
-        let ivStatus = iv.withUnsafeMutableBytes {
-            SecRandomCopyBytes(kSecRandomDefault, KeyEnvelope.ivLength, $0.baseAddress!)
+        let data = try Data(contentsOf: noteURL)
+        guard let note = String(data: data, encoding: .utf8) else {
+            throw PtermExportImportError.invalidArchive
         }
-        guard saltStatus == errSecSuccess, ivStatus == errSecSuccess else {
-            throw PtermExportImportError.invalidKeyEnvelope
-        }
-        let derivedKey = try deriveKey(from: password, salt: salt)
-        let ciphertext = try crypt(operation: CCOperation(kCCEncrypt), input: key, key: derivedKey, iv: iv)
-        return KeyEnvelope.magic + salt + iv + ciphertext
-    }
-
-    private func decryptKeyEnvelope(_ envelope: Data, password: String) throws -> Data {
-        let prefix = KeyEnvelope.magic.count + KeyEnvelope.saltLength + KeyEnvelope.ivLength
-        guard envelope.count >= prefix,
-              envelope.prefix(KeyEnvelope.magic.count) == KeyEnvelope.magic else {
-            throw PtermExportImportError.invalidKeyEnvelope
-        }
-        let saltStart = KeyEnvelope.magic.count
-        let ivStart = saltStart + KeyEnvelope.saltLength
-        let bodyStart = ivStart + KeyEnvelope.ivLength
-        let salt = envelope.subdata(in: saltStart..<ivStart)
-        let iv = envelope.subdata(in: ivStart..<bodyStart)
-        let body = envelope.subdata(in: bodyStart..<envelope.count)
-        let derivedKey = try deriveKey(from: password, salt: salt)
-        let decrypted = try crypt(operation: CCOperation(kCCDecrypt), input: body, key: derivedKey, iv: iv)
-        guard decrypted.count == KeyEnvelope.keyLength else {
-            throw PtermExportImportError.invalidKeyEnvelope
-        }
-        return decrypted
-    }
-
-    private func deriveKey(from password: String, salt: Data) throws -> Data {
-        var derived = Data(count: KeyEnvelope.keyLength)
-        let status = derived.withUnsafeMutableBytes { derivedBytes in
-            salt.withUnsafeBytes { saltBytes in
-                CCKeyDerivationPBKDF(
-                    CCPBKDFAlgorithm(kCCPBKDF2),
-                    password, password.lengthOfBytes(using: .utf8),
-                    saltBytes.bindMemory(to: UInt8.self).baseAddress!, salt.count,
-                    CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256),
-                    KeyEnvelope.rounds,
-                    derivedBytes.bindMemory(to: UInt8.self).baseAddress!, KeyEnvelope.keyLength
-                )
-            }
-        }
-        guard status == kCCSuccess else {
-            throw PtermExportImportError.invalidKeyEnvelope
-        }
-        return derived
-    }
-
-    private func crypt(operation: CCOperation, input: Data, key: Data, iv: Data) throws -> Data {
-        var output = Data(count: input.count + kCCBlockSizeAES128)
-        let outputCapacity = output.count
-        var outLength = 0
-        let status = output.withUnsafeMutableBytes { outputBytes in
-            input.withUnsafeBytes { inputBytes in
-                key.withUnsafeBytes { keyBytes in
-                    iv.withUnsafeBytes { ivBytes in
-                        CCCrypt(
-                            operation,
-                            CCAlgorithm(kCCAlgorithmAES),
-                            CCOptions(kCCOptionPKCS7Padding),
-                            keyBytes.baseAddress, key.count,
-                            ivBytes.baseAddress,
-                            inputBytes.baseAddress, input.count,
-                            outputBytes.baseAddress, outputCapacity,
-                            &outLength
-                        )
-                    }
-                }
-            }
-        }
-        guard status == kCCSuccess else {
-            throw PtermExportImportError.invalidKeyEnvelope
-        }
-        output.removeSubrange(outLength..<output.count)
-        return output
+        return note
     }
 
     private func run(_ executable: String, _ arguments: [String]) throws {

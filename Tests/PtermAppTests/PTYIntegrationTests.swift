@@ -2,13 +2,48 @@ import XCTest
 @preconcurrency @testable import PtermApp
 
 final class PTYIntegrationTests: XCTestCase {
-    func testPTYExecutesZshCommandAndReturnsVersionMarker() throws {
+    func testResolveShellPathPrefersUserShellThenFallsBackInOrder() {
+        XCTAssertEqual(
+            PTY.resolveShellPath(
+                launchOrder: ["/custom/shell", "/bin/zsh", "/bin/bash", "/bin/sh"],
+                userShellPath: "/custom/shell",
+                isExecutable: { $0 == "/custom/shell" || $0 == "/bin/zsh" || $0 == "/bin/bash" || $0 == "/bin/sh" }
+            ),
+            "/custom/shell"
+        )
+        XCTAssertEqual(
+            PTY.resolveShellPath(
+                launchOrder: ["/missing/shell", "/bin/zsh", "/bin/bash", "/bin/sh"],
+                userShellPath: "/missing/shell",
+                isExecutable: { $0 == "/bin/zsh" || $0 == "/bin/bash" || $0 == "/bin/sh" }
+            ),
+            "/bin/zsh"
+        )
+        XCTAssertEqual(
+            PTY.resolveShellPath(
+                launchOrder: ["/missing/shell", "/bin/bash", "/bin/sh"],
+                userShellPath: nil,
+                isExecutable: { $0 == "/bin/bash" || $0 == "/bin/sh" }
+            ),
+            "/bin/bash"
+        )
+        XCTAssertEqual(
+            PTY.resolveShellPath(
+                launchOrder: ["/missing/shell"],
+                userShellPath: "/bin/sh",
+                isExecutable: { $0 == "/bin/sh" }
+            ),
+            "/bin/sh"
+        )
+    }
+
+    func testPTYExecutesResolvedShellAndExportsMatchingShellEnvironment() throws {
         let pty = PTY()
         defer { pty.stop(waitForExit: true) }
 
-        let marker = "__PTERM_ZSH_\(UUID().uuidString)__"
-        let outputExpectation = expectation(description: "pty-zsh-output")
-        let exitExpectation = expectation(description: "pty-zsh-exit")
+        let marker = "__PTERM_SHELL_\(UUID().uuidString)__"
+        let outputExpectation = expectation(description: "pty-shell-output")
+        let exitExpectation = expectation(description: "pty-shell-exit")
         let lock = NSLock()
         var collectedOutput = ""
         var matched = false
@@ -33,10 +68,22 @@ final class PTYIntegrationTests: XCTestCase {
         }
 
         try pty.start(rows: 24, cols: 80, initialDirectory: NSTemporaryDirectory())
-        pty.write("printf '\(marker)%s__\\n' \"$ZSH_VERSION\"\nexit\n")
+        pty.write("shell_name=${0##*/}; shell_name=${shell_name#-}; env_name=${SHELL##*/}; printf '\(marker)%s|%s|%s|%s__\\n' \"$0\" \"$SHELL\" \"$shell_name\" \"$env_name\"\nexit\n")
 
         wait(for: [outputExpectation, exitExpectation], timeout: 8.0)
         XCTAssertTrue(collectedOutput.contains(marker))
+        guard let range = collectedOutput.range(of: "\(marker)") else {
+            return XCTFail("Missing shell marker in PTY output: \(collectedOutput)")
+        }
+        let suffix = collectedOutput[range.upperBound...]
+        guard let endRange = suffix.range(of: "__") else {
+            return XCTFail("Missing shell marker terminator in PTY output: \(collectedOutput)")
+        }
+        let payload = String(suffix[..<endRange.lowerBound])
+        let parts = payload.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+        XCTAssertEqual(parts.count, 4)
+        XCTAssertFalse(parts[1].isEmpty)
+        XCTAssertEqual(parts[2], parts[3])
     }
 
     func testPTYSanitizesInvalidTERMBeforeLaunchingShell() throws {
@@ -105,7 +152,7 @@ final class PTYIntegrationTests: XCTestCase {
         }
 
         try controller.start()
-        controller.sendInput("for i in {0..199}; do print -r -- 'burst'$i; done\nexit\n")
+        controller.sendInput("i=0; while [ \"$i\" -le 199 ]; do printf 'burst%s\\n' \"$i\"; i=$((i+1)); done\nexit\n")
 
         wait(for: [exitExpectation], timeout: 8.0)
         drainMainQueue(testCase: self)
@@ -142,7 +189,7 @@ final class PTYIntegrationTests: XCTestCase {
         }
 
         try controller.start()
-        controller.sendInput("for i in {0..79}; do print -r -- '__ROW__'$i; done\nexit\n")
+        controller.sendInput("i=0; while [ \"$i\" -le 79 ]; do printf '__ROW__%s\\n' \"$i\"; i=$((i+1)); done\nexit\n")
 
         wait(for: [exitExpectation], timeout: 8.0)
         drainMainQueue(testCase: self)
@@ -191,7 +238,7 @@ final class PTYIntegrationTests: XCTestCase {
             workerDone.fulfill()
         }
 
-        controller.sendInput("for i in {0..299}; do print -r -- 'live'$i' marker'; done\nsleep 0.2\nexit\n")
+        controller.sendInput("i=0; while [ \"$i\" -le 299 ]; do printf 'live%s marker\\n' \"$i\"; i=$((i+1)); done\nsleep 0.2\nexit\n")
 
         wait(for: [workerDone, exitExpectation], timeout: 10.0)
         drainMainQueue(testCase: self)
@@ -237,7 +284,7 @@ final class PTYIntegrationTests: XCTestCase {
             }
 
             try controller.start()
-            controller.sendInput("for i in {0..499}; do print -r -- 'audit'$i' payload'; done\nexit\n")
+            controller.sendInput("i=0; while [ \"$i\" -le 499 ]; do printf 'audit%s payload\\n' \"$i\"; i=$((i+1)); done\nexit\n")
 
             wait(for: [exitExpectation], timeout: 10.0)
             controller.auditLogger?.close()
@@ -288,7 +335,7 @@ final class PTYIntegrationTests: XCTestCase {
             }
 
             try controller.start()
-            controller.sendInput("for i in {0..199}; do print -r -- 'mix'$i; done\nsleep 0.3\n")
+            controller.sendInput("i=0; while [ \"$i\" -le 199 ]; do printf 'mix%s\\n' \"$i\"; i=$((i+1)); done\nsleep 0.3\n")
 
             DispatchQueue.global(qos: .userInitiated).async {
                 for index in 0..<20 {

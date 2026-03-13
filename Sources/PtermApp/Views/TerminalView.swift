@@ -8,9 +8,30 @@ import QuartzCore
 /// for scrollback navigation, and delegates rendering to the MetalRenderer.
 /// Wrapped inside a TerminalScrollView for native macOS scrollbar behavior.
 final class TerminalView: MTKView, NSTextInputClient {
+    private enum PreviewPolicy {
+        static let maxCommittedTextPreviewCount = 30
+    }
+
     private struct MouseReportingState {
         let mode: TerminalModel.MouseReportingMode
         let protocolMode: TerminalModel.MouseProtocol
+    }
+
+    private struct CommittedTextPreview {
+        enum Kind {
+            case fadeIn
+            case fadeOut
+        }
+
+        let text: String
+        let row: Int
+        let col: Int
+        let columnWidth: Int
+        let cursorRow: Int?
+        let cursorCol: Int?
+        let startedAt: CFTimeInterval
+        let duration: CFTimeInterval
+        let kind: Kind
     }
 
     /// Terminal controller for this view
@@ -95,10 +116,12 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var windowObservers: [NSObjectProtocol] = []
     private var cursorBlinkTimer: Timer?
     private var outputPulseTimer: Timer?
+    private var committedTextPreviewTimer: Timer?
     private var idleBufferReleaseTimer: Timer?
     private var markedTextLayer: CATextLayer?
     private var markedTextStorage: NSMutableAttributedString?
     private var markedTextSelection = NSRange(location: NSNotFound, length: 0)
+    private var committedTextPreviews: [CommittedTextPreview] = []
     private var pendingTextInputHandled = false
     private var scrollerSyncPending = true
     private var viewIsOpaque = false
@@ -113,6 +136,8 @@ final class TerminalView: MTKView, NSTextInputClient {
     var debugHasKeyboardHandler: Bool { keyboardHandler != nil }
     var debugHasMarkedTextStorage: Bool { markedTextStorage != nil }
     var debugHasOutputPulseTimer: Bool { outputPulseTimer != nil }
+    var debugHasCommittedTextPreview: Bool { !activeCommittedTextPreviewOverlays().isEmpty }
+    var debugCommittedTextPreviewCount: Int { committedTextPreviews.count }
 
     func debugInstallImagePreviewWindowForTesting() {
         guard imagePreviewWindow == nil else { return }
@@ -269,6 +294,7 @@ final class TerminalView: MTKView, NSTextInputClient {
             cursorBlinkTimer = nil
             outputPulseTimer?.invalidate()
             outputPulseTimer = nil
+            clearCommittedTextPreview()
             isPaused = true
             enableSetNeedsDisplay = false
             drawableSize = .zero
@@ -341,6 +367,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         cursorBlinkTimer = nil
         outputPulseTimer?.invalidate()
         outputPulseTimer = nil
+        clearCommittedTextPreview()
         drawableSize = .zero
     }
 
@@ -350,6 +377,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         renderer?.releaseTerminalBuffers(for: self)
         _ = renderer?.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
         keyboardHandler = nil
+        clearCommittedTextPreview()
     }
 
     // MARK: - Setup
@@ -376,6 +404,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     deinit {
         cursorBlinkTimer?.invalidate()
         outputPulseTimer?.invalidate()
+        committedTextPreviewTimer?.invalidate()
         idleBufferReleaseTimer?.invalidate()
         removeWindowObservers()
         hideImagePreview()
@@ -437,6 +466,12 @@ final class TerminalView: MTKView, NSTextInputClient {
     private func destroyMarkedTextLayer() {
         markedTextLayer?.removeFromSuperlayer()
         markedTextLayer = nil
+    }
+
+    private func clearCommittedTextPreview() {
+        committedTextPreviewTimer?.invalidate()
+        committedTextPreviewTimer = nil
+        committedTextPreviews.removeAll(keepingCapacity: false)
     }
 
     private func requestDisplayUpdate() {
@@ -1282,6 +1317,167 @@ final class TerminalView: MTKView, NSTextInputClient {
         )
         markedTextLayer.isHidden = false
     }
+
+    private func shouldAnimateCommittedTextPreview(for text: String) -> Bool {
+        guard !text.isEmpty,
+              !hasMarkedText(),
+              !text.contains("\n"),
+              !text.contains("\r") else {
+            return false
+        }
+        return text.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+    }
+
+    private func previewAlpha(for committedTextPreview: CommittedTextPreview, progress: Double) -> Float {
+        let easedProgress = progress * progress * (3.0 - 2.0 * progress)
+        switch committedTextPreview.kind {
+        case .fadeIn:
+            let delayedProgress = pow(progress, 2.1)
+            let smoothedProgress = delayedProgress * delayedProgress * (3.0 - 2.0 * delayedProgress)
+            return Float(0.02 + 0.98 * smoothedProgress)
+        case .fadeOut:
+            return Float(0.4 * (1.0 - easedProgress))
+        }
+    }
+
+    private func overlay(for committedTextPreview: CommittedTextPreview, at now: CFTimeInterval) -> MetalRenderer.TransientTextOverlay? {
+        let elapsed = now - committedTextPreview.startedAt
+        guard elapsed < committedTextPreview.duration else { return nil }
+        let progress = max(0.0, min(1.0, elapsed / committedTextPreview.duration))
+        let alpha = previewAlpha(for: committedTextPreview, progress: progress)
+        return MetalRenderer.TransientTextOverlay(
+            text: committedTextPreview.text,
+            row: committedTextPreview.row,
+            col: committedTextPreview.col,
+            columnWidth: committedTextPreview.columnWidth,
+            cursorRow: committedTextPreview.cursorRow,
+            cursorCol: committedTextPreview.cursorCol,
+            verticalOffset: committedTextPreview.kind == .fadeOut ? Float(20.0 * easedFall(progress)) : 0,
+            alpha: alpha
+        )
+    }
+
+    func activeCommittedTextPreviewOverlays() -> [MetalRenderer.TransientTextOverlay] {
+        guard !committedTextPreviews.isEmpty else { return [] }
+        let now = CACurrentMediaTime()
+        committedTextPreviews = committedTextPreviews.filter { now - $0.startedAt < $0.duration }
+        if committedTextPreviews.isEmpty {
+            committedTextPreviewTimer?.invalidate()
+            committedTextPreviewTimer = nil
+            return []
+        }
+        return committedTextPreviews.compactMap { overlay(for: $0, at: now) }
+    }
+
+    private func easedFall(_ progress: Double) -> Double {
+        progress * progress * (3.0 - 2.0 * progress)
+    }
+
+    private func columnWidth(for text: String) -> Int {
+        max(1, text.unicodeScalars.reduce(0) { partial, scalar in
+            max(partial + max(CharacterWidth.width(of: scalar.value), 0), 1)
+        })
+    }
+
+    private func showCommittedTextPreview(
+        text: String,
+        row: Int,
+        col: Int,
+        columnWidth: Int,
+        cursorRow: Int?,
+        cursorCol: Int?,
+        kind: CommittedTextPreview.Kind,
+        duration: CFTimeInterval
+    ) {
+        committedTextPreviews.append(CommittedTextPreview(
+            text: text,
+            row: row,
+            col: col,
+            columnWidth: columnWidth,
+            cursorRow: cursorRow,
+            cursorCol: cursorCol,
+            startedAt: CACurrentMediaTime(),
+            duration: duration,
+            kind: kind
+        ))
+        if committedTextPreviews.count > PreviewPolicy.maxCommittedTextPreviewCount {
+            committedTextPreviews.removeFirst(committedTextPreviews.count - PreviewPolicy.maxCommittedTextPreviewCount)
+        }
+        committedTextPreviewTimer?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: committedTextPreviewFrameInterval(), repeats: true) { [weak self] _ in
+            guard let self else { return }
+            if self.activeCommittedTextPreviewOverlays().isEmpty {
+                self.committedTextPreviewTimer?.invalidate()
+                self.committedTextPreviewTimer = nil
+                return
+            }
+            self.requestDisplayUpdate()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        committedTextPreviewTimer = timer
+        requestDisplayUpdate()
+    }
+
+    private func showCommittedTextPreview(_ text: String) {
+        guard shouldAnimateCommittedTextPreview(for: text),
+              let controller = terminalController else { return }
+        let cursor = controller.withModel { $0.cursor }
+        showCommittedTextPreview(
+            text: text,
+            row: cursor.row,
+            col: cursor.col,
+            columnWidth: columnWidth(for: text),
+            cursorRow: cursor.row,
+            cursorCol: cursor.col + columnWidth(for: text),
+            kind: .fadeIn,
+            duration: 0.20
+        )
+    }
+
+    private func deletionPreview(backward: Bool) -> (text: String, row: Int, col: Int, width: Int)? {
+        guard let controller = terminalController else { return nil }
+        return controller.withModel { model -> (text: String, row: Int, col: Int, width: Int)? in
+            let row = model.cursor.row
+            let baseCol = backward ? model.cursor.col - 1 : model.cursor.col
+            guard row >= 0, row < model.rows, baseCol >= 0, baseCol < model.cols else { return nil }
+
+            var targetCol = baseCol
+            let cellAtBase = model.grid.cell(at: row, col: targetCol)
+            if cellAtBase.isWideContinuation {
+                targetCol = max(0, targetCol - 1)
+            }
+
+            let cell = model.grid.cell(at: row, col: targetCol)
+            guard !cell.isWideContinuation,
+                  cell.codepoint >= 0x20,
+                  let scalar = UnicodeScalar(cell.codepoint) else {
+                return nil
+            }
+
+            return (String(scalar), row, targetCol, max(Int(cell.width), 1))
+        }
+    }
+
+    private func showDeletionPreview(backward: Bool) {
+        guard let preview = deletionPreview(backward: backward),
+              shouldAnimateCommittedTextPreview(for: preview.text) else {
+            return
+        }
+        showCommittedTextPreview(
+            text: preview.text,
+            row: preview.row,
+            col: preview.col,
+            columnWidth: preview.width,
+            cursorRow: preview.row,
+            cursorCol: preview.col,
+            kind: .fadeOut,
+            duration: 0.34
+        )
+    }
+
+    private func committedTextPreviewFrameInterval() -> TimeInterval {
+        window?.firstResponder === self ? (1.0 / 60.0) : (1.0 / 30.0)
+    }
 }
 
 // MARK: - MTKViewDelegate
@@ -1303,11 +1499,14 @@ extension TerminalView: MTKViewDelegate {
         }
 
         let border = effectiveBorderConfig()
+        let committedTextPreviews = activeCommittedTextPreviewOverlays()
         controller.withViewport { model, scrollback, scrollOffset in
             renderer.render(model: model, scrollback: scrollback,
                           scrollOffset: scrollOffset, selection: selection,
                           searchHighlight: highlight, linkUnderline: linkUL,
-                          borderConfig: border, in: view)
+                          borderConfig: border,
+                          transientTextOverlays: committedTextPreviews,
+                          in: view)
         }
         scheduleIdleBufferRelease()
 
@@ -1332,10 +1531,14 @@ extension TerminalView {
             text = String(describing: string)
         }
         guard !text.isEmpty else { return }
+        let shouldShowCommittedPreview = shouldAnimateCommittedTextPreview(for: text)
         pendingTextInputHandled = true
         markedTextStorage = nil
         markedTextSelection = NSRange(location: NSNotFound, length: 0)
         destroyMarkedTextLayer()
+        if shouldShowCommittedPreview {
+            showCommittedTextPreview(text)
+        }
         controller.sendInput(text)
     }
 
@@ -1403,6 +1606,16 @@ extension TerminalView {
     }
 
     override func doCommand(by selector: Selector) {
+        if !hasMarkedText() {
+            switch selector {
+            case #selector(NSResponder.deleteBackward(_:)):
+                showDeletionPreview(backward: true)
+            case #selector(NSResponder.deleteForward(_:)):
+                showDeletionPreview(backward: false)
+            default:
+                break
+            }
+        }
         pendingTextInputHandled = ensureKeyboardHandler()?.handleCommand(selector: selector) ?? false
     }
 }

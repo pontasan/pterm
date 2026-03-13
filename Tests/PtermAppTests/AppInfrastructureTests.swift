@@ -481,6 +481,40 @@ final class AppInfrastructureTests: XCTestCase {
         }
     }
 
+    func testShellLaunchConfigurationNormalizesAndFallsBackToDefaults() {
+        XCTAssertEqual(
+            ShellLaunchConfiguration.normalizedLaunchOrder([
+                " /bin/zsh ",
+                "",
+                "relative-shell",
+                "/bin/zsh",
+                "/bin/zsh",
+                "/bin/bash"
+            ]),
+            ["/bin/zsh", "/bin/bash"]
+        )
+        XCTAssertEqual(
+            ShellLaunchConfiguration.normalizedLaunchOrder(["relative-shell", " "]),
+            ShellLaunchConfiguration.default.launchOrder
+        )
+    }
+
+    func testPtermConfigStoreLoadsConfiguredShellLaunchOrder() throws {
+        try withTemporaryHomeDirectory { _ in
+            PtermDirectories.ensureDirectories()
+            let json: [String: Any] = [
+                "shells": [
+                    "launch_order": ["/bin/bash", "/bin/sh", "/bin/bash", "relative-shell"]
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try AtomicFileWriter.write(data, to: PtermDirectories.config, permissions: 0o600)
+
+            let loaded = PtermConfigStore.load()
+            XCTAssertEqual(loaded.shellLaunch.launchOrder, ["/bin/bash", "/bin/sh"])
+        }
+    }
+
     func testShortcutParserParsesConfiguredBindingsAndFallsBackOnInvalidValues() {
         let shortcuts = ShortcutParser.parseMap([
             "find_previous": "Cmd+Shift+G",
@@ -1108,20 +1142,51 @@ final class AppInfrastructureTests: XCTestCase {
         }
     }
 
-    func testExportImportManagerInspectArchiveReportsIncludedAndOverwrittenItems() throws {
+    func testExportImportManagerExportsPlaintextNoteWithoutKeysEnvelope() throws {
+        try withTemporaryDirectory { directory in
+            let noteStore = AppNoteStore(rootDirectory: directory.appendingPathComponent("notes"))
+            try noteStore.saveNote("plain export note")
+
+            let manager = PtermExportImportManager(
+                noteStore: noteStore,
+                configURL: directory.appendingPathComponent("config.json"),
+                sessionsURL: directory.appendingPathComponent("sessions"),
+                workspacesURL: directory.appendingPathComponent("workspaces"),
+                auditURL: directory.appendingPathComponent("audit")
+            )
+            let archiveURL = directory.appendingPathComponent("archive.zip")
+            let extractionRoot = directory.appendingPathComponent("extracted")
+
+            try manager.exportArchive(to: archiveURL, password: "secret")
+            try FileManager.default.createDirectory(at: extractionRoot, withIntermediateDirectories: true)
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            process.arguments = ["-x", "-k", archiveURL.path, extractionRoot.path]
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0)
+
+            let payloadRoot = try XCTUnwrap(
+                FileManager.default.contentsOfDirectory(at: extractionRoot, includingPropertiesForKeys: nil).first
+            )
+            XCTAssertEqual(
+                try String(contentsOf: payloadRoot.appendingPathComponent("note.txt"), encoding: .utf8),
+                "plain export note"
+            )
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: payloadRoot.appendingPathComponent("keys.enc").path)
+            )
+        }
+    }
+
+    func testExportImportManagerImportArchiveReEncryptsPlaintextNoteIntoDestinationStore() throws {
         try withTemporaryDirectory { directory in
             let archiveRoot = directory.appendingPathComponent("payload")
             let archiveURL = directory.appendingPathComponent("archive.zip")
-            let configURL = directory.appendingPathComponent("dest-config.json")
-            let sessionsURL = directory.appendingPathComponent("dest-sessions")
-            let workspacesURL = directory.appendingPathComponent("dest-workspaces")
-            let auditURL = directory.appendingPathComponent("dest-audit")
+            let noteStore = AppNoteStore(rootDirectory: directory.appendingPathComponent("notes"))
             try FileManager.default.createDirectory(at: archiveRoot, withIntermediateDirectories: true)
-            try Data("{}".utf8).write(to: archiveRoot.appendingPathComponent("config.json"))
-            try FileManager.default.createDirectory(at: archiveRoot.appendingPathComponent("sessions"), withIntermediateDirectories: true)
-            try Data("k".utf8).write(to: archiveRoot.appendingPathComponent("keys.enc"))
-            try Data("existing".utf8).write(to: configURL)
-            try FileManager.default.createDirectory(at: sessionsURL, withIntermediateDirectories: true)
+            try Data("imported note".utf8).write(to: archiveRoot.appendingPathComponent("note.txt"))
 
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
@@ -1131,7 +1196,50 @@ final class AppInfrastructureTests: XCTestCase {
             XCTAssertEqual(process.terminationStatus, 0)
 
             let manager = PtermExportImportManager(
-                noteStore: AppNoteStore(rootDirectory: directory.appendingPathComponent("notes")),
+                noteStore: noteStore,
+                configURL: directory.appendingPathComponent("config.json"),
+                sessionsURL: directory.appendingPathComponent("sessions"),
+                workspacesURL: directory.appendingPathComponent("workspaces"),
+                auditURL: directory.appendingPathComponent("audit")
+            )
+
+            try manager.importArchive(from: archiveURL, password: "destination-secret")
+
+            XCTAssertEqual(try noteStore.loadNote(), "imported note")
+            XCTAssertTrue(
+                FileManager.default.fileExists(
+                    atPath: directory.appendingPathComponent("notes").appendingPathComponent("note.enc").path
+                )
+            )
+        }
+    }
+
+    func testExportImportManagerInspectArchiveReportsIncludedAndOverwrittenItems() throws {
+        try withTemporaryDirectory { directory in
+            let archiveRoot = directory.appendingPathComponent("payload")
+            let archiveURL = directory.appendingPathComponent("archive.zip")
+            let configURL = directory.appendingPathComponent("dest-config.json")
+            let sessionsURL = directory.appendingPathComponent("dest-sessions")
+            let workspacesURL = directory.appendingPathComponent("dest-workspaces")
+            let auditURL = directory.appendingPathComponent("dest-audit")
+            let noteStore = AppNoteStore(rootDirectory: directory.appendingPathComponent("notes"))
+            try FileManager.default.createDirectory(at: archiveRoot, withIntermediateDirectories: true)
+            try Data("{}".utf8).write(to: archiveRoot.appendingPathComponent("config.json"))
+            try FileManager.default.createDirectory(at: archiveRoot.appendingPathComponent("sessions"), withIntermediateDirectories: true)
+            try Data("note".utf8).write(to: archiveRoot.appendingPathComponent("note.txt"))
+            try Data("existing".utf8).write(to: configURL)
+            try FileManager.default.createDirectory(at: sessionsURL, withIntermediateDirectories: true)
+            try noteStore.saveNote("existing note")
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            process.arguments = ["-c", "-k", "--keepParent", archiveRoot.path, archiveURL.path]
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0)
+
+            let manager = PtermExportImportManager(
+                noteStore: noteStore,
                 configURL: configURL,
                 sessionsURL: sessionsURL,
                 workspacesURL: workspacesURL,
@@ -1139,8 +1247,8 @@ final class AppInfrastructureTests: XCTestCase {
             )
 
             let preview = try manager.inspectArchive(archiveURL)
-            XCTAssertEqual(Set(preview.includedItems), Set(["config.json", "sessions/", "keys.enc"]))
-            XCTAssertEqual(Set(preview.overwrittenItems), Set(["config.json", "sessions/"]))
+            XCTAssertEqual(Set(preview.includedItems), Set(["config.json", "sessions/", "note.txt"]))
+            XCTAssertEqual(Set(preview.overwrittenItems), Set(["config.json", "sessions/", "note.txt"]))
         }
     }
 
@@ -1198,7 +1306,7 @@ final class AppInfrastructureTests: XCTestCase {
             let archiveURL = directory.appendingPathComponent("archive.zip")
             let configURL = directory.appendingPathComponent("dest-config.json")
             try FileManager.default.createDirectory(at: archiveRoot, withIntermediateDirectories: true)
-            try Data("PTE1invalid".utf8).write(to: archiveRoot.appendingPathComponent("keys.enc"))
+            try Data("note".utf8).write(to: archiveRoot.appendingPathComponent("note.txt"))
             let symlinkURL = archiveRoot.appendingPathComponent("sessions")
             try FileManager.default.createSymbolicLink(atPath: symlinkURL.path, withDestinationPath: "/tmp")
             try Data("existing".utf8).write(to: configURL)

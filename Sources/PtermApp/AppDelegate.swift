@@ -1670,7 +1670,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func exportData(_ sender: Any?) {
         let password = promptPassword(title: "Export Password",
-                                      message: "This password protects the encryption key for notes.")
+                                      message: "Enter a password to unlock the encrypted note for plaintext export.")
         guard let password else { return }
         let panel = NSSavePanel()
         panel.nameFieldStringValue = exportImportManager.defaultExportURL().lastPathComponent
@@ -1691,10 +1691,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openPanel.canChooseDirectories = false
         guard openPanel.runModal() == .OK, let url = openPanel.url else { return }
 
-        var password = promptPassword(title: "Import Password",
-                                      message: "Enter the password used during export.")
-        guard let initialPassword = password else { return }
-        password = initialPassword
+        let password = promptPassword(title: "Import Password",
+                                      message: "Enter a password to re-encrypt the imported note on this Mac.")
+        guard let password else { return }
 
         let preview: PtermExportImportManager.ImportPreview
         do {
@@ -1715,18 +1714,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         confirm.addButton(withTitle: "Cancel")
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
 
-        while let currentPassword = password {
-            do {
-                try exportImportManager.importArchive(from: url, password: currentPassword)
-                relaunchApplication()
-                return
-            } catch PtermExportImportError.invalidKeyEnvelope {
-                password = promptPassword(title: "Incorrect Password",
-                                          message: "Please re-enter the import password.")
-            } catch {
-                NSAlert(error: error).runModal()
-                return
-            }
+        do {
+            try exportImportManager.importArchive(from: url, password: password)
+            relaunchApplication()
+        } catch {
+            NSAlert(error: error).runModal()
         }
     }
 

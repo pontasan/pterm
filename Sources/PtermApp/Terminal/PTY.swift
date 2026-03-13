@@ -5,11 +5,12 @@ import Darwin
 /// Error type for PTY operations.
 enum PTYError: Error {
     case forkptyFailed(String)
+    case shellNotFound(String)
 }
 
 /// Manages a pseudo-terminal (PTY) for communicating with a child shell process.
 ///
-/// Creates a PTY pair via forkpty(), spawns zsh as the child process,
+/// Creates a PTY pair via forkpty(), spawns the user's shell (zsh/bash/sh),
 /// and provides non-blocking I/O for reading output and writing input.
 ///
 /// Thread safety: All access to masterFD and isRunning is protected by fdLock
@@ -79,10 +80,11 @@ final class PTY {
     }
 
     /// Start the PTY with the specified terminal size.
-    /// Spawns zsh as the child process.
+    /// Spawns the user's preferred shell as the child process.
     /// Throws PTYError.forkptyFailed if forkpty() fails.
     func start(rows: UInt16, cols: UInt16, termEnv: String = "xterm-256color",
-               initialDirectory: String? = nil) throws {
+               initialDirectory: String? = nil,
+               shellLaunchOrder: [String] = ShellLaunchConfiguration.default.launchOrder) throws {
         // Validate TERM value: only allow alphanumeric and hyphens
         let validTerm = termEnv.allSatisfy {
             $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_")
@@ -99,6 +101,15 @@ final class PTY {
             ws_ypixel: 0
         )
 
+        let resolvedShellPath = Self.resolveShellPath(
+            launchOrder: shellLaunchOrder,
+            userShellPath: resolvedUserShellPath(),
+            isExecutable: FileManager.default.isExecutableFile(atPath:)
+        )
+        guard let resolvedShellPath else {
+            throw PTYError.shellNotFound("No executable shell found in launch order: \(shellLaunchOrder.joined(separator: ", "))")
+        }
+
         var amaster: Int32 = -1
         let pid = forkpty(&amaster, nil, nil, &winSize)
 
@@ -107,15 +118,14 @@ final class PTY {
         }
 
         if pid == 0 {
-            // Child process: exec zsh
-            setupChildEnvironment(termEnv: safeTerm, initialDirectory: initialDirectory)
-            let shell = "/bin/zsh"
+            // Child process: exec user's preferred shell
+            setupChildEnvironment(shellPath: resolvedShellPath, termEnv: safeTerm, initialDirectory: initialDirectory)
             let argv: [UnsafeMutablePointer<CChar>?] = [
-                strdup(shell),
+                strdup(resolvedShellPath),
                 strdup("--login"),
                 nil
             ]
-            execv(shell, argv)
+            execv(resolvedShellPath, argv)
             // If execv returns, it failed
             _exit(1)
         }
@@ -270,15 +280,37 @@ final class PTY {
 
     // MARK: - Private
 
-    private func setupChildEnvironment(termEnv: String, initialDirectory: String?) {
+    /// Resolve the shell binary to execute from the configured launch order.
+    static func resolveShellPath(
+        launchOrder: [String],
+        userShellPath: String?,
+        isExecutable: (String) -> Bool
+    ) -> String? {
+        for candidate in ShellLaunchConfiguration.normalizedLaunchOrder(launchOrder) {
+            if isExecutable(candidate) {
+                return candidate
+            }
+        }
+        if let userShellPath,
+           !userShellPath.isEmpty,
+           isExecutable(userShellPath) {
+            return userShellPath
+        }
+        return nil
+    }
+
+    private func resolvedUserShellPath() -> String? {
+        let userInfo = getpwuid(getuid())
+        return userInfo.flatMap { String(validatingUTF8: $0.pointee.pw_shell) }
+    }
+
+    private func setupChildEnvironment(shellPath: String, termEnv: String, initialDirectory: String?) {
         let userInfo = getpwuid(getuid())
         let fallbackHome = FileManager.default.homeDirectoryForCurrentUser.path
         let homeDirectory = userInfo.flatMap { String(validatingUTF8: $0.pointee.pw_dir) }
             ?? fallbackHome
         let userName = userInfo.flatMap { String(validatingUTF8: $0.pointee.pw_name) }
             ?? NSUserName()
-        let userShell = userInfo.flatMap { String(validatingUTF8: $0.pointee.pw_shell) }
-            ?? "/bin/zsh"
 
         clearInheritedEnvironment()
 
@@ -286,7 +318,7 @@ final class PTY {
         setenv("HOME", homeDirectory, 1)
         setenv("USER", userName, 1)
         setenv("LOGNAME", userName, 1)
-        setenv("SHELL", userShell, 1)
+        setenv("SHELL", shellPath, 1)
         setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", 1)
         setenv("TMPDIR", NSTemporaryDirectory(), 1)
 

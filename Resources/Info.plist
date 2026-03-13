@@ -7,7 +7,7 @@
     <key>CFBundleExecutable</key>
     <string>PtermApp</string>
     <key>CFBundleIdentifier</key>
-    <string>com.pterm.app</string>
+    <string>com.tranworks.pterm</string>
     <key>CFBundleName</key>
     <string>pterm</string>
     <key>CFBundleDisplayName</key>

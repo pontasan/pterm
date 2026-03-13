@@ -126,6 +126,7 @@ final class TerminalController {
 
     private let termEnv: String
     private let textEncoding: TerminalTextEncoding
+    private let shellLaunchOrder: [String]
     private var persistedFontName: String
     private var persistedFontSize: Double
     private let initialDirectory: String
@@ -177,6 +178,7 @@ final class TerminalController {
     }
 
     init(rows: Int, cols: Int, termEnv: String, textEncoding: TerminalTextEncoding,
+         shellLaunchOrder: [String] = ShellLaunchConfiguration.default.launchOrder,
          scrollbackInitialCapacity: Int,
          scrollbackMaxCapacity: Int,
          fontName: String,
@@ -193,6 +195,7 @@ final class TerminalController {
         )
         self.termEnv = termEnv
         self.textEncoding = textEncoding
+        self.shellLaunchOrder = ShellLaunchConfiguration.normalizedLaunchOrder(shellLaunchOrder)
         self.textDecoder = TerminalTextDecoder(encoding: textEncoding)
         self.persistedFontName = fontName
         self.persistedFontSize = fontSize
@@ -298,8 +301,13 @@ final class TerminalController {
             (model.rows, model.cols)
         }
 
-        try pty.start(rows: UInt16(r), cols: UInt16(c), termEnv: termEnv,
-                      initialDirectory: initialDirectory)
+        try pty.start(
+            rows: UInt16(r),
+            cols: UInt16(c),
+            termEnv: termEnv,
+            initialDirectory: initialDirectory,
+            shellLaunchOrder: shellLaunchOrder
+        )
     }
 
     func stop(waitForExit: Bool = false) {

@@ -611,11 +611,23 @@ final class MetalRenderer {
         let endCol: Int
     }
 
+    struct TransientTextOverlay {
+        let text: String
+        let row: Int
+        let col: Int
+        let columnWidth: Int
+        let cursorRow: Int?
+        let cursorCol: Int?
+        let verticalOffset: Float
+        let alpha: Float
+    }
+
     func render(model: TerminalModel, scrollback: ScrollbackBuffer,
                 scrollOffset: Int, selection: TerminalSelection?,
                 searchHighlight: SearchHighlight? = nil,
                 linkUnderline: LinkUnderline? = nil,
                 borderConfig: BorderConfig? = nil,
+                transientTextOverlays: [TransientTextOverlay] = [],
                 in view: MTKView) {
         guard let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor,
@@ -644,7 +656,8 @@ final class MetalRenderer {
         let sf = Float(glyphAtlas.scaleFactor)
         let vd = buildVertexData(model: model, scrollback: scrollback, scrollOffset: scrollOffset,
                                  selection: selection, searchHighlight: searchHighlight,
-                                 linkUnderline: linkUnderline, scaleFactor: sf,
+                                 linkUnderline: linkUnderline, transientTextOverlays: transientTextOverlays,
+                                 scaleFactor: sf,
                                  bufferSet: bs)
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(
@@ -731,6 +744,7 @@ final class MetalRenderer {
                                   scrollOffset: Int, selection: TerminalSelection?,
                                   searchHighlight: SearchHighlight? = nil,
                                   linkUnderline: LinkUnderline? = nil,
+                                  transientTextOverlays: [TransientTextOverlay] = [],
                                   scaleFactor: Float,
                                   bufferSet: ViewBufferSet) -> VertexData {
         var vd = VertexData()
@@ -815,6 +829,10 @@ final class MetalRenderer {
             }()
 
             for col in 0..<viewCols {
+                let transientTextOverlayCoversCell = transientTextOverlays.contains {
+                    row == $0.row && col >= $0.col && col < ($0.col + $0.columnWidth)
+                }
+
                 let cell: Cell
                 if let sbRow = scrollbackRow {
                     cell = col < sbRow.count ? sbRow[col] : .empty
@@ -889,7 +907,9 @@ final class MetalRenderer {
                 }
 
                 // Block/quadrant elements render more faithfully as geometry.
-                if renderBlockElementIfNeeded(
+                if transientTextOverlayCoversCell {
+                    // Keep the layout/background space, but defer visible glyphs to the transient overlay.
+                } else if renderBlockElementIfNeeded(
                     codepoint: cell.codepoint,
                     x: x, y: y, w: w, h: h,
                     color: fgColor,
@@ -967,8 +987,11 @@ final class MetalRenderer {
 
         // Cursor (only visible when not scrolled back)
         if scrollOffset == 0 && model.cursor.visible {
-            let cx = padX + Float(model.cursor.col) * cellW
-            let cy = padY + Float(model.cursor.row) * cellH
+            let cursorOverlay = transientTextOverlays.last { $0.cursorRow != nil && $0.cursorCol != nil }
+            let cursorCol = cursorOverlay?.cursorCol.map { min(max($0, 0), max(viewCols - 1, 0)) } ?? model.cursor.col
+            let cursorRow = cursorOverlay?.cursorRow.map { min(max($0, 0), max(viewRows - 1, 0)) } ?? model.cursor.row
+            let cx = padX + Float(cursorCol) * cellW
+            let cy = padY + Float(cursorRow) * cellH
             let cursorColor: (Float, Float, Float, Float) = (0.8, 0.8, 0.8, 1)
 
             switch model.cursor.shape {
@@ -989,8 +1012,51 @@ final class MetalRenderer {
             }
         }
 
+        for transientTextOverlay in transientTextOverlays {
+            appendTransientTextOverlay(transientTextOverlay, scaleFactor: scaleFactor, to: &vd.glyphVertices)
+        }
+
         // Scrollbar is handled by NSScroller overlay in TerminalView
         return vd
+    }
+
+    private func appendTransientTextOverlay(
+        _ overlay: TransientTextOverlay,
+        scaleFactor: Float,
+        to vertices: inout [Float]
+    ) {
+        guard overlay.alpha > 0.001 else { return }
+        let cellW = Float(glyphAtlas.cellWidth) * scaleFactor
+        let cellH = Float(glyphAtlas.cellHeight) * scaleFactor
+        let padX = Float(gridPadding) * scaleFactor
+        let padY = Float(gridPadding) * scaleFactor
+        let baseX = padX + Float(overlay.col) * cellW
+        let baseY = padY + Float(overlay.row) * cellH + overlay.verticalOffset * scaleFactor
+        let shouldSnapGlyphPosition = !glyphAtlas.usesOversampledRasterizationForCurrentDisplay
+
+        var columnOffset: Float = 0
+        for scalar in overlay.text.unicodeScalars {
+            guard scalar.value > 0x20,
+                  let glyph = glyphAtlas.glyphInfo(for: scalar.value),
+                  glyph.pixelWidth > 0 else {
+                columnOffset += Float(max(CharacterWidth.width(of: scalar.value), 0)) * cellW
+                continue
+            }
+            let x = baseX + columnOffset + glyph.cellOffsetX
+            let baselineScreenY = baseY + cellH - Float(glyphAtlas.baseline) * scaleFactor
+            let y = baselineScreenY - glyph.baselineOffset
+            let glyphX = shouldSnapGlyphPosition ? Self.snapToPixel(x) : x
+            let glyphY = shouldSnapGlyphPosition ? Self.snapToPixel(y) : y
+
+            addQuad(to: &vertices,
+                   x: glyphX, y: glyphY,
+                   w: Float(glyph.pixelWidth), h: Float(glyph.pixelHeight),
+                   tx: glyph.textureX, ty: glyph.textureY,
+                   tw: glyph.textureW, th: glyph.textureH,
+                   fg: (1.0, 1.0, 1.0, overlay.alpha),
+                   bg: (0, 0, 0, 0))
+            columnOffset += Float(max(CharacterWidth.width(of: scalar.value), 1)) * cellW
+        }
     }
 
     private func resolveForegroundColor(for cell: Cell) -> (r: Float, g: Float, b: Float) {
@@ -1468,6 +1534,7 @@ final class MetalRenderer {
                          searchHighlight: SearchHighlight? = nil,
                          linkUnderline: LinkUnderline? = nil,
                          borderConfig: BorderConfig? = nil,
+                         transientTextOverlays: [TransientTextOverlay] = [],
                          encoder: MTLRenderCommandEncoder,
                          viewportSize: SIMD2<Float>,
                          cellRect: NSRect,
@@ -1476,7 +1543,8 @@ final class MetalRenderer {
         // Build vertex data at full size (positions relative to (0,0))
         let vd = buildVertexData(model: model, scrollback: scrollback, scrollOffset: scrollOffset,
                                  selection: selection, searchHighlight: searchHighlight,
-                                 linkUnderline: linkUnderline, scaleFactor: scaleFactor,
+                                 linkUnderline: linkUnderline, transientTextOverlays: transientTextOverlays,
+                                 scaleFactor: scaleFactor,
                                  bufferSet: bufferSet(for: view))
         // Pixel offset for this cell
         let offsetX = Float(cellRect.origin.x) * scaleFactor

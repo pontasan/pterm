@@ -67,9 +67,41 @@ struct ConfiguredWorkspace: Equatable {
     let terminals: [ConfiguredWorkspaceTerminal]
 }
 
+struct ShellLaunchConfiguration: Equatable {
+    static let defaultLaunchOrder = [
+        "/bin/zsh",
+        "/bin/bash",
+        "/bin/sh"
+    ]
+
+    let launchOrder: [String]
+
+    static let `default` = ShellLaunchConfiguration(launchOrder: defaultLaunchOrder)
+
+    init(launchOrder: [String]) {
+        self.launchOrder = Self.normalizedLaunchOrder(launchOrder)
+    }
+
+    static func normalizedLaunchOrder(_ values: [String]) -> [String] {
+        var normalized: [String] = []
+        var seen = Set<String>()
+
+        for rawValue in values {
+            let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            guard trimmed.hasPrefix("/") else { continue }
+            guard seen.insert(trimmed).inserted else { continue }
+            normalized.append(trimmed)
+        }
+
+        return normalized.isEmpty ? defaultLaunchOrder : normalized
+    }
+}
+
 struct PtermConfig {
     let term: String
     let textEncoding: TerminalTextEncoding
+    let shellLaunch: ShellLaunchConfiguration
     let fontName: String?
     let fontSize: Double?
     let terminalAppearance: TerminalAppearanceConfiguration
@@ -84,6 +116,7 @@ struct PtermConfig {
     static let `default` = PtermConfig(
         term: TerminfoResolver.resolveConfiguredTerm(nil),
         textEncoding: .utf8,
+        shellLaunch: .default,
         fontName: nil,
         fontSize: nil,
         terminalAppearance: .default,
@@ -196,11 +229,15 @@ enum PtermConfigStore {
         let audit = dictionaryValue(root["audit"])
         let security = dictionaryValue(root["security"])
         let shortcuts = dictionaryValue(root["shortcuts"])
+        let shells = dictionaryValue(root["shells"])
         let workspaces = workspaceList(root["workspaces"])
 
         return PtermConfig(
             term: TerminfoResolver.resolveConfiguredTerm(stringValue(root["term"])),
             textEncoding: stringValue(root["text_encoding"]).flatMap(TerminalTextEncoding.init(configuredValue:)) ?? defaults.textEncoding,
+            shellLaunch: ShellLaunchConfiguration(
+                launchOrder: stringArrayValue(shells?["launch_order"]) ?? defaults.shellLaunch.launchOrder
+            ),
             fontName: stringValue(font?["name"]) ?? stringValue(root["font_name"]),
             fontSize: normalizedFontSize(doubleValue(font?["size"]) ?? doubleValue(root["font_size"])),
             terminalAppearance: TerminalAppearanceConfiguration(
@@ -233,6 +270,10 @@ enum PtermConfigStore {
 
     private static func stringValue(_ value: Any?) -> String? {
         value as? String
+    }
+
+    private static func stringArrayValue(_ value: Any?) -> [String]? {
+        value as? [String]
     }
 
     private static func intValue(_ value: Any?) -> Int? {

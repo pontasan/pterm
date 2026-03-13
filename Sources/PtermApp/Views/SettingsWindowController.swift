@@ -23,7 +23,7 @@ private final class SettingsContentView: FlippedView {
 
 // MARK: - Settings Window Controller
 
-final class SettingsWindowController: NSWindowController, NSWindowDelegate {
+final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDelegate {
     private let settingsLabelColumnWidth: CGFloat = 160
     private let settingsControlSpacing: CGFloat = 8
     private enum Section: Int, CaseIterable {
@@ -64,6 +64,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     // Control references
     private var termPopup: NSPopUpButton?
+    private var launchShellsTableView: NSTableView?
+    private var launchShellsValues: [String] = []
     private var encodingPopup: NSPopUpButton?
     private var scrollPersistenceCheck: NSButton?
     private var fontNameLabel: NSTextField?
@@ -179,6 +181,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
 
         resetSection("session", removing: ["scroll_buffer_persistence"])
+        resetSection("shells", removing: ["launch_order"])
         resetSection("appearance", removing: [
             "terminal_foreground_color",
             "terminal_background_color",
@@ -308,6 +311,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         popup.action = #selector(termChanged(_:))
         termPopup = popup
         addView(termRow, 28)
+        addSpacing(12)
+
+        let currentShells = configuredLaunchShells()
+        launchShellsValues = currentShells
+        let shellRow = makeLaunchShellsEditor(width: width)
+        addView(shellRow, 148)
+        addSpacing(4)
+        addView(
+            makeDescriptionLabel(
+                "New terminals try shells in this order. Edit paths directly, then move rows up or down.",
+                width: width
+            ),
+            28
+        )
         addSpacing(12)
 
         let encDisplay = ["UTF-8", "UTF-16", "UTF-16LE", "UTF-16BE"]
@@ -609,6 +626,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         commitConfigChange()
     }
 
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField,
+              field.identifier?.rawValue == "launchShellPathField" else { return }
+        let row = field.tag
+        guard launchShellsValues.indices.contains(row) else { return }
+        let value = field.stringValue.trimmingCharacters(in: .whitespaces)
+        if value.isEmpty {
+            launchShellsValues.remove(at: row)
+        } else {
+            launchShellsValues[row] = value
+        }
+        persistLaunchShells()
+        launchShellsTableView?.reloadData()
+    }
+
     @objc private func scrollPersistenceChanged(_ sender: NSButton) {
         var session = (configData["session"] as? [String: Any]) ?? [:]
         session["scroll_buffer_persistence"] = (sender.state == .on)
@@ -827,6 +859,90 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return (row, popup)
     }
 
+    private func makeLaunchShellsEditor(width: CGFloat) -> NSView {
+        let buttonSize = NSSize(width: 28, height: 28)
+        let buttonSpacing: CGFloat = 4
+        let buttonRowHeight = buttonSize.height
+        let listHeight: CGFloat = 100
+        let gapBetweenTableAndButtons: CGFloat = 6
+        let containerHeight = listHeight + gapBetweenTableAndButtons + buttonRowHeight
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: containerHeight))
+
+        // Label aligned to the top of the table
+        let label = makeLabel("Launch Shells:")
+        let labelY = containerHeight - 20
+        label.frame = NSRect(x: 0, y: labelY, width: settingsLabelColumnWidth, height: 20)
+        container.addSubview(label)
+
+        let tableX = settingsLabelColumnWidth + settingsControlSpacing
+        let tableWidth = width - tableX
+        let tableY = buttonRowHeight + gapBetweenTableAndButtons
+
+        let scrollView = NSScrollView(frame: NSRect(x: tableX, y: tableY, width: tableWidth, height: listHeight))
+        scrollView.borderType = .bezelBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+
+        let tableView = NSTableView(frame: scrollView.bounds)
+        tableView.identifier = NSUserInterfaceItemIdentifier("launchShellsTable")
+        tableView.headerView = nil
+        tableView.rowHeight = 24
+        tableView.intercellSpacing = NSSize(width: 0, height: 2)
+        tableView.selectionHighlightStyle = .regular
+        tableView.dataSource = self
+        tableView.delegate = self
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("path"))
+        column.width = tableWidth - 4
+        tableView.addTableColumn(column)
+        scrollView.documentView = tableView
+        launchShellsTableView = tableView
+        container.addSubview(scrollView)
+
+        // Buttons in a horizontal row below the table
+        let buttonConfigs: [(tooltip: String, symbol: String, action: Selector, identifier: String)] = [
+            ("Add shell", "plus", #selector(addLaunchShellRow(_:)), "launchShellAddButton"),
+            ("Remove selected shell", "minus", #selector(removeLaunchShellRow(_:)), "launchShellRemoveButton"),
+            ("Move selected shell up", "arrow.up", #selector(moveLaunchShellRowUp(_:)), "launchShellUpButton"),
+            ("Move selected shell down", "arrow.down", #selector(moveLaunchShellRowDown(_:)), "launchShellDownButton"),
+        ]
+
+        var currentX = tableX
+        for buttonConfig in buttonConfigs {
+            let button = NSButton(title: "", target: self, action: buttonConfig.action)
+            button.identifier = NSUserInterfaceItemIdentifier(buttonConfig.identifier)
+            button.bezelStyle = .rounded
+            button.toolTip = buttonConfig.tooltip
+            button.frame = NSRect(x: currentX, y: 0, width: buttonSize.width, height: buttonSize.height)
+            configureLaunchShellButton(button, symbolName: buttonConfig.symbol)
+            container.addSubview(button)
+            currentX += buttonSize.width + buttonSpacing
+        }
+
+        // Reset button as a text button
+        let resetButton = NSButton(title: "Reset to Default", target: self, action: #selector(resetLaunchShellRows(_:)))
+        resetButton.identifier = NSUserInterfaceItemIdentifier("launchShellResetButton")
+        resetButton.bezelStyle = .rounded
+        resetButton.toolTip = "Restore default shell order"
+        resetButton.font = NSFont.systemFont(ofSize: 11)
+        resetButton.sizeToFit()
+        resetButton.frame = NSRect(x: currentX + buttonSpacing, y: 0, width: resetButton.frame.width, height: buttonSize.height)
+        container.addSubview(resetButton)
+
+        tableView.reloadData()
+        if !launchShellsValues.isEmpty {
+            tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        }
+        return container
+    }
+
+    private func configureLaunchShellButton(_ button: NSButton, symbolName: String) {
+        if #available(macOS 11.0, *) {
+            button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: button.title)
+            button.imagePosition = .imageOnly
+        }
+    }
+
     private func makeColorWellRow(
         label: String,
         color: NSColor,
@@ -907,6 +1023,69 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         configData[key] as? String
     }
 
+    private func configuredLaunchShells() -> [String] {
+        let shells = configData["shells"] as? [String: Any]
+        let rawValues = shells?["launch_order"] as? [String] ?? ShellLaunchConfiguration.default.launchOrder
+        return ShellLaunchConfiguration.normalizedLaunchOrder(rawValues)
+    }
+
+    private func persistLaunchShells() {
+        let normalized = ShellLaunchConfiguration.normalizedLaunchOrder(launchShellsValues)
+        launchShellsValues = normalized
+        var shells = (configData["shells"] as? [String: Any]) ?? [:]
+        shells["launch_order"] = normalized
+        configData["shells"] = shells
+        commitConfigChange()
+    }
+
+    @objc private func addLaunchShellRow(_ sender: NSButton) {
+        launchShellsValues.append("")
+        let newRow = launchShellsValues.count - 1
+        launchShellsTableView?.reloadData()
+        launchShellsTableView?.selectRowIndexes(IndexSet(integer: newRow), byExtendingSelection: false)
+        launchShellsTableView?.editColumn(0, row: newRow, with: nil, select: true)
+    }
+
+    @objc private func removeLaunchShellRow(_ sender: NSButton) {
+        guard let tableView = launchShellsTableView else { return }
+        let row = tableView.selectedRow
+        guard launchShellsValues.indices.contains(row) else { return }
+        launchShellsValues.remove(at: row)
+        persistLaunchShells()
+        tableView.reloadData()
+        let nextRow = min(row, max(launchShellsValues.count - 1, 0))
+        if !launchShellsValues.isEmpty {
+            tableView.selectRowIndexes(IndexSet(integer: nextRow), byExtendingSelection: false)
+        }
+    }
+
+    @objc private func moveLaunchShellRowUp(_ sender: NSButton) {
+        guard let tableView = launchShellsTableView else { return }
+        let row = tableView.selectedRow
+        guard row > 0, launchShellsValues.indices.contains(row) else { return }
+        launchShellsValues.swapAt(row, row - 1)
+        persistLaunchShells()
+        tableView.reloadData()
+        tableView.selectRowIndexes(IndexSet(integer: row - 1), byExtendingSelection: false)
+    }
+
+    @objc private func moveLaunchShellRowDown(_ sender: NSButton) {
+        guard let tableView = launchShellsTableView else { return }
+        let row = tableView.selectedRow
+        guard row >= 0, row < launchShellsValues.count - 1 else { return }
+        launchShellsValues.swapAt(row, row + 1)
+        persistLaunchShells()
+        tableView.reloadData()
+        tableView.selectRowIndexes(IndexSet(integer: row + 1), byExtendingSelection: false)
+    }
+
+    @objc private func resetLaunchShellRows(_ sender: NSButton) {
+        launchShellsValues = ShellLaunchConfiguration.default.launchOrder
+        persistLaunchShells()
+        launchShellsTableView?.reloadData()
+        launchShellsTableView?.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+    }
+
     private func doubleVal(_ value: Any?) -> Double? {
         if let n = value as? NSNumber { return n.doubleValue }
         return value as? Double
@@ -944,10 +1123,40 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
 extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
     func numberOfRows(in tableView: NSTableView) -> Int {
-        Section.allCases.count
+        if tableView.identifier?.rawValue == "launchShellsTable" {
+            return launchShellsValues.count
+        }
+        return Section.allCases.count
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        if tableView.identifier?.rawValue == "launchShellsTable" {
+            let cellIdentifier = NSUserInterfaceItemIdentifier("LaunchShellCell")
+            let cell: NSTableCellView
+            if let reused = tableView.makeView(withIdentifier: cellIdentifier, owner: nil) as? NSTableCellView {
+                cell = reused
+            } else {
+                cell = NSTableCellView(frame: NSRect(x: 0, y: 0, width: tableView.bounds.width, height: 24))
+                cell.identifier = cellIdentifier
+
+                let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: tableView.bounds.width, height: 24))
+                textField.identifier = NSUserInterfaceItemIdentifier("launchShellPathField")
+                textField.isEditable = true
+                textField.isBordered = false
+                textField.drawsBackground = false
+                textField.backgroundColor = .clear
+                textField.textColor = .white
+                textField.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+                textField.delegate = self
+                cell.addSubview(textField)
+                cell.textField = textField
+            }
+
+            cell.textField?.tag = row
+            cell.textField?.stringValue = launchShellsValues[row]
+            return cell
+        }
+
         guard let section = Section(rawValue: row) else { return nil }
 
         let cellIdentifier = NSUserInterfaceItemIdentifier("SectionCell")
@@ -981,6 +1190,10 @@ extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
+        if let tableView = notification.object as? NSTableView,
+           tableView.identifier?.rawValue == "launchShellsTable" {
+            return
+        }
         let row = sidebarTableView.selectedRow
         guard row >= 0, let section = Section(rawValue: row) else { return }
         showContentForSection(section)

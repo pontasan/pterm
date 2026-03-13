@@ -224,6 +224,7 @@ extension SplitRenderView: MTKViewDelegate {
             // Read live state from TerminalView each frame
             let selection = ref.terminalView?.selection
             let border = ref.terminalView.flatMap { borderConfigProvider?($0) }
+            let transientTextOverlays = ref.terminalView?.activeCommittedTextPreviewOverlays() ?? []
 
             // Convert from NSView coordinates (y=0 at bottom) to Metal coordinates (y=0 at top)
             let flippedRect = NSRect(
@@ -240,6 +241,7 @@ extension SplitRenderView: MTKViewDelegate {
                     scrollOffset: scrollOffset,
                     selection: selection,
                     borderConfig: border,
+                    transientTextOverlays: transientTextOverlays,
                     encoder: encoder,
                     viewportSize: viewportSize,
                     cellRect: flippedRect,
