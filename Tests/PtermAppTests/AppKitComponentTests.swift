@@ -4730,6 +4730,31 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertGreaterThan(view.cachedWorkspaceLayoutCount, 0)
     }
 
+    func testIntegratedViewEmptyStateShowsAndHandlesAddWorkspaceButton() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), renderer: renderer, manager: manager)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 540),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        window.makeKeyAndOrderFront(nil)
+        renderFrame(for: view)
+
+        let addWorkspaceButtonFrame = try XCTUnwrap(reflectedAddWorkspaceButtonFrame(from: view))
+        XCTAssertFalse(addWorkspaceButtonFrame.isEmpty)
+
+        var didRequestAddWorkspace = false
+        view.onAddWorkspace = { didRequestAddWorkspace = true }
+        let down = try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: addWorkspaceButtonFrame.center, in: view, window: window))
+        view.mouseDown(with: down)
+
+        XCTAssertTrue(didRequestAddWorkspace)
+    }
+
     func testIntegratedViewTitleBarSingleClickDoesNotInvokeSelectCallback() throws {
         let renderer = try makeRendererWithPipelinesOrSkip()
         let manager = TerminalManager(rows: 24, cols: 80, config: .default)
@@ -5217,6 +5242,10 @@ final class AppKitComponentTests: XCTestCase {
             terminals: manager.terminals,
             explicitWorkspaceNames: explicitWorkspaceNames
         )
+    }
+
+    private func reflectedAddWorkspaceButtonFrame(from view: IntegratedView) -> NSRect? {
+        mirroredChild(named: "addWorkspaceButtonFrame", in: view)
     }
 
     private func reflectedVisibleWorkspaceLayouts(from view: IntegratedView) -> [ReflectedWorkspaceLayout] {

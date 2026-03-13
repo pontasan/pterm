@@ -144,6 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private enum WorkspaceNaming {
         static let uncategorized = "Uncategorized"
+        static let initialWorkspaceBaseName = "Workspace"
     }
 
     enum TerminalListPresentation: Equatable {
@@ -211,6 +212,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return nil
         }
         return (lastDisplayedController.sessionSnapshot.workspaceName, splitControllers)
+    }
+
+    static func initialWorkspaceName(existingNames: [String]) -> String {
+        let normalizedExistingNames = Set(
+            existingNames.map {
+                FileNameSanitizer.sanitize($0, fallback: WorkspaceNaming.uncategorized)
+            }
+        )
+        let baseName = WorkspaceNaming.initialWorkspaceBaseName
+        if !normalizedExistingNames.contains(baseName) {
+            return baseName
+        }
+
+        var suffix = 2
+        while true {
+            let candidate = "\(baseName) \(suffix)"
+            if !normalizedExistingNames.contains(candidate) {
+                return candidate
+            }
+            suffix += 1
+        }
     }
 
     private var viewMode: ViewMode = .integrated
@@ -366,7 +388,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .showIntegrated:
             switchToIntegrated()
         case .createInitialTerminalAndShowIntegrated:
-            _ = addNewTerminal()
+            _ = addInitialWorkspaceTerminal()
             switchToIntegrated()
         }
 
@@ -1615,11 +1637,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         if state.terminals.isEmpty {
-            if !workspaceNames.isEmpty {
-                switchToIntegrated()
-                return
-            }
-            _ = addNewTerminal()
+            _ = addInitialWorkspaceTerminal()
+            switchToIntegrated()
             return
         }
 
@@ -2179,6 +2198,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func syncIntegratedWorkspaceNames() {
         integratedView?.explicitWorkspaceNames = workspaceNames
+    }
+
+    @discardableResult
+    private func addInitialWorkspaceTerminal() -> TerminalController? {
+        let workspaceName = Self.initialWorkspaceName(existingNames: workspaceNames)
+        return addNewTerminal(workspaceName: workspaceName)
     }
 
     private func promptCreateWorkspace() {

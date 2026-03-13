@@ -50,6 +50,17 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertEqual(disposition, .createInitialTerminalAndShowIntegrated)
     }
 
+    func testInitialWorkspaceNameStartsWithWorkspaceWhenEmpty() {
+        XCTAssertEqual(AppDelegate.initialWorkspaceName(existingNames: []), "Workspace")
+    }
+
+    func testInitialWorkspaceNamePicksNextAvailableWorkspaceSuffix() {
+        XCTAssertEqual(
+            AppDelegate.initialWorkspaceName(existingNames: ["Workspace", "Workspace 2", "Alpha"]),
+            "Workspace 3"
+        )
+    }
+
     func testTerminalListReconciliationKeepsIntegratedPresentationWhenLastTerminalRemoved() {
         let result = AppDelegate.reconcilePresentationAfterTerminalListChange(
             currentPresentation: .integrated,
