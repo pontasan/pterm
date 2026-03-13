@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 
 final class SplitTerminalContainerView: NSView {
     private enum Layout {
@@ -8,9 +9,11 @@ final class SplitTerminalContainerView: NSView {
 
     private static let whiteBorder = MetalRenderer.BorderConfig(color: (1, 1, 1, 1), width: 1)
     private static let blueBorder = MetalRenderer.BorderConfig(color: (0.2, 0.5, 1.0, 1), width: 2)
+    private static let activeBorderRGB: (Float, Float, Float) = (0.9, 0.2, 0.15)
 
     private let renderer: MetalRenderer
     private(set) var controllers: [TerminalController]
+    private var activeOutputTerminalIDs: Set<UUID> = []
     private var scrollViews: [TerminalScrollView] = []
     /// Single MTKView overlay that renders all terminal cells.
     /// Avoids macOS CAMetalLayer compositing issues with multiple Metal layers.
@@ -83,9 +86,26 @@ final class SplitTerminalContainerView: NSView {
 
     /// Compute border config for each cell: white for unfocused, blue for focused.
     private func borderConfig(for terminalView: TerminalView) -> MetalRenderer.BorderConfig? {
+        if let controller = terminalView.terminalController,
+           activeOutputTerminalIDs.contains(controller.id) {
+            let pulse = Float(0.475 + 0.325 * sin(CACurrentMediaTime() * 3.0))
+            return MetalRenderer.BorderConfig(
+                color: (Self.activeBorderRGB.0, Self.activeBorderRGB.1, Self.activeBorderRGB.2, pulse),
+                width: 1.5
+            )
+        }
         guard scrollViews.count > 1 else { return nil }
         let firstResponder = window?.firstResponder
         return (firstResponder === terminalView) ? Self.blueBorder : Self.whiteBorder
+    }
+
+    func setActiveOutputTerminalIDs(_ terminalIDs: Set<UUID>) {
+        let relevantIDs = Set(controllers.map(\.id))
+        let nextIDs = terminalIDs.intersection(relevantIDs)
+        guard nextIDs != activeOutputTerminalIDs else { return }
+        activeOutputTerminalIDs = nextIDs
+        splitRenderView?.hasActiveOutput = !nextIDs.isEmpty
+        splitRenderView?.requestRender()
     }
 
     private func rebuildSubviews() {
@@ -142,6 +162,7 @@ final class SplitTerminalContainerView: NSView {
         }
         addSubview(overlay)
         splitRenderView = overlay
+        splitRenderView?.hasActiveOutput = !activeOutputTerminalIDs.isEmpty
         syncRenderCells()
         applyAppearanceSettings()
     }

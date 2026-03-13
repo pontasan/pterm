@@ -75,6 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Tracks last output time per terminal for active-output indicator.
     private var lastOutputTimes: [UUID: Date] = [:]
     private var outputIdleTimer: Timer?
+    private var activeOutputTerminalIDs: Set<UUID> = []
     /// Suppresses active-output indicator briefly after resize.
     private var lastResizeTime: Date = .distantPast
     /// Tracks terminals that have been idle at least once (initial output burst is over).
@@ -492,6 +493,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        let remainingTerminalIDs = Set(manager.terminals.map(\.id))
+        lastOutputTimes = lastOutputTimes.filter { remainingTerminalIDs.contains($0.key) }
+        terminalsEverIdle = terminalsEverIdle.intersection(remainingTerminalIDs)
+        activeOutputTerminalIDs = activeOutputTerminalIDs.intersection(remainingTerminalIDs)
+        syncVisibleTerminalOutputIndicators()
+
         let wasIntegrated = {
             if case .integrated = viewMode { return true }
             return false
@@ -587,6 +594,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         contentHostView().addSubview(sv)
         terminalScrollView = sv
         terminalView = sv.terminalView
+        terminalView?.isOutputActive = activeOutputTerminalIDs.contains(controller.id)
         terminalView?.applyAppearanceSettings()
         focusedController = controller
 
@@ -643,6 +651,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         contentHostView().addSubview(splitView)
         splitContainerView = splitView
+        splitContainerView?.setActiveOutputTerminalIDs(activeOutputTerminalIDs)
         splitContainerView?.applyAppearanceSettings()
         splitOriginControllers = nil
         viewMode = .split(controllers)
@@ -687,6 +696,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         syncIntegratedWorkspaceNames()
         contentHostView().addSubview(iv)
         setupScrollbarOverlay(for: iv)
+        activeOutputTerminalIDs.forEach { _ = iv.setTerminalOutputActive($0, isActive: true) }
         applyAppearanceSettingsToVisibleViews()
         iv.syncScaleFactorIfNeeded()
         viewMode = .integrated
@@ -1369,6 +1379,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Only show indicator for terminals that have been idle at least once.
             // This prevents the initial shell startup output from triggering the indicator.
             guard self.terminalsEverIdle.contains(controller.id) else { return }
+            self.activeOutputTerminalIDs.insert(controller.id)
+            self.syncVisibleTerminalOutputIndicators()
             self.integratedView?.noteTerminalOutputActivity(controller.id)
         }
         if config.audit.enabled {
@@ -1397,6 +1409,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             for (id, lastTime) in self.lastOutputTimes {
                 if now.timeIntervalSince(lastTime) >= idleThreshold {
                     _ = self.integratedView?.setTerminalOutputActive(id, isActive: false)
+                    self.activeOutputTerminalIDs.remove(id)
+                    self.syncVisibleTerminalOutputIndicators()
                     self.lastOutputTimes.removeValue(forKey: id)
                     self.terminalsEverIdle.insert(id)
                 }
@@ -1411,6 +1425,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func requestSessionPersist() {
         guard !isTerminating else { return }
         sessionPersistenceCoordinator.schedule()
+    }
+
+    private func syncVisibleTerminalOutputIndicators() {
+        terminalView?.isOutputActive = focusedController.map { activeOutputTerminalIDs.contains($0.id) } ?? false
+        splitContainerView?.setActiveOutputTerminalIDs(activeOutputTerminalIDs)
     }
 
     private func flushPendingSessionPersistence() {

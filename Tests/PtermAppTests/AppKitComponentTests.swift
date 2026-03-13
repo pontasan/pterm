@@ -972,6 +972,32 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(view.enableSetNeedsDisplay)
     }
 
+    func testTerminalViewOutputPulseTimerTracksActiveOutputState() throws {
+        let renderer = try makeRendererOrSkip()
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+
+        XCTAssertFalse(view.debugHasOutputPulseTimer)
+
+        view.isOutputActive = true
+        XCTAssertTrue(view.debugHasOutputPulseTimer)
+
+        view.isOutputActive = false
+        XCTAssertFalse(view.debugHasOutputPulseTimer)
+    }
+
+    func testSplitRenderViewOutputPulseTimerTracksActiveOutputState() throws {
+        let renderer = try makeRendererOrSkip()
+        let view = SplitRenderView(frame: NSRect(x: 0, y: 0, width: 480, height: 280), renderer: renderer)
+
+        XCTAssertFalse(view.debugHasOutputPulseTimer)
+
+        view.hasActiveOutput = true
+        XCTAssertTrue(view.debugHasOutputPulseTimer)
+
+        view.hasActiveOutput = false
+        XCTAssertFalse(view.debugHasOutputPulseTimer)
+    }
+
     func testSearchBarViewUpdatesCountAndInvokesCallbacks() {
         let view = SearchBarView(frame: NSRect(x: 0, y: 0, width: 300, height: 32))
         var queries: [String] = []

@@ -23,8 +23,18 @@ final class SplitRenderView: MTKView {
     var cellRefs: [CellRef] = []
     /// Closure to compute border config for a TerminalView each frame.
     var borderConfigProvider: ((TerminalView) -> MetalRenderer.BorderConfig?)?
+    var hasActiveOutput: Bool = false {
+        didSet {
+            guard hasActiveOutput != oldValue else { return }
+            updateOutputPulseTimer()
+            requestRender()
+        }
+    }
     private var viewIsOpaque = false
     private var idleBufferReleaseTimer: Timer?
+    private var outputPulseTimer: Timer?
+
+    var debugHasOutputPulseTimer: Bool { outputPulseTimer != nil }
 
     init(frame: NSRect, renderer: MetalRenderer) {
         self.renderer = renderer
@@ -50,6 +60,7 @@ final class SplitRenderView: MTKView {
 
     deinit {
         idleBufferReleaseTimer?.invalidate()
+        outputPulseTimer?.invalidate()
         renderer.removeBuffers(for: self)
     }
 
@@ -89,6 +100,17 @@ final class SplitRenderView: MTKView {
         scheduleIdleBufferRelease()
     }
 
+    private func updateOutputPulseTimer() {
+        outputPulseTimer?.invalidate()
+        outputPulseTimer = nil
+        guard hasActiveOutput else { return }
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.requestRender()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        outputPulseTimer = timer
+    }
+
     private func scheduleIdleBufferRelease() {
         idleBufferReleaseTimer?.invalidate()
         let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
@@ -111,6 +133,8 @@ final class SplitRenderView: MTKView {
     func releaseInactiveRenderingResourcesNow() {
         idleBufferReleaseTimer?.invalidate()
         idleBufferReleaseTimer = nil
+        outputPulseTimer?.invalidate()
+        outputPulseTimer = nil
         renderer.releaseSplitBuffers(for: self)
         _ = renderer.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
         drawableSize = .zero
@@ -119,6 +143,8 @@ final class SplitRenderView: MTKView {
     func compactForMemoryPressureNow() {
         idleBufferReleaseTimer?.invalidate()
         idleBufferReleaseTimer = nil
+        outputPulseTimer?.invalidate()
+        outputPulseTimer = nil
         renderer.releaseSplitBuffers(for: self)
         _ = renderer.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
     }

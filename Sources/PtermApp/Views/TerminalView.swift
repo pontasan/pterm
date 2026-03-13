@@ -63,6 +63,13 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     /// Border configuration for split-view focus indication (drawn within Metal pipeline).
     var borderConfig: MetalRenderer.BorderConfig?
+    var isOutputActive: Bool = false {
+        didSet {
+            guard isOutputActive != oldValue else { return }
+            updateOutputPulseTimer()
+            requestDisplayUpdate()
+        }
+    }
 
     /// Current text selection (nil = no selection)
     private(set) var selection: TerminalSelection? {
@@ -87,6 +94,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var pressedMouseButton: Int?
     private var windowObservers: [NSObjectProtocol] = []
     private var cursorBlinkTimer: Timer?
+    private var outputPulseTimer: Timer?
     private var idleBufferReleaseTimer: Timer?
     private var markedTextLayer: CATextLayer?
     private var markedTextStorage: NSMutableAttributedString?
@@ -104,6 +112,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     var hasActiveImagePreviewWindow: Bool { imagePreviewWindow != nil }
     var debugHasKeyboardHandler: Bool { keyboardHandler != nil }
     var debugHasMarkedTextStorage: Bool { markedTextStorage != nil }
+    var debugHasOutputPulseTimer: Bool { outputPulseTimer != nil }
 
     func debugInstallImagePreviewWindowForTesting() {
         guard imagePreviewWindow == nil else { return }
@@ -258,6 +267,8 @@ final class TerminalView: MTKView, NSTextInputClient {
         if renderingSuppressed {
             cursorBlinkTimer?.invalidate()
             cursorBlinkTimer = nil
+            outputPulseTimer?.invalidate()
+            outputPulseTimer = nil
             isPaused = true
             enableSetNeedsDisplay = false
             drawableSize = .zero
@@ -275,6 +286,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         syncScaleFactor()
         requestDisplayUpdate()
         updateCursorBlinkTimer()
+        updateOutputPulseTimer()
     }
 
     /// Synchronize the glyph atlas scale factor with the current display.
@@ -327,6 +339,8 @@ final class TerminalView: MTKView, NSTextInputClient {
         keyboardHandler = nil
         cursorBlinkTimer?.invalidate()
         cursorBlinkTimer = nil
+        outputPulseTimer?.invalidate()
+        outputPulseTimer = nil
         drawableSize = .zero
     }
 
@@ -353,6 +367,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         scrollerSyncPending = true
         updateTerminalSize()
         updateCursorBlinkTimer()
+        updateOutputPulseTimer()
         // When a controller is assigned to a new view (e.g., returning to split view),
         // ensure we show the latest output, not stale scrollback position.
         controller.scrollToBottom()
@@ -360,6 +375,7 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     deinit {
         cursorBlinkTimer?.invalidate()
+        outputPulseTimer?.invalidate()
         idleBufferReleaseTimer?.invalidate()
         removeWindowObservers()
         hideImagePreview()
@@ -454,6 +470,32 @@ final class TerminalView: MTKView, NSTextInputClient {
         cursorBlinkTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.requestDisplayUpdate()
         }
+    }
+
+    private func updateOutputPulseTimer() {
+        outputPulseTimer?.invalidate()
+        outputPulseTimer = nil
+        guard demandDrivenRendering,
+              !renderingSuppressed,
+              isOutputActive else {
+            return
+        }
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.requestDisplayUpdate()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        outputPulseTimer = timer
+    }
+
+    private func effectiveBorderConfig() -> MetalRenderer.BorderConfig? {
+        if isOutputActive {
+            let pulse = Float(0.475 + 0.325 * sin(CACurrentMediaTime() * 3.0))
+            return MetalRenderer.BorderConfig(
+                color: (0.9, 0.2, 0.15, pulse),
+                width: 1.5
+            )
+        }
+        return borderConfig
     }
 
     // MARK: - Grid Position from Mouse
@@ -1260,7 +1302,7 @@ extension TerminalView: MTKViewDelegate {
             MetalRenderer.LinkUnderline(row: $0.row, startCol: $0.startCol, endCol: $0.endCol)
         }
 
-        let border = borderConfig
+        let border = effectiveBorderConfig()
         controller.withViewport { model, scrollback, scrollOffset in
             renderer.render(model: model, scrollback: scrollback,
                           scrollOffset: scrollOffset, selection: selection,
