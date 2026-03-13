@@ -274,6 +274,25 @@ final class AppKitComponentTests: XCTestCase {
         }
     }
 
+    func testSettingsWindowPersistsOutputConfirmedInputAnimationToggle() throws {
+        try withTemporaryHomeDirectory { _ in
+            PtermDirectories.ensureDirectories()
+            let controller = SettingsWindowController()
+
+            let checkbox = try XCTUnwrap(
+                allSubviews(in: controller.window?.contentView)
+                    .compactMap { $0 as? NSButton }
+                    .first(where: { $0.title == "Output-confirm input animations" })
+            )
+
+            checkbox.state = .on
+            _ = checkbox.target?.perform(checkbox.action, with: checkbox)
+
+            let loaded = PtermConfigStore.load()
+            XCTAssertTrue(loaded.textInteraction.outputConfirmedInputAnimation)
+        }
+    }
+
     func testSettingsWindowGeneralSectionShowsFactoryResetButton() throws {
         try withIsolatedSettingsController { controller in
             let buttons = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }
@@ -486,6 +505,10 @@ final class AppKitComponentTests: XCTestCase {
                     "launch_order": ["/bin/bash", "/bin/sh"],
                     "preserved_shell_key": "keep"
                 ],
+                "text_interaction": [
+                    "output_confirmed_input_animation": true,
+                    "preserved_text_interaction_key": "keep"
+                ],
                 "font": ["name": "Menlo", "size": 17],
                 "appearance": [
                     "terminal_foreground_color": "#123456",
@@ -547,6 +570,10 @@ final class AppKitComponentTests: XCTestCase {
             XCTAssertNil(shells["launch_order"])
             XCTAssertEqual(shells["preserved_shell_key"] as? String, "keep")
 
+            let textInteraction = try XCTUnwrap(root["text_interaction"] as? [String: Any])
+            XCTAssertNil(textInteraction["output_confirmed_input_animation"])
+            XCTAssertEqual(textInteraction["preserved_text_interaction_key"] as? String, "keep")
+
             let security = try XCTUnwrap(root["security"] as? [String: Any])
             XCTAssertNil(security["osc52_clipboard_read"])
             XCTAssertNil(security["paste_confirmation"])
@@ -562,6 +589,7 @@ final class AppKitComponentTests: XCTestCase {
             XCTAssertEqual(loaded.term, PtermConfig.default.term)
             XCTAssertEqual(loaded.textEncoding, PtermConfig.default.textEncoding)
             XCTAssertEqual(loaded.shellLaunch, PtermConfig.default.shellLaunch)
+            XCTAssertEqual(loaded.textInteraction, PtermConfig.default.textInteraction)
             XCTAssertEqual(loaded.memoryMax, PtermConfig.default.memoryMax)
             XCTAssertEqual(loaded.terminalAppearance, PtermConfig.default.terminalAppearance)
         }
@@ -1482,6 +1510,239 @@ final class AppKitComponentTests: XCTestCase {
         }
 
         XCTAssertEqual(view.debugCommittedTextPreviewCount, 30)
+    }
+
+    func testTerminalViewKeyDownFallbackEnqueuesOutputConfirmedInsertIntentForPrintableText() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 80,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = true
+        view.debugSetSuppressInterpretKeyEvents(true)
+
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: "a",
+            charactersIgnoringModifiers: "a",
+            isARepeat: false,
+            keyCode: 0
+        ))
+
+        view.keyDown(with: event)
+
+        XCTAssertEqual(view.debugPendingCommittedTextIntentCount, 1)
+        XCTAssertTrue(view.debugHasPendingIntentResolutionTimer)
+    }
+
+    func testTerminalViewKeyDownFallbackDoesNotEnqueueIntentForArrowKeys() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 80,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = true
+        view.debugSetSuppressInterpretKeyEvents(true)
+
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: String(UnicodeScalar(NSUpArrowFunctionKey)!),
+            charactersIgnoringModifiers: String(UnicodeScalar(NSUpArrowFunctionKey)!),
+            isARepeat: false,
+            keyCode: 126
+        ))
+
+        view.keyDown(with: event)
+
+        XCTAssertEqual(view.debugPendingCommittedTextIntentCount, 0)
+    }
+
+    func testTerminalViewKeyDownFallbackEnqueuesOutputConfirmedDeleteIntentForBackspace() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 80,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        controller.withModel { model in
+            model.grid.setCell(Cell(codepoint: 97, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 0)
+            model.cursor.row = 0
+            model.cursor.col = 1
+        }
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = true
+        view.debugSetSuppressInterpretKeyEvents(true)
+
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: String(UnicodeScalar(0x7F)!),
+            charactersIgnoringModifiers: String(UnicodeScalar(0x7F)!),
+            isARepeat: false,
+            keyCode: 51
+        ))
+
+        view.keyDown(with: event)
+
+        XCTAssertEqual(view.debugPendingCommittedTextIntentCount, 1)
+    }
+
+    func testTerminalViewKeyDownFallbackEnqueuesDeleteIntentFromRecentInsertionHistory() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 80,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = false
+
+        view.insertText("a", replacementRange: NSRange(location: NSNotFound, length: 0))
+        controller.withModel { model in
+            for col in 0..<model.cols {
+                model.grid.setCell(.empty, at: 0, col: col)
+            }
+            model.cursor.row = 0
+            model.cursor.col = 0
+        }
+
+        view.outputConfirmedInputAnimationsEnabled = true
+        view.debugSetSuppressInterpretKeyEvents(true)
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: String(UnicodeScalar(0x7F)!),
+            charactersIgnoringModifiers: String(UnicodeScalar(0x7F)!),
+            isARepeat: false,
+            keyCode: 51
+        ))
+
+        view.keyDown(with: event)
+
+        XCTAssertEqual(view.debugPendingCommittedTextIntentCount, 1)
+    }
+
+    func testTerminalViewKeyDownFallbackDeleteIntentUsesRecentInsertionHistoryAfterDelay() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 80,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = false
+
+        view.insertText("a", replacementRange: NSRange(location: NSNotFound, length: 0))
+        controller.withModel { model in
+            for col in 0..<model.cols {
+                model.grid.setCell(.empty, at: 0, col: col)
+            }
+            model.cursor.row = 0
+            model.cursor.col = 0
+        }
+
+        Thread.sleep(forTimeInterval: 2.1)
+
+        view.outputConfirmedInputAnimationsEnabled = true
+        view.debugSetSuppressInterpretKeyEvents(true)
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: String(UnicodeScalar(0x7F)!),
+            charactersIgnoringModifiers: String(UnicodeScalar(0x7F)!),
+            isARepeat: false,
+            keyCode: 51
+        ))
+
+        view.keyDown(with: event)
+
+        XCTAssertEqual(view.debugPendingCommittedTextIntentCount, 1)
     }
 
     func testTerminalViewUnmarkTextClearsIMEOverlayAndSelectionState() throws {
@@ -3254,6 +3515,7 @@ final class AppKitComponentTests: XCTestCase {
             term: PtermConfig.default.term,
             textEncoding: PtermConfig.default.textEncoding,
             shellLaunch: PtermConfig.default.shellLaunch,
+            textInteraction: PtermConfig.default.textInteraction,
             fontName: PtermConfig.default.fontName,
             fontSize: PtermConfig.default.fontSize,
             terminalAppearance: TerminalAppearanceConfiguration(
@@ -3336,6 +3598,7 @@ final class AppKitComponentTests: XCTestCase {
             term: PtermConfig.default.term,
             textEncoding: PtermConfig.default.textEncoding,
             shellLaunch: PtermConfig.default.shellLaunch,
+            textInteraction: PtermConfig.default.textInteraction,
             fontName: PtermConfig.default.fontName,
             fontSize: PtermConfig.default.fontSize,
             terminalAppearance: TerminalAppearanceConfiguration(

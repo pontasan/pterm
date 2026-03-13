@@ -7,6 +7,7 @@ final class TerminalManagerIntegrationTests: XCTestCase {
             term: "xterm-256color",
             textEncoding: .utf16,
             shellLaunch: .default,
+            textInteraction: .default,
             fontName: nil,
             fontSize: nil,
             terminalAppearance: .default,

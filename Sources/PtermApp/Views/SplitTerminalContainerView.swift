@@ -24,6 +24,13 @@ final class SplitTerminalContainerView: NSView {
             scrollViews.forEach { $0.terminalView.shortcutConfiguration = shortcutConfiguration }
         }
     }
+    var outputConfirmedInputAnimationsEnabled: Bool = TextInteractionConfiguration.default.outputConfirmedInputAnimation {
+        didSet {
+            scrollViews.forEach {
+                $0.terminalView.outputConfirmedInputAnimationsEnabled = outputConfirmedInputAnimationsEnabled
+            }
+        }
+    }
 
     var onBackToIntegrated: (() -> Void)?
     var onActiveControllerChange: ((TerminalController) -> Void)?
@@ -131,6 +138,7 @@ final class SplitTerminalContainerView: NSView {
         for (index, controller) in controllers.enumerated() {
             let scrollView = scrollViews[index]
             scrollView.terminalView.shortcutConfiguration = shortcutConfiguration
+            scrollView.terminalView.outputConfirmedInputAnimationsEnabled = outputConfirmedInputAnimationsEnabled
             // Suppress individual rendering — SplitRenderView handles it.
             // Also make the CAMetalLayer invisible so it doesn't interfere
             // with Window Server compositing of the overlay SplitRenderView.

@@ -60,6 +60,28 @@ final class KeyboardHandler {
         }
     }
 
+    func debugWillTreatAsRegularTextInput(event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags
+        if modifiers.contains(.control) {
+            return false
+        }
+        if handleSpecialKey(event: event) != nil {
+            return false
+        }
+        return event.characters != nil
+    }
+
+    func debugSpecialKeySelector(for event: NSEvent) -> Selector? {
+        switch event.keyCode {
+        case 51:
+            return #selector(NSResponder.deleteBackward(_:))
+        case 117:
+            return #selector(NSResponder.deleteForward(_:))
+        default:
+            return nil
+        }
+    }
+
     @discardableResult
     func handleCommand(selector: Selector) -> Bool {
         guard let controller = controller else { return false }

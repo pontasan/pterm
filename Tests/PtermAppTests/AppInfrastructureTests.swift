@@ -526,6 +526,22 @@ final class AppInfrastructureTests: XCTestCase {
         }
     }
 
+    func testPtermConfigStoreLoadsOutputConfirmedInputAnimationSetting() throws {
+        try withTemporaryHomeDirectory { _ in
+            PtermDirectories.ensureDirectories()
+            let json: [String: Any] = [
+                "text_interaction": [
+                    "output_confirmed_input_animation": true
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try AtomicFileWriter.write(data, to: PtermDirectories.config, permissions: 0o600)
+
+            let loaded = PtermConfigStore.load()
+            XCTAssertTrue(loaded.textInteraction.outputConfirmedInputAnimation)
+        }
+    }
+
     func testShortcutParserParsesConfiguredBindingsAndFallsBackOnInvalidValues() {
         let shortcuts = ShortcutParser.parseMap([
             "find_previous": "Cmd+Shift+G",

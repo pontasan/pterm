@@ -1,6 +1,36 @@
 import AppKit
+import Foundation
 import MetalKit
 import QuartzCore
+
+private enum InputAnimationDiagnostics {
+    static let enabled = false
+    static let directoryURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pterm-input-animation-diagnostics", isDirectory: true)
+    static let logURL = directoryURL.appendingPathComponent("events.log")
+
+    static func reset() {
+        guard enabled else { return }
+        try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        try? "session-start\n".write(to: logURL, atomically: true, encoding: .utf8)
+    }
+
+    static func log(_ message: String) {
+        guard enabled else { return }
+        let timestamp = String(format: "%.6f", CACurrentMediaTime())
+        let line = "[\(timestamp)] \(message)\n"
+        let data = Data(line.utf8)
+        try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: logURL.path),
+           let handle = try? FileHandle(forWritingTo: logURL) {
+            defer { try? handle.close() }
+            try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: logURL, options: .atomic)
+        }
+    }
+}
 
 /// NSView subclass that hosts a Metal layer for terminal rendering.
 ///
@@ -10,6 +40,7 @@ import QuartzCore
 final class TerminalView: MTKView, NSTextInputClient {
     private enum PreviewPolicy {
         static let maxCommittedTextPreviewCount = 30
+        static let pendingIntentTimeout: CFTimeInterval = 0.60
     }
 
     private struct MouseReportingState {
@@ -34,6 +65,14 @@ final class TerminalView: MTKView, NSTextInputClient {
         let kind: Kind
     }
 
+    private struct RecentCommittedInsertion {
+        let text: String
+        let row: Int
+        let col: Int
+        let columnWidth: Int
+        let recordedAt: CFTimeInterval
+    }
+
     /// Terminal controller for this view
     var terminalController: TerminalController? {
         didSet { setupController() }
@@ -42,6 +81,12 @@ final class TerminalView: MTKView, NSTextInputClient {
     /// Metal renderer
     var renderer: MetalRenderer?
     var shortcutConfiguration: ShortcutConfiguration = .default
+    var outputConfirmedInputAnimationsEnabled: Bool = TextInteractionConfiguration.default.outputConfirmedInputAnimation {
+        didSet {
+            guard !outputConfirmedInputAnimationsEnabled else { return }
+            pendingCommittedTextIntents.removeAll(keepingCapacity: false)
+        }
+    }
     private var selectAllActive = false
 
     /// Keyboard handler
@@ -117,14 +162,18 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var cursorBlinkTimer: Timer?
     private var outputPulseTimer: Timer?
     private var committedTextPreviewTimer: Timer?
+    private var pendingIntentResolutionTimer: Timer?
     private var idleBufferReleaseTimer: Timer?
     private var markedTextLayer: CATextLayer?
     private var markedTextStorage: NSMutableAttributedString?
     private var markedTextSelection = NSRange(location: NSNotFound, length: 0)
     private var committedTextPreviews: [CommittedTextPreview] = []
+    private var recentCommittedInsertions: [RecentCommittedInsertion] = []
+    private var pendingCommittedTextIntents: [CommittedTextAnimationIntent] = []
     private var pendingTextInputHandled = false
     private var scrollerSyncPending = true
     private var viewIsOpaque = false
+    private var debugSuppressInterpretKeyEvents = false
 
     /// URL hover state for Cmd+mouseover visual feedback
     private var hoveredLinkRange: (row: Int, startCol: Int, endCol: Int)?
@@ -138,6 +187,12 @@ final class TerminalView: MTKView, NSTextInputClient {
     var debugHasOutputPulseTimer: Bool { outputPulseTimer != nil }
     var debugHasCommittedTextPreview: Bool { !activeCommittedTextPreviewOverlays().isEmpty }
     var debugCommittedTextPreviewCount: Int { committedTextPreviews.count }
+    var debugPendingCommittedTextIntentCount: Int { pendingCommittedTextIntents.count }
+    var debugHasPendingIntentResolutionTimer: Bool { pendingIntentResolutionTimer != nil }
+
+    func debugSetSuppressInterpretKeyEvents(_ suppressed: Bool) {
+        debugSuppressInterpretKeyEvents = suppressed
+    }
 
     func debugInstallImagePreviewWindowForTesting() {
         guard imagePreviewWindow == nil else { return }
@@ -162,6 +217,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         self.renderer = renderer
 
         super.init(frame: frame, device: renderer.device)
+        InputAnimationDiagnostics.reset()
 
         self.delegate = self
         self.preferredFramesPerSecond = 30
@@ -294,6 +350,8 @@ final class TerminalView: MTKView, NSTextInputClient {
             cursorBlinkTimer = nil
             outputPulseTimer?.invalidate()
             outputPulseTimer = nil
+            pendingIntentResolutionTimer?.invalidate()
+            pendingIntentResolutionTimer = nil
             clearCommittedTextPreview()
             isPaused = true
             enableSetNeedsDisplay = false
@@ -387,6 +445,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         keyboardHandler = nil
 
         controller.onNeedsDisplay = { [weak self] in
+            self?.resolvePendingCommittedTextIntentsIfNeeded()
             self?.requestDisplayUpdate()
             self?.updateMarkedTextOverlay()
             self?.scrollerSyncPending = true
@@ -405,6 +464,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         cursorBlinkTimer?.invalidate()
         outputPulseTimer?.invalidate()
         committedTextPreviewTimer?.invalidate()
+        pendingIntentResolutionTimer?.invalidate()
         idleBufferReleaseTimer?.invalidate()
         removeWindowObservers()
         hideImagePreview()
@@ -471,7 +531,11 @@ final class TerminalView: MTKView, NSTextInputClient {
     private func clearCommittedTextPreview() {
         committedTextPreviewTimer?.invalidate()
         committedTextPreviewTimer = nil
+        pendingIntentResolutionTimer?.invalidate()
+        pendingIntentResolutionTimer = nil
         committedTextPreviews.removeAll(keepingCapacity: false)
+        recentCommittedInsertions.removeAll(keepingCapacity: false)
+        pendingCommittedTextIntents.removeAll(keepingCapacity: false)
     }
 
     private func requestDisplayUpdate() {
@@ -489,6 +553,25 @@ final class TerminalView: MTKView, NSTextInputClient {
     override func setNeedsDisplay(_ invalidRect: NSRect) {
         ensureDrawableStorageAllocatedIfNeeded()
         super.setNeedsDisplay(invalidRect)
+    }
+
+    private func ensurePendingIntentResolutionTimer() {
+        guard outputConfirmedInputAnimationsEnabled,
+              !pendingCommittedTextIntents.isEmpty,
+              pendingIntentResolutionTimer == nil else {
+            return
+        }
+        let timer = Timer.scheduledTimer(withTimeInterval: committedTextPreviewFrameInterval(), repeats: true) { [weak self] _ in
+            guard let self else { return }
+            InputAnimationDiagnostics.log("pending-resolution-timer tick intents=\(self.pendingCommittedTextIntents.count)")
+            self.resolvePendingCommittedTextIntentsIfNeeded()
+            if self.pendingCommittedTextIntents.isEmpty {
+                self.pendingIntentResolutionTimer?.invalidate()
+                self.pendingIntentResolutionTimer = nil
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        pendingIntentResolutionTimer = timer
     }
 
     private func updateCursorBlinkTimer() {
@@ -578,8 +661,19 @@ final class TerminalView: MTKView, NSTextInputClient {
         terminalController?.scrollToBottom()
         clearSelection()
         pendingTextInputHandled = false
-        interpretKeyEvents([event])
+        if !debugSuppressInterpretKeyEvents {
+            interpretKeyEvents([event])
+        }
+        InputAnimationDiagnostics.log(
+            "keyDown chars=\(event.characters ?? "<nil>") pendingHandled=\(pendingTextInputHandled) marked=\(hasMarkedText())"
+        )
         if !pendingTextInputHandled && !hasMarkedText() {
+            if let fallbackText = fallbackDirectTextInput(for: event) {
+                InputAnimationDiagnostics.log("keyDown fallback enqueue text=\(fallbackText.debugDescription)")
+                enqueueCommittedInsertIntentIfNeeded(for: fallbackText)
+            } else {
+                enqueueFallbackDeletionIntentIfNeeded(for: event)
+            }
             ensureKeyboardHandler()?.handleKeyDown(event: event)
         }
     }
@@ -1400,6 +1494,11 @@ final class TerminalView: MTKView, NSTextInputClient {
             duration: duration,
             kind: kind
         ))
+        if kind == .fadeIn {
+            recordRecentCommittedInsertion(text: text, row: row, col: col, columnWidth: columnWidth)
+        } else {
+            discardRecentCommittedInsertion(text: text, row: row, col: col, columnWidth: columnWidth)
+        }
         if committedTextPreviews.count > PreviewPolicy.maxCommittedTextPreviewCount {
             committedTextPreviews.removeFirst(committedTextPreviews.count - PreviewPolicy.maxCommittedTextPreviewCount)
         }
@@ -1418,6 +1517,30 @@ final class TerminalView: MTKView, NSTextInputClient {
         requestDisplayUpdate()
     }
 
+    private func recordRecentCommittedInsertion(text: String, row: Int, col: Int, columnWidth: Int) {
+        let now = CACurrentMediaTime()
+        recentCommittedInsertions.append(
+            RecentCommittedInsertion(
+                text: text,
+                row: row,
+                col: col,
+                columnWidth: columnWidth,
+                recordedAt: now
+            )
+        )
+        if recentCommittedInsertions.count > PreviewPolicy.maxCommittedTextPreviewCount {
+            recentCommittedInsertions.removeFirst(recentCommittedInsertions.count - PreviewPolicy.maxCommittedTextPreviewCount)
+        }
+    }
+
+    private func discardRecentCommittedInsertion(text: String, row: Int, col: Int, columnWidth: Int) {
+        if let index = recentCommittedInsertions.lastIndex(where: {
+            $0.text == text && $0.row == row && $0.col == col && $0.columnWidth == columnWidth
+        }) {
+            recentCommittedInsertions.remove(at: index)
+        }
+    }
+
     private func showCommittedTextPreview(_ text: String) {
         guard shouldAnimateCommittedTextPreview(for: text),
               let controller = terminalController else { return }
@@ -1434,9 +1557,202 @@ final class TerminalView: MTKView, NSTextInputClient {
         )
     }
 
+    private func enqueueCommittedInsertIntentIfNeeded(for text: String) {
+        guard outputConfirmedInputAnimationsEnabled,
+              shouldAnimateCommittedTextPreview(for: text),
+              let controller = terminalController else {
+            return
+        }
+        let cursor = controller.withModel { $0.cursor }
+        let width = columnWidth(for: text)
+        enqueueCommittedTextIntent(
+            kind: .insert,
+            text: text,
+            row: cursor.row,
+            col: cursor.col,
+            columnWidth: width,
+            cursorRow: cursor.row,
+            cursorCol: cursor.col + width
+        )
+    }
+
+    private func fallbackDirectTextInput(for event: NSEvent) -> String? {
+        guard !event.modifierFlags.contains(.command),
+              !event.modifierFlags.contains(.control),
+              !hasMarkedText(),
+              ensureKeyboardHandler()?.debugWillTreatAsRegularTextInput(event: event) == true,
+              let characters = event.characters,
+              shouldAnimateCommittedTextPreview(for: characters) else {
+            return nil
+        }
+        return characters
+    }
+
+    private func enqueueFallbackDeletionIntentIfNeeded(for event: NSEvent) {
+        guard outputConfirmedInputAnimationsEnabled,
+              !hasMarkedText(),
+              let selector = ensureKeyboardHandler()?.debugSpecialKeySelector(for: event) else {
+            return
+        }
+        switch selector {
+        case #selector(NSResponder.deleteBackward(_:)):
+            if let preview = deletionPreview(backward: true),
+               shouldAnimateCommittedTextPreview(for: preview.text) {
+                InputAnimationDiagnostics.log("keyDown fallback enqueue deleteBackward text=\(preview.text.debugDescription)")
+                enqueueCommittedTextIntent(
+                    kind: .deleteBackward,
+                    text: preview.text,
+                    row: preview.row,
+                    col: preview.col,
+                    columnWidth: preview.width,
+                    cursorRow: preview.row,
+                    cursorCol: preview.col
+                )
+            }
+        case #selector(NSResponder.deleteForward(_:)):
+            if let preview = deletionPreview(backward: false),
+               shouldAnimateCommittedTextPreview(for: preview.text) {
+                InputAnimationDiagnostics.log("keyDown fallback enqueue deleteForward text=\(preview.text.debugDescription)")
+                enqueueCommittedTextIntent(
+                    kind: .deleteForward,
+                    text: preview.text,
+                    row: preview.row,
+                    col: preview.col,
+                    columnWidth: preview.width,
+                    cursorRow: preview.row,
+                    cursorCol: preview.col
+                )
+            }
+        default:
+            break
+        }
+    }
+
+    private func currentViewportSnapshot() -> TerminalViewportTextSnapshot? {
+        guard let controller = terminalController else { return nil }
+        return controller.withViewport { model, scrollback, scrollOffset in
+            let rows = model.rows
+            let cols = model.cols
+            let scrollbackRowCount = scrollback.rowCount
+            let firstAbsolute = scrollOffset > 0 ? max(0, scrollbackRowCount - scrollOffset) : scrollbackRowCount
+            let snapshotRows: [[TerminalViewportTextSnapshot.Cell]] = (0..<rows).map { row in
+                let absoluteRow = firstAbsolute + row
+                let isScrollbackRow = absoluteRow < scrollbackRowCount
+                let scrollbackRow = isScrollbackRow ? (scrollback.getRow(at: absoluteRow) ?? []) : nil
+                let gridRow = isScrollbackRow ? -1 : absoluteRow - scrollbackRowCount
+                return (0..<cols).map { col in
+                    let cell: Cell
+                    if let scrollbackRow {
+                        cell = col < scrollbackRow.count ? scrollbackRow[col] : .empty
+                    } else {
+                        cell = model.grid.cell(at: gridRow, col: col)
+                    }
+                    return TerminalViewportTextSnapshot.Cell(
+                        codepoint: cell.codepoint,
+                        width: max(Int(cell.width), 1),
+                        isWideContinuation: cell.isWideContinuation
+                    )
+                }
+            }
+            return TerminalViewportTextSnapshot(
+                rows: rows,
+                cols: cols,
+                scrollOffset: scrollOffset,
+                cursorRow: model.cursor.row,
+                cursorCol: model.cursor.col,
+                cells: snapshotRows
+            )
+        }
+    }
+
+    private func enqueueCommittedTextIntent(
+        kind: CommittedTextAnimationIntent.Kind,
+        text: String,
+        row: Int,
+        col: Int,
+        columnWidth: Int,
+        cursorRow: Int?,
+        cursorCol: Int?
+    ) {
+        guard let snapshot = currentViewportSnapshot() else { return }
+        let now = CACurrentMediaTime()
+        InputAnimationDiagnostics.log(
+            "enqueue kind=\(String(describing: kind)) text=\(text.debugDescription) row=\(row) col=\(col) width=\(columnWidth)"
+        )
+        pendingCommittedTextIntents.append(
+            CommittedTextAnimationIntent(
+                kind: kind,
+                text: text,
+                row: row,
+                col: col,
+                columnWidth: columnWidth,
+                cursorRow: cursorRow,
+                cursorCol: cursorCol,
+                capturedAt: now,
+                expiresAt: now + PreviewPolicy.pendingIntentTimeout,
+                baselineSnapshot: snapshot
+            )
+        )
+        if pendingCommittedTextIntents.count > PreviewPolicy.maxCommittedTextPreviewCount {
+            pendingCommittedTextIntents.removeFirst(
+                pendingCommittedTextIntents.count - PreviewPolicy.maxCommittedTextPreviewCount
+            )
+        }
+        ensurePendingIntentResolutionTimer()
+    }
+
+    private func resolvePendingCommittedTextIntentsIfNeeded() {
+        guard outputConfirmedInputAnimationsEnabled,
+              !pendingCommittedTextIntents.isEmpty,
+              let currentSnapshot = currentViewportSnapshot() else {
+            return
+        }
+        let now = CACurrentMediaTime()
+        InputAnimationDiagnostics.log(
+            "resolve intents=\(pendingCommittedTextIntents.count) cursor=(\(currentSnapshot.cursorRow),\(currentSnapshot.cursorCol))"
+        )
+        var remaining: [CommittedTextAnimationIntent] = []
+        remaining.reserveCapacity(pendingCommittedTextIntents.count)
+        for intent in pendingCommittedTextIntents {
+            let evaluation = CommittedTextAnimationMatcher.evaluate(intent, currentSnapshot: currentSnapshot, now: now)
+            InputAnimationDiagnostics.log(
+                "evaluate kind=\(String(describing: intent.kind)) text=\(intent.text.debugDescription) row=\(intent.row) col=\(intent.col) result=\(String(describing: evaluation))"
+            )
+            if intent.kind == .insert {
+                InputAnimationDiagnostics.log(
+                    "candidates \(CommittedTextAnimationMatcher.debugDescribeInsertCandidates(for: intent, currentSnapshot: currentSnapshot))"
+                )
+            }
+            switch evaluation {
+            case .pending:
+                remaining.append(intent)
+            case .discard:
+                continue
+            case .matched(let match):
+                showCommittedTextPreview(
+                    text: match.text,
+                    row: match.row,
+                    col: match.col,
+                    columnWidth: match.columnWidth,
+                    cursorRow: match.cursorRow,
+                    cursorCol: match.cursorCol,
+                    kind: match.kind == .fadeIn ? .fadeIn : .fadeOut,
+                    duration: match.kind == .fadeIn ? 0.20 : 0.34
+                )
+            }
+        }
+        pendingCommittedTextIntents = remaining
+        if pendingCommittedTextIntents.isEmpty {
+            pendingIntentResolutionTimer?.invalidate()
+            pendingIntentResolutionTimer = nil
+        } else {
+            ensurePendingIntentResolutionTimer()
+        }
+    }
+
     private func deletionPreview(backward: Bool) -> (text: String, row: Int, col: Int, width: Int)? {
         guard let controller = terminalController else { return nil }
-        return controller.withModel { model -> (text: String, row: Int, col: Int, width: Int)? in
+        if let modelPreview = controller.withModel({ model -> (text: String, row: Int, col: Int, width: Int)? in
             let row = model.cursor.row
             let baseCol = backward ? model.cursor.col - 1 : model.cursor.col
             guard row >= 0, row < model.rows, baseCol >= 0, baseCol < model.cols else { return nil }
@@ -1455,7 +1771,12 @@ final class TerminalView: MTKView, NSTextInputClient {
             }
 
             return (String(scalar), row, targetCol, max(Int(cell.width), 1))
+        }) {
+            return modelPreview
         }
+        guard backward else { return nil }
+        guard let recent = recentCommittedInsertions.last else { return nil }
+        return (recent.text, recent.row, recent.col, recent.columnWidth)
     }
 
     private func showDeletionPreview(backward: Bool) {
@@ -1533,11 +1854,18 @@ extension TerminalView {
         guard !text.isEmpty else { return }
         let shouldShowCommittedPreview = shouldAnimateCommittedTextPreview(for: text)
         pendingTextInputHandled = true
+        InputAnimationDiagnostics.log(
+            "insertText text=\(text.debugDescription) animate=\(shouldShowCommittedPreview) outputConfirmed=\(outputConfirmedInputAnimationsEnabled)"
+        )
         markedTextStorage = nil
         markedTextSelection = NSRange(location: NSNotFound, length: 0)
         destroyMarkedTextLayer()
         if shouldShowCommittedPreview {
-            showCommittedTextPreview(text)
+            if outputConfirmedInputAnimationsEnabled {
+                enqueueCommittedInsertIntentIfNeeded(for: text)
+            } else {
+                showCommittedTextPreview(text)
+            }
         }
         controller.sendInput(text)
     }
@@ -1609,9 +1937,37 @@ extension TerminalView {
         if !hasMarkedText() {
             switch selector {
             case #selector(NSResponder.deleteBackward(_:)):
-                showDeletionPreview(backward: true)
+                if outputConfirmedInputAnimationsEnabled,
+                   let preview = deletionPreview(backward: true),
+                   shouldAnimateCommittedTextPreview(for: preview.text) {
+                    enqueueCommittedTextIntent(
+                        kind: .deleteBackward,
+                        text: preview.text,
+                        row: preview.row,
+                        col: preview.col,
+                        columnWidth: preview.width,
+                        cursorRow: preview.row,
+                        cursorCol: preview.col
+                    )
+                } else {
+                    showDeletionPreview(backward: true)
+                }
             case #selector(NSResponder.deleteForward(_:)):
-                showDeletionPreview(backward: false)
+                if outputConfirmedInputAnimationsEnabled,
+                   let preview = deletionPreview(backward: false),
+                   shouldAnimateCommittedTextPreview(for: preview.text) {
+                    enqueueCommittedTextIntent(
+                        kind: .deleteForward,
+                        text: preview.text,
+                        row: preview.row,
+                        col: preview.col,
+                        columnWidth: preview.width,
+                        cursorRow: preview.row,
+                        cursorCol: preview.col
+                    )
+                } else {
+                    showDeletionPreview(backward: false)
+                }
             default:
                 break
             }

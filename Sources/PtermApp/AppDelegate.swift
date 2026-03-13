@@ -603,6 +603,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sv = TerminalScrollView(frame: availableContentFrame(), renderer: renderer)
         sv.autoresizingMask = [.width, .height]
         sv.shortcutConfiguration = config.shortcuts
+        sv.terminalView.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
         sv.terminalView.terminalController = controller
         sv.terminalView.imagePreviewURLProvider = { [weak self] index in
             self?.pastedImageRegistry.url(forPlaceholderIndex: index)
@@ -662,6 +663,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                    controllers: controllers)
         splitView.autoresizingMask = [.width, .height]
         splitView.shortcutConfiguration = config.shortcuts
+        splitView.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
         splitView.imagePreviewURLProvider = { [weak self] index in
             self?.pastedImageRegistry.url(forPlaceholderIndex: index)
         }
@@ -1066,7 +1068,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         manager.updateConfiguration(config)
         setupMenu()
         terminalView?.shortcutConfiguration = config.shortcuts
+        terminalView?.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
         splitContainerView?.shortcutConfiguration = config.shortcuts
+        splitContainerView?.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
         integratedView?.shortcutConfiguration = config.shortcuts
         renderer.updateTerminalAppearance(config.terminalAppearance)
 

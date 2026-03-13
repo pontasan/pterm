@@ -67,6 +67,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var launchShellsTableView: NSTableView?
     private var launchShellsValues: [String] = []
     private var encodingPopup: NSPopUpButton?
+    private var outputConfirmedInputAnimationCheck: NSButton?
     private var scrollPersistenceCheck: NSButton?
     private var fontNameLabel: NSTextField?
     private var fontSizeStepper: NSStepper?
@@ -182,6 +183,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
         resetSection("session", removing: ["scroll_buffer_persistence"])
         resetSection("shells", removing: ["launch_order"])
+        resetSection("text_interaction", removing: ["output_confirmed_input_animation"])
         resetSection("appearance", removing: [
             "terminal_foreground_color",
             "terminal_background_color",
@@ -337,6 +339,26 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         encPopup.action = #selector(encodingChanged(_:))
         encodingPopup = encPopup
         addView(encRow, 28)
+        addSpacing(12)
+
+        let textInteraction = configData["text_interaction"] as? [String: Any]
+        let outputConfirmedInputAnimation = (textInteraction?["output_confirmed_input_animation"] as? Bool) ?? false
+        let outputConfirmedCheck = makeCheckbox(
+            "Output-confirm input animations",
+            checked: outputConfirmedInputAnimation
+        )
+        outputConfirmedCheck.target = self
+        outputConfirmedCheck.action = #selector(outputConfirmedInputAnimationChanged(_:))
+        outputConfirmedInputAnimationCheck = outputConfirmedCheck
+        addView(outputConfirmedCheck, 22)
+        addSpacing(2)
+        addView(
+            makeDescriptionLabel(
+                "When enabled, input and delete animations start only after matching PTY output confirms the visible result.",
+                width: width
+            ),
+            28
+        )
         addSpacing(16)
 
         let session = configData["session"] as? [String: Any]
@@ -623,6 +645,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     @objc private func encodingChanged(_ sender: NSPopUpButton) {
         let map = ["UTF-8": "utf-8", "UTF-16": "utf-16", "UTF-16LE": "utf-16le", "UTF-16BE": "utf-16be"]
         configData["text_encoding"] = map[sender.titleOfSelectedItem ?? "UTF-8"] ?? "utf-8"
+        commitConfigChange()
+    }
+
+    @objc private func outputConfirmedInputAnimationChanged(_ sender: NSButton) {
+        var textInteraction = (configData["text_interaction"] as? [String: Any]) ?? [:]
+        textInteraction["output_confirmed_input_animation"] = (sender.state == .on)
+        configData["text_interaction"] = textInteraction
         commitConfigChange()
     }
 

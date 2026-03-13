@@ -98,10 +98,19 @@ struct ShellLaunchConfiguration: Equatable {
     }
 }
 
+struct TextInteractionConfiguration: Equatable {
+    let outputConfirmedInputAnimation: Bool
+
+    static let `default` = TextInteractionConfiguration(
+        outputConfirmedInputAnimation: true
+    )
+}
+
 struct PtermConfig {
     let term: String
     let textEncoding: TerminalTextEncoding
     let shellLaunch: ShellLaunchConfiguration
+    let textInteraction: TextInteractionConfiguration
     let fontName: String?
     let fontSize: Double?
     let terminalAppearance: TerminalAppearanceConfiguration
@@ -117,6 +126,7 @@ struct PtermConfig {
         term: TerminfoResolver.resolveConfiguredTerm(nil),
         textEncoding: .utf8,
         shellLaunch: .default,
+        textInteraction: .default,
         fontName: nil,
         fontSize: nil,
         terminalAppearance: .default,
@@ -230,6 +240,7 @@ enum PtermConfigStore {
         let security = dictionaryValue(root["security"])
         let shortcuts = dictionaryValue(root["shortcuts"])
         let shells = dictionaryValue(root["shells"])
+        let textInteraction = dictionaryValue(root["text_interaction"])
         let workspaces = workspaceList(root["workspaces"])
 
         return PtermConfig(
@@ -237,6 +248,9 @@ enum PtermConfigStore {
             textEncoding: stringValue(root["text_encoding"]).flatMap(TerminalTextEncoding.init(configuredValue:)) ?? defaults.textEncoding,
             shellLaunch: ShellLaunchConfiguration(
                 launchOrder: stringArrayValue(shells?["launch_order"]) ?? defaults.shellLaunch.launchOrder
+            ),
+            textInteraction: TextInteractionConfiguration(
+                outputConfirmedInputAnimation: boolValue(textInteraction?["output_confirmed_input_animation"]) ?? defaults.textInteraction.outputConfirmedInputAnimation
             ),
             fontName: stringValue(font?["name"]) ?? stringValue(root["font_name"]),
             fontSize: normalizedFontSize(doubleValue(font?["size"]) ?? doubleValue(root["font_size"])),
