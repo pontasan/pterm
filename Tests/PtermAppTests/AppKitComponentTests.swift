@@ -3246,6 +3246,23 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(IntegratedView.effectiveOutputContentRedrawInterval(visibleTerminalCount: 32), 1.0, accuracy: 0.0001)
     }
 
+    func testIntegratedViewVerticallyCenteredTextOriginCentersGlyphBoundsInsideTitleBar() {
+        let frame = NSRect(x: 10, y: 20, width: 200, height: 24)
+        let originY = IntegratedView.verticallyCenteredTextOriginY(
+            frame: frame,
+            scaleFactor: 2.0,
+            contentMinY: 3.0,
+            contentHeight: 12.0
+        )
+
+        let renderedMinY = originY + 3.0
+        let renderedMaxY = renderedMinY + 12.0
+        let frameMinY = Float(frame.minY) * 2.0
+        let frameMaxY = Float(frame.maxY) * 2.0
+
+        XCTAssertEqual((renderedMinY + renderedMaxY) / 2, (frameMinY + frameMaxY) / 2, accuracy: 0.001)
+    }
+
     func testIntegratedViewDeinitReleasesRendererBuffers() throws {
         let renderer = try makeRendererWithPipelinesOrSkip()
         weak var weakView: IntegratedView?

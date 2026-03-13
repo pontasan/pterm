@@ -90,6 +90,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private struct CachedTextVertices {
         let vertices: [Float]
         let width: Float
+        let minY: Float
+        let height: Float
 
         var byteCount: Int {
             vertices.count * MemoryLayout<Float>.stride
@@ -98,6 +100,17 @@ final class IntegratedView: MTKView, NSDraggingSource {
         var storageByteCount: Int {
             vertices.capacity * MemoryLayout<Float>.stride
         }
+    }
+
+    static func verticallyCenteredTextOriginY(
+        frame: NSRect,
+        scaleFactor: Float,
+        contentMinY: Float,
+        contentHeight: Float
+    ) -> Float {
+        let frameY = Float(frame.origin.y) * scaleFactor
+        let frameHeight = Float(frame.height) * scaleFactor
+        return frameY + (frameHeight - contentHeight) / 2 - contentMinY
     }
 
     private struct ThumbnailSurfaceSignature: Hashable {
@@ -869,7 +882,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
             glyphScaleBits: Float(1).bitPattern,
             colorBits: (Float(1).bitPattern, Float(1).bitPattern, Float(1).bitPattern, Float(1).bitPattern)
         )
-        textVertexCache[key] = CachedTextVertices(vertices: Array(repeating: 1, count: floatCount), width: 0)
+        textVertexCache[key] = CachedTextVertices(vertices: Array(repeating: 1, count: floatCount), width: 0, minY: 0, height: 0)
     }
 
     func debugInsertOversizedThumbnailVertexCacheEntries(floatCountPerEntry: Int) {
@@ -2825,10 +2838,9 @@ extension IntegratedView: MTKViewDelegate {
         glyphVertices: inout [Float]
     ) {
         let textX = frame.minX + Layout.closeButtonSize + 8
-        let halfGlyph = renderer.glyphAtlas.cellHeight * 0.5
         drawRightAlignedTitleText(
             text: text,
-            frame: NSRect(x: textX, y: frame.minY + halfGlyph - 4, width: frame.width - Layout.closeButtonSize - 8, height: frame.height),
+            frame: NSRect(x: textX, y: frame.minY, width: frame.width - Layout.closeButtonSize - 8, height: frame.height),
             scaleFactor: scaleFactor,
             viewportSize: viewportSize,
             color: Self.uiWorkspaceHeaderTextColor(alpha: 1.0),
@@ -2849,13 +2861,22 @@ extension IntegratedView: MTKViewDelegate {
     ) {
         let maxChars = Int(frame.width / renderer.glyphAtlas.cellWidth) - 2 // Leave room for close button
         let displayTitle = String(title.prefix(max(0, maxChars)))
-        appendTextVertices(
-            text: displayTitle,
+        let titleVertices = textVertices(
+            for: displayTitle,
             scaleFactor: scaleFactor,
             glyphScale: 0.85,
             color: Self.uiTitleTextColor(alpha: 1.0),
-            originX: Float(frame.origin.x + Layout.closeButtonSize + 8) * scaleFactor,
-            originY: Float(frame.origin.y + (Layout.titleBarHeight - renderer.glyphAtlas.cellHeight) / 2) * scaleFactor,
+            useCache: true
+        )
+        appendTranslatedVertices(
+            titleVertices.vertices,
+            dx: Float(frame.origin.x + Layout.closeButtonSize + 8) * scaleFactor,
+            dy: Self.verticallyCenteredTextOriginY(
+                frame: frame,
+                scaleFactor: scaleFactor,
+                contentMinY: titleVertices.minY,
+                contentHeight: titleVertices.height
+            ),
             to: &glyphVertices
         )
 
@@ -2912,7 +2933,12 @@ extension IntegratedView: MTKViewDelegate {
         } else {
             startX = Float(frame.maxX) * scaleFactor - cached.width - 8 * scaleFactor
         }
-        let textY = Float(frame.origin.y + (Layout.titleBarHeight - renderer.glyphAtlas.cellHeight) / 2) * scaleFactor
+        let textY = Self.verticallyCenteredTextOriginY(
+            frame: frame,
+            scaleFactor: scaleFactor,
+            contentMinY: cached.minY,
+            contentHeight: cached.height
+        )
         appendTranslatedVertices(cached.vertices, dx: startX, dy: textY, to: &glyphVertices)
     }
 
@@ -3502,9 +3528,32 @@ extension IntegratedView: MTKViewDelegate {
             )
         }
 
+        let glyphWidth = Float(chars.count) * cellW
+        guard !vertices.isEmpty else {
+            return CachedTextVertices(
+                vertices: Array(vertices),
+                width: glyphWidth,
+                minY: 0,
+                height: cellH
+            )
+        }
+
+        var minY = Float.greatestFiniteMagnitude
+        var maxY = -Float.greatestFiniteMagnitude
+        var index = 0
+        while index < vertices.count {
+            let y = vertices[index + 1]
+            let h = vertices[index + 3]
+            minY = min(minY, y)
+            maxY = max(maxY, y + h)
+            index += 12
+        }
+
         return CachedTextVertices(
             vertices: Array(vertices),
-            width: Float(chars.count) * cellW
+            width: glyphWidth,
+            minY: minY,
+            height: max(0, maxY - minY)
         )
     }
 
