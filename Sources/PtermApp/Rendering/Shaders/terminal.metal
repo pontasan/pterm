@@ -120,10 +120,9 @@ fragment float4 cursor_fragment(
 ) {
     float alpha;
     if (uniforms.cursorBlink > 0.5) {
-        // Smooth fade using sine wave for gentle blinking
-        alpha = 0.5 + 0.5 * sin(uniforms.time * 2.5);
-        // Clamp to never fully disappear (keep minimum visibility)
-        alpha = 0.3 + alpha * 0.7;
+        // Keep blink subtle to avoid whole-cell flicker on idle terminals.
+        alpha = 0.5 + 0.5 * sin(uniforms.time * 2.0);
+        alpha = 0.78 + alpha * 0.22;
     } else {
         alpha = 1.0;
     }

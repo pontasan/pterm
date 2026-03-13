@@ -627,6 +627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         focusedController = controller
 
         viewMode = .focused(controller)
+        applyAppearanceSettingsToVisibleViews()
         updateTitlebarBackButtonVisibility()
         refreshStatusBarMetrics()
         window.makeFirstResponder(sv.terminalView)
@@ -684,6 +685,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         splitContainerView?.applyAppearanceSettings()
         splitOriginControllers = nil
         viewMode = .split(controllers)
+        applyAppearanceSettingsToVisibleViews()
         updateTitlebarBackButtonVisibility()
         refreshStatusBarMetrics()
         if let activeController = splitView.activeController {
@@ -726,9 +728,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         contentHostView().addSubview(iv)
         setupScrollbarOverlay(for: iv)
         activeOutputTerminalIDs.forEach { _ = iv.setTerminalOutputActive($0, isActive: true) }
+        viewMode = .integrated
         applyAppearanceSettingsToVisibleViews()
         iv.syncScaleFactorIfNeeded()
-        viewMode = .integrated
         updateTitlebarBackButtonVisibility()
         refreshStatusBarMetrics()
         window.makeFirstResponder(iv)
@@ -1173,10 +1175,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Update the window title based on current view mode.
     private func updateWindowTitle() {
+        let newTitle: String
         switch viewMode {
         case .integrated:
             let count = manager.count
-            window.title = "pterm — \(count) terminal(s)"
+            newTitle = "pterm — \(count) terminal(s)"
 
         case .focused(let controller):
             var parts: [String] = []
@@ -1194,10 +1197,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 parts.append("\(model.cols)×\(model.rows)")
             }
 
-            window.title = parts.joined(separator: " — ")
+            newTitle = parts.joined(separator: " — ")
         case .split(let controllers):
-            window.title = "pterm — split (\(controllers.count))"
+            newTitle = "pterm — split (\(controllers.count))"
         }
+        guard window.title != newTitle else { return }
+        window.title = newTitle
     }
 
     // MARK: - Actions
@@ -2471,6 +2476,7 @@ extension AppDelegate: NSWindowDelegate {
             rootView?.layer?.backgroundColor = backgroundColor.cgColor
             hostedContentView.layer?.backgroundColor = backgroundColor.cgColor
         }
+        statusBarView?.setTranslucentBackground(usesTranslucentMaterial)
     }
 
     private func applyAppearanceSettingsToVisibleViews() {

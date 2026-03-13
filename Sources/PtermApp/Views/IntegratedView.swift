@@ -1056,20 +1056,24 @@ final class IntegratedView: MTKView, NSDraggingSource {
         if newScale != renderer.glyphAtlas.scaleFactor {
             renderer.glyphAtlas.updateScaleFactor(newScale)
         }
-        // Ensure drawable matches Retina pixel dimensions
-        let expectedSize = CGSize(width: bounds.width * newScale, height: bounds.height * newScale)
-        if drawableSize != .zero,
-           (abs(drawableSize.width - expectedSize.width) > 1 || abs(drawableSize.height - expectedSize.height) > 1) {
-            drawableSize = expectedSize
+        _ = syncDrawableSizeToBoundsIfNeeded()
+    }
+
+    @discardableResult
+    private func syncDrawableSizeToBoundsIfNeeded() -> Bool {
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        let expectedSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        guard expectedSize.width > 0, expectedSize.height > 0 else { return false }
+        guard abs(drawableSize.width - expectedSize.width) > 1 ||
+                abs(drawableSize.height - expectedSize.height) > 1 else {
+            return false
         }
+        drawableSize = expectedSize
+        return true
     }
 
     private func ensureDrawableStorageAllocatedIfNeeded() {
-        guard drawableSize == .zero else { return }
-        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
-        let expectedSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
-        guard expectedSize.width > 0, expectedSize.height > 0 else { return }
-        drawableSize = expectedSize
+        _ = syncDrawableSizeToBoundsIfNeeded()
     }
 
     private func applyRenderTargetColorSpace() {
@@ -1085,11 +1089,15 @@ final class IntegratedView: MTKView, NSDraggingSource {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         invalidateLayoutCache()
+        _ = syncDrawableSizeToBoundsIfNeeded()
+        setNeedsDisplay(bounds)
     }
 
     override func setBoundsSize(_ newSize: NSSize) {
         super.setBoundsSize(newSize)
         invalidateLayoutCache()
+        _ = syncDrawableSizeToBoundsIfNeeded()
+        setNeedsDisplay(bounds)
     }
 
     override func setNeedsDisplay(_ invalidRect: NSRect) {

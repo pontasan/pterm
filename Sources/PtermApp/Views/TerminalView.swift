@@ -332,13 +332,22 @@ final class TerminalView: MTKView, NSTextInputClient {
         return CGSize(width: bounds.width * scale, height: bounds.height * scale)
     }
 
-    private func ensureDrawableStorageAllocatedIfNeeded() {
-        guard !renderingSuppressed else { return }
-        guard drawableSize == .zero else { return }
+    @discardableResult
+    private func syncDrawableSizeToBoundsIfNeeded() -> Bool {
+        guard !renderingSuppressed else { return false }
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
         let expectedSize = expectedDrawableSize(for: scale)
-        guard expectedSize.width > 0, expectedSize.height > 0 else { return }
+        guard expectedSize.width > 0, expectedSize.height > 0 else { return false }
+        guard abs(drawableSize.width - expectedSize.width) > 1 ||
+                abs(drawableSize.height - expectedSize.height) > 1 else {
+            return false
+        }
         drawableSize = expectedSize
+        return true
+    }
+
+    private func ensureDrawableStorageAllocatedIfNeeded() {
+        _ = syncDrawableSizeToBoundsIfNeeded()
     }
 
     private func updateSuppressedRenderingState() {
@@ -404,6 +413,10 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     private func releaseIdleReusableBuffersNow() {
         guard demandDrivenRendering, !renderingSuppressed else { return }
+        if window?.isKeyWindow == true, window?.firstResponder === self {
+            scheduleIdleBufferRelease()
+            return
+        }
         renderer?.releaseTerminalBuffers(for: self)
         _ = renderer?.compactIdleGlyphAtlas()
         keyboardHandler = nil
@@ -1216,15 +1229,19 @@ final class TerminalView: MTKView, NSTextInputClient {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         hideImagePreview()
+        _ = syncDrawableSizeToBoundsIfNeeded()
         updateTerminalSize()
         updateMarkedTextOverlay()
+        requestDisplayUpdate()
     }
 
     override func setBoundsSize(_ newSize: NSSize) {
         super.setBoundsSize(newSize)
         hideImagePreview()
+        _ = syncDrawableSizeToBoundsIfNeeded()
         updateTerminalSize()
         updateMarkedTextOverlay()
+        requestDisplayUpdate()
     }
 
     private func updateTerminalSize() {
@@ -1446,6 +1463,7 @@ final class TerminalView: MTKView, NSTextInputClient {
             columnWidth: committedTextPreview.columnWidth,
             cursorRow: committedTextPreview.cursorRow,
             cursorCol: committedTextPreview.cursorCol,
+            masksGridGlyphs: committedTextPreview.kind == .fadeIn,
             verticalOffset: committedTextPreview.kind == .fadeOut ? Float(20.0 * easedFall(progress)) : 0,
             alpha: alpha
         )
@@ -1839,12 +1857,14 @@ extension TerminalView: MTKViewDelegate {
 
         let border = effectiveBorderConfig()
         let committedTextPreviews = activeCommittedTextPreviewOverlays()
+        let suppressCursorBlink = !committedTextPreviews.isEmpty || !pendingCommittedTextIntents.isEmpty || hasMarkedText()
         controller.withViewport { model, scrollback, scrollOffset in
             renderer.render(model: model, scrollback: scrollback,
                           scrollOffset: scrollOffset, selection: selection,
                           searchHighlight: highlight, linkUnderline: linkUL,
                           borderConfig: border,
                           transientTextOverlays: committedTextPreviews,
+                          suppressCursorBlink: suppressCursorBlink,
                           in: view)
         }
         scheduleIdleBufferRelease()

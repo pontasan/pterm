@@ -107,6 +107,24 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(labels.first(where: { $0.stringValue == "|" })?.isHidden, true)
     }
 
+    func testStatusBarCanSwitchToTranslucentBackground() {
+        let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
+
+        view.setTranslucentBackground(true)
+
+        XCTAssertEqual(view.layer?.backgroundColor, NSColor.clear.cgColor)
+    }
+
+    func testStatusBarCanSwitchBackToSolidBackground() {
+        let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
+        let expected = NSColor(calibratedWhite: 0.08, alpha: 1).cgColor
+
+        view.setTranslucentBackground(true)
+        view.setTranslucentBackground(false)
+
+        XCTAssertEqual(view.layer?.backgroundColor, expected)
+    }
+
     func testSettingsWindowControllerBuildsExpectedWindowShell() throws {
         try withIsolatedSettingsController { controller in
             let window = controller.window
@@ -163,9 +181,14 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(AppDelegate.shouldUseTranslucentWindowMaterial(isIntegratedViewVisible: true, terminalBackgroundOpacity: 0.0))
     }
 
-    func testWindowMaterialPolicyUsesOpacityOutsideIntegratedView() {
+    func testWindowMaterialPolicyDisablesTranslucencyOnlyForOpaqueNonIntegratedViews() {
         XCTAssertFalse(AppDelegate.shouldUseTranslucentWindowMaterial(isIntegratedViewVisible: false, terminalBackgroundOpacity: 1.0))
+        XCTAssertFalse(AppDelegate.shouldUseTranslucentWindowMaterial(isIntegratedViewVisible: false, terminalBackgroundOpacity: 0.999))
+    }
+
+    func testWindowMaterialPolicyKeepsTranslucencyForTransparentFocusedTerminalBackgrounds() {
         XCTAssertTrue(AppDelegate.shouldUseTranslucentWindowMaterial(isIntegratedViewVisible: false, terminalBackgroundOpacity: 0.5))
+        XCTAssertTrue(AppDelegate.shouldUseTranslucentWindowMaterial(isIntegratedViewVisible: false, terminalBackgroundOpacity: 0.0))
     }
 
     func testSettingsWindowControllerUsesDarkAppearanceAndSpecifiedInitialSize() throws {
@@ -2244,6 +2267,38 @@ final class AppKitComponentTests: XCTestCase {
         }
     }
 
+    func testTerminalViewResizeImmediatelyUpdatesDrawableSizeBeforeNextDraw() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let controller = TerminalController(
+            rows: 8,
+            cols: 20,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.testBackingScaleFactor = 2.0
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        window.makeKeyAndOrderFront(nil)
+        drainMainQueue(testCase: self)
+
+        renderFrame(for: view)
+        XCTAssertEqual(view.drawableSize.width, 640, accuracy: 1.0)
+        XCTAssertEqual(view.drawableSize.height, 320, accuracy: 1.0)
+
+        view.setFrameSize(NSSize(width: 500, height: 260))
+
+        XCTAssertEqual(view.drawableSize.width, 1000, accuracy: 1.0)
+        XCTAssertEqual(view.drawableSize.height, 520, accuracy: 1.0)
+    }
+
     func testSplitTerminalContainerBuildsGridWithOverlayAndControllers() throws {
         let renderer = try makeRendererOrSkip()
         let controllers = (0..<3).map { index in
@@ -2384,6 +2439,47 @@ final class AppKitComponentTests: XCTestCase {
 
         XCTAssertGreaterThan(view.drawableSize.width, 0)
         XCTAssertGreaterThan(view.drawableSize.height, 0)
+    }
+
+    func testTerminalViewIdlePurgeKeepsDrawableForFocusedFirstResponder() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let controller = TerminalController(
+            rows: 6,
+            cols: 24,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/focused-terminal"
+        )
+        controller.withModel { model in
+            for (column, scalar) in "focused idle".unicodeScalars.enumerated() {
+                model.grid.setCell(Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: column)
+            }
+        }
+
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 200), renderer: renderer)
+        view.terminalController = controller
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        window.makeKeyAndOrderFront(nil)
+        drainMainQueue(testCase: self)
+        window.makeFirstResponder(view)
+        drainMainQueue(testCase: self)
+        view.syncScaleFactorIfNeeded()
+        _ = renderer.reusableBuffer(
+            for: view,
+            slot: .overviewTextGlyph,
+            vertices: Array(repeating: 1, count: 256)
+        )
+
+        XCTAssertNotNil(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
+        view.debugReleaseIdleBuffersNow()
+
+        XCTAssertNotNil(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
     }
 
     func testTerminalViewInactiveReleaseDropsDrawableAndBuffersImmediately() throws {
@@ -2557,6 +2653,24 @@ final class AppKitComponentTests: XCTestCase {
         splitRenderView.viewDidChangeBackingProperties()
 
         XCTAssertEqual(splitRenderView.layer?.contentsScale, 3.0)
+    }
+
+    func testSplitRenderViewResizeImmediatelyUpdatesDrawableSizeBeforeNextDraw() throws {
+        let renderer = try makeRendererOrSkip()
+        let splitRenderView = SplitRenderView(frame: NSRect(x: 0, y: 0, width: 420, height: 260), renderer: renderer)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 320))
+        window.testBackingScaleFactor = 2.0
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(splitRenderView)
+
+        splitRenderView.viewDidMoveToWindow()
+        XCTAssertEqual(splitRenderView.drawableSize.width, 840.0, accuracy: 0.5)
+        XCTAssertEqual(splitRenderView.drawableSize.height, 520.0, accuracy: 0.5)
+
+        splitRenderView.setFrameSize(NSSize(width: 500, height: 280))
+
+        XCTAssertEqual(splitRenderView.drawableSize.width, 1000.0, accuracy: 0.5)
+        XCTAssertEqual(splitRenderView.drawableSize.height, 560.0, accuracy: 0.5)
     }
 
     func testSplitRenderViewSyncScaleFactorIfNeededUpdatesDrawableSizeAndAtlasScale() throws {
@@ -4753,6 +4867,28 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(renderer.glyphAtlas.scaleFactor, 2.0)
         XCTAssertEqual(Double(view.drawableSize.width), 1280, accuracy: 1.0)
         XCTAssertEqual(Double(view.drawableSize.height), 720, accuracy: 1.0)
+    }
+
+    func testIntegratedViewResizeImmediatelyUpdatesDrawableSizeBeforeNextDraw() throws {
+        guard let renderer = MetalRenderer(scaleFactor: 2.0) else {
+            throw XCTSkip("Metal unavailable")
+        }
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 640, height: 360), renderer: renderer, manager: manager)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 420))
+        window.testBackingScaleFactor = 2.0
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+
+        view.viewDidMoveToWindow()
+        XCTAssertEqual(Double(view.drawableSize.width), 1280, accuracy: 1.0)
+        XCTAssertEqual(Double(view.drawableSize.height), 720, accuracy: 1.0)
+
+        view.setFrameSize(NSSize(width: 500, height: 280))
+
+        XCTAssertEqual(Double(view.drawableSize.width), 1000, accuracy: 1.0)
+        XCTAssertEqual(Double(view.drawableSize.height), 560, accuracy: 1.0)
     }
 
     func testSplitTerminalContainerRespondsToSimulatedDisplayScaleChangeAcrossOverlayAndTerminalViews() throws {

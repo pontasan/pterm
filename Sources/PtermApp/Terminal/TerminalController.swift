@@ -360,16 +360,21 @@ final class TerminalController {
         let normalized = Self.displayDirectoryName(for: path)
         let expandedPath = (path as NSString).expandingTildeInPath
 
-        let titleOverridden = lock.withWriteLock { () -> Bool in
+        let updateResult = lock.withWriteLock { () -> (titleOverridden: Bool, changed: Bool) in
             let overridden = customTitle != nil
+            let changed = currentDirectoryPath != expandedPath || currentDirectory != normalized
+            guard changed else {
+                return (overridden, false)
+            }
             currentDirectoryPath = expandedPath
             currentDirectory = normalized
-            return overridden
+            return (overridden, true)
         }
+        guard updateResult.changed else { return }
 
         DispatchQueue.main.async { [weak self] in
             self?.onStateChange?()
-            if !titleOverridden {
+            if !updateResult.titleOverridden {
                 self?.onTitleChange?(normalized)
             }
         }

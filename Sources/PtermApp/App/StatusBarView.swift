@@ -1,12 +1,20 @@
 import AppKit
 
 final class StatusBarView: NSView {
+    private enum Style {
+        case solid
+        case translucent
+    }
+
     private let metricsLabel = NSTextField(labelWithString: "CPU: --.-% | MEM: -- MB")
+    private let metricsTemplateLabel = NSTextField(labelWithString: "CPU: 999.9% | MEM: 99999MB")
     private var currentCpu: Double = 0
     private var currentMemBytes: UInt64 = 0
+    private var metricsLabelWidth: CGFloat = 0
     private let backButton: NSButton
     private let separatorLabel: NSTextField
     private let noteButton: NSButton
+    private var style: Style = .solid
     var onBackToIntegrated: (() -> Void)?
     var onOpenNote: (() -> Void)?
 
@@ -21,7 +29,7 @@ final class StatusBarView: NSView {
         noteButton.action = #selector(noteButtonClicked)
 
         wantsLayer = true
-        layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1).cgColor
+        applyCurrentStyle()
 
         let textColor = NSColor(calibratedWhite: 0.7, alpha: 1)
         let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
@@ -30,6 +38,9 @@ final class StatusBarView: NSView {
         metricsLabel.font = font
         metricsLabel.alignment = .right
         addSubview(metricsLabel)
+        metricsTemplateLabel.font = font
+        metricsTemplateLabel.sizeToFit()
+        metricsLabelWidth = ceil(metricsTemplateLabel.frame.width)
 
         backButton.bezelStyle = .recessed
         backButton.isBordered = false
@@ -82,9 +93,8 @@ final class StatusBarView: NSView {
         noteButton.frame = NSRect(x: x, y: vertInset, width: noteButton.frame.width, height: height)
 
         // Right side: metrics
-        metricsLabel.sizeToFit()
-        let metricsX = bounds.width - inset - metricsLabel.frame.width
-        metricsLabel.frame = NSRect(x: metricsX, y: vertInset, width: metricsLabel.frame.width, height: height)
+        let metricsX = bounds.width - inset - metricsLabelWidth
+        metricsLabel.frame = NSRect(x: metricsX, y: vertInset, width: metricsLabelWidth, height: height)
     }
 
     func updateMemoryUsage(bytes: UInt64) {
@@ -99,14 +109,31 @@ final class StatusBarView: NSView {
 
     private func refreshMetricsLabel() {
         let megabytes = Double(currentMemBytes) / (1024 * 1024)
-        metricsLabel.stringValue = String(format: "CPU: %.1f%% | MEM: %.0fMB", currentCpu, megabytes)
-        needsLayout = true
+        let formatted = String(format: "CPU: %.1f%% | MEM: %.0fMB", currentCpu, megabytes)
+        guard metricsLabel.stringValue != formatted else { return }
+        metricsLabel.stringValue = formatted
     }
 
     func setBackButtonVisible(_ visible: Bool) {
         backButton.isHidden = !visible
         separatorLabel.isHidden = !visible
         needsLayout = true
+    }
+
+    func setTranslucentBackground(_ translucent: Bool) {
+        let newStyle: Style = translucent ? .translucent : .solid
+        guard style != newStyle else { return }
+        style = newStyle
+        applyCurrentStyle()
+    }
+
+    private func applyCurrentStyle() {
+        switch style {
+        case .solid:
+            layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1).cgColor
+        case .translucent:
+            layer?.backgroundColor = NSColor.clear.cgColor
+        }
     }
 
     @objc private func backButtonClicked() {

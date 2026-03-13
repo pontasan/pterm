@@ -618,6 +618,7 @@ final class MetalRenderer {
         let columnWidth: Int
         let cursorRow: Int?
         let cursorCol: Int?
+        let masksGridGlyphs: Bool
         let verticalOffset: Float
         let alpha: Float
     }
@@ -628,6 +629,7 @@ final class MetalRenderer {
                 linkUnderline: LinkUnderline? = nil,
                 borderConfig: BorderConfig? = nil,
                 transientTextOverlays: [TransientTextOverlay] = [],
+                suppressCursorBlink: Bool = false,
                 in view: MTKView) {
         guard let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor,
@@ -641,7 +643,7 @@ final class MetalRenderer {
         var uniforms = MetalUniforms(
             viewportSize: vp,
             cursorOpacity: (scrollOffset == 0 && model.cursor.visible) ? 1.0 : 0.0,
-            cursorBlink: model.cursor.blinking ? 1.0 : 0.0,
+            cursorBlink: (model.cursor.blinking && !suppressCursorBlink) ? 1.0 : 0.0,
             time: Float(CACurrentMediaTime() - startTime)
         )
 
@@ -830,7 +832,10 @@ final class MetalRenderer {
 
             for col in 0..<viewCols {
                 let transientTextOverlayCoversCell = transientTextOverlays.contains {
-                    row == $0.row && col >= $0.col && col < ($0.col + $0.columnWidth)
+                    $0.masksGridGlyphs &&
+                    row == $0.row &&
+                    col >= $0.col &&
+                    col < ($0.col + $0.columnWidth)
                 }
 
                 let cell: Cell
@@ -1535,6 +1540,7 @@ final class MetalRenderer {
                          linkUnderline: LinkUnderline? = nil,
                          borderConfig: BorderConfig? = nil,
                          transientTextOverlays: [TransientTextOverlay] = [],
+                         suppressCursorBlink: Bool = false,
                          encoder: MTLRenderCommandEncoder,
                          viewportSize: SIMD2<Float>,
                          cellRect: NSRect,
@@ -1566,7 +1572,7 @@ final class MetalRenderer {
         var uniforms = MetalUniforms(
             viewportSize: viewportSize,
             cursorOpacity: (scrollOffset == 0 && model.cursor.visible) ? 1.0 : 0.0,
-            cursorBlink: model.cursor.blinking ? 1.0 : 0.0,
+            cursorBlink: (model.cursor.blinking && !suppressCursorBlink) ? 1.0 : 0.0,
             time: Float(CACurrentMediaTime() - startTime)
         )
 

@@ -149,12 +149,21 @@ final class SplitRenderView: MTKView {
         _ = renderer.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
     }
 
-    private func ensureDrawableStorageAllocatedIfNeeded() {
-        guard drawableSize == .zero else { return }
+    @discardableResult
+    private func syncDrawableSizeToBoundsIfNeeded() -> Bool {
         let newScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
         let expectedSize = CGSize(width: bounds.width * newScale, height: bounds.height * newScale)
-        guard expectedSize.width > 0, expectedSize.height > 0 else { return }
+        guard expectedSize.width > 0, expectedSize.height > 0 else { return false }
+        guard abs(drawableSize.width - expectedSize.width) > 1 ||
+                abs(drawableSize.height - expectedSize.height) > 1 else {
+            return false
+        }
         drawableSize = expectedSize
+        return true
+    }
+
+    private func ensureDrawableStorageAllocatedIfNeeded() {
+        _ = syncDrawableSizeToBoundsIfNeeded()
     }
 
     private func syncScaleFactor() {
@@ -164,12 +173,20 @@ final class SplitRenderView: MTKView {
         if newScale != renderer.glyphAtlas.scaleFactor {
             renderer.glyphAtlas.updateScaleFactor(newScale)
         }
-        let expectedSize = CGSize(width: bounds.width * newScale, height: bounds.height * newScale)
-        if drawableSize != .zero,
-           (abs(drawableSize.width - expectedSize.width) > 1 || abs(drawableSize.height - expectedSize.height) > 1) {
-            drawableSize = expectedSize
-        }
+        _ = syncDrawableSizeToBoundsIfNeeded()
         setNeedsDisplay(bounds)
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        _ = syncDrawableSizeToBoundsIfNeeded()
+        requestRender()
+    }
+
+    override func setBoundsSize(_ newSize: NSSize) {
+        super.setBoundsSize(newSize)
+        _ = syncDrawableSizeToBoundsIfNeeded()
+        requestRender()
     }
 
     private func updateOpacityMode() {
@@ -225,6 +242,10 @@ extension SplitRenderView: MTKViewDelegate {
             let selection = ref.terminalView?.selection
             let border = ref.terminalView.flatMap { borderConfigProvider?($0) }
             let transientTextOverlays = ref.terminalView?.activeCommittedTextPreviewOverlays() ?? []
+            let suppressCursorBlink =
+                !transientTextOverlays.isEmpty ||
+                ((ref.terminalView?.debugPendingCommittedTextIntentCount ?? 0) > 0) ||
+                (ref.terminalView?.hasMarkedText() ?? false)
 
             // Convert from NSView coordinates (y=0 at bottom) to Metal coordinates (y=0 at top)
             let flippedRect = NSRect(
@@ -242,6 +263,7 @@ extension SplitRenderView: MTKViewDelegate {
                     selection: selection,
                     borderConfig: border,
                     transientTextOverlays: transientTextOverlays,
+                    suppressCursorBlink: suppressCursorBlink,
                     encoder: encoder,
                     viewportSize: viewportSize,
                     cellRect: flippedRect,

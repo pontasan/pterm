@@ -220,6 +220,21 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertEqual(stateChanges, 4)
     }
 
+    func testUpdatingCurrentDirectoryToSamePathDoesNotNotifyAgain() {
+        let controller = makeController(initialDirectory: "/Users/test/project")
+        var titles: [String] = []
+        var stateChanges = 0
+        controller.onTitleChange = { titles.append($0) }
+        controller.onStateChange = { stateChanges += 1 }
+
+        controller.updateCurrentDirectory(path: "/Users/test/project")
+        drainMainQueue(testCase: self)
+
+        XCTAssertTrue(titles.isEmpty)
+        XCTAssertEqual(stateChanges, 0)
+        XCTAssertEqual(controller.title, "project")
+    }
+
     func testSessionSnapshotSanitizesWorkspaceAndPersistsFontSettings() {
         let controller = makeController(workspaceName: " bad/name ")
         controller.setWorkspaceName("  qa/review ")

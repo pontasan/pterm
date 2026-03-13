@@ -514,7 +514,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         addSpacing(8)
         addView(
             makeDescriptionLabel(
-                "Lower opacity lets the macOS window material show through behind the terminal.",
+                "Lower opacity softens the terminal background. Integrated view may still use the macOS window material.",
                 width: width
             ),
             18
