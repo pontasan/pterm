@@ -112,6 +112,7 @@ final class TerminalController {
     private var pendingOutputActivity = false
     private var pendingStateChange = false
     private var renderContentVersion: UInt64 = 0
+    private var outputActivitySuppressedUntil: Date = .distantPast
     private let scrollbackCompactionLock = NSLock()
     private var pendingScrollbackCompaction: DispatchWorkItem?
 
@@ -137,6 +138,7 @@ final class TerminalController {
     private static let minimumCodepointBufferCapacity = 1024
     private static let maxAllTextReserveCapacity = 64 * 1024
     private static let maxSearchReserveCapacity = 4 * 1024
+    private static let inputEchoSuppressionInterval: TimeInterval = 0.35
 
     var persistedSettings: PersistedTerminalSettings {
         PersistedTerminalSettings(
@@ -415,6 +417,13 @@ final class TerminalController {
     /// Send user keyboard input to the PTY.
     func sendInput(_ data: Data) {
         suppressScrollbackClear = false
+        callbackLock.withLock {
+            if Self.shouldSuppressOutputActivity(forInput: data) {
+                outputActivitySuppressedUntil = Date().addingTimeInterval(Self.inputEchoSuppressionInterval)
+            } else {
+                outputActivitySuppressedUntil = .distantPast
+            }
+        }
         auditLogger?.recordInput(data)
         pty.write(data)
     }
@@ -422,9 +431,7 @@ final class TerminalController {
     /// Send a string as input to the PTY.
     func sendInput(_ string: String) {
         guard let data = textEncoding.encode(string) else { return }
-        suppressScrollbackClear = false
-        auditLogger?.recordInput(data)
-        pty.write(data)
+        sendInput(data)
     }
 
     // MARK: - PTY Output Processing
@@ -469,9 +476,13 @@ final class TerminalController {
             }
         }
 
+        let shouldReportOutputActivity = callbackLock.withLock {
+            Date() >= outputActivitySuppressedUntil
+        }
+
         scheduleMainCallbacks(
             needsDisplay: true,
-            outputActivity: true,
+            outputActivity: shouldReportOutputActivity,
             stateChange: clearedScrollback
         )
         scheduleScrollbackCompaction()
@@ -832,6 +843,11 @@ final class TerminalController {
         if callbacks.2 {
             onStateChange?()
         }
+    }
+
+    static func shouldSuppressOutputActivity(forInput data: Data) -> Bool {
+        guard !data.isEmpty else { return false }
+        return !data.contains(0x0A) && !data.contains(0x0D)
     }
 
     private func scheduleScrollbackCompaction() {

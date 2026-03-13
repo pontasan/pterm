@@ -76,6 +76,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastOutputTimes: [UUID: Date] = [:]
     private var outputIdleTimer: Timer?
     private var activeOutputTerminalIDs: Set<UUID> = []
+    private var visibleOutputIndicatorSuppressedUntilByTerminalID: [UUID: Date] = [:]
+    private var visibleOutputIndicatorResumeTimer: Timer?
     /// Suppresses active-output indicator briefly after resize.
     private var lastResizeTime: Date = .distantPast
     /// Tracks terminals that have been idle at least once (initial output burst is over).
@@ -497,6 +499,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastOutputTimes = lastOutputTimes.filter { remainingTerminalIDs.contains($0.key) }
         terminalsEverIdle = terminalsEverIdle.intersection(remainingTerminalIDs)
         activeOutputTerminalIDs = activeOutputTerminalIDs.intersection(remainingTerminalIDs)
+        visibleOutputIndicatorSuppressedUntilByTerminalID =
+            visibleOutputIndicatorSuppressedUntilByTerminalID.filter { remainingTerminalIDs.contains($0.key) }
+        scheduleVisibleOutputIndicatorResumeIfNeeded()
         syncVisibleTerminalOutputIndicators()
 
         let wasIntegrated = {
@@ -594,7 +599,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         contentHostView().addSubview(sv)
         terminalScrollView = sv
         terminalView = sv.terminalView
-        terminalView?.isOutputActive = activeOutputTerminalIDs.contains(controller.id)
+        suppressVisibleOutputIndicators(for: [controller.id])
         terminalView?.applyAppearanceSettings()
         focusedController = controller
 
@@ -651,7 +656,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         contentHostView().addSubview(splitView)
         splitContainerView = splitView
-        splitContainerView?.setActiveOutputTerminalIDs(activeOutputTerminalIDs)
+        suppressVisibleOutputIndicators(for: controllers.map(\.id))
         splitContainerView?.applyAppearanceSettings()
         splitOriginControllers = nil
         viewMode = .split(controllers)
@@ -1428,8 +1433,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func syncVisibleTerminalOutputIndicators() {
-        terminalView?.isOutputActive = focusedController.map { activeOutputTerminalIDs.contains($0.id) } ?? false
-        splitContainerView?.setActiveOutputTerminalIDs(activeOutputTerminalIDs)
+        terminalView?.isOutputActive = focusedController.map {
+            activeOutputTerminalIDs.contains($0.id) && !isVisibleOutputIndicatorSuppressed(for: $0.id)
+        } ?? false
+        let visibleActiveOutputTerminalIDs = Set(
+            activeOutputTerminalIDs.filter { !isVisibleOutputIndicatorSuppressed(for: $0) }
+        )
+        splitContainerView?.setActiveOutputTerminalIDs(visibleActiveOutputTerminalIDs)
+    }
+
+    private func suppressVisibleOutputIndicators(for terminalIDs: [UUID], duration: TimeInterval = 1.0) {
+        let deadline = Date().addingTimeInterval(duration)
+        for id in terminalIDs {
+            visibleOutputIndicatorSuppressedUntilByTerminalID[id] = deadline
+        }
+        scheduleVisibleOutputIndicatorResumeIfNeeded()
+        syncVisibleTerminalOutputIndicators()
+    }
+
+    private func isVisibleOutputIndicatorSuppressed(for terminalID: UUID) -> Bool {
+        guard let deadline = visibleOutputIndicatorSuppressedUntilByTerminalID[terminalID] else {
+            return false
+        }
+        return deadline > Date()
+    }
+
+    private func scheduleVisibleOutputIndicatorResumeIfNeeded() {
+        visibleOutputIndicatorResumeTimer?.invalidate()
+        visibleOutputIndicatorResumeTimer = nil
+
+        let now = Date()
+        visibleOutputIndicatorSuppressedUntilByTerminalID =
+            visibleOutputIndicatorSuppressedUntilByTerminalID.filter { $0.value > now }
+        guard let nextDeadline = visibleOutputIndicatorSuppressedUntilByTerminalID.values.min() else {
+            return
+        }
+
+        let timer = Timer.scheduledTimer(withTimeInterval: max(0.01, nextDeadline.timeIntervalSince(now)), repeats: false) {
+            [weak self] _ in
+            self?.scheduleVisibleOutputIndicatorResumeIfNeeded()
+            self?.syncVisibleTerminalOutputIndicators()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        visibleOutputIndicatorResumeTimer = timer
     }
 
     private func flushPendingSessionPersistence() {

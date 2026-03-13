@@ -86,6 +86,16 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertEqual(controller.debugSearchScratchCapacity, 0)
     }
 
+    func testInputWithoutNewlineSuppressesOutputActivityIndicator() {
+        XCTAssertTrue(TerminalController.shouldSuppressOutputActivity(forInput: Data("abc".utf8)))
+        XCTAssertTrue(TerminalController.shouldSuppressOutputActivity(forInput: Data([0x1B, 0x5B, 0x41])))
+    }
+
+    func testInputWithNewlineDoesNotSuppressOutputActivityIndicator() {
+        XCTAssertFalse(TerminalController.shouldSuppressOutputActivity(forInput: Data("ls\n".utf8)))
+        XCTAssertFalse(TerminalController.shouldSuppressOutputActivity(forInput: Data("echo test\r".utf8)))
+    }
+
     func testTerminalControllerDecodeBufferGrowsOnlyWhenNeeded() {
         let controller = makeController()
 

@@ -7,7 +7,7 @@ final class SplitTerminalContainerView: NSView {
         static let gap: CGFloat = 1
     }
 
-    private static let whiteBorder = MetalRenderer.BorderConfig(color: (1, 1, 1, 1), width: 1)
+    private static let whiteBorder = MetalRenderer.BorderConfig(color: (0.4, 0.4, 0.4, 0.3), width: 1)
     private static let blueBorder = MetalRenderer.BorderConfig(color: (0.2, 0.5, 1.0, 1), width: 2)
     private static let activeBorderRGB: (Float, Float, Float) = (0.9, 0.2, 0.15)
 
