@@ -188,6 +188,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    static func statusBarMetrics(
+        appMemoryBytes: UInt64,
+        cpuUsageByPID: [pid_t: Double]
+    ) -> (cpuPercent: Double, memoryBytes: UInt64) {
+        (cpuUsageByPID[getpid()] ?? 0, appMemoryBytes)
+    }
+
     static func initialLaunchDisposition(
         restoredSession: PersistedSessionState?,
         bootstrappedConfiguredWorkspaces: Bool
@@ -800,38 +807,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateWindowTitle()
     }
 
-    private func terminalPIDs(for controller: TerminalController) -> [pid_t] {
-        var pids: [pid_t] = [controller.processID]
-        if let fg = controller.foregroundProcessID, fg != controller.processID {
-            pids.append(fg)
-        }
-        return pids
-    }
-
     private func refreshStatusBarMetrics() {
-        switch viewMode {
-        case .integrated:
-            statusBarView.updateMemoryUsage(bytes: lastAppMemoryBytes)
-            let appCpu = cpuUsageByPID[getpid()] ?? 0
-            statusBarView.updateCpuUsage(percent: appCpu)
-        case .focused(let controller):
-            let pids = terminalPIDs(for: controller)
-            let cpu = pids.compactMap { cpuUsageByPID[$0] }.reduce(0, +)
-            let processMem = lastMemoryByPID[controller.processID] ?? 0
-            let mem = processMem + controller.scrollbackCapacity
-            statusBarView.updateCpuUsage(percent: cpu)
-            statusBarView.updateMemoryUsage(bytes: mem)
-        case .split(let controllers):
-            var totalCpu: Double = 0
-            var totalMem: UInt64 = 0
-            for c in controllers {
-                let pids = terminalPIDs(for: c)
-                totalCpu += pids.compactMap { cpuUsageByPID[$0] }.reduce(0, +)
-                totalMem += (lastMemoryByPID[c.processID] ?? 0) + c.scrollbackCapacity
-            }
-            statusBarView.updateCpuUsage(percent: totalCpu)
-            statusBarView.updateMemoryUsage(bytes: totalMem)
-        }
+        let metrics = Self.statusBarMetrics(
+            appMemoryBytes: lastAppMemoryBytes,
+            cpuUsageByPID: cpuUsageByPID
+        )
+        statusBarView.updateCpuUsage(percent: metrics.cpuPercent)
+        statusBarView.updateMemoryUsage(bytes: metrics.memoryBytes)
     }
 
     private func startMetricsMonitor() {

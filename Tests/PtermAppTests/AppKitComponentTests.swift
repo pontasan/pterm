@@ -191,6 +191,22 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(AppDelegate.shouldUseTranslucentWindowMaterial(isIntegratedViewVisible: false, terminalBackgroundOpacity: 0.0))
     }
 
+    func testStatusBarMetricsAlwaysUseAppProcessValues() {
+        let otherPID = pid_t(99999)
+        let currentPID = getpid()
+
+        let metrics = AppDelegate.statusBarMetrics(
+            appMemoryBytes: 384 * 1024 * 1024,
+            cpuUsageByPID: [
+                otherPID: 88.0,
+                currentPID: 21.5
+            ]
+        )
+
+        XCTAssertEqual(metrics.cpuPercent, 21.5, accuracy: 0.0001)
+        XCTAssertEqual(metrics.memoryBytes, 384 * 1024 * 1024)
+    }
+
     func testSettingsWindowControllerUsesDarkAppearanceAndSpecifiedInitialSize() throws {
         try withIsolatedSettingsController { controller in
             let window = controller.window
