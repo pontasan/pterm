@@ -246,7 +246,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appIsActive: Bool,
         windowIsVisible: Bool
     ) -> Bool {
-        appIsActive && windowIsVisible
+        _ = appIsActive
+        return windowIsVisible
     }
 
     static func shouldTrackIntegratedOverviewActivity(
@@ -2546,6 +2547,10 @@ extension AppDelegate: NSWindowDelegate {
         syncVisibleRenderScaleFactors()
     }
 
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        refreshMetricsMonitoringState()
+    }
+
     func windowDidMiniaturize(_ notification: Notification) {
         stopMetricsMonitor()
         releaseInactiveRenderingResourcesNow()
@@ -2561,6 +2566,7 @@ extension AppDelegate: NSWindowDelegate {
     }
 
     @objc func applicationDidResignActive(_ notification: Notification) {
+        refreshMetricsMonitoringState()
         // Switching to another app should not tear down visible render resources.
         // Doing so forces glyph atlas / buffer reconstruction on the first frame
         // after reactivation, which can expose transient corruption before the

@@ -61,11 +61,18 @@ final class MetalRenderer {
     }
 
     /// Result of building vertex data for a single frame.
-    struct VertexData {
+    final class VertexData {
         var bgVertices: [Float] = []
         var glyphVertices: [Float] = []
         var cursorVertices: [Float] = []
         var overlayVertices: [Float] = []
+
+        func reset(keepingCapacity: Bool = true) {
+            bgVertices.removeAll(keepingCapacity: keepingCapacity)
+            glyphVertices.removeAll(keepingCapacity: keepingCapacity)
+            cursorVertices.removeAll(keepingCapacity: keepingCapacity)
+            overlayVertices.removeAll(keepingCapacity: keepingCapacity)
+        }
     }
 
     struct SearchMatchSpan {
@@ -131,6 +138,7 @@ final class MetalRenderer {
         var overviewThumbnailBgBuffer: MTLBuffer?
         var overviewThumbnailGlyphBuffer: MTLBuffer?
         var overviewThumbnailSurfaceBuffer: MTLBuffer?
+        let terminalVertexScratch = VertexData()
         var terminalScrollbackRowsScratch: [[Cell]] = []
         var terminalScrollbackRowHasData: [Bool] = []
         var terminalSearchMatchesScratch: [[SearchMatchSpan]] = []
@@ -248,6 +256,7 @@ final class MetalRenderer {
         bufferSet.cursorBuffer = nil
         bufferSet.overlayBuffer = nil
         bufferSet.borderBuffer = nil
+        bufferSet.terminalVertexScratch.reset(keepingCapacity: false)
         bufferSet.terminalScrollbackRowsScratch.removeAll(keepingCapacity: false)
         bufferSet.terminalScrollbackRowHasData.removeAll(keepingCapacity: false)
         bufferSet.terminalSearchMatchesScratch.removeAll(keepingCapacity: false)
@@ -261,6 +270,7 @@ final class MetalRenderer {
         bufferSet.splitCursorBuffer = nil
         bufferSet.splitOverlayBuffer = nil
         bufferSet.splitBorderBuffer = nil
+        bufferSet.terminalVertexScratch.reset(keepingCapacity: false)
         bufferSet.terminalScrollbackRowsScratch.removeAll(keepingCapacity: false)
         bufferSet.terminalScrollbackRowHasData.removeAll(keepingCapacity: false)
         bufferSet.terminalSearchMatchesScratch.removeAll(keepingCapacity: false)
@@ -760,7 +770,8 @@ final class MetalRenderer {
                                   transientTextOverlays: [TransientTextOverlay] = [],
                                   scaleFactor: Float,
                                   bufferSet: ViewBufferSet) -> VertexData {
-        var vd = VertexData()
+        let vd = bufferSet.terminalVertexScratch
+        vd.reset()
         var cachedGlyphs: [UInt32: GlyphAtlas.GlyphInfo] = [:]
         var missingGlyphs: Set<UInt32> = []
 
@@ -1351,6 +1362,26 @@ final class MetalRenderer {
         return true
     }
 
+    @inline(__always)
+    private func appendVertexLinearized(to vertices: inout [Float],
+                                        x: Float, y: Float,
+                                        tx: Float, ty: Float,
+                                        linearFG: (r: Float, g: Float, b: Float, a: Float),
+                                        linearBG: (r: Float, g: Float, b: Float, a: Float)) {
+        vertices.append(x)
+        vertices.append(y)
+        vertices.append(tx)
+        vertices.append(ty)
+        vertices.append(linearFG.r)
+        vertices.append(linearFG.g)
+        vertices.append(linearFG.b)
+        vertices.append(linearFG.a)
+        vertices.append(linearBG.r)
+        vertices.append(linearBG.g)
+        vertices.append(linearBG.b)
+        vertices.append(linearBG.a)
+    }
+
     /// Add a quad (2 triangles = 6 vertices) to the vertex array.
     @inline(__always)
     private func addQuad(to vertices: inout [Float],
@@ -1360,38 +1391,16 @@ final class MetalRenderer {
                         bg: (r: Float, g: Float, b: Float, a: Float)) {
         let linearFG = Self.linearizeSRGBColor(r: fg.r, g: fg.g, b: fg.b, a: fg.a)
         let linearBG = Self.linearizeSRGBColor(r: bg.r, g: bg.g, b: bg.b, a: bg.a)
-        // Triangle 1: top-left, top-right, bottom-left
-        appendVertex(to: &vertices, x: x, y: y, tx: tx, ty: ty, fg: linearFG, bg: linearBG)
-        appendVertex(to: &vertices, x: x + w, y: y, tx: tx + tw, ty: ty, fg: linearFG, bg: linearBG)
-        appendVertex(to: &vertices, x: x, y: y + h, tx: tx, ty: ty + th, fg: linearFG, bg: linearBG)
-        // Triangle 2: top-right, bottom-right, bottom-left
-        appendVertex(to: &vertices, x: x + w, y: y, tx: tx + tw, ty: ty, fg: linearFG, bg: linearBG)
-        appendVertex(to: &vertices, x: x + w, y: y + h, tx: tx + tw, ty: ty + th, fg: linearFG, bg: linearBG)
-        appendVertex(to: &vertices, x: x, y: y + h, tx: tx, ty: ty + th, fg: linearFG, bg: linearBG)
-    }
 
-    @inline(__always)
-    private func appendVertex(
-        to vertices: inout [Float],
-        x: Float,
-        y: Float,
-        tx: Float,
-        ty: Float,
-        fg: (r: Float, g: Float, b: Float, a: Float),
-        bg: (r: Float, g: Float, b: Float, a: Float)
-    ) {
-        vertices.append(x)
-        vertices.append(y)
-        vertices.append(tx)
-        vertices.append(ty)
-        vertices.append(fg.r)
-        vertices.append(fg.g)
-        vertices.append(fg.b)
-        vertices.append(fg.a)
-        vertices.append(bg.r)
-        vertices.append(bg.g)
-        vertices.append(bg.b)
-        vertices.append(bg.a)
+        // Triangle 1: top-left, top-right, bottom-left
+        appendVertexLinearized(to: &vertices, x: x, y: y, tx: tx, ty: ty, linearFG: linearFG, linearBG: linearBG)
+        appendVertexLinearized(to: &vertices, x: x + w, y: y, tx: tx + tw, ty: ty, linearFG: linearFG, linearBG: linearBG)
+        appendVertexLinearized(to: &vertices, x: x, y: y + h, tx: tx, ty: ty + th, linearFG: linearFG, linearBG: linearBG)
+
+        // Triangle 2: top-right, bottom-right, bottom-left
+        appendVertexLinearized(to: &vertices, x: x + w, y: y, tx: tx + tw, ty: ty, linearFG: linearFG, linearBG: linearBG)
+        appendVertexLinearized(to: &vertices, x: x + w, y: y + h, tx: tx + tw, ty: ty + th, linearFG: linearFG, linearBG: linearBG)
+        appendVertexLinearized(to: &vertices, x: x, y: y + h, tx: tx, ty: ty + th, linearFG: linearFG, linearBG: linearBG)
     }
 
     // MARK: - Public API for IntegratedView
@@ -1598,8 +1607,11 @@ final class MetalRenderer {
         let viewRows = model.rows
         let viewCols = model.cols
         let approximateCellCount = max(1, viewRows * viewCols)
-        bgVertices.reserveCapacity(bgVertices.count + approximateCellCount * 18)
-        glyphVertices.reserveCapacity(glyphVertices.count + approximateCellCount * 24)
+        // A thumbnail cell can contribute up to one background quad and one glyph quad.
+        // Reserve against full quad payloads so dirty thumbnail rebuilds don't repeatedly
+        // grow the backing arrays while streaming output.
+        bgVertices.reserveCapacity(bgVertices.count + approximateCellCount * floatsPerQuad)
+        glyphVertices.reserveCapacity(glyphVertices.count + approximateCellCount * floatsPerQuad)
 
         // Compute the full terminal size in pixels (as if rendering at full size)
         let termW = padX * 2 + Float(viewCols) * cellW

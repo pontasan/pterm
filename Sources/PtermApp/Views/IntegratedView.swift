@@ -102,6 +102,31 @@ final class IntegratedView: MTKView, NSDraggingSource {
         }
     }
 
+    private struct DecorationVertexCacheKey: Hashable {
+        enum Kind: UInt8 {
+            case thumbnailBackground
+            case workspaceBackground
+            case terminalCloseButton
+            case workspaceCloseButton
+            case workspaceAddButton
+            case floatingAddButton
+        }
+
+        let kind: Kind
+        let bits: [UInt64]
+        let flags: UInt8
+    }
+
+    private struct CachedDecorationVertices {
+        let overlay: [Float]
+        let circle: [Float]
+        let icon: [Float]
+
+        var byteCount: Int {
+            (overlay.count + circle.count + icon.count) * MemoryLayout<Float>.stride
+        }
+    }
+
     static func verticallyCenteredTextOriginY(
         frame: NSRect,
         scaleFactor: Float,
@@ -399,6 +424,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private var cachedFlattenedThumbnails: [ThumbnailLayout] = []
     private var cachedVisibleThumbnails: [ThumbnailLayout] = []
     private var textVertexCache: [TextVertexCacheKey: CachedTextVertices] = [:]
+    private var decorationVertexCache: [DecorationVertexCacheKey: CachedDecorationVertices] = [:]
     private var textAtlasSignature: TextAtlasSignature?
     private var thumbnailSurfaceCache: [UUID: CachedThumbnailSurface] = [:]
     private var dirtyThumbnailSurfaceIDs: Set<UUID> = []
@@ -490,6 +516,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
 
     var cachedTextVertexCount: Int { textVertexCache.count }
+    var cachedDecorationVertexCount: Int { decorationVertexCache.count }
     var cachedThumbnailVertexCount: Int { thumbnailSurfaceCache.count }
     func debugHasThumbnailSurfaceCacheEntry(for controllerID: UUID) -> Bool {
         thumbnailSurfaceCache[controllerID] != nil
@@ -532,6 +559,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
     var cachedCPUStatusCount: Int { cachedCPUStatusByTerminalID.count }
     var cachedTextVertexBytes: Int { textVertexCache.values.reduce(0) { $0 + $1.byteCount } }
+    var cachedDecorationVertexBytes: Int { decorationVertexCache.values.reduce(0) { $0 + $1.byteCount } }
     var cachedThumbnailVertexBytes: Int { thumbnailSurfaceCache.values.reduce(0) { $0 + $1.byteCount } }
     func debugCachedThumbnailSurfaceContentVersion(for controllerID: UUID) -> UInt64? {
         thumbnailSurfaceCache[controllerID]?.signature.contentVersion
@@ -1402,6 +1430,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         cachedVisibleWorkspaceLayouts = []
         cachedFlattenedThumbnails = []
         cachedVisibleThumbnails = []
+        decorationVertexCache.removeAll()
     }
 
     private func pruneThumbnailVertexCache(activeTerminalIDs: Set<UUID>, preferredTerminalIDs: Set<UUID>) {
@@ -1459,6 +1488,10 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
         if force || !textVertexCache.isEmpty {
             textVertexCache.removeAll()
+        }
+
+        if force || !decorationVertexCache.isEmpty {
+            decorationVertexCache.removeAll()
         }
 
         if force || !thumbnailSurfaceCache.isEmpty {
@@ -1539,6 +1572,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         guard textAtlasSignature != signature else { return }
         textAtlasSignature = signature
         textVertexCache.removeAll()
+        decorationVertexCache.removeAll()
         renderer.releaseOverviewBuffers(for: self)
     }
 
@@ -2777,6 +2811,40 @@ extension IntegratedView: MTKViewDelegate {
         viewportSize: SIMD2<Float>,
         vertices: inout [Float]
     ) {
+        if !isActiveOutput,
+           let cached = cachedThumbnailDecorationVertices(
+                frame: frame,
+                titleFrame: titleFrame,
+                isHovered: isHovered,
+                isSelected: isSelected,
+                scaleFactor: scaleFactor
+        ) {
+            vertices.append(contentsOf: cached.overlay)
+            return
+        }
+
+        appendThumbnailBackgroundVertices(
+            frame: frame,
+            titleFrame: titleFrame,
+            isHovered: isHovered,
+            isSelected: isSelected,
+            isActiveOutput: isActiveOutput,
+            time: time,
+            scaleFactor: scaleFactor,
+            vertices: &vertices
+        )
+    }
+
+    private func appendThumbnailBackgroundVertices(
+        frame: NSRect,
+        titleFrame: NSRect,
+        isHovered: Bool,
+        isSelected: Bool,
+        isActiveOutput: Bool,
+        time: Float,
+        scaleFactor: Float,
+        vertices: inout [Float]
+    ) {
         let fullFrame = titleFrame.union(frame)
         let x = Float(fullFrame.origin.x) * scaleFactor
         let y = Float(fullFrame.origin.y) * scaleFactor
@@ -2882,6 +2950,41 @@ extension IntegratedView: MTKViewDelegate {
         circleVertices: inout [Float],
         iconVertices: inout [Float]
     ) {
+        if let cached = cachedWorkspaceDecorationVertices(
+            workspace: workspace,
+            scaleFactor: scaleFactor
+        ) {
+            overlayVertices.append(contentsOf: cached.overlay)
+            circleVertices.append(contentsOf: cached.circle)
+            iconVertices.append(contentsOf: cached.icon)
+        } else {
+            appendWorkspaceBackgroundDecorationVertices(
+                workspace: workspace,
+                scaleFactor: scaleFactor,
+                isCloseHovered: hoveredWorkspaceClose == workspace.name,
+                overlayVertices: &overlayVertices,
+                circleVertices: &circleVertices,
+                iconVertices: &iconVertices
+            )
+        }
+
+        drawWorkspaceHeaderText(
+            text: workspace.name,
+            frame: workspace.headerFrame,
+            scaleFactor: scaleFactor,
+            viewportSize: viewportSize,
+            glyphVertices: &glyphVertices
+        )
+    }
+
+    private func appendWorkspaceBackgroundDecorationVertices(
+        workspace: WorkspaceLayout,
+        scaleFactor: Float,
+        isCloseHovered: Bool,
+        overlayVertices: inout [Float],
+        circleVertices: inout [Float],
+        iconVertices: inout [Float]
+    ) {
         let x = Float(workspace.frame.origin.x) * scaleFactor
         let y = Float(workspace.frame.origin.y) * scaleFactor
         let w = Float(workspace.frame.width) * scaleFactor
@@ -2902,25 +3005,17 @@ extension IntegratedView: MTKViewDelegate {
         renderer.addQuadPublic(to: &overlayVertices, x: x + w - bw, y: y, w: bw, h: h,
                                tx: 0, ty: 0, tw: 0, th: 0,
                                fg: Self.uiWorkspaceBorderColor(alpha: 0.7), bg: (0, 0, 0, 0))
-
-        drawWorkspaceHeaderText(
-            text: workspace.name,
-            frame: workspace.headerFrame,
-            scaleFactor: scaleFactor,
-            viewportSize: viewportSize,
-            glyphVertices: &glyphVertices
-        )
         drawWorkspaceAddButton(
             frame: workspace.addFrame,
             scaleFactor: scaleFactor,
-            viewportSize: viewportSize,
+            viewportSize: .zero,
             vertices: &overlayVertices
         )
         drawWorkspaceCloseButton(
             frame: workspace.closeFrame,
-            isHovered: hoveredWorkspaceClose == workspace.name,
+            isHovered: isCloseHovered,
             scaleFactor: scaleFactor,
-            viewportSize: viewportSize,
+            viewportSize: .zero,
             circleVertices: &circleVertices,
             iconVertices: &iconVertices
         )
@@ -3044,6 +3139,19 @@ extension IntegratedView: MTKViewDelegate {
         viewportSize: SIMD2<Float>,
         vertices: inout [Float]
     ) {
+        if let cached = cachedWorkspaceAddButtonVertices(frame: frame, scaleFactor: scaleFactor) {
+            vertices.append(contentsOf: cached.overlay)
+            return
+        }
+
+        appendWorkspaceAddButtonVertices(frame: frame, scaleFactor: scaleFactor, vertices: &vertices)
+    }
+
+    private func appendWorkspaceAddButtonVertices(
+        frame: NSRect,
+        scaleFactor: Float,
+        vertices: inout [Float]
+    ) {
         let x = Float(frame.origin.x) * scaleFactor
         let y = Float(frame.origin.y) * scaleFactor
         let size = Float(frame.width) * scaleFactor
@@ -3099,6 +3207,17 @@ extension IntegratedView: MTKViewDelegate {
         circleVertices: inout [Float],
         iconVertices: inout [Float]
     ) {
+        if let cached = cachedCloseButtonVertices(
+            kind: .workspaceCloseButton,
+            frame: frame,
+            isHovered: isHovered,
+            scaleFactor: scaleFactor
+        ) {
+            circleVertices.append(contentsOf: cached.circle)
+            iconVertices.append(contentsOf: cached.icon)
+            return
+        }
+
         drawMacOSCloseButton(
             frame: frame,
             isHovered: isHovered,
@@ -3362,6 +3481,17 @@ extension IntegratedView: MTKViewDelegate {
         circleVertices: inout [Float],
         iconVertices: inout [Float]
     ) {
+        if let cached = cachedCloseButtonVertices(
+            kind: .terminalCloseButton,
+            frame: frame,
+            isHovered: isHovered,
+            scaleFactor: scaleFactor
+        ) {
+            circleVertices.append(contentsOf: cached.circle)
+            iconVertices.append(contentsOf: cached.icon)
+            return
+        }
+
         drawMacOSCloseButton(
             frame: frame,
             isHovered: isHovered,
@@ -3385,6 +3515,13 @@ extension IntegratedView: MTKViewDelegate {
         let x = Float(bx) * scaleFactor
         let y = Float(by) * scaleFactor
         let size = Float(btnSize) * scaleFactor
+
+        let frame = NSRect(x: bx, y: by, width: btnSize, height: btnSize)
+        if let cached = cachedFloatingAddButtonVertices(frame: frame, scaleFactor: scaleFactor) {
+            vertices.append(contentsOf: cached.overlay)
+            addWorkspaceButtonFrame = frame
+            return
+        }
 
         // Background
         renderer.addQuadPublic(
@@ -3416,6 +3553,177 @@ extension IntegratedView: MTKViewDelegate {
             bg: (0, 0, 0, 0)
         )
         addWorkspaceButtonFrame = NSRect(x: bx, y: by, width: btnSize, height: btnSize)
+    }
+
+    private func cachedThumbnailDecorationVertices(
+        frame: NSRect,
+        titleFrame: NSRect,
+        isHovered: Bool,
+        isSelected: Bool,
+        scaleFactor: Float
+    ) -> CachedDecorationVertices? {
+        let key = DecorationVertexCacheKey(
+            kind: .thumbnailBackground,
+            bits: frameBits(frame) + frameBits(titleFrame) + [UInt64(scaleFactor.bitPattern)],
+            flags: (isHovered ? 1 : 0) | (isSelected ? 2 : 0)
+        )
+        if let cached = decorationVertexCache[key] {
+            return cached
+        }
+        var overlay: [Float] = []
+        overlay.reserveCapacity(8 * 72)
+        appendThumbnailBackgroundVertices(
+            frame: frame,
+            titleFrame: titleFrame,
+            isHovered: isHovered,
+            isSelected: isSelected,
+            isActiveOutput: false,
+            time: 0,
+            scaleFactor: scaleFactor,
+            vertices: &overlay
+        )
+        let cached = CachedDecorationVertices(overlay: overlay, circle: [], icon: [])
+        decorationVertexCache[key] = cached
+        return cached
+    }
+
+    private func cachedWorkspaceDecorationVertices(
+        workspace: WorkspaceLayout,
+        scaleFactor: Float
+    ) -> CachedDecorationVertices? {
+        let key = DecorationVertexCacheKey(
+            kind: .workspaceBackground,
+            bits: frameBits(workspace.frame) + frameBits(workspace.headerFrame) + frameBits(workspace.addFrame) + frameBits(workspace.closeFrame) + [UInt64(scaleFactor.bitPattern)],
+            flags: hoveredWorkspaceClose == workspace.name ? 1 : 0
+        )
+        if let cached = decorationVertexCache[key] {
+            return cached
+        }
+        var overlay: [Float] = []
+        var circle: [Float] = []
+        var icon: [Float] = []
+        overlay.reserveCapacity(12 * 72)
+        circle.reserveCapacity(72)
+        icon.reserveCapacity(72)
+        appendWorkspaceBackgroundDecorationVertices(
+            workspace: workspace,
+            scaleFactor: scaleFactor,
+            isCloseHovered: hoveredWorkspaceClose == workspace.name,
+            overlayVertices: &overlay,
+            circleVertices: &circle,
+            iconVertices: &icon
+        )
+        let cached = CachedDecorationVertices(overlay: overlay, circle: circle, icon: icon)
+        decorationVertexCache[key] = cached
+        return cached
+    }
+
+    private func cachedWorkspaceAddButtonVertices(
+        frame: NSRect,
+        scaleFactor: Float
+    ) -> CachedDecorationVertices? {
+        let key = DecorationVertexCacheKey(
+            kind: .workspaceAddButton,
+            bits: frameBits(frame) + [UInt64(scaleFactor.bitPattern)],
+            flags: 0
+        )
+        if let cached = decorationVertexCache[key] {
+            return cached
+        }
+        var overlay: [Float] = []
+        overlay.reserveCapacity(4 * 72)
+        appendWorkspaceAddButtonVertices(frame: frame, scaleFactor: scaleFactor, vertices: &overlay)
+        let cached = CachedDecorationVertices(overlay: overlay, circle: [], icon: [])
+        decorationVertexCache[key] = cached
+        return cached
+    }
+
+    private func cachedFloatingAddButtonVertices(
+        frame: NSRect,
+        scaleFactor: Float
+    ) -> CachedDecorationVertices? {
+        let key = DecorationVertexCacheKey(
+            kind: .floatingAddButton,
+            bits: frameBits(frame) + [UInt64(scaleFactor.bitPattern)],
+            flags: 0
+        )
+        if let cached = decorationVertexCache[key] {
+            return cached
+        }
+        var overlay: [Float] = []
+        overlay.reserveCapacity(4 * 72)
+        let btnSize = frame.width
+        let x = Float(frame.origin.x) * scaleFactor
+        let y = Float(frame.origin.y) * scaleFactor
+        let size = Float(btnSize) * scaleFactor
+        renderer.addQuadPublic(
+            to: &overlay, x: x, y: y, w: size, h: size,
+            tx: 0, ty: 0, tw: 0, th: 0,
+            fg: Self.uiFloatingAddWorkspaceBackgroundColor(alpha: 0.80),
+            bg: (0, 0, 0, 0)
+        )
+        let cx = x + size / 2
+        let cy = y + size / 2
+        let lineW: Float = 2.5 * scaleFactor
+        let lineLen: Float = size * 0.4
+        renderer.addQuadPublic(
+            to: &overlay,
+            x: cx - lineLen / 2, y: cy - lineW / 2,
+            w: lineLen, h: lineW,
+            tx: 0, ty: 0, tw: 0, th: 0,
+            fg: Self.uiFloatingAddWorkspaceForegroundColor(alpha: 1.0),
+            bg: (0, 0, 0, 0)
+        )
+        renderer.addQuadPublic(
+            to: &overlay,
+            x: cx - lineW / 2, y: cy - lineLen / 2,
+            w: lineW, h: lineLen,
+            tx: 0, ty: 0, tw: 0, th: 0,
+            fg: Self.uiFloatingAddWorkspaceForegroundColor(alpha: 1.0),
+            bg: (0, 0, 0, 0)
+        )
+        let cached = CachedDecorationVertices(overlay: overlay, circle: [], icon: [])
+        decorationVertexCache[key] = cached
+        return cached
+    }
+
+    private func cachedCloseButtonVertices(
+        kind: DecorationVertexCacheKey.Kind,
+        frame: NSRect,
+        isHovered: Bool,
+        scaleFactor: Float
+    ) -> CachedDecorationVertices? {
+        let key = DecorationVertexCacheKey(
+            kind: kind,
+            bits: frameBits(frame) + [UInt64(scaleFactor.bitPattern)],
+            flags: isHovered ? 1 : 0
+        )
+        if let cached = decorationVertexCache[key] {
+            return cached
+        }
+        var circle: [Float] = []
+        var icon: [Float] = []
+        circle.reserveCapacity(72)
+        icon.reserveCapacity(72)
+        drawMacOSCloseButton(
+            frame: frame,
+            isHovered: isHovered,
+            scaleFactor: scaleFactor,
+            circleVertices: &circle,
+            iconVertices: &icon
+        )
+        let cached = CachedDecorationVertices(overlay: [], circle: circle, icon: icon)
+        decorationVertexCache[key] = cached
+        return cached
+    }
+
+    private func frameBits(_ frame: NSRect) -> [UInt64] {
+        [
+            Double(frame.origin.x).bitPattern,
+            Double(frame.origin.y).bitPattern,
+            Double(frame.size.width).bitPattern,
+            Double(frame.size.height).bitPattern
+        ]
     }
 
     private func drawVertices(

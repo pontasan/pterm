@@ -5483,6 +5483,24 @@ final class AppKitComponentTests: XCTestCase {
         )
     }
 
+    func testIntegratedViewOverviewDecorationCacheStabilizesAcrossRepeatedRenders() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        _ = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), fontName: "Menlo", fontSize: 13)
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 640, height: 360), renderer: renderer, manager: manager)
+
+        view.debugEnsureLayoutCache()
+        XCTAssertEqual(view.cachedDecorationVertexCount, 0)
+
+        XCTAssertNotNil(view.debugRenderedOverviewOpaquePixelCount(in: NSRect(x: 0, y: 0, width: 640, height: 360)))
+        let cachedCountAfterFirstRender = view.cachedDecorationVertexCount
+        XCTAssertGreaterThan(cachedCountAfterFirstRender, 0)
+
+        XCTAssertNotNil(view.debugRenderedOverviewOpaquePixelCount(in: NSRect(x: 0, y: 0, width: 640, height: 360)))
+        XCTAssertEqual(view.cachedDecorationVertexCount, cachedCountAfterFirstRender)
+    }
+
     func testIntegratedViewDynamicThumbnailVertexBudgetsScaleWithVisibleTerminalCount() {
         XCTAssertEqual(IntegratedView.effectiveThumbnailVertexSoftLimit(preferredTerminalCount: 0), 8)
         XCTAssertEqual(IntegratedView.effectiveThumbnailVertexSoftLimit(preferredTerminalCount: 3), 8)

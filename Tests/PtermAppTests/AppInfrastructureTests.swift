@@ -94,10 +94,11 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertEqual(inactive, [99])
     }
 
-    func testShouldRunMetricsMonitorRequiresActiveAndVisibleWindow() {
+    func testShouldRunMetricsMonitorRequiresVisibleWindowOnly() {
         XCTAssertTrue(AppDelegate.shouldRunMetricsMonitor(appIsActive: true, windowIsVisible: true))
-        XCTAssertFalse(AppDelegate.shouldRunMetricsMonitor(appIsActive: false, windowIsVisible: true))
+        XCTAssertTrue(AppDelegate.shouldRunMetricsMonitor(appIsActive: false, windowIsVisible: true))
         XCTAssertFalse(AppDelegate.shouldRunMetricsMonitor(appIsActive: true, windowIsVisible: false))
+        XCTAssertFalse(AppDelegate.shouldRunMetricsMonitor(appIsActive: false, windowIsVisible: false))
     }
 
     func testMetricsMonitorIntervalUsesSlowerSamplingOutsideIntegratedPresentation() {
