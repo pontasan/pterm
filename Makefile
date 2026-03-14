@@ -1,7 +1,7 @@
 # pterm - macOS Terminal Emulator
 # Build system: SPM + xcrun metal + shell scripts
 
-.PHONY: build debug test clean bundle run shaders package verify-bundle verify-signature
+.PHONY: build debug test regression-test clean bundle run shaders package verify-bundle verify-signature
 
 # Output directories
 BUILD_DIR = .build
@@ -11,7 +11,7 @@ SHADER_DIR = Sources/PtermApp/Rendering/Shaders
 METAL_TOOLCHAIN = TOOLCHAINS=Metal
 
 # Build release
-build:
+build: regression-test
 	swift build -c release
 	@$(MAKE) bundle CONFIG=release
 
@@ -26,6 +26,10 @@ run: debug
 
 # Run tests
 test:
+	swift test
+
+# Mandatory regression gate for production/release builds
+regression-test:
 	swift test
 
 # Clean

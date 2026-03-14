@@ -3,35 +3,6 @@ import Foundation
 import MetalKit
 import QuartzCore
 
-private enum InputAnimationDiagnostics {
-    static let enabled = false
-    static let directoryURL = FileManager.default.temporaryDirectory
-        .appendingPathComponent("pterm-input-animation-diagnostics", isDirectory: true)
-    static let logURL = directoryURL.appendingPathComponent("events.log")
-
-    static func reset() {
-        guard enabled else { return }
-        try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        try? "session-start\n".write(to: logURL, atomically: true, encoding: .utf8)
-    }
-
-    static func log(_ message: String) {
-        guard enabled else { return }
-        let timestamp = String(format: "%.6f", CACurrentMediaTime())
-        let line = "[\(timestamp)] \(message)\n"
-        let data = Data(line.utf8)
-        try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        if FileManager.default.fileExists(atPath: logURL.path),
-           let handle = try? FileHandle(forWritingTo: logURL) {
-            defer { try? handle.close() }
-            try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-        } else {
-            try? data.write(to: logURL, options: .atomic)
-        }
-    }
-}
-
 /// NSView subclass that hosts a Metal layer for terminal rendering.
 ///
 /// Handles keyboard input, mouse events (text selection), scroll wheel
@@ -244,7 +215,6 @@ final class TerminalView: MTKView, NSTextInputClient {
         self.renderer = renderer
 
         super.init(frame: frame, device: renderer.device)
-        InputAnimationDiagnostics.reset()
 
         self.delegate = self
         self.preferredFramesPerSecond = 30
@@ -607,7 +577,6 @@ final class TerminalView: MTKView, NSTextInputClient {
         }
         let timer = Timer.scheduledTimer(withTimeInterval: committedTextPreviewFrameInterval(), repeats: true) { [weak self] _ in
             guard let self else { return }
-            InputAnimationDiagnostics.log("pending-resolution-timer tick intents=\(self.pendingCommittedTextIntents.count)")
             self.resolvePendingCommittedTextIntentsIfNeeded()
             if self.pendingCommittedTextIntents.isEmpty {
                 self.pendingIntentResolutionTimer?.invalidate()
@@ -711,12 +680,8 @@ final class TerminalView: MTKView, NSTextInputClient {
         if !debugSuppressInterpretKeyEvents {
             interpretKeyEvents([event])
         }
-        InputAnimationDiagnostics.log(
-            "keyDown chars=\(event.characters ?? "<nil>") pendingHandled=\(pendingTextInputHandled) marked=\(hasMarkedText())"
-        )
         if !pendingTextInputHandled && !hasMarkedText() {
             if let fallbackText = fallbackDirectTextInput(for: event) {
-                InputAnimationDiagnostics.log("keyDown fallback enqueue text=\(fallbackText.debugDescription)")
                 enqueueCommittedInsertIntentIfNeeded(for: fallbackText)
             } else {
                 enqueueFallbackDeletionIntentIfNeeded(for: event)
@@ -1668,7 +1633,6 @@ final class TerminalView: MTKView, NSTextInputClient {
         case #selector(NSResponder.deleteBackward(_:)):
             if let preview = deletionPreview(backward: true),
                shouldAnimateCommittedTextPreview(for: preview.text) {
-                InputAnimationDiagnostics.log("keyDown fallback enqueue deleteBackward text=\(preview.text.debugDescription)")
                 enqueueCommittedTextIntent(
                     kind: .deleteBackward,
                     text: preview.text,
@@ -1682,7 +1646,6 @@ final class TerminalView: MTKView, NSTextInputClient {
         case #selector(NSResponder.deleteForward(_:)):
             if let preview = deletionPreview(backward: false),
                shouldAnimateCommittedTextPreview(for: preview.text) {
-                InputAnimationDiagnostics.log("keyDown fallback enqueue deleteForward text=\(preview.text.debugDescription)")
                 enqueueCommittedTextIntent(
                     kind: .deleteForward,
                     text: preview.text,
@@ -1746,9 +1709,6 @@ final class TerminalView: MTKView, NSTextInputClient {
     ) {
         guard let snapshot = currentViewportSnapshot() else { return }
         let now = CACurrentMediaTime()
-        InputAnimationDiagnostics.log(
-            "enqueue kind=\(String(describing: kind)) text=\(text.debugDescription) row=\(row) col=\(col) width=\(columnWidth)"
-        )
         pendingCommittedTextIntents.append(
             CommittedTextAnimationIntent(
                 kind: kind,
@@ -1778,21 +1738,10 @@ final class TerminalView: MTKView, NSTextInputClient {
             return
         }
         let now = CACurrentMediaTime()
-        InputAnimationDiagnostics.log(
-            "resolve intents=\(pendingCommittedTextIntents.count) cursor=(\(currentSnapshot.cursorRow),\(currentSnapshot.cursorCol))"
-        )
         var remaining: [CommittedTextAnimationIntent] = []
         remaining.reserveCapacity(pendingCommittedTextIntents.count)
         for intent in pendingCommittedTextIntents {
             let evaluation = CommittedTextAnimationMatcher.evaluate(intent, currentSnapshot: currentSnapshot, now: now)
-            InputAnimationDiagnostics.log(
-                "evaluate kind=\(String(describing: intent.kind)) text=\(intent.text.debugDescription) row=\(intent.row) col=\(intent.col) result=\(String(describing: evaluation))"
-            )
-            if intent.kind == .insert {
-                InputAnimationDiagnostics.log(
-                    "candidates \(CommittedTextAnimationMatcher.debugDescribeInsertCandidates(for: intent, currentSnapshot: currentSnapshot))"
-                )
-            }
             switch evaluation {
             case .pending:
                 remaining.append(intent)
@@ -1935,9 +1884,6 @@ extension TerminalView {
         markedTextSelection = NSRange(location: NSNotFound, length: 0)
         destroyMarkedTextLayer()
         let shouldShowCommittedPreview = shouldAnimateCommittedTextPreview(for: text)
-        InputAnimationDiagnostics.log(
-            "insertText text=\(text.debugDescription) animate=\(shouldShowCommittedPreview) outputConfirmed=\(outputConfirmedInputAnimationsEnabled)"
-        )
         if shouldShowCommittedPreview {
             if outputConfirmedInputAnimationsEnabled {
                 enqueueCommittedInsertIntentIfNeeded(for: text)

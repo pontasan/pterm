@@ -44,17 +44,6 @@ final class StatusBarView: NSView {
         metricsTemplateLabel.sizeToFit()
         metricsLabelWidth = ceil(metricsTemplateLabel.frame.width)
 
-        overviewHintLabel.textColor = NSColor(calibratedWhite: 0.55, alpha: 1)
-        overviewHintLabel.font = font
-        overviewHintLabel.lineBreakMode = .byTruncatingTail
-        overviewHintLabel.isHidden = true
-        addSubview(overviewHintLabel)
-
-        overviewHintSeparatorLabel.textColor = NSColor(calibratedWhite: 0.4, alpha: 1)
-        overviewHintSeparatorLabel.font = font
-        overviewHintSeparatorLabel.isHidden = true
-        addSubview(overviewHintSeparatorLabel)
-
         backButton.bezelStyle = .recessed
         backButton.isBordered = false
         backButton.contentTintColor = textColor
@@ -74,6 +63,17 @@ final class StatusBarView: NSView {
         noteButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
         noteButton.toolTip = "Edit Notes"
         addSubview(noteButton)
+
+        overviewHintLabel.textColor = NSColor(calibratedWhite: 0.55, alpha: 1)
+        overviewHintLabel.font = font
+        overviewHintLabel.lineBreakMode = .byTruncatingTail
+        overviewHintLabel.isHidden = true
+        addSubview(overviewHintLabel)
+
+        overviewHintSeparatorLabel.textColor = NSColor(calibratedWhite: 0.4, alpha: 1)
+        overviewHintSeparatorLabel.font = font
+        overviewHintSeparatorLabel.isHidden = true
+        addSubview(overviewHintSeparatorLabel)
     }
 
     @available(*, unavailable)

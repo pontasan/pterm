@@ -19,7 +19,8 @@ enum TypewriterKeyClickPlayerFactory {
     }
 
     private static var isRunningUnitTests: Bool {
-        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
+            NSClassFromString("XCTestCase") != nil
     }
 }
 

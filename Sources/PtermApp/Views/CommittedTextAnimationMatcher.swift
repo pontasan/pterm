@@ -389,11 +389,24 @@ enum CommittedTextAnimationMatcher {
                 )
                 guard alignment >= 8 else { continue }
 
+                let cursorGap: Int?
+                if currentSnapshot.cursorRow == row,
+                   currentSnapshot.cursorCol >= col + intent.columnWidth {
+                    cursorGap = currentSnapshot.cursorCol - (col + intent.columnWidth)
+                } else {
+                    cursorGap = nil
+                }
+                let cursorAdjacent = (cursorGap ?? .max) <= max(3, intent.columnWidth + 1)
+                let nearOriginalLocation = row == intent.row &&
+                    abs(col - intent.col) <= max(1, intent.columnWidth)
+                let relocatedPromptLikeMatch = row != intent.row &&
+                    rowChange.count <= min(12, currentSnapshot.cols / 2) &&
+                    alignment >= 12
+                guard cursorAdjacent || nearOriginalLocation || relocatedPromptLikeMatch else { continue }
+
                 let lowerRowBonus = row * 8
                 let cursorAdjacentBonus: Int
-                if currentSnapshot.cursorRow == row,
-                   currentSnapshot.cursorCol >= col + intent.columnWidth,
-                   currentSnapshot.cursorCol - (col + intent.columnWidth) <= max(3, intent.columnWidth + 1) {
+                if cursorAdjacent {
                     cursorAdjacentBonus = 10_000
                 } else {
                     cursorAdjacentBonus = 0
@@ -696,7 +709,7 @@ enum CommittedTextAnimationMatcher {
         }
 
         let staysNearOriginalColumn = matchedLocation.row == intent.row &&
-            abs(matchedLocation.col - intent.col) <= max(8, intent.columnWidth + 4)
+            abs(matchedLocation.col - intent.col) <= max(1, intent.columnWidth)
         if rowChange.count <= min(24, currentSnapshot.cols / 2) &&
             staysNearOriginalColumn {
             return true

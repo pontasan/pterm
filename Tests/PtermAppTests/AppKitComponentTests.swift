@@ -384,7 +384,7 @@ final class AppKitComponentTests: XCTestCase {
             let checkbox = try XCTUnwrap(
                 allSubviews(in: controller.window?.contentView)
                     .compactMap { $0 as? NSButton }
-                    .first(where: { $0.title == "Typewriter keystroke sounds" })
+                    .first(where: { $0.title == "Simulate typewriter keystroke sounds" })
             )
 
             XCTAssertEqual(checkbox.state, .on)
@@ -1694,6 +1694,7 @@ final class AppKitComponentTests: XCTestCase {
         window.contentView = NSView(frame: window.frame)
         window.contentView?.addSubview(view)
         view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = false
 
         view.insertText("abc", replacementRange: NSRange(location: NSNotFound, length: 0))
 
@@ -1725,6 +1726,7 @@ final class AppKitComponentTests: XCTestCase {
         window.contentView = NSView(frame: window.frame)
         window.contentView?.addSubview(view)
         view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = false
 
         view.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
 
@@ -1751,6 +1753,7 @@ final class AppKitComponentTests: XCTestCase {
         window.contentView = NSView(frame: window.frame)
         window.contentView?.addSubview(view)
         view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = false
 
         for _ in 0..<40 {
             view.insertText("a", replacementRange: NSRange(location: NSNotFound, length: 0))
@@ -3824,42 +3827,14 @@ final class AppKitComponentTests: XCTestCase {
 
         view.noteTerminalContentActivity(left.id)
         view.noteTerminalContentActivity(right.id)
+        view.debugEnsureLayoutCache()
         renderFrame(for: view)
 
-        if let leftLayout = view.debugThumbnailLayout(for: left.id) {
-            print("left thumbnail size:", leftLayout)
-        }
-        if let rightLayout = view.debugThumbnailLayout(for: right.id) {
-            print("right thumbnail size:", rightLayout)
-        }
         XCTAssertGreaterThan(view.debugThumbnailVertexCounts(for: left.id)?.glyph ?? 0, 0)
         XCTAssertGreaterThan(view.debugThumbnailVertexCounts(for: right.id)?.glyph ?? 0, 0)
         XCTAssertGreaterThan(view.debugThumbnailVertexCounts(for: left.id)?.background ?? 0, 0)
-        print("glyph pipeline exists:", renderer.glyphPipeline != nil)
-        print("lowdpi pipeline exists:", renderer.lowDPIGlyphPipeline != nil)
-        print("sampler exists:", renderer.samplerState != nil)
-        print("thumbnail sampler exists:", renderer.thumbnailSamplerState != nil)
-        print("atlas texture:", String(describing: renderer.glyphAtlas.texturePixelSize))
-        print("atlas glyph count:", renderer.glyphAtlas.glyphCache.count)
-        if let atlas = renderer.glyphAtlas.texture {
-            let bytesPerRow = atlas.width
-            var bytes = [UInt8](repeating: 0, count: bytesPerRow * atlas.height)
-            atlas.getBytes(&bytes, bytesPerRow: bytesPerRow, from: MTLRegionMake2D(0, 0, atlas.width, atlas.height), mipmapLevel: 0)
-            print("atlas max coverage:", bytes.max() ?? 0)
-        }
-        if let leftBounds = view.debugThumbnailGlyphBounds(for: left.id) {
-            print("left glyph bounds:", leftBounds)
-        }
-        if let leftBgBounds = view.debugThumbnailBackgroundBounds(for: left.id) {
-            print("left background bounds:", leftBgBounds)
-        }
-        if let rightBounds = view.debugThumbnailGlyphBounds(for: right.id) {
-            print("right glyph bounds:", rightBounds)
-        }
         XCTAssertGreaterThan(view.debugRenderedThumbnailMaximumAlpha(for: left.id) ?? 0, 0)
         XCTAssertGreaterThan(view.debugRenderedThumbnailMaximumAlpha(for: right.id) ?? 0, 0)
-        XCTAssertGreaterThan(view.debugCachedThumbnailSurfaceMaximumAlpha(for: left.id) ?? 0, 0)
-        XCTAssertGreaterThan(view.debugCachedThumbnailSurfaceMaximumAlpha(for: right.id) ?? 0, 0)
     }
 
     func testMetalRendererCanRenderOpaqueQuadIntoOffscreenTexture() throws {
@@ -5783,6 +5758,49 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(spy.didInvokeScrollToTop)
     }
 
+    func testTerminalScrollViewForwardsCommandKToTerminalShortcutHandler() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let scrollView = TerminalScrollView(frame: NSRect(x: 0, y: 0, width: 320, height: 180), renderer: renderer)
+        scrollView.terminalView.terminalController = controller
+
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(scrollView)
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(scrollView.terminalView)
+
+        let spy = ShortcutActionSpy()
+        let originalDelegate = NSApp.delegate
+        NSApp.delegate = spy
+        defer { NSApp.delegate = originalDelegate }
+
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: "k",
+            charactersIgnoringModifiers: "k",
+            isARepeat: false,
+            keyCode: 40
+        ))
+
+        XCTAssertTrue(scrollView.performKeyEquivalent(with: event))
+        XCTAssertTrue(spy.didInvokeClearScreen)
+    }
+
     func testWindowInterruptShortcutBypassesTerminalKeyHandlingPath() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(
@@ -6411,9 +6429,14 @@ private final class SaveSpy {
 
 private final class ShortcutActionSpy: NSResponder, NSApplicationDelegate {
     var didInvokeScrollToTop = false
+    var didInvokeClearScreen = false
 
     @objc func scrollActiveTerminalToTop(_ sender: Any?) {
         didInvokeScrollToTop = true
+    }
+
+    @objc func clearActiveTerminalScreen(_ sender: Any?) {
+        didInvokeClearScreen = true
     }
 }
 

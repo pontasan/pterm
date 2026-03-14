@@ -362,4 +362,142 @@ final class PTYIntegrationTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(controller.scrollback.rowCount, 0)
         }
     }
+
+    @MainActor
+    func testTerminalControllerRealPTYInterruptStopsStreamingBeforeAllLinesRender() throws {
+        let controller = TerminalController(
+            rows: 6,
+            cols: 48,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        defer { controller.stop(waitForExit: true) }
+
+        let readyToInterrupt = expectation(description: "controller-stream-threshold-visible")
+        let streamQuiesced = expectation(description: "controller-stream-quiesced-after-interrupt")
+        let exitExpectation = expectation(description: "controller-exit-after-interrupt")
+
+        let marker = "__INT__"
+        let totalLines = 9_999
+        let interruptThreshold = 20
+        let quietInterval: TimeInterval = 0.30
+        let lock = NSLock()
+        var thresholdReached = false
+        var interruptIssued = false
+        var quietSignaled = false
+        var exitSignaled = false
+        var highestSeen = -1
+        var lastProgressAt = CACurrentMediaTime()
+
+        controller.onOutputActivity = {
+            let snapshot = controller.allText()
+            let latestSeen = Self.highestStreamingMarker(in: snapshot, marker: marker)
+            var shouldInterrupt = false
+            var shouldSignalThreshold = false
+
+            lock.lock()
+            if latestSeen > highestSeen {
+                highestSeen = latestSeen
+                lastProgressAt = CACurrentMediaTime()
+            }
+            if !thresholdReached, latestSeen >= interruptThreshold {
+                thresholdReached = true
+                shouldSignalThreshold = true
+            }
+            if thresholdReached, !interruptIssued {
+                interruptIssued = true
+                shouldInterrupt = true
+            }
+            lock.unlock()
+
+            if shouldSignalThreshold {
+                readyToInterrupt.fulfill()
+            }
+            if shouldInterrupt {
+                controller.performInterrupt()
+                pollForQuiet()
+            }
+        }
+
+        controller.onExit = {
+            guard !exitSignaled else { return }
+            exitSignaled = true
+            exitExpectation.fulfill()
+        }
+
+        func pollForQuiet() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                let latestSeen = Self.highestStreamingMarker(in: controller.allText(), marker: marker)
+                var shouldContinuePolling = false
+                var shouldSignalQuiet = false
+
+                lock.lock()
+                if latestSeen > highestSeen {
+                    highestSeen = latestSeen
+                    lastProgressAt = CACurrentMediaTime()
+                }
+                if !quietSignaled {
+                    if CACurrentMediaTime() - lastProgressAt >= quietInterval {
+                        quietSignaled = true
+                        shouldSignalQuiet = true
+                    } else {
+                        shouldContinuePolling = true
+                    }
+                }
+                lock.unlock()
+
+                if shouldSignalQuiet {
+                    streamQuiesced.fulfill()
+                    controller.sendInput("exit\n")
+                    return
+                }
+                if shouldContinuePolling {
+                    pollForQuiet()
+                }
+            }
+        }
+
+        try controller.start()
+        controller.sendInput(
+            """
+            i=0
+            while [ "$i" -le \(totalLines) ]; do
+              printf '\(marker)%05d\\n' "$i"
+              i=$((i+1))
+              sleep 0.005
+            done
+            exit
+            """
+        )
+
+        wait(for: [readyToInterrupt, streamQuiesced, exitExpectation], timeout: 10.0)
+        drainMainQueue(testCase: self)
+
+        let finalText = controller.allText()
+        let finalHighestSeen = Self.highestStreamingMarker(in: finalText, marker: marker)
+        XCTAssertGreaterThanOrEqual(finalHighestSeen, interruptThreshold)
+        XCTAssertLessThan(finalHighestSeen, totalLines)
+        XCTAssertFalse(finalText.contains("\(marker)\(String(format: "%05d", totalLines))"))
+    }
+
+    private static func highestStreamingMarker(in text: String, marker: String) -> Int {
+        var highest = -1
+        var searchStart = text.startIndex
+        while let range = text.range(of: marker, range: searchStart..<text.endIndex) {
+            let digitsStart = range.upperBound
+            let digitsEnd = text.index(digitsStart, offsetBy: 5, limitedBy: text.endIndex) ?? text.endIndex
+            if digitsEnd > digitsStart {
+                let digits = text[digitsStart..<digitsEnd]
+                if digits.count == 5, let value = Int(digits) {
+                    highest = max(highest, value)
+                }
+            }
+            searchStart = range.upperBound
+        }
+        return highest
+    }
 }

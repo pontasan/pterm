@@ -40,6 +40,8 @@ Release build:
 make build
 ```
 
+`make build` runs the full regression test suite before producing the release app bundle.
+
 Run tests:
 
 ```bash
