@@ -1938,6 +1938,9 @@ extension TerminalView {
         markedTextStorage = NSMutableAttributedString(attributedString: attributed)
         markedTextSelection = selectedRange
         updateMarkedTextOverlay()
+        if typewriterSoundEnabled, attributed.length > 0 {
+            inputFeedbackPlayer.playKeystroke()
+        }
     }
 
     func unmarkText() {

@@ -1530,6 +1530,51 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(spy.playCount, 0)
     }
 
+    func testTerminalViewMarkedTextPlaysSoundForIMEComposition() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let spy = KeyClickSpy()
+        view.terminalController = controller
+        view.inputFeedbackPlayer = spy
+
+        view.setMarkedText("かな", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertEqual(spy.playCount, 1)
+    }
+
+    func testTerminalViewMarkedTextDoesNotPlaySoundWhenDisabled() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let spy = KeyClickSpy()
+        view.terminalController = controller
+        view.inputFeedbackPlayer = spy
+        view.typewriterSoundEnabled = false
+
+        view.setMarkedText("かな", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertEqual(spy.playCount, 0)
+    }
+
     func testTerminalViewCommandInputPlaysSoundOnce() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(
