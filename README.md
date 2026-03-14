@@ -48,6 +48,12 @@ Run tests:
 make test
 ```
 
+Profile CPU hot paths:
+
+```bash
+make profile-cpu
+```
+
 ## Signing and Distribution
 
 Sign with a Developer ID certificate:

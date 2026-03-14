@@ -179,15 +179,6 @@ final class PTY {
         self.readSource = source
         source.resume()
 
-        let writeSource = DispatchSource.makeWriteSource(fileDescriptor: amaster,
-                                                         queue: Self.writeQueue)
-        writeSource.setEventHandler { [weak self] in
-            self?.drainPendingWrites()
-        }
-        writeSource.setCancelHandler { /* intentionally empty */ }
-        self.writeSource = writeSource
-        writeSource.resume()
-
         // Monitor child process exit
         monitorChildExit()
     }
@@ -487,11 +478,15 @@ final class PTY {
     }
 
     private func drainPendingWrites() {
-        guard currentMasterFD() >= 0 else { return }
+        guard currentMasterFD() >= 0 else {
+            disarmWriteSource()
+            return
+        }
 
         while true {
             let isHighPriority = prepareNextWriteIfNeeded()
             guard let pendingWrite = currentPendingWrite(isHighPriority: isHighPriority) else {
+                disarmWriteSource()
                 return
             }
 
@@ -510,6 +505,7 @@ final class PTY {
             }
 
             if result == 0 {
+                armWriteSourceIfNeeded()
                 return
             }
 
@@ -517,12 +513,34 @@ final class PTY {
             case EINTR:
                 continue
             case EAGAIN:
+                armWriteSourceIfNeeded()
                 return
             default:
                 clearPendingWrites()
+                disarmWriteSource()
                 return
             }
         }
+    }
+
+    private func armWriteSourceIfNeeded() {
+        guard currentMasterFD() >= 0, writeSource == nil else { return }
+        let source = DispatchSource.makeWriteSource(
+            fileDescriptor: currentMasterFD(),
+            queue: Self.writeQueue
+        )
+        source.setEventHandler { [weak self] in
+            self?.drainPendingWrites()
+        }
+        source.setCancelHandler { /* intentionally empty */ }
+        writeSource = source
+        source.resume()
+    }
+
+    private func disarmWriteSource() {
+        guard let source = writeSource else { return }
+        writeSource = nil
+        source.cancel()
     }
 
     private func prepareNextWriteIfNeeded() -> Bool {

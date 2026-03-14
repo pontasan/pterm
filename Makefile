@@ -1,7 +1,7 @@
 # pterm - macOS Terminal Emulator
 # Build system: SPM + xcrun metal + shell scripts
 
-.PHONY: build debug test regression-test clean bundle run shaders package verify-bundle verify-signature
+.PHONY: build debug test regression-test clean bundle run shaders package verify-bundle verify-signature profile-cpu profile-cpu-attach
 
 # Output directories
 BUILD_DIR = .build
@@ -23,6 +23,14 @@ debug:
 # Run the app (debug)
 run: debug
 	@open $(APP_BUNDLE)
+
+# Profile CPU hot paths by launching a fresh debug app instance
+profile-cpu:
+	@Scripts/profile-cpu.sh
+
+# Profile CPU hot paths by attaching to an already-running app instance
+profile-cpu-attach:
+	@Scripts/profile-cpu.sh --attach-existing --no-build
 
 # Run tests
 test:
