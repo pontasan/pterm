@@ -306,6 +306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Ensure ~/.pterm/ directories exist
         PtermDirectories.ensureDirectories()
         config = PtermConfigStore.load()
+        TypewriterSoundPlayer.shared.configure(enabled: config.textInteraction.typewriterSoundEnabled)
         startConfigWatcher()
 
         // Initialize Metal renderer
@@ -1058,6 +1059,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func reloadConfigurationFromDisk() {
         config = PtermConfigStore.load()
+        TypewriterSoundPlayer.shared.configure(enabled: config.textInteraction.typewriterSoundEnabled)
         manager.updateConfiguration(config)
         setupMenu()
         terminalView?.shortcutConfiguration = config.shortcuts

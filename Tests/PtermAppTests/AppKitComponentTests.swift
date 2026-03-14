@@ -60,6 +60,22 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(player.debugSoundFileCount, 10)
     }
 
+    func testTypewriterSoundPlayerPreloadsAndUnloadsPlayerPool() {
+        let player = TypewriterSoundPlayer()
+
+        XCTAssertEqual(player.debugLoadedPlayerCount, 0)
+
+        player.configure(enabled: true)
+        let loadedCount = player.debugLoadedPlayerCount
+        XCTAssertGreaterThan(loadedCount, 0)
+
+        player.playKeystroke()
+        XCTAssertEqual(player.debugLoadedPlayerCount, loadedCount)
+
+        player.configure(enabled: false)
+        XCTAssertEqual(player.debugLoadedPlayerCount, 0)
+    }
+
     func testStatusBarViewStartsWithPlaceholderMetrics() {
         let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
         view.layoutSubtreeIfNeeded()
