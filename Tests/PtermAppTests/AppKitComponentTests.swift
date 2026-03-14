@@ -58,7 +58,7 @@ final class AppKitComponentTests: XCTestCase {
     func testTypewriterSoundPlayerFindsBundledAudioFiles() {
         let player = TypewriterSoundPlayer()
 
-        XCTAssertEqual(player.debugSoundFileCount, 10)
+        XCTAssertEqual(player.debugSoundFileCount, 36)
     }
 
     func testTypewriterSoundPlayerPreloadsAndUnloadsPlayerPool() {

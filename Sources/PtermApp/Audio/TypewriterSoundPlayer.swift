@@ -57,7 +57,7 @@ final class TypewriterSoundPlayer: NSObject, TypewriterKeyClicking, AVAudioPlaye
     }
 
     static let shared = TypewriterSoundPlayer()
-    private static let playerPoolSizePerSound = 4
+    private static let playerPoolSizePerSound = 1
 
     private let soundURLs: [URL]
     private var variants: [SoundVariant] = []
