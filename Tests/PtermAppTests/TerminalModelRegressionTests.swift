@@ -607,6 +607,16 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(titles.suffix(2), ["Existing", ""])
     }
 
+    func testTerminalModelOSC7UpdatesWorkingDirectoryFromFileURL() {
+        let harness = TerminalModelHarness()
+        var workingDirectories: [String] = []
+        harness.model.onWorkingDirectoryChange = { workingDirectories.append($0) }
+
+        harness.feed("\u{1B}]7;file:///tmp/project\u{07}")
+
+        XCTAssertEqual(workingDirectories, ["/tmp/project"])
+    }
+
     func testTerminalModelOSC1DoesNotChangeWindowTitle() {
         let harness = TerminalModelHarness()
         var titles: [String] = []

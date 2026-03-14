@@ -104,8 +104,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var exportImportManager = PtermExportImportManager(noteStore: appNoteStore)
 
     private var cpuUsageByPID: [pid_t: Double] = [:]
-    private var lastMemoryByPID: [pid_t: UInt64] = [:]
     private var lastAppMemoryBytes: UInt64 = 0
+    private var lastForegroundProcessIDByTerminalID: [UUID: pid_t] = [:]
     private let sessionPersistenceQueue = DispatchQueue(label: SessionPersistence.queueLabel, qos: .utility)
     private var memoryPressureCoordinator: MemoryPressureCoordinator?
     private lazy var sessionPersistenceCoordinator = DebouncedActionCoordinator(
@@ -206,6 +206,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cpuUsageByPID: [pid_t: Double]
     ) -> (cpuPercent: Double, memoryBytes: UInt64) {
         (cpuUsageByPID[getpid()] ?? 0, appMemoryBytes)
+    }
+
+    static func monitoredMetricsPIDs(
+        appPID: pid_t,
+        terminals: [TerminalController],
+        presentation: TerminalListPresentation,
+        appIsActive: Bool,
+        windowIsVisible: Bool
+    ) -> [pid_t] {
+        var pids: [pid_t] = [appPID]
+        guard appIsActive, windowIsVisible, case .integrated = presentation else {
+            return pids
+        }
+
+        for terminal in terminals {
+            pids.append(terminal.processID)
+            if let foregroundPID = terminal.foregroundProcessID,
+               foregroundPID != terminal.processID {
+                pids.append(foregroundPID)
+            }
+        }
+        return pids
+    }
+
+    static func metricsMonitorInterval(
+        presentation: TerminalListPresentation,
+        appIsActive: Bool,
+        windowIsVisible: Bool
+    ) -> TimeInterval {
+        guard appIsActive, windowIsVisible else { return 10.0 }
+        if case .integrated = presentation {
+            return 3.0
+        }
+        return 10.0
+    }
+
+    static func shouldRunMetricsMonitor(
+        appIsActive: Bool,
+        windowIsVisible: Bool
+    ) -> Bool {
+        appIsActive && windowIsVisible
+    }
+
+    static func shouldTrackIntegratedOverviewActivity(
+        presentation: TerminalListPresentation,
+        appIsActive: Bool,
+        windowIsVisible: Bool
+    ) -> Bool {
+        _ = appIsActive
+        guard windowIsVisible else { return false }
+        if case .integrated = presentation {
+            return true
+        }
+        return false
+    }
+
+    static func shouldPromoteOutputActivityToVisibleIndicator(
+        terminalHasEverBeenIdle: Bool,
+        secondsSinceLastResize: TimeInterval
+    ) -> Bool {
+        guard terminalHasEverBeenIdle else { return false }
+        return secondsSinceLastResize >= 1.0
+    }
+
+    @discardableResult
+    static func refreshCurrentDirectories(
+        for controllers: [TerminalController],
+        refresh: ((TerminalController) -> Bool)? = nil
+    ) -> Int {
+        var refreshed = 0
+        var seen: Set<UUID> = []
+        for controller in controllers where seen.insert(controller.id).inserted {
+            let didRefresh = refresh?(controller) ?? controller.refreshCurrentDirectoryFromShellProcess()
+            if didRefresh {
+                refreshed += 1
+            }
+        }
+        return refreshed
     }
 
     static func initialLaunchDisposition(
@@ -611,6 +689,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - View Switching
 
     private func switchToFocused(_ controller: TerminalController) {
+        Self.refreshCurrentDirectories(for: [controller])
         applyRendererSettings(for: controller)
 
         // Remove integrated view
@@ -654,6 +733,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         viewMode = .focused(controller)
         applyAppearanceSettingsToVisibleViews()
         updateTitlebarBackButtonVisibility()
+        refreshMetricsMonitoringState()
         refreshStatusBarMetrics()
         window.makeFirstResponder(sv.terminalView)
         sv.terminalView.syncScaleFactorIfNeeded()
@@ -671,6 +751,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
+
+        Self.refreshCurrentDirectories(for: controllers)
 
         integratedView?.releaseInactiveRenderingResourcesNow()
         integratedView?.removeFromSuperview()
@@ -713,6 +795,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         viewMode = .split(controllers)
         applyAppearanceSettingsToVisibleViews()
         updateTitlebarBackButtonVisibility()
+        refreshMetricsMonitoringState()
         refreshStatusBarMetrics()
         if let activeController = splitView.activeController {
             applyRendererSettings(for: activeController)
@@ -725,6 +808,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func switchToIntegrated() {
+        Self.refreshCurrentDirectories(for: manager.terminals)
         // Remove focused terminal scroll view
         terminalView?.releaseInactiveRenderingResourcesNow()
         terminalScrollView?.removeFromSuperview()
@@ -753,11 +837,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         syncIntegratedWorkspaceNames()
         contentHostView().addSubview(iv)
         setupScrollbarOverlay(for: iv)
+        iv.invalidateDynamicThumbnailCaches()
         activeOutputTerminalIDs.forEach { _ = iv.setTerminalOutputActive($0, isActive: true) }
         viewMode = .integrated
         applyAppearanceSettingsToVisibleViews()
         iv.syncScaleFactorIfNeeded()
         updateTitlebarBackButtonVisibility()
+        refreshMetricsMonitoringState()
         refreshStatusBarMetrics()
         window.makeFirstResponder(iv)
 
@@ -835,33 +921,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusBarView.updateMemoryUsage(bytes: metrics.memoryBytes)
     }
 
+    private var currentPresentation: TerminalListPresentation {
+        switch viewMode {
+        case .integrated:
+            return .integrated
+        case .focused(let controller):
+            return .focused(controller.id)
+        case .split(let controllers):
+            return .split(controllers.map(\.id))
+        }
+    }
+
     private func startMetricsMonitor() {
-        let monitor = ProcessMetricsMonitor(interval: 3.0)
+        metricsMonitor?.stop()
+        metricsMonitor = nil
+        guard Self.shouldRunMetricsMonitor(
+            appIsActive: NSApp.isActive,
+            windowIsVisible: window?.occlusionState.contains(.visible) ?? true
+        ) else {
+            return
+        }
+        let monitor = ProcessMetricsMonitor(
+            interval: Self.metricsMonitorInterval(
+                presentation: currentPresentation,
+                appIsActive: NSApp.isActive,
+                windowIsVisible: window?.occlusionState.contains(.visible) ?? false
+            )
+        )
         monitor.onUpdate = { [weak self] snapshot in
             guard let self else { return }
             self.cpuUsageByPID = snapshot.cpuUsageByPID
-            self.lastMemoryByPID = snapshot.memoryByPID
             self.lastAppMemoryBytes = snapshot.appMemoryBytes
+            let activeTerminalIDs = Set(self.manager.terminals.map(\.id))
+            self.lastForegroundProcessIDByTerminalID =
+                self.lastForegroundProcessIDByTerminalID.filter { activeTerminalIDs.contains($0.key) }
             self.manager.terminals.forEach { terminal in
-                if let cwd = snapshot.currentDirectoryByPID[terminal.processID] {
-                    terminal.updateCurrentDirectory(path: cwd)
+                let foregroundPID = terminal.foregroundProcessID ?? terminal.processID
+                let previousForegroundPID = self.lastForegroundProcessIDByTerminalID.updateValue(
+                    foregroundPID,
+                    forKey: terminal.id
+                )
+                if previousForegroundPID != foregroundPID {
+                    _ = terminal.refreshCurrentDirectoryFromShellProcess()
                 }
             }
             self.refreshStatusBarMetrics()
         }
         monitor.start { [weak self] in
             guard let self else { return [] }
-            var pids: [pid_t] = [getpid()]
-            for terminal in self.manager.terminals {
-                pids.append(terminal.processID)
-                if let foregroundPID = terminal.foregroundProcessID,
-                   foregroundPID != terminal.processID {
-                    pids.append(foregroundPID)
-                }
-            }
-            return pids
+            return Self.monitoredMetricsPIDs(
+                appPID: getpid(),
+                terminals: self.manager.terminals,
+                presentation: self.currentPresentation,
+                appIsActive: NSApp.isActive,
+                windowIsVisible: self.window?.occlusionState.contains(.visible) ?? false
+            )
         }
         metricsMonitor = monitor
+    }
+
+    private func stopMetricsMonitor() {
+        metricsMonitor?.stop()
+        metricsMonitor = nil
+    }
+
+    private func refreshMetricsMonitoringState() {
+        if Self.shouldRunMetricsMonitor(
+            appIsActive: NSApp.isActive,
+            windowIsVisible: window?.occlusionState.contains(.visible) ?? false
+        ) {
+            startMetricsMonitor()
+        } else {
+            stopMetricsMonitor()
+        }
     }
 
     private func availableContentFrame() -> NSRect {
@@ -1420,15 +1552,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Always track last output time (needed to detect when terminal becomes idle)
             self.lastOutputTimes[controller.id] = now
             self.ensureOutputIdleTimer()
-            self.integratedView?.noteTerminalContentActivity(controller.id)
-            // Suppress indicator briefly after window resize (SIGWINCH)
-            if now.timeIntervalSince(self.lastResizeTime) < 1.0 { return }
-            // Only show indicator for terminals that have been idle at least once.
-            // This prevents the initial shell startup output from triggering the indicator.
-            guard self.terminalsEverIdle.contains(controller.id) else { return }
+            guard Self.shouldPromoteOutputActivityToVisibleIndicator(
+                terminalHasEverBeenIdle: self.terminalsEverIdle.contains(controller.id),
+                secondsSinceLastResize: now.timeIntervalSince(self.lastResizeTime)
+            ) else {
+                return
+            }
             self.activeOutputTerminalIDs.insert(controller.id)
             self.syncVisibleTerminalOutputIndicators()
-            self.integratedView?.noteTerminalOutputActivity(controller.id)
+            if Self.shouldTrackIntegratedOverviewActivity(
+                presentation: self.currentPresentation,
+                appIsActive: NSApp.isActive,
+                windowIsVisible: self.window?.occlusionState.contains(.visible) ?? false
+            ) {
+                self.integratedView?.noteTerminalContentActivity(controller.id)
+                self.integratedView?.noteTerminalOutputActivity(controller.id)
+            }
         }
         if config.audit.enabled {
             let logger = TerminalAuditLogger(
@@ -1460,6 +1599,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.syncVisibleTerminalOutputIndicators()
                     self.lastOutputTimes.removeValue(forKey: id)
                     self.terminalsEverIdle.insert(id)
+                    if let terminal = self.manager.terminals.first(where: { $0.id == id }),
+                       terminal.foregroundProcessID ?? terminal.processID == terminal.processID {
+                        _ = terminal.refreshCurrentDirectoryFromShellProcess()
+                    }
                 }
             }
             if self.lastOutputTimes.isEmpty {
@@ -2404,10 +2547,12 @@ extension AppDelegate: NSWindowDelegate {
     }
 
     func windowDidMiniaturize(_ notification: Notification) {
+        stopMetricsMonitor()
         releaseInactiveRenderingResourcesNow()
     }
 
     func windowDidDeminiaturize(_ notification: Notification) {
+        refreshMetricsMonitoringState()
         restoreVisibleRenderingResourcesIfNeeded()
     }
 
@@ -2424,14 +2569,17 @@ extension AppDelegate: NSWindowDelegate {
     }
 
     @objc func applicationDidBecomeActive(_ notification: Notification) {
+        refreshMetricsMonitoringState()
         restoreVisibleRenderingResourcesIfNeeded()
     }
 
     @objc func applicationDidHide(_ notification: Notification) {
+        stopMetricsMonitor()
         releaseInactiveRenderingResourcesNow()
     }
 
     @objc func applicationDidUnhide(_ notification: Notification) {
+        refreshMetricsMonitoringState()
         restoreVisibleRenderingResourcesIfNeeded()
     }
 

@@ -50,7 +50,8 @@ final class TerminalControllerTests: XCTestCase {
         workspaceName: String = "Main Workspace",
         scrollbackPersistencePath: String? = nil,
         scrollbackInitialCapacity: Int = 4096,
-        scrollbackMaxCapacity: Int = 4096
+        scrollbackMaxCapacity: Int = 4096,
+        currentDirectoryProvider: @escaping (pid_t) -> String? = { _ in nil }
     ) -> TerminalController {
         TerminalController(
             rows: rows,
@@ -64,7 +65,8 @@ final class TerminalControllerTests: XCTestCase {
             initialDirectory: initialDirectory,
             customTitle: customTitle,
             workspaceName: workspaceName,
-            scrollbackPersistencePath: scrollbackPersistencePath
+            scrollbackPersistencePath: scrollbackPersistencePath,
+            currentDirectoryProvider: currentDirectoryProvider
         )
     }
 
@@ -913,6 +915,22 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertTrue(titles.isEmpty)
         XCTAssertEqual(stateChanges, 1)
         XCTAssertEqual(controller.sessionSnapshot.currentDirectory, "/tmp/other")
+    }
+
+    func testRefreshCurrentDirectoryFromProcessIDUsesInjectedProvider() {
+        let controller = makeController(
+            initialDirectory: "/tmp/start",
+            currentDirectoryProvider: { _ in "/tmp/refreshed" }
+        )
+        var titles: [String] = []
+        controller.onTitleChange = { titles.append($0) }
+
+        XCTAssertTrue(controller.refreshCurrentDirectory(fromProcessID: 123))
+        drainMainQueue(testCase: self)
+
+        XCTAssertEqual(controller.title, "refreshed")
+        XCTAssertEqual(controller.sessionSnapshot.currentDirectory, "/tmp/refreshed")
+        XCTAssertEqual(titles.last, "refreshed")
     }
 
     func testSetScrollOffsetClampsNegativeAndLargeValues() {

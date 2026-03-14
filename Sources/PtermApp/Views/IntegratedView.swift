@@ -201,11 +201,31 @@ final class IntegratedView: MTKView, NSDraggingSource {
             hasher.combine(defaultBackgroundBits.2)
             hasher.combine(defaultBackgroundBits.3)
         }
+
+        func isContentCompatible(with other: ThumbnailSurfaceSignature) -> Bool {
+            rows == other.rows &&
+                cols == other.cols &&
+                scrollbackRowCount == other.scrollbackRowCount &&
+                scrollOffset == other.scrollOffset &&
+                fontName == other.fontName &&
+                fontSizeBits == other.fontSizeBits &&
+                glyphScaleBits == other.glyphScaleBits &&
+                thumbnailWidthBits == other.thumbnailWidthBits &&
+                thumbnailHeightBits == other.thumbnailHeightBits &&
+                defaultForegroundBits.0 == other.defaultForegroundBits.0 &&
+                defaultForegroundBits.1 == other.defaultForegroundBits.1 &&
+                defaultForegroundBits.2 == other.defaultForegroundBits.2 &&
+                defaultBackgroundBits.0 == other.defaultBackgroundBits.0 &&
+                defaultBackgroundBits.1 == other.defaultBackgroundBits.1 &&
+                defaultBackgroundBits.2 == other.defaultBackgroundBits.2 &&
+                defaultBackgroundBits.3 == other.defaultBackgroundBits.3
+        }
     }
 
     private struct CachedThumbnailSurface {
         let signature: ThumbnailSurfaceSignature
         let texture: MTLTexture
+        let lastRenderTime: CFTimeInterval
 
         var byteCount: Int {
             texture.width * texture.height * 4
@@ -288,13 +308,13 @@ final class IntegratedView: MTKView, NSDraggingSource {
     }
 
     func noteTerminalOutputActivity(_ terminalID: UUID) {
-        thumbnailSurfaceCache.removeValue(forKey: terminalID)
+        dirtyThumbnailSurfaceIDs.insert(terminalID)
         let inserted = setTerminalOutputActive(terminalID, isActive: true)
         scheduleOverviewContentRedraw(forceImmediate: inserted)
     }
 
     func noteTerminalContentActivity(_ terminalID: UUID) {
-        thumbnailSurfaceCache.removeValue(forKey: terminalID)
+        dirtyThumbnailSurfaceIDs.insert(terminalID)
         scheduleOverviewContentRedraw(forceImmediate: false)
     }
 
@@ -381,6 +401,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private var textVertexCache: [TextVertexCacheKey: CachedTextVertices] = [:]
     private var textAtlasSignature: TextAtlasSignature?
     private var thumbnailSurfaceCache: [UUID: CachedThumbnailSurface] = [:]
+    private var dirtyThumbnailSurfaceIDs: Set<UUID> = []
     private var cachedCPUStatusByTerminalID: [UUID: CachedCPUStatus] = [:]
     private var stagingPreContentOverlayVertices: [Float] = []
     private var stagingPostContentOverlayVertices: [Float] = []
@@ -396,6 +417,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private var outputPulseTimer: Timer?
     private var outputContentRedrawTimer: Timer?
     private var lastOutputContentRedrawTime: CFTimeInterval = 0
+    private var thumbnailRefreshAllowanceForCurrentFrame: Set<UUID> = []
     private var overviewOutputDisplayRequestCount = 0
     private var isOverviewScrolling = false
 
@@ -462,10 +484,18 @@ final class IntegratedView: MTKView, NSDraggingSource {
         return min(1.0, max(0.25, scaledInterval))
     }
 
+    static func effectiveThumbnailRefreshBudget(visibleTerminalCount: Int) -> Int {
+        let clampedVisibleCount = max(1, visibleTerminalCount)
+        return max(1, Int(ceil(Double(clampedVisibleCount) * 0.25)))
+    }
+
     var cachedTextVertexCount: Int { textVertexCache.count }
     var cachedThumbnailVertexCount: Int { thumbnailSurfaceCache.count }
     func debugHasThumbnailSurfaceCacheEntry(for controllerID: UUID) -> Bool {
         thumbnailSurfaceCache[controllerID] != nil
+    }
+    func debugHasDirtyThumbnailSurface(for controllerID: UUID) -> Bool {
+        dirtyThumbnailSurfaceIDs.contains(controllerID)
     }
     func debugCachedThumbnailSurfaceOpaquePixelCount(for controllerID: UUID) -> Int? {
         guard let texture = thumbnailSurfaceCache[controllerID]?.texture else { return nil }
@@ -602,7 +632,11 @@ final class IntegratedView: MTKView, NSDraggingSource {
             thumbnailSize: NSSize(width: 8, height: 8),
             terminalAppearance: renderer.terminalAppearance
         )
-        thumbnailSurfaceCache[controllerID] = CachedThumbnailSurface(signature: signature, texture: texture)
+        thumbnailSurfaceCache[controllerID] = CachedThumbnailSurface(
+            signature: signature,
+            texture: texture,
+            lastRenderTime: CACurrentMediaTime()
+        )
     }
 
     func debugRenderedThumbnailOpaquePixelCount(for controllerID: UUID) -> Int? {
@@ -616,7 +650,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
               let readableTexture = makeReadableOverviewThumbnailTexture(size: layout.thumbnail.size, scaleFactor: scaleFactor) else {
             return nil
         }
-        _ = layout.controller.withViewport { model, scrollback, scrollOffset in
+        layout.controller.withViewport { model, scrollback, scrollOffset in
             renderer.renderThumbnailToTexture(
                 model: model,
                 scrollback: scrollback,
@@ -624,7 +658,9 @@ final class IntegratedView: MTKView, NSDraggingSource {
                 texture: renderTexture,
                 thumbnailSize: layout.thumbnail.size,
                 scaleFactor: scaleFactor,
-                commandBuffer: commandBuffer
+                commandBuffer: commandBuffer,
+                bgScratch: &thumbnailCacheBuildBgScratch,
+                glyphScratch: &thumbnailCacheBuildGlyphScratch
             )
         }
         if let blit = commandBuffer.makeBlitCommandEncoder() {
@@ -664,7 +700,9 @@ final class IntegratedView: MTKView, NSDraggingSource {
                 texture: readableTexture,
                 thumbnailSize: layout.thumbnail.size,
                 scaleFactor: scaleFactor,
-                commandBuffer: commandBuffer
+                commandBuffer: commandBuffer,
+                bgScratch: &thumbnailCacheBuildBgScratch,
+                glyphScratch: &thumbnailCacheBuildGlyphScratch
             )
         }
         commandBuffer.commit()
@@ -912,7 +950,11 @@ final class IntegratedView: MTKView, NSDraggingSource {
             descriptor.usage = [.shaderRead, .renderTarget]
             descriptor.storageMode = .private
             let texture = renderer.device.makeTexture(descriptor: descriptor)!
-            thumbnailSurfaceCache[controller.id] = CachedThumbnailSurface(signature: signature, texture: texture)
+            thumbnailSurfaceCache[controller.id] = CachedThumbnailSurface(
+                signature: signature,
+                texture: texture,
+                lastRenderTime: CACurrentMediaTime()
+            )
         }
     }
 
@@ -1047,6 +1089,16 @@ final class IntegratedView: MTKView, NSDraggingSource {
         updateLayoutCacheIfNeeded()
         syncCompanionDocumentView()
         updateRenderLoopState()
+        setNeedsDisplay(bounds)
+    }
+
+    func invalidateDynamicThumbnailCaches() {
+        thumbnailSurfaceCache.removeAll()
+        dirtyThumbnailSurfaceIDs.removeAll()
+        cachedCPUStatusByTerminalID.removeAll()
+        lastOutputContentRedrawTime = 0
+        outputContentRedrawTimer?.invalidate()
+        outputContentRedrawTimer = nil
         setNeedsDisplay(bounds)
     }
 
@@ -1367,6 +1419,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         if thumbnailSurfaceCache.count < originalCount {
             renderer.releaseOverviewBuffers(for: self)
         }
+        dirtyThumbnailSurfaceIDs = dirtyThumbnailSurfaceIDs.filter { activeTerminalIDs.contains($0) }
     }
 
     private func pruneCPUStatusCache(activeTerminalIDs: Set<UUID>) {
@@ -1410,6 +1463,9 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
         if force || !thumbnailSurfaceCache.isEmpty {
             thumbnailSurfaceCache.removeAll()
+        }
+        if force || !dirtyThumbnailSurfaceIDs.isEmpty {
+            dirtyThumbnailSurfaceIDs.removeAll()
         }
     }
 
@@ -1585,6 +1641,13 @@ final class IntegratedView: MTKView, NSDraggingSource {
                 terminalAppearance: renderer.terminalAppearance
             )
             if let cached = thumbnailSurfaceCache[controller.id], cached.signature == signature {
+                dirtyThumbnailSurfaceIDs.remove(controller.id)
+                return cached
+            }
+            if let cached = thumbnailSurfaceCache[controller.id],
+               cached.signature.isContentCompatible(with: signature),
+               dirtyThumbnailSurfaceIDs.contains(controller.id),
+               !thumbnailRefreshAllowanceForCurrentFrame.contains(controller.id) {
                 return cached
             }
             guard let commandBuffer else {
@@ -1600,10 +1663,17 @@ final class IntegratedView: MTKView, NSDraggingSource {
                 texture: texture,
                 thumbnailSize: thumbnailSize,
                 scaleFactor: scaleFactor,
-                commandBuffer: commandBuffer
+                commandBuffer: commandBuffer,
+                bgScratch: &thumbnailCacheBuildBgScratch,
+                glyphScratch: &thumbnailCacheBuildGlyphScratch
             )
-            let cached = CachedThumbnailSurface(signature: signature, texture: texture)
+            let cached = CachedThumbnailSurface(
+                signature: signature,
+                texture: texture,
+                lastRenderTime: CACurrentMediaTime()
+            )
             thumbnailSurfaceCache[controller.id] = cached
+            dirtyThumbnailSurfaceIDs.remove(controller.id)
             pruneThumbnailVertexCache(
                 activeTerminalIDs: Set(manager.terminals.map(\.id)),
                 preferredTerminalIDs: Set(cachedVisibleThumbnails.map(\.controller.id))
@@ -2362,6 +2432,22 @@ extension IntegratedView: MTKViewDelegate {
         renderPassDescriptor.colorAttachments[0].clearColor = Self.overviewBackgroundClearColor()
 
         let viewportSize = SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height))
+        let visibleTerminalCount = cachedVisibleThumbnails.isEmpty ? manager.terminals.count : cachedVisibleThumbnails.count
+        let thumbnailRefreshBudget = Self.effectiveThumbnailRefreshBudget(visibleTerminalCount: visibleTerminalCount)
+        let compatibleDirtyIDs = cachedVisibleThumbnails.compactMap { frame -> (UUID, CFTimeInterval)? in
+            let controllerID = frame.controller.id
+            guard dirtyThumbnailSurfaceIDs.contains(controllerID),
+                  let cached = thumbnailSurfaceCache[controllerID] else {
+                return nil
+            }
+            return (controllerID, cached.lastRenderTime)
+        }
+        thumbnailRefreshAllowanceForCurrentFrame = Set(
+            compatibleDirtyIDs
+                .sorted { $0.1 < $1.1 }
+                .prefix(thumbnailRefreshBudget)
+                .map(\.0)
+        )
         stagingPreContentOverlayVertices.removeAll(keepingCapacity: true)
         stagingPostContentOverlayVertices.removeAll(keepingCapacity: true)
         stagingThumbnailBgVertices.removeAll(keepingCapacity: true)
@@ -2401,6 +2487,7 @@ extension IntegratedView: MTKViewDelegate {
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(
             descriptor: renderPassDescriptor) else {
+            thumbnailRefreshAllowanceForCurrentFrame.removeAll(keepingCapacity: true)
             return
         }
 
@@ -2574,6 +2661,7 @@ extension IntegratedView: MTKViewDelegate {
         )
 
         encoder.endEncoding()
+        thumbnailRefreshAllowanceForCurrentFrame.removeAll(keepingCapacity: true)
     }
 
     private func flushOverviewContentBatch(

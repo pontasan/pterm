@@ -4770,7 +4770,7 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertFalse(view.activeOutputTerminals.contains(controller.id))
     }
 
-    func testIntegratedViewContentActivityInvalidatesThumbnailSurfaceCacheEntry() throws {
+    func testIntegratedViewContentActivityMarksThumbnailSurfaceDirtyWithoutEvictingCacheEntry() throws {
         let renderer = try makeRendererWithPipelinesOrSkip()
         let manager = TerminalManager(rows: 24, cols: 80, config: .default)
         defer { manager.stopAll(waitForExit: true) }
@@ -4794,7 +4794,38 @@ final class AppKitComponentTests: XCTestCase {
 
         view.noteTerminalContentActivity(controller.id)
 
-        XCTAssertFalse(view.debugHasThumbnailSurfaceCacheEntry(for: controller.id))
+        XCTAssertTrue(view.debugHasThumbnailSurfaceCacheEntry(for: controller.id))
+        XCTAssertTrue(view.debugHasDirtyThumbnailSurface(for: controller.id))
+    }
+
+    func testIntegratedViewRenderClearsDirtyThumbnailSurfaceWhenRefreshBudgetAllowsIt() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let controller = try manager.addTerminal(
+            initialDirectory: NSTemporaryDirectory(),
+            fontName: renderer.glyphAtlas.fontName,
+            fontSize: Double(renderer.glyphAtlas.fontSize)
+        )
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 640, height: 360), renderer: renderer, manager: manager)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 360))
+        window.contentView = NSView(frame: view.frame)
+        window.contentView?.addSubview(view)
+        let overlay = ScrollbarOverlayView(frame: view.frame)
+        overlay.documentView = ScrollDocumentView(frame: view.bounds)
+        overlay.contentView.postsBoundsChangedNotifications = true
+        view.companionScrollView = overlay
+
+        renderFrame(for: view)
+        view.debugSeedThumbnailSurfaceCacheForTesting(controllerID: controller.id)
+        XCTAssertTrue(view.debugHasThumbnailSurfaceCacheEntry(for: controller.id))
+        view.noteTerminalContentActivity(controller.id)
+        XCTAssertTrue(view.debugHasDirtyThumbnailSurface(for: controller.id))
+
+        renderFrame(for: view)
+
+        XCTAssertTrue(view.debugHasThumbnailSurfaceCacheEntry(for: controller.id))
+        XCTAssertFalse(view.debugHasDirtyThumbnailSurface(for: controller.id))
     }
 
     func testIntegratedViewOffscreenThumbnailSurfaceRendersVisibleTerminalContentForEachController() throws {
@@ -5153,6 +5184,16 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(IntegratedView.effectiveOutputContentRedrawInterval(visibleTerminalCount: 4), 0.70, accuracy: 0.0001)
         XCTAssertEqual(IntegratedView.effectiveOutputContentRedrawInterval(visibleTerminalCount: 8), 1.0, accuracy: 0.0001)
         XCTAssertEqual(IntegratedView.effectiveOutputContentRedrawInterval(visibleTerminalCount: 32), 1.0, accuracy: 0.0001)
+    }
+
+    func testIntegratedViewThumbnailRefreshBudgetScalesWithVisibleTerminalCount() {
+        XCTAssertEqual(IntegratedView.effectiveThumbnailRefreshBudget(visibleTerminalCount: 0), 1)
+        XCTAssertEqual(IntegratedView.effectiveThumbnailRefreshBudget(visibleTerminalCount: 1), 1)
+        XCTAssertEqual(IntegratedView.effectiveThumbnailRefreshBudget(visibleTerminalCount: 2), 1)
+        XCTAssertEqual(IntegratedView.effectiveThumbnailRefreshBudget(visibleTerminalCount: 4), 1)
+        XCTAssertEqual(IntegratedView.effectiveThumbnailRefreshBudget(visibleTerminalCount: 5), 2)
+        XCTAssertEqual(IntegratedView.effectiveThumbnailRefreshBudget(visibleTerminalCount: 8), 2)
+        XCTAssertEqual(IntegratedView.effectiveThumbnailRefreshBudget(visibleTerminalCount: 12), 3)
     }
 
     func testIntegratedViewVerticallyCenteredTextOriginCentersGlyphBoundsInsideTitleBar() {

@@ -61,6 +61,160 @@ final class AppInfrastructureTests: XCTestCase {
         )
     }
 
+    func testMonitoredMetricsPIDsIncludesOnlyAppPIDOutsideIntegratedVisibleActiveState() {
+        let controller = TerminalController(
+            rows: 24,
+            cols: 80,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 1024,
+            scrollbackMaxCapacity: 1024,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp",
+            currentDirectoryProvider: { _ in nil }
+        )
+
+        let focused = AppDelegate.monitoredMetricsPIDs(
+            appPID: 99,
+            terminals: [controller],
+            presentation: .focused(controller.id),
+            appIsActive: true,
+            windowIsVisible: true
+        )
+        XCTAssertEqual(focused, [99])
+
+        let inactive = AppDelegate.monitoredMetricsPIDs(
+            appPID: 99,
+            terminals: [controller],
+            presentation: .integrated,
+            appIsActive: false,
+            windowIsVisible: true
+        )
+        XCTAssertEqual(inactive, [99])
+    }
+
+    func testShouldRunMetricsMonitorRequiresActiveAndVisibleWindow() {
+        XCTAssertTrue(AppDelegate.shouldRunMetricsMonitor(appIsActive: true, windowIsVisible: true))
+        XCTAssertFalse(AppDelegate.shouldRunMetricsMonitor(appIsActive: false, windowIsVisible: true))
+        XCTAssertFalse(AppDelegate.shouldRunMetricsMonitor(appIsActive: true, windowIsVisible: false))
+    }
+
+    func testMetricsMonitorIntervalUsesSlowerSamplingOutsideIntegratedPresentation() {
+        XCTAssertEqual(
+            AppDelegate.metricsMonitorInterval(
+                presentation: .integrated,
+                appIsActive: true,
+                windowIsVisible: true
+            ),
+            3.0,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            AppDelegate.metricsMonitorInterval(
+                presentation: .focused(UUID()),
+                appIsActive: true,
+                windowIsVisible: true
+            ),
+            10.0,
+            accuracy: 0.001
+        )
+    }
+
+    func testShouldTrackIntegratedOverviewActivityRequiresIntegratedVisibleActivePresentation() {
+        XCTAssertTrue(
+            AppDelegate.shouldTrackIntegratedOverviewActivity(
+                presentation: .integrated,
+                appIsActive: true,
+                windowIsVisible: true
+            )
+        )
+        XCTAssertFalse(
+            AppDelegate.shouldTrackIntegratedOverviewActivity(
+                presentation: .focused(UUID()),
+                appIsActive: true,
+                windowIsVisible: true
+            )
+        )
+        XCTAssertTrue(
+            AppDelegate.shouldTrackIntegratedOverviewActivity(
+                presentation: .integrated,
+                appIsActive: false,
+                windowIsVisible: true
+            )
+        )
+        XCTAssertFalse(
+            AppDelegate.shouldTrackIntegratedOverviewActivity(
+                presentation: .integrated,
+                appIsActive: true,
+                windowIsVisible: false
+            )
+        )
+    }
+
+    func testVisibleOutputIndicatorPromotionDependsOnIdleHistoryAndResizeSuppressionOnly() {
+        XCTAssertTrue(
+            AppDelegate.shouldPromoteOutputActivityToVisibleIndicator(
+                terminalHasEverBeenIdle: true,
+                secondsSinceLastResize: 1.01
+            )
+        )
+        XCTAssertFalse(
+            AppDelegate.shouldPromoteOutputActivityToVisibleIndicator(
+                terminalHasEverBeenIdle: false,
+                secondsSinceLastResize: 10.0
+            )
+        )
+        XCTAssertFalse(
+            AppDelegate.shouldPromoteOutputActivityToVisibleIndicator(
+                terminalHasEverBeenIdle: true,
+                secondsSinceLastResize: 0.25
+            )
+        )
+    }
+
+    func testRefreshCurrentDirectoriesRefreshesEachUniqueControllerOnce() {
+        var refreshCalls: [UUID] = []
+        let first = TerminalController(
+            rows: 24,
+            cols: 80,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 1024,
+            scrollbackMaxCapacity: 1024,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/one",
+            currentDirectoryProvider: { pid in
+                _ = pid
+                return "/tmp/refreshed-\(pid)"
+            }
+        )
+        let second = TerminalController(
+            rows: 24,
+            cols: 80,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 1024,
+            scrollbackMaxCapacity: 1024,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/two",
+            currentDirectoryProvider: { pid in
+                _ = pid
+                return "/tmp/refreshed-\(pid)"
+            }
+        )
+
+        let refreshed = AppDelegate.refreshCurrentDirectories(for: [first, first, second]) { controller in
+            refreshCalls.append(controller.id)
+            return true
+        }
+
+        XCTAssertEqual(refreshed, 2)
+        XCTAssertEqual(refreshCalls, [first.id, second.id])
+    }
+
     func testTerminalListReconciliationKeepsIntegratedPresentationWhenLastTerminalRemoved() {
         let result = AppDelegate.reconcilePresentationAfterTerminalListChange(
             currentPresentation: .integrated,
@@ -1397,8 +1551,6 @@ final class AppInfrastructureTests: XCTestCase {
         let expectation = expectation(description: "metrics-update")
         monitor.onUpdate = { snapshot in
             XCTAssertTrue(snapshot.cpuUsageByPID.isEmpty)
-            XCTAssertTrue(snapshot.currentDirectoryByPID.isEmpty)
-            XCTAssertTrue(snapshot.memoryByPID.isEmpty)
             XCTAssertGreaterThan(snapshot.appMemoryBytes, 0)
             expectation.fulfill()
         }
@@ -1417,13 +1569,8 @@ final class AppInfrastructureTests: XCTestCase {
     }
 
     @MainActor
-    func testProcessMetricsMonitorStopReleasesDescendantScratchStorage() {
+    func testProcessMetricsMonitorStopKeepsDescendantScratchAtZero() {
         let monitor = ProcessMetricsMonitor(interval: 60)
-        monitor.debugPrimeDescendantScratch(queueCount: 8, resultCount: 16, childCount: 32)
-
-        XCTAssertGreaterThan(monitor.debugDescendantQueueScratchCapacity, 0)
-        XCTAssertGreaterThan(monitor.debugDescendantResultScratchCapacity, 0)
-        XCTAssertGreaterThan(monitor.debugChildPIDBufferScratchCapacity, 0)
 
         monitor.stop()
 
@@ -1443,16 +1590,9 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertEqual(monitor.debugLastSampleCount, 0)
     }
 
-    func testProcessMetricsMonitorCompactsOversizedDescendantScratchAfterPeakUsageDrops() {
+    func testProcessMetricsMonitorDescendantScratchRemainsDisabled() {
         let monitor = ProcessMetricsMonitor(interval: 60)
         monitor.debugPrimeDescendantScratch(queueCount: 512, resultCount: 1024, childCount: 2048)
-
-        let initialQueueCapacity = monitor.debugDescendantQueueScratchCapacity
-        let initialResultCapacity = monitor.debugDescendantResultScratchCapacity
-        let initialChildCapacity = monitor.debugChildPIDBufferScratchCapacity
-        XCTAssertGreaterThan(initialQueueCapacity, 64)
-        XCTAssertGreaterThan(initialResultCapacity, 64)
-        XCTAssertGreaterThan(initialChildCapacity, 64)
 
         monitor.debugCompactDescendantScratchForTesting(
             retainingQueueCount: 4,
@@ -1460,9 +1600,9 @@ final class AppInfrastructureTests: XCTestCase {
             childCount: 16
         )
 
-        XCTAssertLessThan(monitor.debugDescendantQueueScratchCapacity, initialQueueCapacity)
-        XCTAssertLessThan(monitor.debugDescendantResultScratchCapacity, initialResultCapacity)
-        XCTAssertLessThan(monitor.debugChildPIDBufferScratchCapacity, initialChildCapacity)
+        XCTAssertEqual(monitor.debugDescendantQueueScratchCapacity, 0)
+        XCTAssertEqual(monitor.debugDescendantResultScratchCapacity, 0)
+        XCTAssertEqual(monitor.debugChildPIDBufferScratchCapacity, 0)
     }
 
     func testProcessMetricsMonitorConvertsAbsoluteTicksUsingMachTimebase() {
@@ -1477,7 +1617,7 @@ final class AppInfrastructureTests: XCTestCase {
     }
 
     @MainActor
-    func testProcessMetricsMonitorCapturesCurrentDirectoryAndMemoryForLiveChildProcess() throws {
+    func testProcessMetricsMonitorCapturesCPUForLiveChildProcess() throws {
         try withTemporaryDirectory { directory in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -1494,19 +1634,38 @@ final class AppInfrastructureTests: XCTestCase {
             let monitor = ProcessMetricsMonitor(interval: 60)
             let expectation = expectation(description: "metrics-update-live-child")
             monitor.onUpdate = { snapshot in
-                guard let cwd = snapshot.currentDirectoryByPID[process.processIdentifier],
-                      let memory = snapshot.memoryByPID[process.processIdentifier] else {
+                guard let cpu = snapshot.cpuUsageByPID[process.processIdentifier] else {
                     return
                 }
-                let resolvedCWD = URL(fileURLWithPath: cwd).resolvingSymlinksInPath().path
-                XCTAssertEqual(resolvedCWD, directory.resolvingSymlinksInPath().path)
-                XCTAssertGreaterThan(memory, 0)
+                XCTAssertGreaterThanOrEqual(cpu, 0)
                 expectation.fulfill()
             }
 
             monitor.start(pidsProvider: { [process.processIdentifier] })
             wait(for: [expectation], timeout: 1.0)
             monitor.stop()
+        }
+    }
+
+    func testProcessInspectionCapturesCurrentDirectoryForLiveChildProcess() throws {
+        try withTemporaryDirectory { directory in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.currentDirectoryURL = directory
+            process.arguments = ["-c", "sleep 2"]
+            try process.run()
+            defer {
+                if process.isRunning {
+                    process.terminate()
+                    process.waitUntilExit()
+                }
+            }
+
+            let cwd = try XCTUnwrap(ProcessInspection.currentDirectory(pid: process.processIdentifier))
+            XCTAssertEqual(
+                URL(fileURLWithPath: cwd).resolvingSymlinksInPath().path,
+                directory.resolvingSymlinksInPath().path
+            )
         }
     }
 

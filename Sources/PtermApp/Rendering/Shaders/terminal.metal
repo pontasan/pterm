@@ -19,6 +19,7 @@ struct VertexOut {
 /// Uniforms passed per frame.
 struct Uniforms {
     float2 viewportSize;
+    float2 positionOffset;
     float  cursorOpacity; // For smooth cursor fade animation
     float  cursorBlink;   // 1.0 = blinking, 0.0 = steady
     float  time;
@@ -36,7 +37,7 @@ vertex VertexOut bg_vertex(
     VertexIn in = vertices[vertexID];
 
     // Convert pixel coordinates to Metal NDC (-1..1)
-    float2 ndc = (in.position / uniforms.viewportSize) * 2.0 - 1.0;
+    float2 ndc = ((in.position + uniforms.positionOffset) / uniforms.viewportSize) * 2.0 - 1.0;
     ndc.y = -ndc.y; // Flip Y (Metal has origin at bottom-left)
 
     out.position = float4(ndc, 0.0, 1.0);
@@ -62,7 +63,7 @@ vertex VertexOut glyph_vertex(
     VertexOut out;
     VertexIn in = vertices[vertexID];
 
-    float2 ndc = (in.position / uniforms.viewportSize) * 2.0 - 1.0;
+    float2 ndc = ((in.position + uniforms.positionOffset) / uniforms.viewportSize) * 2.0 - 1.0;
     ndc.y = -ndc.y;
 
     out.position = float4(ndc, 0.0, 1.0);

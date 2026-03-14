@@ -58,6 +58,7 @@ final class TerminalModel {
 
     /// Callback when title changes
     var onTitleChange: ((String) -> Void)?
+    var onWorkingDirectoryChange: ((String) -> Void)?
 
     /// Callback when bell is triggered
     var onBell: (() -> Void)?
@@ -855,6 +856,9 @@ final class TerminalModel {
         case 52: // Clipboard access (OSC 52)
             handleOSC52(text)
 
+        case 7: // Current working directory
+            handleOSC7(text)
+
         default:
             break
         }
@@ -902,6 +906,16 @@ final class TerminalModel {
             return
         }
         onClipboardWrite?(string)
+    }
+
+    private func handleOSC7(_ payload: String) {
+        guard let url = URL(string: payload),
+              url.scheme?.caseInsensitiveCompare("file") == .orderedSame else {
+            return
+        }
+        let path = url.path
+        guard !path.isEmpty else { return }
+        onWorkingDirectoryChange?(path)
     }
 
     // MARK: - Reset

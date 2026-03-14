@@ -5,9 +5,6 @@ final class ProcessMetricsMonitor {
     struct Snapshot {
         let cpuUsageByPID: [pid_t: Double]
         let appMemoryBytes: UInt64
-        let currentDirectoryByPID: [pid_t: String]
-        /// Resident memory per monitored PID including all descendant processes.
-        let memoryByPID: [pid_t: UInt64]
     }
 
     private struct CPUSample {
@@ -17,14 +14,12 @@ final class ProcessMetricsMonitor {
 
     var onUpdate: ((Snapshot) -> Void)?
 
-    private var timer: Timer?
+    private var timer: DispatchSourceTimer?
     private var lastSamples: [pid_t: CPUSample] = [:]
-    private var descendantQueueScratch: [pid_t] = []
-    private var descendantResultScratch: [pid_t] = []
-    private var childPIDBufferScratch: [pid_t] = []
     private let interval: TimeInterval
     private let timebaseNumer: Double
     private let timebaseDenom: Double
+    private let queue = DispatchQueue(label: "com.pterm.process-metrics-monitor", qos: .utility)
 
     init(interval: TimeInterval = 3.0) {
         self.interval = interval
@@ -36,30 +31,35 @@ final class ProcessMetricsMonitor {
 
     func start(pidsProvider: @escaping () -> [pid_t]) {
         stop()
-        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        let repeatingNanoseconds = UInt64(max(0.1, interval) * 1_000_000_000)
+        let leewayNanoseconds = UInt64(min(1.0, max(0.05, interval * 0.25)) * 1_000_000_000)
+        timer.schedule(
+            deadline: .now(),
+            repeating: .nanoseconds(Int(repeatingNanoseconds)),
+            leeway: .nanoseconds(Int(leewayNanoseconds))
+        )
+        timer.setEventHandler { [weak self] in
             self?.sample(pids: pidsProvider())
         }
         self.timer = timer
-        RunLoop.main.add(timer, forMode: .common)
-        sample(pids: pidsProvider())
+        timer.resume()
     }
 
     func stop() {
-        timer?.invalidate()
+        timer?.setEventHandler {}
+        timer?.cancel()
         timer = nil
         lastSamples.removeAll(keepingCapacity: false)
-        releaseScratchStorage()
     }
 
     var debugLastSampleCount: Int { lastSamples.count }
-    var debugDescendantQueueScratchCapacity: Int { descendantQueueScratch.capacity }
-    var debugDescendantResultScratchCapacity: Int { descendantResultScratch.capacity }
-    var debugChildPIDBufferScratchCapacity: Int { childPIDBufferScratch.capacity }
+    var debugDescendantQueueScratchCapacity: Int { 0 }
+    var debugDescendantResultScratchCapacity: Int { 0 }
+    var debugChildPIDBufferScratchCapacity: Int { 0 }
 
     func debugPrimeDescendantScratch(queueCount: Int, resultCount: Int, childCount: Int) {
-        descendantQueueScratch = Array(repeating: 1, count: queueCount)
-        descendantResultScratch = Array(repeating: 1, count: resultCount)
-        childPIDBufferScratch = Array(repeating: 1, count: childCount)
+        _ = (queueCount, resultCount, childCount)
     }
 
     func debugPrimeLastSamples(_ pids: [pid_t], timestamp: TimeInterval = 1.0) {
@@ -71,26 +71,18 @@ final class ProcessMetricsMonitor {
         resultCount: Int,
         childCount: Int
     ) {
-        descendantQueueScratch = Array(descendantQueueScratch.prefix(min(queueCount, descendantQueueScratch.count)))
-        descendantResultScratch = Array(descendantResultScratch.prefix(min(resultCount, descendantResultScratch.count)))
-        childPIDBufferScratch = Array(childPIDBufferScratch.prefix(min(childCount, childPIDBufferScratch.count)))
-        compactScratchStorageIfOversized()
+        _ = (queueCount, resultCount, childCount)
     }
 
     private func sample(pids: [pid_t]) {
         let now = ProcessInfo.processInfo.systemUptime
         var usage: [pid_t: Double] = [:]
         var nextSamples: [pid_t: CPUSample] = [:]
-        var currentDirectoryByPID: [pid_t: String] = [:]
-        var memoryByPID: [pid_t: UInt64] = [:]
 
         for pid in Set(pids) {
             guard let totalTime = processCPUTime(pid: pid) else { continue }
             let sample = CPUSample(totalTime: totalTime, timestamp: now)
             nextSamples[pid] = sample
-            if let cwd = processCurrentDirectory(pid: pid) {
-                currentDirectoryByPID[pid] = cwd
-            }
 
             if let previous = lastSamples[pid], sample.timestamp > previous.timestamp {
                 let deltaTime = cpuTimeSeconds(fromAbsoluteTicks: sample.totalTime &- previous.totalTime)
@@ -102,44 +94,16 @@ final class ProcessMetricsMonitor {
             } else {
                 usage[pid] = 0
             }
-
-            // Collect memory for this PID and all its descendants
-            let descendants = collectDescendants(of: pid)
-            var totalMemory: UInt64 = processResidentMemory(pid: pid)
-            for child in descendants {
-                totalMemory += processResidentMemory(pid: child)
-                // Also track CPU for descendant processes
-                if nextSamples[child] == nil,
-                   let childTime = processCPUTime(pid: child) {
-                    let childSample = CPUSample(totalTime: childTime, timestamp: now)
-                    nextSamples[child] = childSample
-                    if let prev = lastSamples[child], childSample.timestamp > prev.timestamp {
-                        let dt = cpuTimeSeconds(fromAbsoluteTicks: childSample.totalTime &- prev.totalTime)
-                        let elapsed = childSample.timestamp - prev.timestamp
-                        if elapsed > 0 {
-                            let pct = min(999.0, max(0, (dt / elapsed) * 100.0))
-                            usage[child] = pct
-                        }
-                    } else {
-                        usage[child] = 0
-                    }
-                }
-            }
-            memoryByPID[pid] = totalMemory
         }
 
         lastSamples = nextSamples
-        if pids.isEmpty {
-            releaseScratchStorage()
-        } else {
-            compactScratchStorageIfOversized()
-        }
-        onUpdate?(Snapshot(
+        let snapshot = Snapshot(
             cpuUsageByPID: usage,
-            appMemoryBytes: currentProcessResidentMemory(),
-            currentDirectoryByPID: currentDirectoryByPID,
-            memoryByPID: memoryByPID
-        ))
+            appMemoryBytes: currentProcessResidentMemory()
+        )
+        DispatchQueue.main.async { [weak self] in
+            self?.onUpdate?(snapshot)
+        }
     }
 
     private func processCPUTime(pid: pid_t) -> UInt64? {
@@ -150,8 +114,6 @@ final class ProcessMetricsMonitor {
     }
 
     func cpuTimeSeconds(fromAbsoluteTicks ticks: UInt64) -> Double {
-        // proc_taskinfo CPU counters are reported in the platform's absolute-time units.
-        // Convert them through mach_timebase_info so our CPU percentages match the system tools.
         (Double(ticks) * timebaseNumer / timebaseDenom) / 1_000_000_000.0
     }
 
@@ -165,76 +127,5 @@ final class ProcessMetricsMonitor {
         }
         guard result == KERN_SUCCESS else { return 0 }
         return UInt64(info.resident_size)
-    }
-
-    private func processResidentMemory(pid: pid_t) -> UInt64 {
-        var info = proc_taskinfo()
-        let size = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, Int32(MemoryLayout<proc_taskinfo>.stride))
-        guard size == Int32(MemoryLayout<proc_taskinfo>.stride) else { return 0 }
-        return UInt64(info.pti_resident_size)
-    }
-
-    private func collectDescendants(of rootPID: pid_t) -> [pid_t] {
-        descendantResultScratch.removeAll(keepingCapacity: true)
-        descendantQueueScratch.removeAll(keepingCapacity: true)
-        descendantQueueScratch.append(rootPID)
-
-        var queueIndex = 0
-        while queueIndex < descendantQueueScratch.count {
-            let parent = descendantQueueScratch[queueIndex]
-            queueIndex += 1
-            let count = proc_listchildpids(parent, nil, 0)
-            guard count > 0 else { continue }
-            let childCapacity = Int(count)
-            if childPIDBufferScratch.count != childCapacity {
-                childPIDBufferScratch = [pid_t](repeating: 0, count: childCapacity)
-            } else {
-                childPIDBufferScratch.replaceSubrange(0..<childCapacity, with: repeatElement(0, count: childCapacity))
-            }
-            let actual = proc_listchildpids(
-                parent,
-                &childPIDBufferScratch,
-                count * Int32(MemoryLayout<pid_t>.stride)
-            )
-            let childCount = Int(actual) / MemoryLayout<pid_t>.stride
-            for i in 0..<childCount {
-                let child = childPIDBufferScratch[i]
-                if child > 0 {
-                    descendantResultScratch.append(child)
-                    descendantQueueScratch.append(child)
-                }
-            }
-        }
-        return descendantResultScratch
-    }
-
-    private func releaseScratchStorage() {
-        descendantQueueScratch = []
-        descendantResultScratch = []
-        childPIDBufferScratch = []
-    }
-
-    private func compactScratchStorageIfOversized() {
-        compact(&descendantQueueScratch)
-        compact(&descendantResultScratch)
-        compact(&childPIDBufferScratch)
-    }
-
-    private func compact(_ scratch: inout [pid_t]) {
-        let usedCount = scratch.count
-        guard scratch.capacity > max(64, usedCount * 4) else { return }
-        scratch = Array(scratch)
-    }
-
-    private func processCurrentDirectory(pid: pid_t) -> String? {
-        var info = proc_vnodepathinfo()
-        let size = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, Int32(MemoryLayout<proc_vnodepathinfo>.stride))
-        guard size == Int32(MemoryLayout<proc_vnodepathinfo>.stride) else { return nil }
-        let path = info.pvi_cdir.vip_path
-        return withUnsafePointer(to: path) {
-            $0.withMemoryRebound(to: CChar.self, capacity: MemoryLayout.size(ofValue: path)) {
-                String(cString: $0)
-            }
-        }
     }
 }

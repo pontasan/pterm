@@ -324,6 +324,7 @@ final class MetalRenderer {
 
     struct MetalUniforms {
         var viewportSize: SIMD2<Float> = .zero
+        var positionOffset: SIMD2<Float> = .zero
         var cursorOpacity: Float = 1.0
         var cursorBlink: Float = 1.0
         var time: Float = 0.0
@@ -355,6 +356,7 @@ final class MetalRenderer {
 
     /// Floats per vertex: position(2) + texCoord(2) + fgColor(4) + bgColor(4) = 12
     private let floatsPerVertex = 12
+    private let floatsPerQuad = 72
 
     init?(scaleFactor: CGFloat = 2.0) {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -650,6 +652,7 @@ final class MetalRenderer {
         let vp = SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height))
         var uniforms = MetalUniforms(
             viewportSize: vp,
+            positionOffset: .zero,
             cursorOpacity: (scrollOffset == 0 && model.cursor.visible) ? 1.0 : 0.0,
             cursorBlink: (model.cursor.blinking && !suppressCursorBlink) ? 1.0 : 0.0,
             time: Float(CACurrentMediaTime() - startTime)
@@ -758,6 +761,8 @@ final class MetalRenderer {
                                   scaleFactor: Float,
                                   bufferSet: ViewBufferSet) -> VertexData {
         var vd = VertexData()
+        var cachedGlyphs: [UInt32: GlyphAtlas.GlyphInfo] = [:]
+        var missingGlyphs: Set<UInt32> = []
 
         let cellW = Float(glyphAtlas.cellWidth) * scaleFactor
         let cellH = Float(glyphAtlas.cellHeight) * scaleFactor
@@ -770,10 +775,12 @@ final class MetalRenderer {
         let viewCols = model.cols
         let sbCount = scrollback.rowCount
         let approximateCellCount = max(1, viewRows * viewCols)
-        vd.bgVertices.reserveCapacity(approximateCellCount * 18)
-        vd.glyphVertices.reserveCapacity(approximateCellCount * 24)
-        vd.cursorVertices.reserveCapacity(72)
-        vd.overlayVertices.reserveCapacity(approximateCellCount * 12)
+        // Reserve close to worst-case visible geometry up front so hot redraw paths
+        // don't repeatedly grow the backing arrays while streaming output.
+        vd.bgVertices.reserveCapacity(approximateCellCount * floatsPerQuad)
+        vd.glyphVertices.reserveCapacity(approximateCellCount * floatsPerQuad * 2)
+        vd.cursorVertices.reserveCapacity(floatsPerQuad)
+        vd.overlayVertices.reserveCapacity(approximateCellCount * floatsPerQuad * 2)
 
         // Pre-fetch scrollback rows that are visible in the viewport.
         // Each row is fetched once and reused for all columns.
@@ -792,6 +799,22 @@ final class MetalRenderer {
         }
 
         let firstAbsolute = scrollOffset > 0 ? max(0, sbCount - scrollOffset) : sbCount
+
+        @inline(__always)
+        func glyphInfo(for codepoint: UInt32) -> GlyphAtlas.GlyphInfo? {
+            if let cached = cachedGlyphs[codepoint] {
+                return cached
+            }
+            if missingGlyphs.contains(codepoint) {
+                return nil
+            }
+            if let glyph = glyphAtlas.glyphInfo(for: codepoint) {
+                cachedGlyphs[codepoint] = glyph
+                return glyph
+            }
+            missingGlyphs.insert(codepoint)
+            return nil
+        }
 
         // Build per-visible-row search match lists once so we can walk them linearly.
         prepareTerminalSearchMatchesScratch(in: bufferSet, rowCount: viewRows)
@@ -930,7 +953,7 @@ final class MetalRenderer {
                 ) {
                     // no-op
                 } else if cell.codepoint > 0x20, // Skip spaces
-                   let glyph = glyphAtlas.glyphInfo(for: cell.codepoint),
+                   let glyph = glyphInfo(for: cell.codepoint),
                    glyph.pixelWidth > 0 {
 
                     let rawGlyphX: Float
@@ -1028,7 +1051,13 @@ final class MetalRenderer {
         }
 
         for transientTextOverlay in transientTextOverlays {
-            appendTransientTextOverlay(transientTextOverlay, scaleFactor: scaleFactor, to: &vd.glyphVertices)
+            appendTransientTextOverlay(
+                transientTextOverlay,
+                scaleFactor: scaleFactor,
+                cachedGlyphs: &cachedGlyphs,
+                missingGlyphs: &missingGlyphs,
+                to: &vd.glyphVertices
+            )
         }
 
         // Scrollbar is handled by NSScroller overlay in TerminalView
@@ -1077,6 +1106,7 @@ final class MetalRenderer {
         let viewportSize = SIMD2<Float>(Float(texture.width), Float(texture.height))
         var uniforms = MetalUniforms(
             viewportSize: viewportSize,
+            positionOffset: .zero,
             cursorOpacity: (scrollOffset == 0 && model.cursor.visible) ? 1.0 : 0.0,
             cursorBlink: (model.cursor.blinking && !suppressCursorBlink) ? 1.0 : 0.0,
             time: Float(CACurrentMediaTime() - startTime)
@@ -1145,6 +1175,8 @@ final class MetalRenderer {
     private func appendTransientTextOverlay(
         _ overlay: TransientTextOverlay,
         scaleFactor: Float,
+        cachedGlyphs: inout [UInt32: GlyphAtlas.GlyphInfo],
+        missingGlyphs: inout Set<UInt32>,
         to vertices: inout [Float]
     ) {
         guard overlay.alpha > 0.001 else { return }
@@ -1156,10 +1188,26 @@ final class MetalRenderer {
         let baseY = padY + Float(overlay.row) * cellH + overlay.verticalOffset * scaleFactor
         let shouldSnapGlyphPosition = !glyphAtlas.usesOversampledRasterizationForCurrentDisplay
 
+        @inline(__always)
+        func glyphInfo(for codepoint: UInt32) -> GlyphAtlas.GlyphInfo? {
+            if let cached = cachedGlyphs[codepoint] {
+                return cached
+            }
+            if missingGlyphs.contains(codepoint) {
+                return nil
+            }
+            if let glyph = glyphAtlas.glyphInfo(for: codepoint) {
+                cachedGlyphs[codepoint] = glyph
+                return glyph
+            }
+            missingGlyphs.insert(codepoint)
+            return nil
+        }
+
         var columnOffset: Float = 0
         for scalar in overlay.text.unicodeScalars {
             guard scalar.value > 0x20,
-                  let glyph = glyphAtlas.glyphInfo(for: scalar.value),
+                  let glyph = glyphInfo(for: scalar.value),
                   glyph.pixelWidth > 0 else {
                 columnOffset += Float(max(CharacterWidth.width(of: scalar.value), 0)) * cellW
                 continue
@@ -1229,6 +1277,7 @@ final class MetalRenderer {
         return (foreground.r, foreground.g, foreground.b, 1.0)
     }
 
+    @inline(__always)
     @discardableResult
     private func renderBlockElementIfNeeded(
         codepoint: UInt32,
@@ -1239,72 +1288,71 @@ final class MetalRenderer {
         color: (r: Float, g: Float, b: Float),
         vertices: inout [Float]
     ) -> Bool {
-        let rects = blockElementRects(for: codepoint, width: w, height: h)
-        guard !rects.isEmpty else { return false }
+        let halfW = w * 0.5
+        let halfH = h * 0.5
+        let quarterH = max(1.0, h * 0.25)
+        let eighthW = max(1.0, w * 0.125)
 
-        for rect in rects {
+        @inline(__always)
+        func addBlockQuad(_ dx: Float, _ dy: Float, _ dw: Float, _ dh: Float) {
             addQuad(to: &vertices,
-                   x: x + rect.x, y: y + rect.y, w: rect.w, h: rect.h,
+                   x: x + dx, y: y + dy, w: dw, h: dh,
                    tx: 0, ty: 0, tw: 0, th: 0,
                    fg: (color.r, color.g, color.b, 1),
                    bg: (color.r, color.g, color.b, 1))
         }
-        return true
-    }
-
-    private func blockElementRects(
-        for codepoint: UInt32,
-        width: Float,
-        height: Float
-    ) -> [(x: Float, y: Float, w: Float, h: Float)] {
-        let halfW = width * 0.5
-        let halfH = height * 0.5
-        let quarterH = max(1.0, height * 0.25)
-        let eighthW = max(1.0, width * 0.125)
 
         switch codepoint {
         case 0x2580:
-            return [(0, 0, width, halfH)]
+            addBlockQuad(0, 0, w, halfH)
         case 0x2581:
-            return [(0, height - quarterH, width, quarterH)]
+            addBlockQuad(0, h - quarterH, w, quarterH)
         case 0x2584:
-            return [(0, halfH, width, halfH)]
+            addBlockQuad(0, halfH, w, halfH)
         case 0x2588:
-            return [(0, 0, width, height)]
+            addBlockQuad(0, 0, w, h)
         case 0x258C:
-            return [(0, 0, halfW, height)]
+            addBlockQuad(0, 0, halfW, h)
         case 0x258F:
-            return [(0, 0, eighthW, height)]
+            addBlockQuad(0, 0, eighthW, h)
         case 0x2590:
-            return [(halfW, 0, halfW, height)]
+            addBlockQuad(halfW, 0, halfW, h)
         case 0x2595:
-            return [(width - eighthW, 0, eighthW, height)]
+            addBlockQuad(w - eighthW, 0, eighthW, h)
         case 0x2596:
-            return [(0, halfH, halfW, halfH)]
+            addBlockQuad(0, halfH, halfW, halfH)
         case 0x2597:
-            return [(halfW, halfH, halfW, halfH)]
+            addBlockQuad(halfW, halfH, halfW, halfH)
         case 0x2598:
-            return [(0, 0, halfW, halfH)]
+            addBlockQuad(0, 0, halfW, halfH)
         case 0x2599:
-            return [(0, 0, halfW, halfH), (0, halfH, width, halfH)]
+            addBlockQuad(0, 0, halfW, halfH)
+            addBlockQuad(0, halfH, w, halfH)
         case 0x259A:
-            return [(0, 0, halfW, halfH), (halfW, halfH, halfW, halfH)]
+            addBlockQuad(0, 0, halfW, halfH)
+            addBlockQuad(halfW, halfH, halfW, halfH)
         case 0x259B:
-            return [(0, 0, width, halfH), (0, halfH, halfW, halfH)]
+            addBlockQuad(0, 0, w, halfH)
+            addBlockQuad(0, halfH, halfW, halfH)
         case 0x259C:
-            return [(0, 0, width, halfH), (halfW, halfH, halfW, halfH)]
+            addBlockQuad(0, 0, w, halfH)
+            addBlockQuad(halfW, halfH, halfW, halfH)
         case 0x259D:
-            return [(halfW, 0, halfW, halfH)]
+            addBlockQuad(halfW, 0, halfW, halfH)
         case 0x259E:
-            return [(halfW, 0, halfW, halfH), (0, halfH, halfW, halfH)]
+            addBlockQuad(halfW, 0, halfW, halfH)
+            addBlockQuad(0, halfH, halfW, halfH)
         case 0x259F:
-            return [(halfW, 0, halfW, halfH), (0, halfH, width, halfH)]
+            addBlockQuad(halfW, 0, halfW, halfH)
+            addBlockQuad(0, halfH, w, halfH)
         default:
-            return []
+            return false
         }
+        return true
     }
 
     /// Add a quad (2 triangles = 6 vertices) to the vertex array.
+    @inline(__always)
     private func addQuad(to vertices: inout [Float],
                         x: Float, y: Float, w: Float, h: Float,
                         tx: Float, ty: Float, tw: Float, th: Float,
@@ -1322,6 +1370,7 @@ final class MetalRenderer {
         appendVertex(to: &vertices, x: x, y: y + h, tx: tx, ty: ty + th, fg: linearFG, bg: linearBG)
     }
 
+    @inline(__always)
     private func appendVertex(
         to vertices: inout [Float],
         x: Float,
@@ -1408,7 +1457,9 @@ final class MetalRenderer {
         texture: MTLTexture,
         thumbnailSize: NSSize,
         scaleFactor: Float,
-        commandBuffer: MTLCommandBuffer
+        commandBuffer: MTLCommandBuffer,
+        bgScratch: inout [Float],
+        glyphScratch: inout [Float]
     ) {
         let renderPassDescriptor = MTLRenderPassDescriptor()
         renderPassDescriptor.colorAttachments[0].texture = texture
@@ -1427,7 +1478,9 @@ final class MetalRenderer {
             encoder: encoder,
             viewportSize: SIMD2<Float>(Float(texture.width), Float(texture.height)),
             thumbnailRect: NSRect(origin: .zero, size: thumbnailSize),
-            scaleFactor: scaleFactor
+            scaleFactor: scaleFactor,
+            bgScratch: &bgScratch,
+            glyphScratch: &glyphScratch
         )
 
         encoder.endEncoding()
@@ -1484,42 +1537,49 @@ final class MetalRenderer {
     func renderThumbnail(model: TerminalModel, scrollback: ScrollbackBuffer,
                          scrollOffset: Int, encoder: MTLRenderCommandEncoder,
                          viewportSize: SIMD2<Float>, thumbnailRect: NSRect,
-                         scaleFactor: Float) {
-        var thumbBgVertices: [Float] = []
-        var thumbGlyphVertices: [Float] = []
+                         scaleFactor: Float,
+                         bgScratch: inout [Float],
+                         glyphScratch: inout [Float]) {
+        bgScratch.removeAll(keepingCapacity: true)
+        glyphScratch.removeAll(keepingCapacity: true)
         appendThumbnailVertexData(
             model: model,
             scrollback: scrollback,
             scrollOffset: scrollOffset,
             thumbnailRect: thumbnailRect,
             scaleFactor: scaleFactor,
-            bgVertices: &thumbBgVertices,
-            glyphVertices: &thumbGlyphVertices
+            bgVertices: &bgScratch,
+            glyphVertices: &glyphScratch
         )
 
         // Draw thumbnail backgrounds
-        var thumbUniforms = MetalUniforms(viewportSize: viewportSize, cursorOpacity: 0, time: 0)
+        var thumbUniforms = MetalUniforms(
+            viewportSize: viewportSize,
+            positionOffset: .zero,
+            cursorOpacity: 0,
+            time: 0
+        )
 
-        if !thumbBgVertices.isEmpty, let pipeline = bgPipeline,
-           let buf = makeTemporaryBuffer(vertices: thumbBgVertices) {
+        if !bgScratch.isEmpty, let pipeline = bgPipeline,
+           let buf = makeTemporaryBuffer(vertices: bgScratch) {
             encoder.setRenderPipelineState(pipeline)
             encoder.setVertexBuffer(buf, offset: 0, index: 0)
             encoder.setVertexBytes(&thumbUniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0,
-                                  vertexCount: thumbBgVertices.count / floatsPerVertex)
+                                  vertexCount: bgScratch.count / floatsPerVertex)
         }
 
         // Draw thumbnail glyphs (linear filtering for scaled-down text)
-        if !thumbGlyphVertices.isEmpty, let pipeline = glyphPipelineForCurrentOutput(),
+        if !glyphScratch.isEmpty, let pipeline = glyphPipelineForCurrentOutput(),
            let atlas = glyphAtlas.texture,
-           let buf = makeTemporaryBuffer(vertices: thumbGlyphVertices) {
+           let buf = makeTemporaryBuffer(vertices: glyphScratch) {
             encoder.setRenderPipelineState(pipeline)
             encoder.setVertexBuffer(buf, offset: 0, index: 0)
             encoder.setVertexBytes(&thumbUniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
             encoder.setFragmentTexture(atlas, index: 0)
             encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0,
-                                  vertexCount: thumbGlyphVertices.count / floatsPerVertex)
+                                  vertexCount: glyphScratch.count / floatsPerVertex)
         }
     }
 
@@ -1528,6 +1588,8 @@ final class MetalRenderer {
                                    scaleFactor: Float,
                                    bgVertices: inout [Float],
                                    glyphVertices: inout [Float]) {
+        var cachedGlyphs: [UInt32: GlyphAtlas.GlyphInfo] = [:]
+        var missingGlyphs: Set<UInt32> = []
         let cellW = Float(glyphAtlas.cellWidth) * scaleFactor
         let cellH = Float(glyphAtlas.cellHeight) * scaleFactor
         let padX = Float(gridPadding) * scaleFactor
@@ -1574,6 +1636,22 @@ final class MetalRenderer {
         }
 
         let firstAbsolute = scrollOffset > 0 ? max(0, sbCount - scrollOffset) : sbCount
+
+        @inline(__always)
+        func glyphInfo(for codepoint: UInt32) -> GlyphAtlas.GlyphInfo? {
+            if let cached = cachedGlyphs[codepoint] {
+                return cached
+            }
+            if missingGlyphs.contains(codepoint) {
+                return nil
+            }
+            if let glyph = glyphAtlas.glyphInfo(for: codepoint) {
+                cachedGlyphs[codepoint] = glyph
+                return glyph
+            }
+            missingGlyphs.insert(codepoint)
+            return nil
+        }
 
         for row in 0..<viewRows {
             let absoluteRow = firstAbsolute + row
@@ -1626,7 +1704,7 @@ final class MetalRenderer {
 
                 // Glyph
                 if cell.codepoint > 0x20,
-                   let glyph = glyphAtlas.glyphInfo(for: cell.codepoint),
+                   let glyph = glyphInfo(for: cell.codepoint),
                    glyph.pixelWidth > 0 {
                     let glyphFullX = fullX + (
                         cell.width == 1
@@ -1704,6 +1782,7 @@ final class MetalRenderer {
 
         var uniforms = MetalUniforms(
             viewportSize: viewportSize,
+            positionOffset: SIMD2<Float>(offsetX, offsetY),
             cursorOpacity: (scrollOffset == 0 && model.cursor.visible) ? 1.0 : 0.0,
             cursorBlink: (model.cursor.blinking && !suppressCursorBlink) ? 1.0 : 0.0,
             time: Float(CACurrentMediaTime() - startTime)
@@ -1711,8 +1790,7 @@ final class MetalRenderer {
 
         // 1. Backgrounds
         if !vd.bgVertices.isEmpty, let pipeline = bgPipeline {
-            let shifted = shiftedVertices(vd.bgVertices, offsetX: offsetX, offsetY: offsetY)
-            if let buf = makeTemporaryBuffer(vertices: shifted) {
+            if let buf = makeTemporaryBuffer(vertices: vd.bgVertices) {
                 encoder.setRenderPipelineState(pipeline)
                 encoder.setVertexBuffer(buf, offset: 0, index: 0)
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
@@ -1724,8 +1802,7 @@ final class MetalRenderer {
         // 2. Glyphs
         if !vd.glyphVertices.isEmpty, let pipeline = glyphPipelineForCurrentOutput(),
            let atlas = glyphAtlas.texture {
-            let shifted = shiftedVertices(vd.glyphVertices, offsetX: offsetX, offsetY: offsetY)
-            if let buf = makeTemporaryBuffer(vertices: shifted) {
+            if let buf = makeTemporaryBuffer(vertices: vd.glyphVertices) {
                 encoder.setRenderPipelineState(pipeline)
                 encoder.setVertexBuffer(buf, offset: 0, index: 0)
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
@@ -1738,8 +1815,7 @@ final class MetalRenderer {
 
         // 3. Cursor
         if !vd.cursorVertices.isEmpty, let pipeline = cursorPipeline {
-            let shifted = shiftedVertices(vd.cursorVertices, offsetX: offsetX, offsetY: offsetY)
-            if let buf = makeTemporaryBuffer(vertices: shifted) {
+            if let buf = makeTemporaryBuffer(vertices: vd.cursorVertices) {
                 encoder.setRenderPipelineState(pipeline)
                 encoder.setVertexBuffer(buf, offset: 0, index: 0)
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
@@ -1751,8 +1827,7 @@ final class MetalRenderer {
 
         // 4. Overlay (underline, strikethrough, block elements)
         if !vd.overlayVertices.isEmpty, let pipeline = overlayPipeline {
-            let shifted = shiftedVertices(vd.overlayVertices, offsetX: offsetX, offsetY: offsetY)
-            if let buf = makeTemporaryBuffer(vertices: shifted) {
+            if let buf = makeTemporaryBuffer(vertices: vd.overlayVertices) {
                 encoder.setRenderPipelineState(pipeline)
                 encoder.setVertexBuffer(buf, offset: 0, index: 0)
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
@@ -1767,16 +1842,16 @@ final class MetalRenderer {
             let bw = border.width * scaleFactor
             let c = border.color
             // Top
-            addQuad(to: &bv, x: offsetX, y: offsetY, w: cellPixelW, h: bw,
+            addQuad(to: &bv, x: 0, y: 0, w: cellPixelW, h: bw,
                    tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
             // Bottom
-            addQuad(to: &bv, x: offsetX, y: offsetY + cellPixelH - bw, w: cellPixelW, h: bw,
+            addQuad(to: &bv, x: 0, y: cellPixelH - bw, w: cellPixelW, h: bw,
                    tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
             // Left
-            addQuad(to: &bv, x: offsetX, y: offsetY + bw, w: bw, h: cellPixelH - 2 * bw,
+            addQuad(to: &bv, x: 0, y: bw, w: bw, h: cellPixelH - 2 * bw,
                    tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
             // Right
-            addQuad(to: &bv, x: offsetX + cellPixelW - bw, y: offsetY + bw, w: bw, h: cellPixelH - 2 * bw,
+            addQuad(to: &bv, x: cellPixelW - bw, y: bw, w: bw, h: cellPixelH - 2 * bw,
                    tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
             if let buf = makeTemporaryBuffer(vertices: bv) {
                 encoder.setRenderPipelineState(pipeline)
@@ -1786,25 +1861,6 @@ final class MetalRenderer {
                                       vertexCount: bv.count / floatsPerVertex)
             }
         }
-    }
-
-    private func shiftedVertices(_ source: [Float], offsetX: Float, offsetY: Float) -> [Float] {
-        guard !source.isEmpty else { return [] }
-        var shifted: [Float] = []
-        shifted.reserveCapacity(source.count)
-        source.withUnsafeBufferPointer { sourcePointer in
-            let stride = floatsPerVertex
-            var index = 0
-            while index < sourcePointer.count {
-                shifted.append(sourcePointer[index] + offsetX)
-                shifted.append(sourcePointer[index + 1] + offsetY)
-                for component in 2..<stride {
-                    shifted.append(sourcePointer[index + component])
-                }
-                index += stride
-            }
-        }
-        return shifted
     }
 
     private func prepareTerminalScrollbackRowsScratch(in bufferSet: ViewBufferSet, rowCount: Int) {

@@ -135,6 +135,7 @@ final class TerminalController {
     private var persistedFontSize: Double
     private let initialDirectory: String
     private let scrollbackPersistenceEnabled: Bool
+    private let currentDirectoryProvider: (pid_t) -> String?
     private var parserRequestedScrollbackClear = false
     private var suppressScrollbackClear = false
     private var isShuttingDown = false
@@ -202,7 +203,8 @@ final class TerminalController {
          fontSize: Double,
          initialDirectory: String? = nil, customTitle: String? = nil,
          workspaceName: String = "Uncategorized", id: UUID = UUID(),
-         scrollbackPersistencePath: String? = nil) {
+         scrollbackPersistencePath: String? = nil,
+         currentDirectoryProvider: @escaping (pid_t) -> String? = { ProcessInspection.currentDirectory(pid: $0) }) {
         self.model = TerminalModel(rows: rows, cols: cols)
         self.pty = PTY()
         self.scrollback = ScrollbackBuffer(
@@ -219,6 +221,7 @@ final class TerminalController {
         self.initialDirectory = (initialDirectory as NSString?)?.expandingTildeInPath
             ?? FileManager.default.homeDirectoryForCurrentUser.path
         self.scrollbackPersistenceEnabled = scrollbackPersistencePath != nil
+        self.currentDirectoryProvider = currentDirectoryProvider
         self.customTitle = customTitle
         self.workspaceName = FileNameSanitizer.sanitize(workspaceName, fallback: "Uncategorized")
         self.id = id
@@ -261,6 +264,10 @@ final class TerminalController {
             DispatchQueue.main.async {
                 self?.onTitleChange?(title)
             }
+        }
+
+        model.onWorkingDirectoryChange = { [weak self] path in
+            self?.updateCurrentDirectory(path: path)
         }
 
         model.onResponse = { [weak self] response in
@@ -395,6 +402,20 @@ final class TerminalController {
                 self?.onTitleChange?(normalized)
             }
         }
+    }
+
+    @discardableResult
+    func refreshCurrentDirectoryFromShellProcess() -> Bool {
+        refreshCurrentDirectory(fromProcessID: processID)
+    }
+
+    @discardableResult
+    func refreshCurrentDirectory(fromProcessID pid: pid_t?) -> Bool {
+        guard let pid, pid > 0, let path = currentDirectoryProvider(pid) else {
+            return false
+        }
+        updateCurrentDirectory(path: path)
+        return true
     }
 
     func setCustomTitle(_ title: String?) {
