@@ -107,12 +107,16 @@ final class TerminalController {
     /// Coalesces bursty PTY-driven callbacks onto a single main-queue hop.
     private let callbackLock = NSLock()
     private let extractionScratchLock = NSLock()
+    private let interruptDrainLock = NSLock()
     private var mainCallbacksScheduled = false
     private var pendingNeedsDisplay = false
     private var pendingOutputActivity = false
     private var pendingStateChange = false
+    private var interruptDiscardingOutput = false
+    private var pendingInterruptDrainCompletion: DispatchWorkItem?
     private var renderContentVersion: UInt64 = 0
     private var outputActivitySuppressedUntil: Date = .distantPast
+    private var interruptCatchUpUntil: Date = .distantPast
     private let scrollbackCompactionLock = NSLock()
     private var pendingScrollbackCompaction: DispatchWorkItem?
 
@@ -140,6 +144,7 @@ final class TerminalController {
     private static let maxAllTextReserveCapacity = 64 * 1024
     private static let maxSearchReserveCapacity = 4 * 1024
     private static let inputEchoSuppressionInterval: TimeInterval = 0.35
+    private static let interruptDrainQuietPeriod: TimeInterval = 0.10
 
     var persistedSettings: PersistedTerminalSettings {
         PersistedTerminalSettings(
@@ -158,6 +163,18 @@ final class TerminalController {
     var thumbnailContentVersion: UInt64 {
         callbackLock.withLock {
             renderContentVersion
+        }
+    }
+
+    var currentRenderContentVersion: UInt64 {
+        callbackLock.withLock {
+            renderContentVersion
+        }
+    }
+
+    var isInInterruptCatchUpMode: Bool {
+        callbackLock.withLock {
+            Date() < interruptCatchUpUntil
         }
     }
 
@@ -447,6 +464,31 @@ final class TerminalController {
         sendInput(data)
     }
 
+    /// Send an interrupt equivalent to Ctrl+C by injecting the PTY's VINTR byte.
+    /// This preserves normal terminal semantics across local shells, SSH, and
+    /// other intermediate clients that expect to receive the control character
+    /// on stdin rather than a locally-generated Unix signal.
+    func performInterrupt() {
+        performInterrupt(controlCharacter: 0x03)
+    }
+
+    func performInterrupt(controlCharacter: UInt8) {
+        callbackLock.withLock {
+            interruptDiscardingOutput = true
+            outputActivitySuppressedUntil = .distantPast
+            interruptCatchUpUntil = .distantPast
+        }
+        scheduleInterruptDrainCompletion()
+        sendControlCharacter(controlCharacter)
+    }
+
+    private func sendControlCharacter(_ controlCharacter: UInt8) {
+        let data = Data([controlCharacter])
+        suppressScrollbackClear = false
+        auditLogger?.recordInput(data)
+        pty.writeControlCharacter(controlCharacter)
+    }
+
     // MARK: - PTY Output Processing
 
     /// Handle raw bytes from PTY output.
@@ -454,8 +496,22 @@ final class TerminalController {
     /// The entire decode + parse pipeline runs under lock to ensure
     /// decoder and parser state are never accessed concurrently.
     private func handlePTYOutput(_ data: Data) {
+        let shouldDiscardInterruptOutput = callbackLock.withLock {
+            interruptDiscardingOutput
+        }
+        if shouldDiscardInterruptOutput {
+            scheduleInterruptDrainCompletion()
+            return
+        }
+
+        processPTYOutput(data, recordAudit: true)
+    }
+
+    private func processPTYOutput(_ data: Data, recordAudit: Bool) {
         cancelPendingScrollbackCompaction()
-        auditLogger?.recordOutput(data)
+        if recordAudit {
+            auditLogger?.recordOutput(data)
+        }
         var clearedScrollback = false
         data.withUnsafeBytes { rawPtr in
             guard let ptr = rawPtr.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
@@ -851,7 +907,13 @@ final class TerminalController {
             if needsDisplay {
                 renderContentVersion &+= 1
             }
-            pendingNeedsDisplay = pendingNeedsDisplay || needsDisplay
+            if needsDisplay {
+                if Date() < interruptCatchUpUntil {
+                    pendingNeedsDisplay = true
+                } else {
+                    pendingNeedsDisplay = pendingNeedsDisplay || needsDisplay
+                }
+            }
             pendingOutputActivity = pendingOutputActivity || outputActivity
             pendingStateChange = pendingStateChange || stateChange
             if mainCallbacksScheduled {
@@ -886,6 +948,33 @@ final class TerminalController {
         }
         if callbacks.2 {
             onStateChange?()
+        }
+    }
+
+    private func scheduleInterruptDrainCompletion() {
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.completeInterruptDrainIfNeeded()
+        }
+
+        interruptDrainLock.withLock {
+            pendingInterruptDrainCompletion?.cancel()
+            pendingInterruptDrainCompletion = workItem
+        }
+
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.interruptDrainQuietPeriod,
+            execute: workItem
+        )
+    }
+
+    private func completeInterruptDrainIfNeeded() {
+        interruptDrainLock.withLock {
+            pendingInterruptDrainCompletion = nil
+        }
+
+        callbackLock.withLock {
+            guard interruptDiscardingOutput else { return }
+            interruptDiscardingOutput = false
         }
     }
 

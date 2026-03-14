@@ -200,6 +200,11 @@ final class TerminalModel {
 
     // MARK: - Print
 
+    func displayLocalInterruptPromptBoundary() {
+        cursor.col = 0
+        lineFeed()
+    }
+
     private func handlePrint(_ codepoint: UInt32) {
         let translatedCodepoint = translateCharacterSet(codepoint)
         let width = CharacterWidth.width(of: translatedCodepoint)

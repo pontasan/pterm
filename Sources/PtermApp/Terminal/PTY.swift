@@ -18,8 +18,28 @@ enum PTYError: Error {
 final class PTY {
     private enum ReadBufferPolicy {
         static let minimumCapacity = 4096
-        static let preferredCapacity = 16384
+        static let preferredCapacity = 65536
+        static let maximumBatchBytes = 1024 * 1024
     }
+
+    private struct PendingWrite {
+        let data: Data
+        var offset: Int = 0
+
+        var remainingByteCount: Int {
+            data.count - offset
+        }
+    }
+
+    private static let readQueue = DispatchQueue(
+        label: "com.pterm.pty.read",
+        qos: .userInitiated
+    )
+
+    private static let writeQueue = DispatchQueue(
+        label: "com.pterm.pty.write",
+        qos: .userInteractive
+    )
 
     /// File descriptor of the PTY master side
     private var masterFD: Int32 = -1
@@ -40,6 +60,7 @@ final class PTY {
 
     /// Dispatch source for reading PTY output
     private var readSource: DispatchSourceRead?
+    private var writeSource: DispatchSourceWrite?
 
     /// Signals that the child process has fully exited and been reaped.
     private let exitSemaphore = DispatchSemaphore(value: 0)
@@ -53,6 +74,11 @@ final class PTY {
 
     /// Callback invoked when the child process exits
     var onExit: (() -> Void)?
+
+    private var pendingHighPriorityWrites: [PendingWrite] = []
+    private var pendingRegularWrites: [PendingWrite] = []
+    private var activeHighPriorityWrite: PendingWrite?
+    private var activeRegularWrite: PendingWrite?
 
     /// Terminal size (rows x cols)
     private var termRows: UInt16 = 24
@@ -144,7 +170,7 @@ final class PTY {
 
         // Set up dispatch source for reading
         let source = DispatchSource.makeReadSource(fileDescriptor: amaster,
-                                                    queue: .global(qos: .userInteractive))
+                                                    queue: Self.readQueue)
         source.setEventHandler { [weak self] in
             self?.handleReadEvent()
         }
@@ -152,6 +178,15 @@ final class PTY {
         source.setCancelHandler { /* intentionally empty */ }
         self.readSource = source
         source.resume()
+
+        let writeSource = DispatchSource.makeWriteSource(fileDescriptor: amaster,
+                                                         queue: Self.writeQueue)
+        writeSource.setEventHandler { [weak self] in
+            self?.drainPendingWrites()
+        }
+        writeSource.setCancelHandler { /* intentionally empty */ }
+        self.writeSource = writeSource
+        writeSource.resume()
 
         // Monitor child process exit
         monitorChildExit()
@@ -177,7 +212,15 @@ final class PTY {
         // Cancel dispatch source first to prevent further read events
         readSource?.cancel()
         readSource = nil
+        writeSource?.cancel()
+        writeSource = nil
         releaseReadBuffer()
+        Self.writeQueue.sync {
+            pendingHighPriorityWrites.removeAll(keepingCapacity: false)
+            pendingRegularWrites.removeAll(keepingCapacity: false)
+            activeHighPriorityWrite = nil
+            activeRegularWrite = nil
+        }
 
         // Close FD under lock — single close site prevents double-close
         fdLock.lock()
@@ -213,31 +256,22 @@ final class PTY {
 
     /// Write data to the PTY (user input).
     func write(_ data: Data) {
-        fdLock.lock()
-        let fd = masterFD
-        fdLock.unlock()
-
-        guard fd >= 0 else { return }
-        data.withUnsafeBytes { ptr in
-            guard let baseAddr = ptr.baseAddress else { return }
-            var remaining = data.count
-            var offset = 0
-            while remaining > 0 {
-                let written = Darwin.write(fd, baseAddr + offset, remaining)
-                if written < 0 {
-                    if errno == EAGAIN || errno == EINTR { continue }
-                    break
-                }
-                offset += written
-                remaining -= written
-            }
-        }
+        enqueueWrite(data, highPriority: false)
     }
 
     /// Write a string to the PTY.
     func write(_ string: String) {
         guard let data = string.data(using: .utf8) else { return }
         write(data)
+    }
+
+    func writeControlCharacter(_ byte: UInt8) {
+        fdLock.lock()
+        let fd = masterFD
+        fdLock.unlock()
+
+        guard fd >= 0 else { return }
+        enqueueWrite(Data([byte]), highPriority: true)
     }
 
     /// Returns the current foreground process group leader PID for this PTY.
@@ -351,21 +385,44 @@ final class PTY {
         guard fd >= 0 else { return }
 
         var buffer = preparedReadBuffer()
-        let bytesRead = read(fd, &buffer, buffer.count)
+        var aggregatedData = Data()
+        aggregatedData.reserveCapacity(ReadBufferPolicy.preferredCapacity)
+
+        while aggregatedData.count < ReadBufferPolicy.maximumBatchBytes {
+            let bytesRead = read(fd, &buffer, buffer.count)
+            if bytesRead > 0 {
+                aggregatedData.append(buffer, count: bytesRead)
+                continue
+            }
+
+            storeReadBuffer(buffer)
+
+            if bytesRead == 0 || (bytesRead < 0 && errno != EAGAIN && errno != EINTR) {
+                fdLock.lock()
+                _isRunning = false
+                fdLock.unlock()
+                releaseReadBuffer()
+                if !aggregatedData.isEmpty {
+                    onOutput?(aggregatedData)
+                    shrinkIdleReadBufferIfNeeded()
+                }
+                DispatchQueue.main.async { [weak self] in
+                    self?.onExit?()
+                }
+                return
+            }
+
+            if bytesRead < 0 && errno == EINTR {
+                continue
+            }
+            break
+        }
+
         storeReadBuffer(buffer)
 
-        if bytesRead > 0 {
-            let data = Data(buffer[0..<bytesRead])
-            onOutput?(data)
+        if !aggregatedData.isEmpty {
+            onOutput?(aggregatedData)
             shrinkIdleReadBufferIfNeeded()
-        } else if bytesRead == 0 || (bytesRead < 0 && errno != EAGAIN) {
-            fdLock.lock()
-            _isRunning = false
-            fdLock.unlock()
-            releaseReadBuffer()
-            DispatchQueue.main.async { [weak self] in
-                self?.onExit?()
-            }
         }
     }
 
@@ -413,5 +470,100 @@ final class PTY {
                 self.onExit?()
             }
         }
+    }
+
+    private func enqueueWrite(_ data: Data, highPriority: Bool) {
+        guard !data.isEmpty else { return }
+        Self.writeQueue.async { [weak self] in
+            guard let self else { return }
+            let pending = PendingWrite(data: data)
+            if highPriority {
+                self.pendingHighPriorityWrites.append(pending)
+            } else {
+                self.pendingRegularWrites.append(pending)
+            }
+            self.drainPendingWrites()
+        }
+    }
+
+    private func drainPendingWrites() {
+        guard currentMasterFD() >= 0 else { return }
+
+        while true {
+            let isHighPriority = prepareNextWriteIfNeeded()
+            guard let pendingWrite = currentPendingWrite(isHighPriority: isHighPriority) else {
+                return
+            }
+
+            let result = pendingWrite.data.withUnsafeBytes { rawBuffer -> Int in
+                guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+                return Darwin.write(
+                    currentMasterFD(),
+                    baseAddress + pendingWrite.offset,
+                    pendingWrite.remainingByteCount
+                )
+            }
+
+            if result > 0 {
+                advanceCurrentWrite(isHighPriority: isHighPriority, bytesWritten: result)
+                continue
+            }
+
+            if result == 0 {
+                return
+            }
+
+            switch errno {
+            case EINTR:
+                continue
+            case EAGAIN:
+                return
+            default:
+                clearPendingWrites()
+                return
+            }
+        }
+    }
+
+    private func prepareNextWriteIfNeeded() -> Bool {
+        if activeHighPriorityWrite == nil, !pendingHighPriorityWrites.isEmpty {
+            activeHighPriorityWrite = pendingHighPriorityWrites.removeFirst()
+        }
+        if activeHighPriorityWrite != nil {
+            return true
+        }
+        if activeRegularWrite == nil, !pendingRegularWrites.isEmpty {
+            activeRegularWrite = pendingRegularWrites.removeFirst()
+        }
+        return false
+    }
+
+    private func currentPendingWrite(isHighPriority: Bool) -> PendingWrite? {
+        isHighPriority ? activeHighPriorityWrite : activeRegularWrite
+    }
+
+    private func advanceCurrentWrite(isHighPriority: Bool, bytesWritten: Int) {
+        if isHighPriority {
+            guard var write = activeHighPriorityWrite else { return }
+            write.offset += bytesWritten
+            activeHighPriorityWrite = write.remainingByteCount == 0 ? nil : write
+        } else {
+            guard var write = activeRegularWrite else { return }
+            write.offset += bytesWritten
+            activeRegularWrite = write.remainingByteCount == 0 ? nil : write
+        }
+    }
+
+    private func clearPendingWrites() {
+        pendingHighPriorityWrites.removeAll(keepingCapacity: false)
+        pendingRegularWrites.removeAll(keepingCapacity: false)
+        activeHighPriorityWrite = nil
+        activeRegularWrite = nil
+    }
+
+    private func currentMasterFD() -> Int32 {
+        fdLock.lock()
+        defer { fdLock.unlock() }
+        return masterFD
     }
 }

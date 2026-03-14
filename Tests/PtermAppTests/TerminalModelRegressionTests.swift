@@ -76,6 +76,30 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(bellCount, 3)
     }
 
+    func testDisplayLocalInterruptPromptBoundaryMovesToNextLineWhenCurrentLineHasContent() {
+        let harness = TerminalModelHarness(rows: 3, cols: 8)
+        harness.feed("abc")
+
+        harness.model.displayLocalInterruptPromptBoundary()
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0x61)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 1).codepoint, 0x62)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 2).codepoint, 0x63)
+        XCTAssertEqual(harness.model.grid.cell(at: 1, col: 0).codepoint, 0x20)
+        XCTAssertEqual(harness.model.cursor.row, 1)
+        XCTAssertEqual(harness.model.cursor.col, 0)
+    }
+
+    func testDisplayLocalInterruptPromptBoundaryAdvancesEvenOnEmptyLine() {
+        let harness = TerminalModelHarness(rows: 3, cols: 8)
+
+        harness.model.displayLocalInterruptPromptBoundary()
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0x20)
+        XCTAssertEqual(harness.model.cursor.row, 1)
+        XCTAssertEqual(harness.model.cursor.col, 0)
+    }
+
     func testTerminalGridInsertBlanksAndDeleteCellsShiftContent() {
         let grid = TerminalGrid(rows: 1, cols: 5)
         for (col, codepoint) in [UInt32(65), 66, 67, 68, 69].enumerated() {

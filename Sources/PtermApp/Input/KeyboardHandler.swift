@@ -32,6 +32,16 @@ final class KeyboardHandler {
             if let chars = event.charactersIgnoringModifiers,
                let scalar = chars.unicodeScalars.first {
                 let code = scalar.value
+                if code == 0x63 { // c
+                    controller.performInterrupt()
+                    playInputFeedbackIfEnabled()
+                    return true
+                }
+                if code == 0x5A || code == 0x7A { // z
+                    controller.performInterrupt(controlCharacter: 0x1A)
+                    playInputFeedbackIfEnabled()
+                    return true
+                }
                 // Ctrl+A (0x01) through Ctrl+Z (0x1A)
                 if code >= 0x61 && code <= 0x7A { // a-z
                     controller.sendInput(String(UnicodeScalar(code - 0x60)!))
@@ -52,7 +62,7 @@ final class KeyboardHandler {
                 }
                 // Ctrl+\ = 0x1C
                 if code == 0x5C {
-                    controller.sendInput(String(UnicodeScalar(0x1C)!))
+                    controller.performInterrupt(controlCharacter: 0x1C)
                     playInputFeedbackIfEnabled()
                     return true
                 }
@@ -145,7 +155,10 @@ final class KeyboardHandler {
 
     private func playInputFeedbackIfEnabled() {
         guard inputFeedbackEnabled() else { return }
-        inputFeedbackPlayer.playKeystroke()
+        DispatchQueue.main.async { [inputFeedbackPlayer, inputFeedbackEnabled] in
+            guard inputFeedbackEnabled() else { return }
+            inputFeedbackPlayer.playKeystroke()
+        }
     }
 
     private func handleSpecialKey(event: NSEvent) -> String? {

@@ -15,8 +15,9 @@ private extension String {
     }
 }
 
-private final class PtermWindow: NSWindow {
+final class PtermWindow: NSWindow {
     var onBackToIntegratedShortcut: (() -> Void)?
+    var onInterruptShortcut: (() -> Bool)?
     private static let supportedModifierMask: NSEvent.ModifierFlags = [.command, .shift, .option, .control]
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -28,6 +29,9 @@ private final class PtermWindow: NSWindow {
     }
 
     override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown, isInterruptShortcut(event), onInterruptShortcut?() == true {
+            return
+        }
         if event.type == .keyDown, isBackToIntegratedShortcut(event) {
             onBackToIntegratedShortcut?()
             return
@@ -38,6 +42,15 @@ private final class PtermWindow: NSWindow {
     private func isBackToIntegratedShortcut(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection(Self.supportedModifierMask)
         return modifiers == [.command] && event.keyCode == 50  // Cmd+` (backtick)
+    }
+
+    private func isInterruptShortcut(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(Self.supportedModifierMask)
+        guard modifiers == [.control],
+              let characters = event.charactersIgnoringModifiers?.lowercased() else {
+            return false
+        }
+        return characters == "c"
     }
 }
 
@@ -339,6 +352,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case .integrated:
                 break
             }
+        }
+        appWindow.onInterruptShortcut = { [weak self] in
+            self?.handleHighPriorityInterruptShortcut() ?? false
         }
         window = appWindow
         window.center()
@@ -1291,7 +1307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sourceView.clearSelection()
         } else {
             // No selection: send SIGINT (Ctrl+C)
-            controller.sendInput("\u{03}")
+            controller.performInterrupt()
         }
     }
 
@@ -1831,6 +1847,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func handleHighPriorityInterruptShortcut() -> Bool {
+        guard let target = activeTerminalInteractionTarget(),
+              window?.firstResponder === target.view else {
+            return false
+        }
+        return target.view.handlePriorityInterruptShortcut()
+    }
+
     @objc func clearActiveTerminalScreen(_ sender: Any?) {
         guard let target = activeTerminalInteractionTarget() else { return }
         target.controller.clearScrollback()
@@ -1971,8 +1995,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showSearchBar() {
-        guard searchBarView == nil,
-              let terminalView = activeSearchTerminalView() else { return }
+        if let searchBarView {
+            searchBarView.focus()
+            return
+        }
+        guard let terminalView = activeSearchTerminalView() else { return }
 
         terminalView.beginSearch()
         let bar = SearchBarView(frame: searchBarFrame())
@@ -2389,7 +2416,11 @@ extension AppDelegate: NSWindowDelegate {
     }
 
     @objc func applicationDidResignActive(_ notification: Notification) {
-        releaseInactiveRenderingResourcesNow()
+        // Switching to another app should not tear down visible render resources.
+        // Doing so forces glyph atlas / buffer reconstruction on the first frame
+        // after reactivation, which can expose transient corruption before the
+        // next demand-driven redraw settles. We still release on hide/minimize
+        // and under memory pressure.
     }
 
     @objc func applicationDidBecomeActive(_ notification: Notification) {

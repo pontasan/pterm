@@ -1467,6 +1467,7 @@ final class AppKitComponentTests: XCTestCase {
         ))
 
         XCTAssertTrue(handler.handleKeyDown(event: event))
+        drainMainQueue(testCase: self)
         XCTAssertEqual(spy.playCount, 1)
     }
 
@@ -1520,6 +1521,7 @@ final class AppKitComponentTests: XCTestCase {
 
         view.insertText("a", replacementRange: NSRange(location: NSNotFound, length: 0))
 
+        drainMainQueue(testCase: self)
         XCTAssertEqual(spy.playCount, 1)
     }
 
@@ -1565,6 +1567,7 @@ final class AppKitComponentTests: XCTestCase {
 
         view.setMarkedText("かな", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
 
+        drainMainQueue(testCase: self)
         XCTAssertEqual(spy.playCount, 1)
     }
 
@@ -1610,6 +1613,7 @@ final class AppKitComponentTests: XCTestCase {
 
         view.doCommand(by: #selector(NSResponder.insertTab(_:)))
 
+        drainMainQueue(testCase: self)
         XCTAssertEqual(spy.playCount, 1)
     }
 
@@ -5777,6 +5781,70 @@ final class AppKitComponentTests: XCTestCase {
 
         XCTAssertTrue(scrollView.performKeyEquivalent(with: event))
         XCTAssertTrue(spy.didInvokeScrollToTop)
+    }
+
+    func testWindowInterruptShortcutBypassesTerminalKeyHandlingPath() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let scrollView = TerminalScrollView(frame: NSRect(x: 0, y: 0, width: 320, height: 180), renderer: renderer)
+        scrollView.terminalView.terminalController = controller
+
+        try withTemporaryDirectory { directory in
+            controller.auditLogger = TerminalAuditLogger(
+                rootDirectory: directory,
+                sessionID: UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!,
+                timeZoneIdentifier: "Asia/Tokyo",
+                termEnv: "xterm-256color",
+                workspaceNameProvider: { "Main" },
+                terminalNameProvider: { "test" },
+                sizeProvider: { (12, 4) },
+                nowProvider: { Date(timeIntervalSince1970: 1_700_000_000) }
+            )
+
+            let window = PtermWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220),
+                                     styleMask: [.titled],
+                                     backing: .buffered,
+                                     defer: false)
+            window.contentView = NSView(frame: window.frame)
+            window.contentView?.addSubview(scrollView)
+            window.onInterruptShortcut = { [weak terminalView = scrollView.terminalView] in
+                terminalView?.handlePriorityInterruptShortcut() ?? false
+            }
+            window.makeKeyAndOrderFront(nil)
+            window.makeFirstResponder(scrollView.terminalView)
+
+            let event = try XCTUnwrap(NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [.control],
+                timestamp: 0,
+                windowNumber: window.windowNumber,
+                context: nil,
+                characters: "\u{03}",
+                charactersIgnoringModifiers: "c",
+                isARepeat: false,
+                keyCode: 8
+            ))
+
+            window.sendEvent(event)
+            controller.auditLogger?.close()
+
+            let castPath = try XCTUnwrap(
+                FileManager.default.subpathsOfDirectory(atPath: directory.path)
+                    .first(where: { $0.hasSuffix(".cast") })
+            )
+            let castContents = try String(contentsOf: directory.appendingPathComponent(castPath))
+            XCTAssertTrue(castContents.contains("\\u0003"))
+        }
     }
 
     func testIntegratedViewDragReorderTerminalAndWorkspaceCallbacks() throws {

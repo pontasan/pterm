@@ -189,6 +189,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var hoveredImagePlaceholder: TerminalController.DetectedImagePlaceholder?
     private var imagePreviewWindow: NSWindow?
     private var imagePreviewView: NSImageView?
+    private var lastDrawnRenderContentVersion: UInt64 = 0
 
     var hasActiveImagePreviewWindow: Bool { imagePreviewWindow != nil }
     var debugHasKeyboardHandler: Bool { keyboardHandler != nil }
@@ -199,6 +200,14 @@ final class TerminalView: MTKView, NSTextInputClient {
     var debugPendingCommittedTextIntentCount: Int { pendingCommittedTextIntents.count }
     var debugHasPendingIntentResolutionTimer: Bool { pendingIntentResolutionTimer != nil }
     var debugLastPendingCommittedTextIntentText: String? { pendingCommittedTextIntents.last?.text }
+
+    private func queueInputFeedbackIfEnabled() {
+        guard typewriterSoundEnabled else { return }
+        let player = inputFeedbackPlayer
+        DispatchQueue.main.async {
+            player.playKeystroke()
+        }
+    }
 
     func debugSetSuppressInterpretKeyEvents(_ suppressed: Bool) {
         debugSuppressInterpretKeyEvents = suppressed
@@ -219,6 +228,14 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     func debugReleaseImagePreviewWindowNow() {
         hideImagePreview()
+    }
+
+    @discardableResult
+    func handlePriorityInterruptShortcut() -> Bool {
+        guard let controller = terminalController else { return false }
+        controller.performInterrupt()
+        queueInputFeedbackIfEnabled()
+        return true
     }
 
     // MARK: - Initialization
@@ -678,9 +695,12 @@ final class TerminalView: MTKView, NSTextInputClient {
         }
 
         if event.modifierFlags.contains(.control) {
+            let handled = ensureKeyboardHandler()?.handleKeyDown(event: event) ?? false
             terminalController?.scrollToBottom()
             clearSelection()
-            ensureKeyboardHandler()?.handleKeyDown(event: event)
+            if handled {
+                return
+            }
             return
         }
 
@@ -1863,6 +1883,11 @@ extension TerminalView: MTKViewDelegate {
               let renderer = renderer,
               let controller = terminalController else { return }
 
+        let currentVersion = controller.currentRenderContentVersion
+        if controller.isInInterruptCatchUpMode && currentVersion == lastDrawnRenderContentVersion {
+            return
+        }
+
         let highlight: MetalRenderer.SearchHighlight? = searchMatches.isEmpty ? nil :
             MetalRenderer.SearchHighlight(matches: searchMatches, currentIndex: currentSearchIndex)
         let linkUL: MetalRenderer.LinkUnderline? = hoveredLinkRange.map {
@@ -1881,6 +1906,7 @@ extension TerminalView: MTKViewDelegate {
                           suppressCursorBlink: suppressCursorBlink,
                           in: view)
         }
+        lastDrawnRenderContentVersion = currentVersion
         scheduleIdleBufferRelease()
 
         if scrollerSyncPending {
@@ -1920,9 +1946,7 @@ extension TerminalView {
             }
         }
         controller.sendInput(text)
-        if typewriterSoundEnabled {
-            inputFeedbackPlayer.playKeystroke()
-        }
+        queueInputFeedbackIfEnabled()
     }
 
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
@@ -1938,8 +1962,8 @@ extension TerminalView {
         markedTextStorage = NSMutableAttributedString(attributedString: attributed)
         markedTextSelection = selectedRange
         updateMarkedTextOverlay()
-        if typewriterSoundEnabled, attributed.length > 0 {
-            inputFeedbackPlayer.playKeystroke()
+        if attributed.length > 0 {
+            queueInputFeedbackIfEnabled()
         }
     }
 
