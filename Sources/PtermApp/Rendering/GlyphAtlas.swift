@@ -75,6 +75,7 @@ final class GlyphAtlas {
         var textureW: Float     // Texture width (0..1)
         var textureH: Float     // Texture height (0..1)
         var cellOffsetX: Float  // Distance from terminal cell origin to bitmap left in display pixels
+        var bitmapPadding: Float // Transparent atlas padding around the rasterized glyph in display pixels
         var bearingX: Float     // Horizontal bearing (points)
         var baselineOffset: Float // Distance from bitmap top to baseline in display pixels
         var pixelWidth: Int     // Display pixel width of glyph image
@@ -207,7 +208,7 @@ final class GlyphAtlas {
             // Space or zero-width glyph
             let info = GlyphInfo(
                 textureX: 0, textureY: 0, textureW: 0, textureH: 0,
-                cellOffsetX: 0, bearingX: 0, baselineOffset: 0,
+                cellOffsetX: 0, bitmapPadding: 0, bearingX: 0, baselineOffset: 0,
                 pixelWidth: 0, pixelHeight: 0,
                 advance: Float(advance.width),
                 lastAccessGeneration: accessGeneration
@@ -289,6 +290,7 @@ final class GlyphAtlas {
         // top/baseline relationship survives the downscale exactly.
         let renderPixelWidth = max(1, Int(round(CGFloat(pixelW) * displayScale / scale)))
         let renderPixelHeight = max(1, Int(round(CGFloat(pixelH) * displayScale / scale)))
+        let displayPadding = Float((CGFloat(paddingPixels) * displayScale) / scale)
         let cellOffsetX = Float(
             (((cellWidth - advance.width) * 0.5) + boundingRect.origin.x) * displayScale
         )
@@ -306,6 +308,7 @@ final class GlyphAtlas {
             textureW: Float(pixelW) / Float(atlasPixelW),
             textureH: Float(pixelH) / Float(atlasPixelH),
             cellOffsetX: cellOffsetX,
+            bitmapPadding: displayPadding,
             bearingX: Float(boundingRect.origin.x),
             baselineOffset: baselineOffset,
             pixelWidth: renderPixelWidth,
@@ -453,7 +456,7 @@ final class GlyphAtlas {
             return font as CTFont
         }
 
-        for candidate in ["SFMono-Regular", ".SFNSMono-Regular", "Menlo-Regular"] {
+        for candidate in ["SFMono-Regular", "Menlo-Regular"] {
             if let font = NSFont(name: candidate, size: size) {
                 return font as CTFont
             }

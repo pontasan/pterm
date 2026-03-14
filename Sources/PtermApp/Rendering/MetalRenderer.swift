@@ -42,6 +42,14 @@ final class MetalRenderer {
         round(value)
     }
 
+    private static func wideGlyphOffsetX(
+        _ glyph: GlyphAtlas.GlyphInfo,
+        spanWidth: Float,
+        singleCellWidth: Float
+    ) -> Float {
+        glyph.cellOffsetX + ((spanWidth - singleCellWidth) * 0.5)
+    }
+
     struct TerminalAppearance {
         var defaultForeground: (r: Float, g: Float, b: Float)
         var defaultBackground: (r: Float, g: Float, b: Float, a: Float)
@@ -929,9 +937,11 @@ final class MetalRenderer {
                     if cell.width == 1 {
                         rawGlyphX = x + glyph.cellOffsetX
                     } else {
-                        let glyphAdvance = max(0, glyph.advance * scaleFactor)
-                        let centeredOffset = max(0, (w - glyphAdvance) * 0.5)
-                        rawGlyphX = x + centeredOffset + Float(glyph.bearingX) * scaleFactor
+                        rawGlyphX = x + Self.wideGlyphOffsetX(
+                            glyph,
+                            spanWidth: w,
+                            singleCellWidth: cellW
+                        )
                     }
                     // Position glyph so its baseline (at baselineOffset pixels from
                     // the bitmap top) aligns with the cell's baseline screen position.
@@ -1025,6 +1035,113 @@ final class MetalRenderer {
         return vd
     }
 
+    func debugBuildVertexDataForTesting(
+        model: TerminalModel,
+        scrollback: ScrollbackBuffer,
+        scrollOffset: Int = 0,
+        selection: TerminalSelection? = nil,
+        transientTextOverlays: [TransientTextOverlay] = []
+    ) -> VertexData {
+        buildVertexData(
+            model: model,
+            scrollback: scrollback,
+            scrollOffset: scrollOffset,
+            selection: selection,
+            searchHighlight: nil,
+            linkUnderline: nil,
+            transientTextOverlays: transientTextOverlays,
+            scaleFactor: Float(glyphAtlas.scaleFactor),
+            bufferSet: ViewBufferSet()
+        )
+    }
+
+    func debugRenderToTextureForTesting(
+        model: TerminalModel,
+        scrollback: ScrollbackBuffer,
+        texture: MTLTexture,
+        scrollOffset: Int = 0,
+        selection: TerminalSelection? = nil,
+        transientTextOverlays: [TransientTextOverlay] = [],
+        suppressCursorBlink: Bool = true
+    ) {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            return
+        }
+
+        let renderPassDescriptor = MTLRenderPassDescriptor()
+        renderPassDescriptor.colorAttachments[0].texture = texture
+        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].storeAction = .store
+        renderPassDescriptor.colorAttachments[0].clearColor = terminalClearColor
+
+        let viewportSize = SIMD2<Float>(Float(texture.width), Float(texture.height))
+        var uniforms = MetalUniforms(
+            viewportSize: viewportSize,
+            cursorOpacity: (scrollOffset == 0 && model.cursor.visible) ? 1.0 : 0.0,
+            cursorBlink: (model.cursor.blinking && !suppressCursorBlink) ? 1.0 : 0.0,
+            time: Float(CACurrentMediaTime() - startTime)
+        )
+        let bufferSet = ViewBufferSet()
+        let scaleFactor = Float(glyphAtlas.scaleFactor)
+        let vertexData = buildVertexData(
+            model: model,
+            scrollback: scrollback,
+            scrollOffset: scrollOffset,
+            selection: selection,
+            transientTextOverlays: transientTextOverlays,
+            scaleFactor: scaleFactor,
+            bufferSet: bufferSet
+        )
+
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+            return
+        }
+
+        if !vertexData.bgVertices.isEmpty,
+           let pipeline = bgPipeline,
+           let buffer = makeTemporaryBuffer(vertices: vertexData.bgVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexData.bgVertices.count / floatsPerVertex)
+        }
+
+        if !vertexData.glyphVertices.isEmpty,
+           let pipeline = glyphPipelineForCurrentOutput(),
+           let atlas = glyphAtlas.texture,
+           let buffer = makeTemporaryBuffer(vertices: vertexData.glyphVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.setFragmentTexture(atlas, index: 0)
+            encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexData.glyphVertices.count / floatsPerVertex)
+        }
+
+        if !vertexData.cursorVertices.isEmpty,
+           let pipeline = cursorPipeline,
+           let buffer = makeTemporaryBuffer(vertices: vertexData.cursorVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexData.cursorVertices.count / floatsPerVertex)
+        }
+
+        if !vertexData.overlayVertices.isEmpty,
+           let pipeline = overlayPipeline,
+           let buffer = makeTemporaryBuffer(vertices: vertexData.overlayVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexData.overlayVertices.count / floatsPerVertex)
+        }
+
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+    }
+
     private func appendTransientTextOverlay(
         _ overlay: TransientTextOverlay,
         scaleFactor: Float,
@@ -1047,7 +1164,16 @@ final class MetalRenderer {
                 columnOffset += Float(max(CharacterWidth.width(of: scalar.value), 0)) * cellW
                 continue
             }
-            let x = baseX + columnOffset + glyph.cellOffsetX
+            let characterWidth = max(CharacterWidth.width(of: scalar.value), 1)
+            let x = baseX + columnOffset + (
+                characterWidth == 1
+                    ? glyph.cellOffsetX
+                    : Self.wideGlyphOffsetX(
+                        glyph,
+                        spanWidth: Float(characterWidth) * cellW,
+                        singleCellWidth: cellW
+                    )
+            )
             let baselineScreenY = baseY + cellH - Float(glyphAtlas.baseline) * scaleFactor
             let y = baselineScreenY - glyph.baselineOffset
             let glyphX = shouldSnapGlyphPosition ? Self.snapToPixel(x) : x
@@ -1060,7 +1186,7 @@ final class MetalRenderer {
                    tw: glyph.textureW, th: glyph.textureH,
                    fg: (1.0, 1.0, 1.0, overlay.alpha),
                    bg: (0, 0, 0, 0))
-            columnOffset += Float(max(CharacterWidth.width(of: scalar.value), 1)) * cellW
+            columnOffset += Float(characterWidth) * cellW
         }
     }
 
@@ -1502,8 +1628,15 @@ final class MetalRenderer {
                 if cell.codepoint > 0x20,
                    let glyph = glyphAtlas.glyphInfo(for: cell.codepoint),
                    glyph.pixelWidth > 0 {
-
-                    let glyphFullX = fullX + glyph.cellOffsetX
+                    let glyphFullX = fullX + (
+                        cell.width == 1
+                            ? glyph.cellOffsetX
+                            : Self.wideGlyphOffsetX(
+                                glyph,
+                                spanWidth: fullW,
+                                singleCellWidth: cellW
+                            )
+                    )
                     let baselineScreenY = fullY + fullH - Float(glyphAtlas.baseline) * scaleFactor
                     let glyphFullY = baselineScreenY - glyph.baselineOffset
                     let glyphFullW = Float(glyph.pixelWidth)

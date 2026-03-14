@@ -1,4 +1,5 @@
 import AppKit
+import MetalKit
 
 // MARK: - Markdown Syntax Highlighter
 
@@ -23,6 +24,16 @@ final class MarkdownHighlighter {
         self.font = font
     }
 
+    private var boldFont: NSFont {
+        NSFont(descriptor: font.fontDescriptor.withSymbolicTraits(.bold), size: font.pointSize)
+            ?? NSFont.monospacedSystemFont(ofSize: font.pointSize, weight: .bold)
+    }
+
+    private var italicFont: NSFont {
+        NSFont(descriptor: font.fontDescriptor.withSymbolicTraits(.italic), size: font.pointSize)
+            ?? font
+    }
+
     /// Apply full Markdown highlighting to the given text storage.
     /// Must be called on the main thread, outside of any processEditing cycle.
     func highlight(_ textStorage: NSTextStorage) {
@@ -40,7 +51,7 @@ final class MarkdownHighlighter {
         let nsText = textStorage.string as NSString
 
         applyRegex(textStorage, nsText: nsText, pattern: "^#{1,6}\\s+.*$",
-                   color: headingColor, font: NSFont.boldSystemFont(ofSize: font.pointSize))
+                   color: headingColor, font: boldFont)
         applyRegex(textStorage, nsText: nsText, pattern: "^>+\\s*.*$",
                    color: blockquoteColor, font: nil)
         applyRegex(textStorage, nsText: nsText, pattern: "^(\\*{3,}|-{3,}|_{3,})\\s*$",
@@ -74,9 +85,7 @@ final class MarkdownHighlighter {
                    backgroundColor: codeBgColor)
         applyRegex(textStorage, nsText: nsText, pattern: "(\\*\\*|__)(?=\\S)(.+?)(?<=\\S)\\1",
                    color: boldColor,
-                   font: NSFont.boldSystemFont(ofSize: font.pointSize))
-        let italicFont = NSFont(descriptor: font.fontDescriptor.withSymbolicTraits(.italic),
-                                size: font.pointSize) ?? font
+                   font: boldFont)
         applyRegex(textStorage, nsText: nsText, pattern: "(?<![*_])([*_])(?=\\S)(.+?)(?<=\\S)\\1(?![*_])",
                    color: italicColor, font: italicFont)
         applyRegex(textStorage, nsText: nsText, pattern: "\\[([^\\]]+)\\]\\(([^)]+)\\)",
@@ -318,7 +327,8 @@ final class MarkdownAutoFormatDelegate: NSObject, NSTextViewDelegate {
 final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate {
     private static let editorBaseBackgroundColor = NSColor(calibratedRed: 0.118, green: 0.118, blue: 0.118, alpha: 1)
     private static let editorGlassBackgroundColor = NSColor.clear
-    private var textView: NSTextView!
+    private var textView: MarkdownInputTextView!
+    private var metalSurfaceView: MarkdownMetalSurfaceView!
     private var gutterView: LineNumberGutterView!
     private var autoFormatDelegate: MarkdownAutoFormatDelegate!
     private var highlighter: MarkdownHighlighter!
@@ -330,9 +340,14 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
     private var isDirty = false
     private var baseTitle: String
     private var saveFn: (String) throws -> Void
+    private var metalRenderer: MetalRenderer!
     var onClose: (() -> Void)?
 
-    init(initialText: String, onSave: @escaping (String) throws -> Void) {
+    init(
+        initialText: String,
+        onSave: @escaping (String) throws -> Void,
+        typewriterSoundEnabled: Bool = TextInteractionConfiguration.default.typewriterSoundEnabled
+    ) {
         self.saveFn = onSave
         self.baseTitle = "Notes"
         let contentRect = NSRect(x: 0, y: 0, width: 720, height: 560)
@@ -351,6 +366,10 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         window.delegate = self
 
         let editorFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        self.metalRenderer = MarkdownMetalRendererFactory.make(
+            font: editorFont,
+            scaleFactor: NSScreen.main?.backingScaleFactor ?? 2.0
+        )
         let rootView = NSView(frame: window.contentView?.bounds ?? contentRect)
         rootView.autoresizingMask = [.width, .height]
         rootView.wantsLayer = true
@@ -373,7 +392,7 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
 
         // TextKit 1 stack (required for line number position queries)
         let textStorage = NSTextStorage()
-        let layoutManager = NSLayoutManager()
+        let layoutManager = MarkdownEditorLayoutManager()
         let textContainer = NSTextContainer(containerSize: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
         textContainer.widthTracksTextView = true
         textStorage.addLayoutManager(layoutManager)
@@ -400,7 +419,7 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         scrollView.scrollerStyle = .overlay
 
         let contentSize = scrollView.contentSize
-        let tv = NSTextView(frame: NSRect(origin: .zero, size: contentSize), textContainer: textContainer)
+        let tv = MarkdownInputTextView(frame: NSRect(origin: .zero, size: contentSize), textContainer: textContainer)
         tv.minSize = NSSize(width: 0, height: contentSize.height)
         tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         tv.isVerticallyResizable = true
@@ -424,6 +443,7 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         tv.backgroundColor = editorBg
         tv.drawsBackground = false
         tv.insertionPointColor = NSColor.white
+        tv.typewriterSoundEnabled = typewriterSoundEnabled
         tv.selectedTextAttributes = [
             .backgroundColor: NSColor(calibratedRed: 0.17, green: 0.33, blue: 0.53, alpha: 1),
             .foregroundColor: NSColor.white,
@@ -439,6 +459,16 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         scrollView.documentView = tv
         gutter.textView = tv
 
+        let surface = MarkdownMetalSurfaceView(
+            frame: scrollView.contentView.bounds,
+            renderer: metalRenderer,
+            textView: tv,
+            clipView: scrollView.contentView
+        )
+        surface.autoresizingMask = [.width, .height]
+        scrollView.contentView.addSubview(surface)
+        metalSurfaceView = surface
+
         // Syntax highlighter
         let syntaxHighlighter = MarkdownHighlighter(font: editorFont)
         highlighter = syntaxHighlighter
@@ -447,12 +477,26 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         // Auto-format delegate
         let fmtDelegate = MarkdownAutoFormatDelegate()
         fmtDelegate.highlighter = syntaxHighlighter
-        fmtDelegate.onTextChange = { [weak self, weak gutter] _ in
+        fmtDelegate.onTextChange = { [weak self, weak gutter, weak surface, weak tv] _ in
             gutter?.needsDisplay = true
+            self?.syncTextViewportLayout()
+            surface?.requestRender()
+            if let tv {
+                tv.onVisualStateChanged?()
+            }
             self?.markDirty()
         }
         tv.delegate = fmtDelegate
         autoFormatDelegate = fmtDelegate
+        tv.onCommittedTextInserted = { [weak surface] text, location in
+            surface?.enqueueCommittedTextPreview(text: text, insertionLocation: location)
+        }
+        tv.onDeletionPreviewRequested = { [weak surface] text, rect, color in
+            surface?.enqueueDeletionPreview(text: text, rect: rect, color: color)
+        }
+        tv.onVisualStateChanged = { [weak surface] in
+            surface?.requestRender()
+        }
 
         self.scrollView = scrollView
         textView = tv
@@ -462,6 +506,7 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
                                                name: NSView.boundsDidChangeNotification,
                                                object: scrollView.contentView)
         scrollView.contentView.postsBoundsChangedNotifications = true
+        syncTextViewportLayout()
 
         contentView.addSubview(scrollView)
 
@@ -530,6 +575,7 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
 
     @objc private func scrollOrTextDidChange(_ notification: Notification) {
         gutterView.needsDisplay = true
+        metalSurfaceView.syncFrameToClipView()
     }
 
     private func markDirty() {
@@ -556,6 +602,8 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         guard let window else { return }
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(textView)
+        syncTextViewportLayout()
+        metalSurfaceView.requestRender()
     }
 
     func windowDidResize(_ notification: Notification) {
@@ -565,6 +613,8 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
         textView.frame.size.width = contentSize.width
         textContainer.containerSize = NSSize(width: contentSize.width, height: CGFloat.greatestFiniteMagnitude)
         gutterView.needsDisplay = true
+        syncTextViewportLayout()
+        metalSurfaceView.syncFrameToClipView()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -596,5 +646,17 @@ final class MarkdownEditorWindowController: NSWindowController, NSWindowDelegate
             NSEvent.removeMonitor(keyMonitor)
         }
         NotificationCenter.default.removeObserver(self)
+    }
+
+    private func syncTextViewportLayout() {
+        guard let scrollView,
+              let textContainer = textView.textContainer,
+              let layoutManager = textView.layoutManager else { return }
+        let contentSize = scrollView.contentSize
+        textContainer.containerSize = NSSize(width: contentSize.width, height: .greatestFiniteMagnitude)
+        layoutManager.ensureLayout(for: textContainer)
+        let usedRect = layoutManager.usedRect(for: textContainer)
+        let height = max(contentSize.height, ceil(usedRect.height + (textView.textContainerInset.height * 2)))
+        textView.frame = NSRect(x: 0, y: 0, width: contentSize.width, height: height)
     }
 }

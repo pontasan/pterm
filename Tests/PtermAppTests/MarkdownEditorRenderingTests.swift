@@ -1,28 +1,35 @@
 import AppKit
+import MetalKit
 import XCTest
 @testable import PtermApp
 
 @MainActor
 final class MarkdownEditorRenderingTests: XCTestCase {
+    private final class KeyClickSpy: TypewriterKeyClicking {
+        private(set) var count = 0
+
+        func playKeystroke() {
+            count += 1
+        }
+    }
+
     func testEditorRendersVisibleGlyphsForNonEmptyText() throws {
-        let outputDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("pterm-test-note-editor", isDirectory: true)
-        try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         let controller = MarkdownEditorWindowController(
             initialText: "",
             onSave: { _ in }
         )
 
-        guard let textView = findTextView(in: try requireWindow(from: controller)) else {
+        let window = try requireWindow(from: controller)
+        guard let textView = findTextView(in: window) else {
             XCTFail("Markdown editor did not contain an NSTextView")
             return
         }
-
-        let beforeBitmap = try bitmap(in: textView)
-        try write(bitmap: beforeBitmap, to: outputDirectory.appendingPathComponent("before.png"))
+        guard let metalView = findMetalView(in: window) else {
+            XCTFail("Markdown editor did not contain a Metal text surface")
+            return
+        }
 
         textView.insertText("abc\n日本語", replacementRange: textView.selectedRange())
-        textView.displayIfNeeded()
 
         XCTAssertEqual(textView.string, "abc\n日本語")
         var effectiveRange = NSRange(location: 0, length: 0)
@@ -47,30 +54,142 @@ final class MarkdownEditorRenderingTests: XCTestCase {
         let usedRect = layoutManager.usedRect(for: textContainer)
         XCTAssertGreaterThan(usedRect.width, 0, "Expected non-zero layout width")
         XCTAssertGreaterThan(usedRect.height, 0, "Expected non-zero layout height")
+        XCTAssertTrue(metalView.isPaused, "Markdown Metal surface should render on demand")
+        XCTAssertTrue(metalView.enableSetNeedsDisplay, "Markdown Metal surface should be demand-driven")
+        XCTAssertGreaterThan(metalView.drawableSize.width, 0, "Expected non-zero drawable width")
+        XCTAssertGreaterThan(metalView.drawableSize.height, 0, "Expected non-zero drawable height")
+        if let metalSurface = metalView as? MarkdownMetalSurfaceView {
+            XCTAssertEqual(metalSurface.debugPrepareVisibleGlyphsForTesting(), 0, "Expected committed glyphs to stay masked while insert preview is active")
+            XCTAssertGreaterThan(metalSurface.debugLastRenderedCharacterRange.length, 0, "Expected visible markdown characters to be rendered")
+            XCTAssertGreaterThan(metalSurface.debugActivePreviewCount, 0, "Expected committed insert preview to be active")
+            RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+            XCTAssertEqual(metalSurface.debugActivePreviewCount, 0, "Expected committed insert preview to expire")
+            XCTAssertGreaterThan(metalSurface.debugPrepareVisibleGlyphsForTesting(), 0, "Expected visible glyph vertices to be generated after preview finishes")
+        } else {
+            XCTFail("Markdown editor did not expose a markdown metal surface view")
+        }
+    }
 
-        let afterBitmap = try bitmap(in: textView)
-        try write(bitmap: afterBitmap, to: outputDirectory.appendingPathComponent("after.png"))
-        let contentStartX = Int(ceil(textView.textContainerInset.width)) + 8
-        let changedPixels = changedPixelCount(before: beforeBitmap, after: afterBitmap, contentStartX: contentStartX)
-        let brightPixels = brightPixelCount(in: afterBitmap, contentStartX: contentStartX)
-        try """
-        string=\(textView.string.debugDescription)
-        contentStartX=\(contentStartX)
-        changedPixels=\(changedPixels)
-        brightPixels=\(brightPixels)
-        textColor=\(String(describing: textView.textColor))
-        typingAttributes=\(textView.typingAttributes)
-        """.write(to: outputDirectory.appendingPathComponent("diagnostics.txt"), atomically: true, encoding: .utf8)
-
-        XCTAssertGreaterThan(
-            changedPixels,
-            200,
-            "Expected inserting text to visibly change the editor content bitmap"
+    func testEditorMetalSurfaceCullsRenderingToVisibleRangeForLargeDocument() throws {
+        let longText = (0..<2000).map { "line-\($0)" }.joined(separator: "\n")
+        let controller = MarkdownEditorWindowController(
+            initialText: longText,
+            onSave: { _ in }
         )
-        XCTAssertGreaterThan(
-            brightPixels,
-            200,
-            "Expected bright text pixels in the editor content region"
+
+        let window = try requireWindow(from: controller)
+        guard let textView = findTextView(in: window),
+              let metalView = findMarkdownMetalSurface(in: window) else {
+            XCTFail("Markdown editor did not expose expected views")
+            return
+        }
+
+        let renderedRange = metalView.debugCurrentCulledCharacterRange()
+        XCTAssertGreaterThan(renderedRange.length, 0)
+        XCTAssertLessThan(renderedRange.length, (textView.string as NSString).length)
+    }
+
+    func testEditorMetalSurfaceUpdatesCullRangeAfterScroll() throws {
+        let longText = (0..<2000).map { "line-\($0)" }.joined(separator: "\n")
+        let controller = MarkdownEditorWindowController(
+            initialText: longText,
+            onSave: { _ in }
+        )
+
+        let window = try requireWindow(from: controller)
+        guard let textView = findTextView(in: window),
+              let metalView = findMarkdownMetalSurface(in: window),
+              let scrollView = textView.enclosingScrollView else {
+            XCTFail("Markdown editor did not expose expected views")
+            return
+        }
+
+        let before = metalView.debugCurrentCulledCharacterRange()
+
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: 4000))
+        NotificationCenter.default.post(name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
+        let after = metalView.debugCurrentCulledCharacterRange()
+        XCTAssertNotEqual(before.location, after.location)
+    }
+
+    func testEditorDeleteBackwardPlaysTypewriterSound() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "abc",
+            onSave: { _ in }
+        )
+
+        let window = try requireWindow(from: controller)
+        guard let textView = findTextView(in: window) as? MarkdownInputTextView else {
+            XCTFail("Markdown editor did not contain a markdown input text view")
+            return
+        }
+
+        let spy = KeyClickSpy()
+        textView.inputFeedbackPlayer = spy
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        textView.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+
+        XCTAssertEqual(textView.string, "ab")
+        XCTAssertEqual(spy.count, 1)
+    }
+
+    func testEditorDeleteBackwardCreatesTransientPreview() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "abc",
+            onSave: { _ in }
+        )
+
+        let window = try requireWindow(from: controller)
+        guard let textView = findTextView(in: window) as? MarkdownInputTextView,
+              let metalSurface = findMarkdownMetalSurface(in: window) else {
+            XCTFail("Markdown editor did not expose expected views")
+            return
+        }
+
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        textView.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+
+        XCTAssertEqual(textView.string, "ab")
+        XCTAssertGreaterThan(metalSurface.debugActivePreviewCount, 0, "Expected delete preview to be active")
+    }
+
+    func testEditorJapaneseMarkedTextOverlayMatchesCommittedRendererForRepeatedWideGlyphs() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "",
+            onSave: { _ in }
+        )
+
+        let window = try requireWindow(from: controller)
+        guard let textView = findTextView(in: window) as? MarkdownInputTextView,
+              let metalSurface = findMarkdownMetalSurface(in: window) else {
+            XCTFail("Markdown editor did not expose expected views")
+            return
+        }
+
+        textView.setMarkedText("ああ", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        metalSurface.debugUpdateMarkedTextOverlayNow()
+
+        let overlayFrames = metalSurface.debugMarkedTextOverlayFramesForTesting
+
+        textView.insertText("ああ", replacementRange: NSRange(location: NSNotFound, length: 0))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+        _ = metalSurface.debugPrepareVisibleGlyphsForTesting()
+        let committedFrames = metalSurface.debugCommittedGlyphFramesForTesting()
+
+        XCTAssertEqual(overlayFrames.count, 2)
+        XCTAssertEqual(committedFrames.count, 2)
+        XCTAssertEqual(overlayFrames[0].minX, committedFrames[0].minX, accuracy: 1.0)
+        XCTAssertEqual(overlayFrames[1].minX, committedFrames[1].minX, accuracy: 1.0)
+        XCTAssertEqual(overlayFrames[1].minX - overlayFrames[0].minX, committedFrames[1].minX - committedFrames[0].minX, accuracy: 1.0)
+        XCTAssertEqual(overlayFrames[0].width, committedFrames[0].width, accuracy: 1.0)
+        XCTAssertEqual(overlayFrames[1].width, committedFrames[1].width, accuracy: 1.0)
+        XCTAssertEqual(overlayFrames[0].minY, committedFrames[0].minY, accuracy: 1.0)
+        XCTAssertEqual(overlayFrames[1].minY, committedFrames[1].minY, accuracy: 1.0)
+        XCTAssertEqual(
+            overlayFrames[1].maxX - overlayFrames[0].minX,
+            committedFrames[1].maxX - committedFrames[0].minX,
+            accuracy: 1.0
         )
     }
 
@@ -524,6 +643,61 @@ final class MarkdownEditorRenderingTests: XCTestCase {
         )
     }
 
+    func testEditorHeadingUsesMonospacedBoldFontInsteadOfVariableWidthSystemBold() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "# test",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)),
+              let storage = textView.textStorage else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        drainMainQueue(testCase: self)
+
+        let headingFont = storage.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        XCTAssertNotNil(headingFont)
+        XCTAssertTrue(headingFont?.fontDescriptor.symbolicTraits.contains(.monoSpace) == true)
+        XCTAssertTrue(headingFont?.fontDescriptor.symbolicTraits.contains(.bold) == true)
+    }
+
+    func testEditorSyntaxHighlightFontsPreserveMonospaceAcrossStyledMarkdown() throws {
+        let controller = MarkdownEditorWindowController(
+            initialText: "# Heading\n**bold** _italic_ `code`\n```\nblock\n```",
+            onSave: { _ in }
+        )
+
+        guard let textView = findTextView(in: try requireWindow(from: controller)),
+              let storage = textView.textStorage else {
+            XCTFail("Markdown editor did not contain an NSTextView")
+            return
+        }
+
+        drainMainQueue(testCase: self)
+
+        let nsString = storage.string as NSString
+        let headingFont = storage.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        let boldFont = storage.attribute(.font, at: nsString.range(of: "bold").location, effectiveRange: nil) as? NSFont
+        let italicFont = storage.attribute(.font, at: nsString.range(of: "italic").location, effectiveRange: nil) as? NSFont
+        let inlineCodeFont = storage.attribute(.font, at: nsString.range(of: "code").location, effectiveRange: nil) as? NSFont
+        let fencedCodeFont = storage.attribute(.font, at: nsString.range(of: "block").location, effectiveRange: nil) as? NSFont
+
+        XCTAssertNotNil(headingFont)
+        XCTAssertTrue(headingFont?.isFixedPitch == true, "Heading font should remain fixed-pitch")
+        XCTAssertNotNil(boldFont)
+        XCTAssertTrue(boldFont?.isFixedPitch == true, "Bold font should remain fixed-pitch")
+        XCTAssertNotNil(italicFont)
+        XCTAssertTrue(italicFont?.isFixedPitch == true, "Italic font should remain fixed-pitch")
+        XCTAssertNotNil(inlineCodeFont)
+        XCTAssertTrue(inlineCodeFont?.isFixedPitch == true, "Inline code font should remain fixed-pitch")
+        XCTAssertNotNil(fencedCodeFont)
+        XCTAssertTrue(fencedCodeFont?.isFixedPitch == true, "Fenced code font should remain fixed-pitch")
+        XCTAssertTrue(headingFont?.fontDescriptor.symbolicTraits.contains(.bold) == true)
+        XCTAssertTrue(italicFont?.fontDescriptor.symbolicTraits.contains(.italic) == true)
+    }
+
     func testEditorHighlightsBoldItalicAndLinkText() throws {
         let controller = MarkdownEditorWindowController(
             initialText: "**bold** _italic_ [link](https://example.com)",
@@ -788,6 +962,40 @@ final class MarkdownEditorRenderingTests: XCTestCase {
         for subview in view.subviews {
             if let textView = findTextView(in: subview) {
                 return textView
+            }
+        }
+        return nil
+    }
+
+    private func findMetalView(in window: NSWindow) -> MTKView? {
+        guard let contentView = window.contentView else { return nil }
+        return findMetalView(in: contentView)
+    }
+
+    private func findMarkdownMetalSurface(in window: NSWindow) -> MarkdownMetalSurfaceView? {
+        guard let contentView = window.contentView else { return nil }
+        return findMarkdownMetalSurface(in: contentView)
+    }
+
+    private func findMarkdownMetalSurface(in view: NSView) -> MarkdownMetalSurfaceView? {
+        if let surface = view as? MarkdownMetalSurfaceView {
+            return surface
+        }
+        for subview in view.subviews {
+            if let surface = findMarkdownMetalSurface(in: subview) {
+                return surface
+            }
+        }
+        return nil
+    }
+
+    private func findMetalView(in view: NSView) -> MTKView? {
+        if let metalView = view as? MTKView {
+            return metalView
+        }
+        for subview in view.subviews {
+            if let metalView = findMetalView(in: subview) {
+                return metalView
             }
         }
         return nil

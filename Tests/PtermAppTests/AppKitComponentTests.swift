@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 import Metal
 import MetalKit
 import ObjectiveC.runtime
@@ -1054,6 +1055,936 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(Set(atlas.glyphCache.keys), [66])
     }
 
+    func testGlyphAtlasJapaneseGlyphHasSaneFallbackMetrics() throws {
+        let renderer = try makeRendererOrSkip()
+        let atlas = GlyphAtlas(
+            device: renderer.device,
+            fontSize: 14,
+            scaleFactor: 2.0,
+            prerasterizeASCII: false
+        )
+
+        let glyph = try XCTUnwrap(atlas.glyphInfo(for: 0x3042)) // あ
+
+        XCTAssertGreaterThan(glyph.advance, Float(atlas.cellWidth))
+        XCTAssertGreaterThan(glyph.pixelWidth, 0)
+        XCTAssertGreaterThan(glyph.pixelHeight, 0)
+        XCTAssertGreaterThanOrEqual(glyph.bitmapPadding, 1)
+        XCTAssertLessThan(glyph.bitmapPadding * 2, Float(glyph.pixelWidth))
+    }
+
+    func testGlyphAtlasDefaultFontDoesNotFallBackToTimesNewRoman() throws {
+        let renderer = try makeRendererOrSkip()
+        let atlas = GlyphAtlas(
+            device: renderer.device,
+            fontSize: 14,
+            scaleFactor: 2.0,
+            prerasterizeASCII: false
+        )
+
+        XCTAssertNotEqual(atlas.fontName, "TimesNewRomanPSMT")
+    }
+
+    func testRendererJapaneseWideGlyphUsesAtlasWidthWithoutHorizontalScaling() throws {
+        let renderer = try makeRendererOrSkip()
+        let model = TerminalModel(rows: 1, cols: 4)
+        model.grid.setCell(
+            Cell(codepoint: 0x3042, attributes: .default, width: 2, isWideContinuation: false),
+            at: 0,
+            col: 0
+        )
+        model.grid.setCell(
+            Cell(codepoint: 0, attributes: .default, width: 0, isWideContinuation: true),
+            at: 0,
+            col: 1
+        )
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: model, scrollback: scrollback)
+        XCTAssertEqual(vertexData.glyphVertices.count, 72)
+
+        let glyph = try XCTUnwrap(renderer.glyphAtlas.glyphInfo(for: 0x3042))
+        let vertexStride = 12
+        let xs = Swift.stride(from: 0, to: vertexData.glyphVertices.count, by: vertexStride).map {
+            vertexData.glyphVertices[$0]
+        }
+        let minX = try XCTUnwrap(xs.min())
+        let maxX = try XCTUnwrap(xs.max())
+        let actualWidth = maxX - minX
+
+        XCTAssertEqual(actualWidth, Float(glyph.pixelWidth), accuracy: 0.5)
+
+        let scale = Float(renderer.glyphAtlas.scaleFactor)
+        let singleCellWidth = Float(renderer.glyphAtlas.cellWidth) * scale
+        let spanWidth = singleCellWidth * 2
+        let gridPadding = Float(renderer.gridPadding) * scale
+        let expectedX = round(gridPadding + glyph.cellOffsetX + ((spanWidth - singleCellWidth) * 0.5))
+        XCTAssertEqual(minX, expectedX, accuracy: 0.5)
+    }
+
+    func testRendererConsecutiveJapaneseWideGlyphsStayOnTwoCellGrid() throws {
+        let renderer = try makeRendererOrSkip()
+        let model = TerminalModel(rows: 1, cols: 6)
+        model.grid.setCell(
+            Cell(codepoint: 0x3042, attributes: .default, width: 2, isWideContinuation: false),
+            at: 0,
+            col: 0
+        )
+        model.grid.setCell(
+            Cell(codepoint: 0, attributes: .default, width: 0, isWideContinuation: true),
+            at: 0,
+            col: 1
+        )
+        model.grid.setCell(
+            Cell(codepoint: 0x3044, attributes: .default, width: 2, isWideContinuation: false),
+            at: 0,
+            col: 2
+        )
+        model.grid.setCell(
+            Cell(codepoint: 0, attributes: .default, width: 0, isWideContinuation: true),
+            at: 0,
+            col: 3
+        )
+
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: model, scrollback: scrollback)
+
+        XCTAssertEqual(vertexData.glyphVertices.count, 144)
+
+        let vertexStride = 12
+        let xs = Swift.stride(from: 0, to: vertexData.glyphVertices.count, by: vertexStride).map {
+            vertexData.glyphVertices[$0]
+        }
+        let firstGlyphMinX = try XCTUnwrap(xs.prefix(6).min())
+        let secondGlyphMinX = try XCTUnwrap(xs.dropFirst(6).prefix(6).min())
+        let firstGlyph = try XCTUnwrap(renderer.glyphAtlas.glyphInfo(for: 0x3042))
+        let secondGlyph = try XCTUnwrap(renderer.glyphAtlas.glyphInfo(for: 0x3044))
+        let expectedDelta =
+            (Float(renderer.glyphAtlas.cellWidth) * Float(renderer.glyphAtlas.scaleFactor) * 2) +
+            (secondGlyph.cellOffsetX - firstGlyph.cellOffsetX)
+
+        XCTAssertEqual(secondGlyphMinX - firstGlyphMinX, expectedDelta, accuracy: 0.5)
+    }
+
+    func testRendererJapaneseWideGlyphPreservesSingleCellBearingWhenExpandedToTwoCells() throws {
+        let renderer = try makeRendererOrSkip()
+        let glyph = try XCTUnwrap(renderer.glyphAtlas.glyphInfo(for: 0x3042))
+
+        let scale = Float(renderer.glyphAtlas.scaleFactor)
+        let singleCellWidth = Float(renderer.glyphAtlas.cellWidth) * scale
+        let spanWidth = singleCellWidth * 2
+
+        let singleCellOffset = glyph.cellOffsetX
+        let wideCellOffset = singleCellOffset + ((spanWidth - singleCellWidth) * 0.5)
+
+        XCTAssertEqual(wideCellOffset - singleCellOffset, singleCellWidth * 0.5, accuracy: 0.01)
+    }
+
+    func testRendererConsecutiveIdenticalJapaneseWideGlyphsStayExactlyOnTwoCellGrid() throws {
+        let renderer = try makeRendererOrSkip()
+        let model = TerminalModel(rows: 1, cols: 6)
+        model.grid.setCell(
+            Cell(codepoint: 0x3042, attributes: .default, width: 2, isWideContinuation: false),
+            at: 0,
+            col: 0
+        )
+        model.grid.setCell(
+            Cell(codepoint: 0, attributes: .default, width: 0, isWideContinuation: true),
+            at: 0,
+            col: 1
+        )
+        model.grid.setCell(
+            Cell(codepoint: 0x3042, attributes: .default, width: 2, isWideContinuation: false),
+            at: 0,
+            col: 2
+        )
+        model.grid.setCell(
+            Cell(codepoint: 0, attributes: .default, width: 0, isWideContinuation: true),
+            at: 0,
+            col: 3
+        )
+
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: model, scrollback: scrollback)
+
+        XCTAssertEqual(vertexData.glyphVertices.count, 144)
+
+        let vertexStride = 12
+        let xs = Swift.stride(from: 0, to: vertexData.glyphVertices.count, by: vertexStride).map {
+            vertexData.glyphVertices[$0]
+        }
+        let firstGlyphMinX = try XCTUnwrap(xs.prefix(6).min())
+        let secondGlyphMinX = try XCTUnwrap(xs.dropFirst(6).prefix(6).min())
+        let expectedDelta = Float(renderer.glyphAtlas.cellWidth) * Float(renderer.glyphAtlas.scaleFactor) * 2
+
+        XCTAssertEqual(secondGlyphMinX - firstGlyphMinX, expectedDelta, accuracy: 0.5)
+    }
+
+    func testRendererMixedASCIIAndJapaneseGlyphsPreserveCellBoundaries() throws {
+        let renderer = try makeRendererOrSkip()
+        let model = TerminalModel(rows: 1, cols: 6)
+        model.grid.setCell(
+            Cell(codepoint: 0x41, attributes: .default, width: 1, isWideContinuation: false),
+            at: 0,
+            col: 0
+        )
+        model.grid.setCell(
+            Cell(codepoint: 0x3042, attributes: .default, width: 2, isWideContinuation: false),
+            at: 0,
+            col: 1
+        )
+        model.grid.setCell(
+            Cell(codepoint: 0, attributes: .default, width: 0, isWideContinuation: true),
+            at: 0,
+            col: 2
+        )
+        model.grid.setCell(
+            Cell(codepoint: 0x42, attributes: .default, width: 1, isWideContinuation: false),
+            at: 0,
+            col: 3
+        )
+
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: model, scrollback: scrollback)
+        XCTAssertEqual(vertexData.glyphVertices.count, 216)
+
+        let vertexStride = 12
+        let xs = Swift.stride(from: 0, to: vertexData.glyphVertices.count, by: vertexStride).map {
+            vertexData.glyphVertices[$0]
+        }
+
+        let asciiLeftMinX = try XCTUnwrap(xs.prefix(6).min())
+        let wideMinX = try XCTUnwrap(xs.dropFirst(6).prefix(6).min())
+        let asciiRightMinX = try XCTUnwrap(xs.dropFirst(12).prefix(6).min())
+
+        let cellSpan = Float(renderer.glyphAtlas.cellWidth) * Float(renderer.glyphAtlas.scaleFactor)
+        XCTAssertGreaterThan(wideMinX, asciiLeftMinX)
+        XCTAssertGreaterThan(asciiRightMinX, wideMinX)
+        XCTAssertEqual(asciiRightMinX - asciiLeftMinX, cellSpan * 3, accuracy: 1.0)
+    }
+
+    func testRendererJapaneseWideGlyphPlacementStaysStableAcrossDisplayScales() throws {
+        let scales: [CGFloat] = [1.0, 2.0, 2.5]
+
+        for scale in scales {
+            guard let renderer = MetalRenderer(scaleFactor: scale) else {
+                throw XCTSkip("Metal unavailable")
+            }
+            let model = TerminalModel(rows: 1, cols: 4)
+            model.grid.setCell(
+                Cell(codepoint: 0x3042, attributes: .default, width: 2, isWideContinuation: false),
+                at: 0,
+                col: 0
+            )
+            model.grid.setCell(
+                Cell(codepoint: 0, attributes: .default, width: 0, isWideContinuation: true),
+                at: 0,
+                col: 1
+            )
+
+            let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+            let vertexData = renderer.debugBuildVertexDataForTesting(model: model, scrollback: scrollback)
+            XCTAssertEqual(vertexData.glyphVertices.count, 72)
+
+            let glyph = try XCTUnwrap(renderer.glyphAtlas.glyphInfo(for: 0x3042))
+            let vertexStride = 12
+            let xs = Swift.stride(from: 0, to: vertexData.glyphVertices.count, by: vertexStride).map {
+                vertexData.glyphVertices[$0]
+            }
+            let minX = try XCTUnwrap(xs.min())
+            let maxX = try XCTUnwrap(xs.max())
+            let actualWidth = maxX - minX
+
+            XCTAssertEqual(actualWidth, Float(glyph.pixelWidth), accuracy: 0.5)
+
+            let scale = Float(renderer.glyphAtlas.scaleFactor)
+            let singleCellWidth = Float(renderer.glyphAtlas.cellWidth) * scale
+            let spanWidth = singleCellWidth * 2
+            let gridPadding = Float(renderer.gridPadding) * scale
+            let expectedX = round(gridPadding + glyph.cellOffsetX + ((spanWidth - singleCellWidth) * 0.5))
+            XCTAssertEqual(minX, expectedX, accuracy: 0.5)
+        }
+    }
+
+    func testRendererWideContinuationCellDoesNotEmitDuplicateJapaneseGlyph() throws {
+        let renderer = try makeRendererOrSkip()
+        let model = TerminalModel(rows: 1, cols: 4)
+        model.grid.setCell(
+            Cell(codepoint: 0x3042, attributes: .default, width: 2, isWideContinuation: false),
+            at: 0,
+            col: 0
+        )
+        model.grid.setCell(
+            Cell(codepoint: 0x3042, attributes: .default, width: 0, isWideContinuation: true),
+            at: 0,
+            col: 1
+        )
+
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: model, scrollback: scrollback)
+
+        XCTAssertEqual(vertexData.glyphVertices.count, 72, "Expected exactly one rendered glyph quad for a wide character")
+    }
+
+    func testThumbnailRendererJapaneseWideGlyphUsesSameTwoCellPlacementRule() throws {
+        let renderer = try makeRendererOrSkip()
+        let model = TerminalModel(rows: 1, cols: 4)
+        model.grid.setCell(
+            Cell(codepoint: 0x3042, attributes: .default, width: 2, isWideContinuation: false),
+            at: 0,
+            col: 0
+        )
+        model.grid.setCell(
+            Cell(codepoint: 0, attributes: .default, width: 0, isWideContinuation: true),
+            at: 0,
+            col: 1
+        )
+
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        var bgVertices: [Float] = []
+        var glyphVertices: [Float] = []
+        renderer.appendThumbnailVertexData(
+            model: model,
+            scrollback: scrollback,
+            scrollOffset: 0,
+            thumbnailRect: NSRect(x: 0, y: 0, width: 200, height: 100),
+            scaleFactor: Float(renderer.glyphAtlas.scaleFactor),
+            bgVertices: &bgVertices,
+            glyphVertices: &glyphVertices
+        )
+
+        XCTAssertEqual(glyphVertices.count, 72)
+        let vertexStride = 12
+        let xs = Swift.stride(from: 0, to: glyphVertices.count, by: vertexStride).map { glyphVertices[$0] }
+        let minX = try XCTUnwrap(xs.min())
+        let maxX = try XCTUnwrap(xs.max())
+
+        XCTAssertGreaterThan(maxX - minX, 0)
+    }
+
+    func testTerminalModelParserMarksJapaneseInputAsWideCells() {
+        let harness = TerminalModelHarness(rows: 1, cols: 6)
+
+        harness.feed("あい")
+
+        let first = harness.model.grid.cell(at: 0, col: 0)
+        let firstContinuation = harness.model.grid.cell(at: 0, col: 1)
+        let second = harness.model.grid.cell(at: 0, col: 2)
+        let secondContinuation = harness.model.grid.cell(at: 0, col: 3)
+
+        XCTAssertEqual(first.codepoint, 0x3042)
+        XCTAssertEqual(first.width, 2)
+        XCTAssertFalse(first.isWideContinuation)
+
+        XCTAssertEqual(firstContinuation.width, 0)
+        XCTAssertTrue(firstContinuation.isWideContinuation)
+
+        XCTAssertEqual(second.codepoint, 0x3044)
+        XCTAssertEqual(second.width, 2)
+        XCTAssertFalse(second.isWideContinuation)
+
+        XCTAssertEqual(secondContinuation.width, 0)
+        XCTAssertTrue(secondContinuation.isWideContinuation)
+        XCTAssertEqual(harness.model.cursor.col, 4)
+    }
+
+    func testTerminalModelJapaneseInputRendersOnTwoCellGridEndToEnd() throws {
+        let renderer = try makeRendererOrSkip()
+        let harness = TerminalModelHarness(rows: 1, cols: 6)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+
+        harness.feed("あい")
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        XCTAssertEqual(vertexData.glyphVertices.count, 144)
+
+        let vertexStride = 12
+        let xs = Swift.stride(from: 0, to: vertexData.glyphVertices.count, by: vertexStride).map {
+            vertexData.glyphVertices[$0]
+        }
+        let firstGlyphMinX = try XCTUnwrap(xs.prefix(6).min())
+        let secondGlyphMinX = try XCTUnwrap(xs.dropFirst(6).prefix(6).min())
+        let firstGlyph = try XCTUnwrap(renderer.glyphAtlas.glyphInfo(for: 0x3042))
+        let secondGlyph = try XCTUnwrap(renderer.glyphAtlas.glyphInfo(for: 0x3044))
+        let expectedDelta =
+            (Float(renderer.glyphAtlas.cellWidth) * Float(renderer.glyphAtlas.scaleFactor) * 2) +
+            (secondGlyph.cellOffsetX - firstGlyph.cellOffsetX)
+
+        XCTAssertEqual(secondGlyphMinX - firstGlyphMinX, expectedDelta, accuracy: 0.5)
+    }
+
+    func testTerminalModelIdenticalJapaneseInputRendersOnExactTwoCellGridEndToEnd() throws {
+        let renderer = try makeRendererOrSkip()
+        let harness = TerminalModelHarness(rows: 1, cols: 6)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+
+        harness.feed("ああ")
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        XCTAssertEqual(vertexData.glyphVertices.count, 144)
+
+        let vertexStride = 12
+        let xs = Swift.stride(from: 0, to: vertexData.glyphVertices.count, by: vertexStride).map {
+            vertexData.glyphVertices[$0]
+        }
+        let firstGlyphMinX = try XCTUnwrap(xs.prefix(6).min())
+        let secondGlyphMinX = try XCTUnwrap(xs.dropFirst(6).prefix(6).min())
+        let expectedDelta = Float(renderer.glyphAtlas.cellWidth) * Float(renderer.glyphAtlas.scaleFactor) * 2
+
+        XCTAssertEqual(secondGlyphMinX - firstGlyphMinX, expectedDelta, accuracy: 0.5)
+    }
+
+    func testTerminalModelMixedJapaneseScriptsRemainWideAndAdvanceOnTwoCellGrid() throws {
+        let renderer = try makeRendererOrSkip()
+        let harness = TerminalModelHarness(rows: 1, cols: 8)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+
+        harness.feed("あア語")
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0x3042)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 1).isWideContinuation)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 2).codepoint, 0x30A2)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 2).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 3).isWideContinuation)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 4).codepoint, 0x8A9E)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 4).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 5).isWideContinuation)
+        XCTAssertEqual(harness.model.cursor.col, 6)
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        XCTAssertEqual(vertexData.glyphVertices.count, 216)
+
+        let vertexStride = 12
+        let xs = Swift.stride(from: 0, to: vertexData.glyphVertices.count, by: vertexStride).map {
+            vertexData.glyphVertices[$0]
+        }
+        let firstGlyphMinX = try XCTUnwrap(xs.prefix(6).min())
+        let secondGlyphMinX = try XCTUnwrap(xs.dropFirst(6).prefix(6).min())
+        let thirdGlyphMinX = try XCTUnwrap(xs.dropFirst(12).prefix(6).min())
+        let firstGlyph = try XCTUnwrap(renderer.glyphAtlas.glyphInfo(for: 0x3042))
+        let secondGlyph = try XCTUnwrap(renderer.glyphAtlas.glyphInfo(for: 0x30A2))
+        let thirdGlyph = try XCTUnwrap(renderer.glyphAtlas.glyphInfo(for: 0x8A9E))
+        let twoCellSpan = Float(renderer.glyphAtlas.cellWidth) * Float(renderer.glyphAtlas.scaleFactor) * 2
+
+        XCTAssertEqual(secondGlyphMinX - firstGlyphMinX, twoCellSpan + (secondGlyph.cellOffsetX - firstGlyph.cellOffsetX), accuracy: 0.5)
+        XCTAssertEqual(thirdGlyphMinX - secondGlyphMinX, twoCellSpan + (thirdGlyph.cellOffsetX - secondGlyph.cellOffsetX), accuracy: 0.5)
+    }
+
+    func testTerminalModelJapaneseWideGlyphWrapsAtRowBoundaryWithoutSplitting() throws {
+        let renderer = try makeRendererOrSkip()
+        let harness = TerminalModelHarness(rows: 2, cols: 4)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+
+        harness.feed("あああ")
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0x3042)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 1).isWideContinuation)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 2).codepoint, 0x3042)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 3).isWideContinuation)
+        XCTAssertEqual(harness.model.grid.cell(at: 1, col: 0).codepoint, 0x3042)
+        XCTAssertTrue(harness.model.grid.cell(at: 1, col: 1).isWideContinuation)
+        XCTAssertEqual(harness.model.cursor.row, 1)
+        XCTAssertEqual(harness.model.cursor.col, 2)
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        XCTAssertEqual(vertexData.glyphVertices.count, 216)
+
+        let vertexStride = 12
+        let xs = Swift.stride(from: 0, to: vertexData.glyphVertices.count, by: vertexStride).map {
+            vertexData.glyphVertices[$0]
+        }
+        let ys = Swift.stride(from: 1, to: vertexData.glyphVertices.count, by: vertexStride).map {
+            vertexData.glyphVertices[$0]
+        }
+
+        let firstRowFirstGlyphMinX = try XCTUnwrap(xs.prefix(6).min())
+        let firstRowSecondGlyphMinX = try XCTUnwrap(xs.dropFirst(6).prefix(6).min())
+        let secondRowGlyphMinX = try XCTUnwrap(xs.dropFirst(12).prefix(6).min())
+        let firstRowMinY = try XCTUnwrap(ys.prefix(6).min())
+        let secondRowMinY = try XCTUnwrap(ys.dropFirst(12).prefix(6).min())
+
+        let scale = Float(renderer.glyphAtlas.scaleFactor)
+        let singleCellWidth = Float(renderer.glyphAtlas.cellWidth) * scale
+        let twoCellSpan = singleCellWidth * 2
+        let gridPadding = Float(renderer.gridPadding) * scale
+        let glyph = try XCTUnwrap(renderer.glyphAtlas.glyphInfo(for: 0x3042))
+        let expectedWrappedRowX = round(gridPadding + glyph.cellOffsetX + (singleCellWidth * 0.5))
+
+        XCTAssertEqual(firstRowSecondGlyphMinX - firstRowFirstGlyphMinX, twoCellSpan, accuracy: 0.5)
+        XCTAssertEqual(secondRowGlyphMinX, expectedWrappedRowX, accuracy: 0.5)
+        XCTAssertGreaterThan(secondRowMinY, firstRowMinY)
+    }
+
+    func testTerminalModelJapanesePunctuationRemainsWideAndWrapsCleanly() throws {
+        let renderer = try makeRendererOrSkip()
+        let harness = TerminalModelHarness(rows: 2, cols: 4)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+
+        harness.feed("語。あ")
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0x8A9E)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 1).isWideContinuation)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 2).codepoint, 0x3002)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 3).isWideContinuation)
+        XCTAssertEqual(harness.model.grid.cell(at: 1, col: 0).codepoint, 0x3042)
+        XCTAssertTrue(harness.model.grid.cell(at: 1, col: 1).isWideContinuation)
+        XCTAssertEqual(harness.model.cursor.row, 1)
+        XCTAssertEqual(harness.model.cursor.col, 2)
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        XCTAssertEqual(vertexData.glyphVertices.count, 216)
+    }
+
+    func testTerminalModelFullwidthLatinAndIdeographicSpaceOccupyWideCells() {
+        let harness = TerminalModelHarness(rows: 1, cols: 8)
+
+        harness.feed("Ａ　Ｂ")
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0xFF21)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 1).isWideContinuation)
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 2).codepoint, 0x3000)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 2).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 3).isWideContinuation)
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 4).codepoint, 0xFF22)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 4).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 5).isWideContinuation)
+
+        XCTAssertEqual(harness.model.cursor.col, 6)
+    }
+
+    func testTerminalModelJapaneseQuotesRemainWideAndWrapCleanly() {
+        let harness = TerminalModelHarness(rows: 2, cols: 4)
+
+        harness.feed("「語」")
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0x300C)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 1).isWideContinuation)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 2).codepoint, 0x8A9E)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 3).isWideContinuation)
+        XCTAssertEqual(harness.model.grid.cell(at: 1, col: 0).codepoint, 0x300D)
+        XCTAssertTrue(harness.model.grid.cell(at: 1, col: 1).isWideContinuation)
+        XCTAssertEqual(harness.model.cursor.row, 1)
+        XCTAssertEqual(harness.model.cursor.col, 2)
+    }
+
+    func testTerminalModelHalfwidthKatakanaRemainSingleCellWhileFullwidthJapaneseStayWide() {
+        let harness = TerminalModelHarness(rows: 1, cols: 8)
+
+        harness.feed("ｱあｲ")
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0xFF71)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).width, 1)
+        XCTAssertFalse(harness.model.grid.cell(at: 0, col: 0).isWideContinuation)
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 1).codepoint, 0x3042)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 1).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 2).isWideContinuation)
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 3).codepoint, 0xFF72)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 3).width, 1)
+        XCTAssertFalse(harness.model.grid.cell(at: 0, col: 3).isWideContinuation)
+
+        XCTAssertEqual(harness.model.cursor.col, 4)
+    }
+
+    func testTerminalModelFullwidthDigitsMixedWithJapaneseStayOnExpectedCellWidths() {
+        let harness = TerminalModelHarness(rows: 1, cols: 12)
+
+        harness.feed("３月１４日")
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0xFF13)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 1).isWideContinuation)
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 2).codepoint, 0x6708)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 2).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 3).isWideContinuation)
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 4).codepoint, 0xFF11)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 4).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 5).isWideContinuation)
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 6).codepoint, 0xFF14)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 6).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 7).isWideContinuation)
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 8).codepoint, 0x65E5)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 8).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 9).isWideContinuation)
+
+        XCTAssertEqual(harness.model.cursor.col, 10)
+    }
+
+    func testTerminalModelJapaneseQuotesAndFullwidthDigitsStayWideAcrossWrap() {
+        let harness = TerminalModelHarness(rows: 2, cols: 4)
+
+        harness.feed("「３」")
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0x300C)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 1).isWideContinuation)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 2).codepoint, 0xFF13)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 3).isWideContinuation)
+        XCTAssertEqual(harness.model.grid.cell(at: 1, col: 0).codepoint, 0x300D)
+        XCTAssertTrue(harness.model.grid.cell(at: 1, col: 1).isWideContinuation)
+        XCTAssertEqual(harness.model.cursor.row, 1)
+        XCTAssertEqual(harness.model.cursor.col, 2)
+    }
+
+    func testTerminalModelJapaneseMiddleDotAndLongVowelMarkRemainWide() {
+        let harness = TerminalModelHarness(rows: 1, cols: 8)
+
+        harness.feed("ア・ー")
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0x30A2)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 1).isWideContinuation)
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 2).codepoint, 0x30FB)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 2).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 3).isWideContinuation)
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 4).codepoint, 0x30FC)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 4).width, 2)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 5).isWideContinuation)
+
+        XCTAssertEqual(harness.model.cursor.col, 6)
+    }
+
+    func testTerminalModelMixedASCIIAndJapaneseInputPreservesCellBoundariesEndToEnd() throws {
+        let renderer = try makeRendererOrSkip()
+        let harness = TerminalModelHarness(rows: 1, cols: 6)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+
+        harness.feed("AあB")
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0x41)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 1).codepoint, 0x3042)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 2).isWideContinuation)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 3).codepoint, 0x42)
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        XCTAssertEqual(vertexData.glyphVertices.count, 216)
+
+        let vertexStride = 12
+        let xs = Swift.stride(from: 0, to: vertexData.glyphVertices.count, by: vertexStride).map {
+            vertexData.glyphVertices[$0]
+        }
+        let asciiLeftMinX = try XCTUnwrap(xs.prefix(6).min())
+        let wideMinX = try XCTUnwrap(xs.dropFirst(6).prefix(6).min())
+        let asciiRightMinX = try XCTUnwrap(xs.dropFirst(12).prefix(6).min())
+        let cellSpan = Float(renderer.glyphAtlas.cellWidth) * Float(renderer.glyphAtlas.scaleFactor)
+
+        XCTAssertGreaterThan(wideMinX, asciiLeftMinX)
+        XCTAssertGreaterThan(asciiRightMinX, wideMinX)
+        XCTAssertEqual(asciiRightMinX - asciiLeftMinX, cellSpan * 3, accuracy: 1.0)
+    }
+
+    func testTerminalJapaneseInputOffscreenRenderProducesPixelsWithinExpectedBounds() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let harness = TerminalModelHarness(rows: 1, cols: 6)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        harness.feed("あい")
+        harness.model.cursor.visible = false
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        let expectedBounds = try XCTUnwrap(glyphBounds(in: vertexData.glyphVertices))
+
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: renderer, width: 256, height: 96))
+        renderer.debugRenderToTextureForTesting(model: harness.model, scrollback: scrollback, texture: texture)
+
+        let renderedBounds = try XCTUnwrap(brightPixelBounds(in: texture, threshold: 32))
+        let expectedWidth = Int(ceil(expectedBounds.maxX - expectedBounds.minX))
+
+        XCTAssertGreaterThan(renderedBounds.width, 0)
+        XCTAssertGreaterThan(renderedBounds.height, 0)
+        XCTAssertGreaterThanOrEqual(renderedBounds.width, Int(Float(expectedWidth) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.width, expectedWidth)
+    }
+
+    func testTerminalJapaneseInputOffscreenRenderRemainsSaneAcrossDisplayScales() throws {
+        let scales: [CGFloat] = [1.0, 2.0, 2.5]
+
+        for scale in scales {
+            guard let renderer = MetalRenderer(scaleFactor: scale) else {
+                throw XCTSkip("Metal unavailable")
+            }
+            let shaderURL = Self.projectRootURL()
+                .appendingPathComponent("Sources/PtermApp/Rendering/Shaders/terminal.metal")
+            let source = try String(contentsOf: shaderURL, encoding: .utf8)
+            let library = try renderer.device.makeLibrary(source: source, options: nil)
+            renderer.setupPipelines(library: library)
+
+            let harness = TerminalModelHarness(rows: 1, cols: 6)
+            let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+            harness.feed("あい")
+            harness.model.cursor.visible = false
+
+            let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+            let expectedBounds = try XCTUnwrap(glyphBounds(in: vertexData.glyphVertices))
+            let expectedWidth = Int(ceil(expectedBounds.maxX - expectedBounds.minX))
+
+            let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: renderer, width: 320, height: 120))
+            renderer.debugRenderToTextureForTesting(model: harness.model, scrollback: scrollback, texture: texture)
+
+            let renderedBounds = try XCTUnwrap(brightPixelBounds(in: texture, threshold: 32))
+
+            XCTAssertGreaterThan(renderedBounds.width, 0)
+            XCTAssertGreaterThanOrEqual(renderedBounds.width, Int(Float(expectedWidth) * 0.55), "scale=\(scale)")
+            XCTAssertLessThanOrEqual(renderedBounds.width, expectedWidth, "scale=\(scale)")
+        }
+    }
+
+    func testTerminalMixedASCIIAndJapaneseOffscreenRenderProducesExpectedInkWidth() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let harness = TerminalModelHarness(rows: 1, cols: 6)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        harness.feed("AあB")
+        harness.model.cursor.visible = false
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        let expectedBounds = try XCTUnwrap(glyphBounds(in: vertexData.glyphVertices))
+        let expectedWidth = Int(ceil(expectedBounds.maxX - expectedBounds.minX))
+
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: renderer, width: 256, height: 96))
+        renderer.debugRenderToTextureForTesting(model: harness.model, scrollback: scrollback, texture: texture)
+
+        let renderedBounds = try XCTUnwrap(brightPixelBounds(in: texture, threshold: 32))
+
+        XCTAssertGreaterThan(renderedBounds.width, 0)
+        XCTAssertGreaterThanOrEqual(renderedBounds.width, Int(Float(expectedWidth) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.width, expectedWidth)
+    }
+
+    func testTerminalIdenticalJapaneseInputOffscreenRenderMatchesRepeatedTwoCellGeometry() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let harness = TerminalModelHarness(rows: 1, cols: 6)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        harness.feed("ああ")
+        harness.model.cursor.visible = false
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        let expectedBounds = try XCTUnwrap(glyphBounds(in: vertexData.glyphVertices))
+        let expectedWidth = Int(ceil(expectedBounds.maxX - expectedBounds.minX))
+
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: renderer, width: 256, height: 96))
+        renderer.debugRenderToTextureForTesting(model: harness.model, scrollback: scrollback, texture: texture)
+
+        let renderedBounds = try XCTUnwrap(brightPixelBounds(in: texture, threshold: 32))
+
+        XCTAssertGreaterThan(renderedBounds.width, 0)
+        XCTAssertGreaterThanOrEqual(renderedBounds.width, Int(Float(expectedWidth) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.width, expectedWidth)
+    }
+
+    func testTerminalMixedJapaneseScriptsOffscreenRenderMatchesGeometry() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let harness = TerminalModelHarness(rows: 1, cols: 8)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        harness.feed("あア語")
+        harness.model.cursor.visible = false
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        let expectedBounds = try XCTUnwrap(glyphBounds(in: vertexData.glyphVertices))
+        let expectedWidth = Int(ceil(expectedBounds.maxX - expectedBounds.minX))
+
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: renderer, width: 320, height: 96))
+        renderer.debugRenderToTextureForTesting(model: harness.model, scrollback: scrollback, texture: texture)
+
+        let renderedBounds = try XCTUnwrap(brightPixelBounds(in: texture, threshold: 32))
+
+        XCTAssertGreaterThan(renderedBounds.width, 0)
+        XCTAssertGreaterThanOrEqual(renderedBounds.width, Int(Float(expectedWidth) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.width, expectedWidth)
+    }
+
+    func testTerminalJapaneseWideGlyphWrapOffscreenRenderMatchesTwoRowGeometry() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let harness = TerminalModelHarness(rows: 2, cols: 4)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        harness.feed("あああ")
+        harness.model.cursor.visible = false
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        let expectedBounds = try XCTUnwrap(glyphBounds(in: vertexData.glyphVertices))
+        let expectedWidth = Int(ceil(expectedBounds.maxX - expectedBounds.minX))
+        let expectedHeight = Int(ceil(expectedBounds.maxY - expectedBounds.minY))
+
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: renderer, width: 256, height: 128))
+        renderer.debugRenderToTextureForTesting(model: harness.model, scrollback: scrollback, texture: texture)
+
+        let renderedBounds = try XCTUnwrap(brightPixelBounds(in: texture, threshold: 32))
+
+        XCTAssertGreaterThan(renderedBounds.width, 0)
+        XCTAssertGreaterThan(renderedBounds.height, 0)
+        XCTAssertGreaterThanOrEqual(renderedBounds.width, Int(Float(expectedWidth) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.width, expectedWidth)
+        XCTAssertGreaterThanOrEqual(renderedBounds.height, Int(Float(expectedHeight) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.height, expectedHeight)
+    }
+
+    func testTerminalJapanesePunctuationWrapOffscreenRenderMatchesGeometry() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let harness = TerminalModelHarness(rows: 2, cols: 4)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        harness.feed("語。あ")
+        harness.model.cursor.visible = false
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        let expectedBounds = try XCTUnwrap(glyphBounds(in: vertexData.glyphVertices))
+        let expectedWidth = Int(ceil(expectedBounds.maxX - expectedBounds.minX))
+        let expectedHeight = Int(ceil(expectedBounds.maxY - expectedBounds.minY))
+
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: renderer, width: 256, height: 128))
+        renderer.debugRenderToTextureForTesting(model: harness.model, scrollback: scrollback, texture: texture)
+
+        let renderedBounds = try XCTUnwrap(brightPixelBounds(in: texture, threshold: 32))
+
+        XCTAssertGreaterThan(renderedBounds.width, 0)
+        XCTAssertGreaterThan(renderedBounds.height, 0)
+        XCTAssertGreaterThanOrEqual(renderedBounds.width, Int(Float(expectedWidth) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.width, expectedWidth)
+        XCTAssertGreaterThanOrEqual(renderedBounds.height, Int(Float(expectedHeight) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.height, expectedHeight)
+    }
+
+    func testTerminalFullwidthLatinOffscreenRenderMatchesGeometry() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let harness = TerminalModelHarness(rows: 1, cols: 6)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        harness.feed("ＡＢ")
+        harness.model.cursor.visible = false
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        let expectedBounds = try XCTUnwrap(glyphBounds(in: vertexData.glyphVertices))
+        let expectedWidth = Int(ceil(expectedBounds.maxX - expectedBounds.minX))
+
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: renderer, width: 256, height: 96))
+        renderer.debugRenderToTextureForTesting(model: harness.model, scrollback: scrollback, texture: texture)
+
+        let renderedBounds = try XCTUnwrap(brightPixelBounds(in: texture, threshold: 32))
+
+        XCTAssertGreaterThan(renderedBounds.width, 0)
+        XCTAssertGreaterThanOrEqual(renderedBounds.width, Int(Float(expectedWidth) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.width, expectedWidth)
+    }
+
+    func testTerminalJapaneseQuotesWrapOffscreenRenderMatchesGeometry() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let harness = TerminalModelHarness(rows: 2, cols: 4)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        harness.feed("「語」")
+        harness.model.cursor.visible = false
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        let expectedBounds = try XCTUnwrap(glyphBounds(in: vertexData.glyphVertices))
+        let expectedWidth = Int(ceil(expectedBounds.maxX - expectedBounds.minX))
+        let expectedHeight = Int(ceil(expectedBounds.maxY - expectedBounds.minY))
+
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: renderer, width: 256, height: 128))
+        renderer.debugRenderToTextureForTesting(model: harness.model, scrollback: scrollback, texture: texture)
+
+        let renderedBounds = try XCTUnwrap(brightPixelBounds(in: texture, threshold: 32))
+
+        XCTAssertGreaterThan(renderedBounds.width, 0)
+        XCTAssertGreaterThan(renderedBounds.height, 0)
+        XCTAssertGreaterThanOrEqual(renderedBounds.width, Int(Float(expectedWidth) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.width, expectedWidth)
+        XCTAssertGreaterThanOrEqual(renderedBounds.height, Int(Float(expectedHeight) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.height, expectedHeight)
+    }
+
+    func testTerminalHalfwidthKatakanaMixedWithWideJapaneseOffscreenRenderMatchesGeometry() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let harness = TerminalModelHarness(rows: 1, cols: 8)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        harness.feed("ｱあｲ")
+        harness.model.cursor.visible = false
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        let expectedBounds = try XCTUnwrap(glyphBounds(in: vertexData.glyphVertices))
+        let expectedWidth = Int(ceil(expectedBounds.maxX - expectedBounds.minX))
+
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: renderer, width: 256, height: 96))
+        renderer.debugRenderToTextureForTesting(model: harness.model, scrollback: scrollback, texture: texture)
+
+        let renderedBounds = try XCTUnwrap(brightPixelBounds(in: texture, threshold: 32))
+
+        XCTAssertGreaterThan(renderedBounds.width, 0)
+        XCTAssertGreaterThanOrEqual(renderedBounds.width, Int(Float(expectedWidth) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.width, expectedWidth)
+    }
+
+    func testTerminalFullwidthDigitsMixedWithJapaneseOffscreenRenderMatchesGeometry() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let harness = TerminalModelHarness(rows: 1, cols: 12)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        harness.feed("３月１４日")
+        harness.model.cursor.visible = false
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        let expectedBounds = try XCTUnwrap(glyphBounds(in: vertexData.glyphVertices))
+        let expectedWidth = Int(ceil(expectedBounds.maxX - expectedBounds.minX))
+
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: renderer, width: 320, height: 96))
+        renderer.debugRenderToTextureForTesting(model: harness.model, scrollback: scrollback, texture: texture)
+
+        let renderedBounds = try XCTUnwrap(brightPixelBounds(in: texture, threshold: 32))
+
+        XCTAssertGreaterThan(renderedBounds.width, 0)
+        XCTAssertGreaterThanOrEqual(renderedBounds.width, Int(Float(expectedWidth) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.width, expectedWidth)
+    }
+
+    func testTerminalJapaneseQuotesAndFullwidthDigitsWrapOffscreenRenderMatchesGeometry() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let harness = TerminalModelHarness(rows: 2, cols: 4)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        harness.feed("「３」")
+        harness.model.cursor.visible = false
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        let expectedBounds = try XCTUnwrap(glyphBounds(in: vertexData.glyphVertices))
+        let expectedWidth = Int(ceil(expectedBounds.maxX - expectedBounds.minX))
+        let expectedHeight = Int(ceil(expectedBounds.maxY - expectedBounds.minY))
+
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: renderer, width: 256, height: 128))
+        renderer.debugRenderToTextureForTesting(model: harness.model, scrollback: scrollback, texture: texture)
+
+        let renderedBounds = try XCTUnwrap(brightPixelBounds(in: texture, threshold: 32))
+
+        XCTAssertGreaterThan(renderedBounds.width, 0)
+        XCTAssertGreaterThan(renderedBounds.height, 0)
+        XCTAssertGreaterThanOrEqual(renderedBounds.width, Int(Float(expectedWidth) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.width, expectedWidth)
+        XCTAssertGreaterThanOrEqual(renderedBounds.height, Int(Float(expectedHeight) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.height, expectedHeight)
+    }
+
+    func testTerminalJapaneseMiddleDotAndLongVowelMarkOffscreenRenderMatchesGeometry() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let harness = TerminalModelHarness(rows: 1, cols: 8)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        harness.feed("ア・ー")
+        harness.model.cursor.visible = false
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        let expectedBounds = try XCTUnwrap(glyphBounds(in: vertexData.glyphVertices))
+        let expectedWidth = Int(ceil(expectedBounds.maxX - expectedBounds.minX))
+
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: renderer, width: 256, height: 96))
+        renderer.debugRenderToTextureForTesting(model: harness.model, scrollback: scrollback, texture: texture)
+
+        let renderedBounds = try XCTUnwrap(brightPixelBounds(in: texture, threshold: 32))
+
+        XCTAssertGreaterThan(renderedBounds.width, 0)
+        XCTAssertGreaterThanOrEqual(renderedBounds.width, Int(Float(expectedWidth) * 0.55))
+        XCTAssertLessThanOrEqual(renderedBounds.width, expectedWidth)
+    }
+
     func testIntegratedViewCloseButtonColorUsesDisplayP3ToSRGBConversion() {
         let expectedCircle = NSColor(displayP3Red: 236.0 / 255.0, green: 103.0 / 255.0, blue: 101.0 / 255.0, alpha: 1.0)
             .usingColorSpace(.sRGB) ?? .systemRed
@@ -1348,6 +2279,110 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(rendered?.string, "日本語")
         XCTAssertEqual(textLayer?.isHidden, false)
         XCTAssertGreaterThan(textLayer?.frame.width ?? 0, 0)
+    }
+
+    func testTerminalViewJapaneseMarkedTextOverlayWidthMatchesCommittedRendererWidth() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 16,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 400, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        let sample = "日本語"
+        view.setMarkedText(sample, selectedRange: NSRange(location: sample.count, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        view.updateMarkedTextOverlayPublic()
+
+        let textLayer = try XCTUnwrap(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first)
+        let rendererWidth = try rendererWidthInPoints(for: sample, renderer: renderer, rows: 1, cols: 16)
+
+        XCTAssertEqual(textLayer.frame.width, rendererWidth, accuracy: 1.0)
+    }
+
+    func testTerminalViewJapaneseMarkedTextOverlayWidthMatchesCommittedRendererAcrossRepresentativeSamples() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 24,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 480, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        for sample in ["あア語", "語。あ", "「３」", "ア・ー", "３月１４日"] {
+            view.setMarkedText(sample, selectedRange: NSRange(location: sample.count, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+            view.updateMarkedTextOverlayPublic()
+
+            let textLayer = try XCTUnwrap(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first)
+            let rendererWidth = try rendererWidthInPoints(for: sample, renderer: renderer, rows: 2, cols: 24)
+
+            XCTAssertEqual(textLayer.frame.width, rendererWidth, accuracy: 1.0, "sample=\(sample)")
+        }
+    }
+
+    func testTerminalViewRepeatedJapaneseMarkedTextGlyphOriginsMatchCommittedRenderer() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 16,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 400, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        let sample = "ああ"
+        view.setMarkedText(sample, selectedRange: NSRange(location: sample.count, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        view.updateMarkedTextOverlayPublic()
+
+        let textLayer = try XCTUnwrap(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first)
+        let overlayOrigins = try overlayGlyphOriginsInPoints(from: textLayer)
+        let rendererRects = try rendererGlyphRectsInPoints(for: sample, renderer: renderer, rows: 1, cols: 16)
+        let rendererOrigins = rendererRects.map(\.minX)
+
+        XCTAssertEqual(overlayOrigins.count, 2)
+        XCTAssertEqual(rendererOrigins.count, 2)
+        XCTAssertEqual(overlayOrigins[0], rendererOrigins[0], accuracy: 1.0)
+        XCTAssertEqual(overlayOrigins[1], rendererOrigins[1], accuracy: 1.0)
+        XCTAssertEqual(
+            overlayOrigins[1] - overlayOrigins[0],
+            rendererOrigins[1] - rendererOrigins[0],
+            accuracy: 1.0
+        )
     }
 
     func testTerminalViewDoesNotCreateMarkedTextLayerUntilIMECompositionBegins() throws {
@@ -2098,7 +3133,7 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(view.debugLastPendingCommittedTextIntentText, "あ")
     }
 
-    func testTerminalViewOutputConfirmedIMECommitEnqueuesInsertIntentAfterUnmarking() throws {
+    func testTerminalViewOutputConfirmedIMECommitDoesNotEnqueueCommittedPreviewIntent() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(
             rows: 4,
@@ -2119,8 +3154,8 @@ final class AppKitComponentTests: XCTestCase {
 
         view.insertText("あああ", replacementRange: NSRange(location: NSNotFound, length: 0))
 
-        XCTAssertEqual(view.debugPendingCommittedTextIntentCount, 1)
-        XCTAssertEqual(view.debugLastPendingCommittedTextIntentText, "あああ")
+        XCTAssertEqual(view.debugPendingCommittedTextIntentCount, 0)
+        XCTAssertFalse(view.debugHasCommittedTextPreview)
         XCTAssertFalse(view.hasMarkedText())
     }
 
@@ -6051,6 +7086,133 @@ final class AppKitComponentTests: XCTestCase {
     private func allSubviews(in view: NSView?) -> [NSView] {
         guard let view else { return [] }
         return [view] + view.subviews.flatMap { allSubviews(in: $0) }
+    }
+
+    private func makeSharedRenderTexture(renderer: MetalRenderer, width: Int, height: Int) -> MTLTexture? {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: MetalRenderer.renderTargetPixelFormat,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        descriptor.storageMode = .shared
+        descriptor.usage = [.renderTarget, .shaderRead]
+        return renderer.device.makeTexture(descriptor: descriptor)
+    }
+
+    private func glyphBounds(in glyphVertices: [Float]) -> (minX: Float, maxX: Float, minY: Float, maxY: Float)? {
+        guard !glyphVertices.isEmpty else { return nil }
+        let vertexStride = 12
+        var minX = Float.greatestFiniteMagnitude
+        var maxX = -Float.greatestFiniteMagnitude
+        var minY = Float.greatestFiniteMagnitude
+        var maxY = -Float.greatestFiniteMagnitude
+        for index in Swift.stride(from: 0, to: glyphVertices.count, by: vertexStride) {
+            minX = min(minX, glyphVertices[index])
+            maxX = max(maxX, glyphVertices[index])
+            minY = min(minY, glyphVertices[index + 1])
+            maxY = max(maxY, glyphVertices[index + 1])
+        }
+        return (minX, maxX, minY, maxY)
+    }
+
+    private func rendererWidthInPoints(
+        for text: String,
+        renderer: MetalRenderer,
+        rows: Int,
+        cols: Int
+    ) throws -> CGFloat {
+        let harness = TerminalModelHarness(rows: rows, cols: cols)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        harness.feed(text)
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+        let bounds = try XCTUnwrap(glyphBounds(in: vertexData.glyphVertices))
+        return CGFloat(bounds.maxX - bounds.minX) / renderer.glyphAtlas.scaleFactor
+    }
+
+    private func rendererGlyphRectsInPoints(
+        for text: String,
+        renderer: MetalRenderer,
+        rows: Int,
+        cols: Int
+    ) throws -> [CGRect] {
+        let harness = TerminalModelHarness(rows: rows, cols: cols)
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        harness.feed(text)
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: harness.model, scrollback: scrollback)
+
+        let floatsPerGlyph = 72
+        var rects: [CGRect] = []
+        for glyphBase in stride(from: 0, to: vertexData.glyphVertices.count, by: floatsPerGlyph) {
+            let glyphSlice = Array(vertexData.glyphVertices[glyphBase..<min(glyphBase + floatsPerGlyph, vertexData.glyphVertices.count)])
+            guard let bounds = glyphBounds(in: glyphSlice) else { continue }
+            rects.append(
+                CGRect(
+                    x: CGFloat(bounds.minX) / renderer.glyphAtlas.scaleFactor,
+                    y: CGFloat(bounds.minY) / renderer.glyphAtlas.scaleFactor,
+                    width: CGFloat(bounds.maxX - bounds.minX) / renderer.glyphAtlas.scaleFactor,
+                    height: CGFloat(bounds.maxY - bounds.minY) / renderer.glyphAtlas.scaleFactor
+                )
+            )
+        }
+        return rects
+    }
+
+    private func overlayGlyphOriginsInPoints(from textLayer: CATextLayer) throws -> [CGFloat] {
+        let attributed = try XCTUnwrap(textLayer.string as? NSAttributedString)
+        let line = CTLineCreateWithAttributedString(attributed)
+        let runs = CTLineGetGlyphRuns(line) as NSArray as? [CTRun] ?? []
+
+        var origins: [CGFloat] = []
+        for run in runs {
+            let glyphCount = CTRunGetGlyphCount(run)
+            guard glyphCount > 0 else { continue }
+
+            var positions = [CGPoint](repeating: .zero, count: glyphCount)
+            CTRunGetPositions(run, CFRangeMake(0, 0), &positions)
+
+            for index in 0..<glyphCount {
+                origins.append(textLayer.frame.minX + positions[index].x)
+            }
+        }
+
+        return origins.sorted()
+    }
+
+    private func brightPixelBounds(in texture: MTLTexture, threshold: UInt8) -> (minX: Int, maxX: Int, minY: Int, maxY: Int, width: Int, height: Int)? {
+        let bytesPerRow = texture.width * 4
+        var bytes = [UInt8](repeating: 0, count: bytesPerRow * texture.height)
+        texture.getBytes(&bytes, bytesPerRow: bytesPerRow, from: MTLRegionMake2D(0, 0, texture.width, texture.height), mipmapLevel: 0)
+
+        var minX = Int.max
+        var maxX = Int.min
+        var minY = Int.max
+        var maxY = Int.min
+
+        for y in 0..<texture.height {
+            for x in 0..<texture.width {
+                let index = (y * bytesPerRow) + (x * 4)
+                let blue = bytes[index]
+                let green = bytes[index + 1]
+                let red = bytes[index + 2]
+                if max(red, max(green, blue)) > threshold {
+                    minX = min(minX, x)
+                    maxX = max(maxX, x)
+                    minY = min(minY, y)
+                    maxY = max(maxY, y)
+                }
+            }
+        }
+
+        guard minX != Int.max else { return nil }
+        return (
+            minX: minX,
+            maxX: maxX,
+            minY: minY,
+            maxY: maxY,
+            width: (maxX - minX) + 1,
+            height: (maxY - minY) + 1
+        )
     }
 
     private func findSubview(in view: NSView?, matching predicate: (NSView) -> Bool) -> NSView? {

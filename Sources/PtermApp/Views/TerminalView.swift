@@ -1407,7 +1407,7 @@ final class TerminalView: MTKView, NSTextInputClient {
 
         let font = NSFont(name: renderer.glyphAtlas.fontName, size: renderer.glyphAtlas.fontSize)
             ?? NSFont.monospacedSystemFont(ofSize: renderer.glyphAtlas.fontSize, weight: .regular)
-        let attributed = NSAttributedString(
+        let attributed = NSMutableAttributedString(
             string: markedTextStorage.string,
             attributes: [
                 .font: font,
@@ -1415,17 +1415,77 @@ final class TerminalView: MTKView, NSTextInputClient {
                 .underlineStyle: NSUnderlineStyle.single.rawValue
             ]
         )
+        let desiredMetrics = desiredMarkedTextRendererMetrics(for: markedTextStorage.string)
+        if let desiredWidth = desiredMetrics?.width {
+            let naturalWidth = attributed.size().width
+            let characterCount = markedTextStorage.string.count
+            if characterCount > 1 {
+                let tracking = (desiredWidth - naturalWidth) / CGFloat(characterCount - 1)
+                if tracking != 0 {
+                    var location = 0
+                    for character in markedTextStorage.string {
+                        let range = NSRange(location: location, length: String(character).utf16.count)
+                        if location + range.length < attributed.length {
+                            attributed.addAttribute(.kern, value: tracking, range: range)
+                        }
+                        location += range.length
+                    }
+                }
+            }
+        }
         let cursorRect = currentCursorRect()
         markedTextLayer.string = attributed
         markedTextLayer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        let desiredWidth = desiredMetrics?.width ?? attributed.size().width
+        let desiredOriginX = desiredMetrics?.originX ?? 0
         let size = attributed.size()
         markedTextLayer.frame = NSRect(
-            x: cursorRect.minX,
+            x: cursorRect.minX + desiredOriginX,
             y: cursorRect.minY + max(0, (cursorRect.height - size.height) / 2),
-            width: max(size.width, 1),
+            width: max(desiredWidth, 1),
             height: max(size.height, cursorRect.height)
         )
         markedTextLayer.isHidden = false
+    }
+
+    private func desiredMarkedTextRendererMetrics(for text: String) -> (originX: CGFloat, width: CGFloat)? {
+        guard let renderer else { return nil }
+        let scale = renderer.glyphAtlas.scaleFactor
+        let cellWidthPixels = renderer.glyphAtlas.cellWidth * scale
+
+        var columnOffset: CGFloat = 0
+        var minX = CGFloat.greatestFiniteMagnitude
+        var maxX = -CGFloat.greatestFiniteMagnitude
+        var sawRenderableGlyph = false
+
+        for scalar in text.unicodeScalars {
+            let characterWidth = max(CharacterWidth.width(of: scalar.value), 1)
+            defer { columnOffset += CGFloat(characterWidth) * cellWidthPixels }
+
+            guard scalar.value > 0x20,
+                  let glyph = renderer.glyphAtlas.glyphInfo(for: scalar.value),
+                  glyph.pixelWidth > 0 else {
+                continue
+            }
+
+            let glyphX: CGFloat
+            if characterWidth == 1 {
+                glyphX = columnOffset + CGFloat(glyph.cellOffsetX)
+            } else {
+                let spanWidth = CGFloat(characterWidth) * cellWidthPixels
+                glyphX = columnOffset + CGFloat(glyph.cellOffsetX) + ((spanWidth - cellWidthPixels) * 0.5)
+            }
+            let glyphMaxX = glyphX + CGFloat(glyph.pixelWidth)
+            minX = min(minX, glyphX)
+            maxX = max(maxX, glyphMaxX)
+            sawRenderableGlyph = true
+        }
+
+        guard sawRenderableGlyph else { return nil }
+        return (
+            originX: minX / scale,
+            width: (maxX - minX) / scale
+        )
     }
 
     private func shouldAnimateCommittedTextPreview(for text: String) -> Bool {
@@ -1879,11 +1939,12 @@ extension TerminalView {
             text = String(describing: string)
         }
         guard !text.isEmpty else { return }
+        let committedFromMarkedText = hasMarkedText()
         pendingTextInputHandled = true
         markedTextStorage = nil
         markedTextSelection = NSRange(location: NSNotFound, length: 0)
         destroyMarkedTextLayer()
-        let shouldShowCommittedPreview = shouldAnimateCommittedTextPreview(for: text)
+        let shouldShowCommittedPreview = !committedFromMarkedText && shouldAnimateCommittedTextPreview(for: text)
         if shouldShowCommittedPreview {
             if outputConfirmedInputAnimationsEnabled {
                 enqueueCommittedInsertIntentIfNeeded(for: text)
