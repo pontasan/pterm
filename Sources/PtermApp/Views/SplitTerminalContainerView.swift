@@ -31,6 +31,13 @@ final class SplitTerminalContainerView: NSView {
             }
         }
     }
+    var typewriterSoundEnabled: Bool = TextInteractionConfiguration.default.typewriterSoundEnabled {
+        didSet {
+            scrollViews.forEach {
+                $0.terminalView.typewriterSoundEnabled = typewriterSoundEnabled
+            }
+        }
+    }
 
     var onBackToIntegrated: (() -> Void)?
     var onActiveControllerChange: ((TerminalController) -> Void)?
@@ -139,6 +146,7 @@ final class SplitTerminalContainerView: NSView {
             let scrollView = scrollViews[index]
             scrollView.terminalView.shortcutConfiguration = shortcutConfiguration
             scrollView.terminalView.outputConfirmedInputAnimationsEnabled = outputConfirmedInputAnimationsEnabled
+            scrollView.terminalView.typewriterSoundEnabled = typewriterSoundEnabled
             // Suppress individual rendering — SplitRenderView handles it.
             // Also make the CAMetalLayer invisible so it doesn't interfere
             // with Window Server compositing of the overlay SplitRenderView.

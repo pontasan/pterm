@@ -60,6 +60,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var contentScroll: NSScrollView!
     private var currentSection: Section = .general
     private var configData: [String: Any] = [:]
+    private let configURL: URL
     var onClose: (() -> Void)?
 
     // Control references
@@ -68,6 +69,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var launchShellsValues: [String] = []
     private var encodingPopup: NSPopUpButton?
     private var outputConfirmedInputAnimationCheck: NSButton?
+    private var typewriterSoundCheck: NSButton?
     private var scrollPersistenceCheck: NSButton?
     private var fontNameLabel: NSTextField?
     private var fontSizeStepper: NSStepper?
@@ -91,7 +93,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var encryptCheck: NSButton?
     private var factoryResetButton: NSButton?
 
-    init() {
+    init(configURL: URL = PtermDirectories.config) {
+        self.configURL = configURL
         let contentRect = NSRect(x: 0, y: 0, width: 640, height: 480)
         let styleMask: NSWindow.StyleMask = [.titled, .closable, .resizable, .miniaturizable]
         let window = NSWindow(contentRect: contentRect, styleMask: styleMask,
@@ -128,8 +131,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     // MARK: - Config I/O
 
     private func loadConfigData() {
-        let url = PtermDirectories.config
-        guard let data = try? Data(contentsOf: url),
+        guard let data = try? Data(contentsOf: configURL),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             configData = [:]
             return
@@ -140,7 +142,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private func saveConfigData() throws {
         let data = try JSONSerialization.data(withJSONObject: configData,
                                               options: [.prettyPrinted, .sortedKeys])
-        try AtomicFileWriter.write(data, to: PtermDirectories.config, permissions: 0o600)
+        try AtomicFileWriter.write(data, to: configURL, permissions: 0o600)
     }
 
     private func commitConfigChange() {
@@ -183,7 +185,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
         resetSection("session", removing: ["scroll_buffer_persistence"])
         resetSection("shells", removing: ["launch_order"])
-        resetSection("text_interaction", removing: ["output_confirmed_input_animation"])
+        resetSection("text_interaction", removing: ["output_confirmed_input_animation", "typewriter_sound_enabled"])
         resetSection("appearance", removing: [
             "terminal_foreground_color",
             "terminal_background_color",
@@ -342,7 +344,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         addSpacing(12)
 
         let textInteraction = configData["text_interaction"] as? [String: Any]
-        let outputConfirmedInputAnimation = (textInteraction?["output_confirmed_input_animation"] as? Bool) ?? false
+        let outputConfirmedInputAnimation = (textInteraction?["output_confirmed_input_animation"] as? Bool) ?? TextInteractionConfiguration.default.outputConfirmedInputAnimation
         let outputConfirmedCheck = makeCheckbox(
             "Output-confirm input animations",
             checked: outputConfirmedInputAnimation
@@ -355,6 +357,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         addView(
             makeDescriptionLabel(
                 "When enabled, input and delete animations start only after matching PTY output confirms the visible result.",
+                width: width
+            ),
+            28
+        )
+        addSpacing(12)
+
+        let typewriterSoundEnabled = (textInteraction?["typewriter_sound_enabled"] as? Bool) ?? TextInteractionConfiguration.default.typewriterSoundEnabled
+        let typewriterSoundCheckbox = makeCheckbox(
+            "Simulate typewriter keystroke sounds",
+            checked: typewriterSoundEnabled
+        )
+        typewriterSoundCheckbox.target = self
+        typewriterSoundCheckbox.action = #selector(typewriterSoundChanged(_:))
+        typewriterSoundCheck = typewriterSoundCheckbox
+        addView(typewriterSoundCheckbox, 22)
+        addSpacing(2)
+        addView(
+            makeDescriptionLabel(
+                "Simulate mechanical typewriter keystroke sounds whenever terminal input is committed.",
                 width: width
             ),
             28
@@ -651,6 +672,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     @objc private func outputConfirmedInputAnimationChanged(_ sender: NSButton) {
         var textInteraction = (configData["text_interaction"] as? [String: Any]) ?? [:]
         textInteraction["output_confirmed_input_animation"] = (sender.state == .on)
+        configData["text_interaction"] = textInteraction
+        commitConfigChange()
+    }
+
+    @objc private func typewriterSoundChanged(_ sender: NSButton) {
+        var textInteraction = (configData["text_interaction"] as? [String: Any]) ?? [:]
+        textInteraction["typewriter_sound_enabled"] = (sender.state == .on)
         configData["text_interaction"] = textInteraction
         commitConfigChange()
     }

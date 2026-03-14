@@ -8,6 +8,8 @@ final class StatusBarView: NSView {
 
     private let metricsLabel = NSTextField(labelWithString: "CPU: --.-% | MEM: -- MB")
     private let metricsTemplateLabel = NSTextField(labelWithString: "CPU: 999.9% | MEM: 99999MB")
+    private let overviewHintLabel = NSTextField(labelWithString: "Cmd+A: Show all terminals")
+    private let overviewHintSeparatorLabel = NSTextField(labelWithString: "|")
     private var currentCpu: Double = 0
     private var currentMemBytes: UInt64 = 0
     private var metricsLabelWidth: CGFloat = 0
@@ -41,6 +43,17 @@ final class StatusBarView: NSView {
         metricsTemplateLabel.font = font
         metricsTemplateLabel.sizeToFit()
         metricsLabelWidth = ceil(metricsTemplateLabel.frame.width)
+
+        overviewHintLabel.textColor = NSColor(calibratedWhite: 0.55, alpha: 1)
+        overviewHintLabel.font = font
+        overviewHintLabel.lineBreakMode = .byTruncatingTail
+        overviewHintLabel.isHidden = true
+        addSubview(overviewHintLabel)
+
+        overviewHintSeparatorLabel.textColor = NSColor(calibratedWhite: 0.4, alpha: 1)
+        overviewHintSeparatorLabel.font = font
+        overviewHintSeparatorLabel.isHidden = true
+        addSubview(overviewHintSeparatorLabel)
 
         backButton.bezelStyle = .recessed
         backButton.isBordered = false
@@ -95,6 +108,20 @@ final class StatusBarView: NSView {
         // Right side: metrics
         let metricsX = bounds.width - inset - metricsLabelWidth
         metricsLabel.frame = NSRect(x: metricsX, y: vertInset, width: metricsLabelWidth, height: height)
+
+        if !overviewHintLabel.isHidden {
+            overviewHintSeparatorLabel.sizeToFit()
+            overviewHintSeparatorLabel.frame = NSRect(
+                x: noteButton.frame.maxX + spacing,
+                y: vertInset,
+                width: overviewHintSeparatorLabel.frame.width,
+                height: height
+            )
+            let hintMinX = overviewHintSeparatorLabel.frame.maxX + spacing
+            let hintMaxX = metricsLabel.frame.minX - 12
+            let availableWidth = max(0, hintMaxX - hintMinX)
+            overviewHintLabel.frame = NSRect(x: hintMinX, y: vertInset, width: availableWidth, height: height)
+        }
     }
 
     func updateMemoryUsage(bytes: UInt64) {
@@ -117,6 +144,12 @@ final class StatusBarView: NSView {
     func setBackButtonVisible(_ visible: Bool) {
         backButton.isHidden = !visible
         separatorLabel.isHidden = !visible
+        needsLayout = true
+    }
+
+    func setOverviewSelectAllHintVisible(_ visible: Bool) {
+        overviewHintLabel.isHidden = !visible
+        overviewHintSeparatorLabel.isHidden = !visible
         needsLayout = true
     }
 

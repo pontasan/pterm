@@ -100,9 +100,11 @@ struct ShellLaunchConfiguration: Equatable {
 
 struct TextInteractionConfiguration: Equatable {
     let outputConfirmedInputAnimation: Bool
+    let typewriterSoundEnabled: Bool
 
     static let `default` = TextInteractionConfiguration(
-        outputConfirmedInputAnimation: true
+        outputConfirmedInputAnimation: true,
+        typewriterSoundEnabled: true
     )
 }
 
@@ -220,9 +222,9 @@ enum PtermConfigStore {
         }
     }
 
-    static func load() -> PtermConfig {
+    static func load(from configURL: URL = PtermDirectories.config) -> PtermConfig {
         let defaults = PtermConfig.default
-        guard let data = try? Data(contentsOf: PtermDirectories.config),
+        guard let data = try? Data(contentsOf: configURL),
               let object = try? JSONSerialization.jsonObject(with: data),
               let root = object as? [String: Any] else {
             return defaults
@@ -250,7 +252,8 @@ enum PtermConfigStore {
                 launchOrder: stringArrayValue(shells?["launch_order"]) ?? defaults.shellLaunch.launchOrder
             ),
             textInteraction: TextInteractionConfiguration(
-                outputConfirmedInputAnimation: boolValue(textInteraction?["output_confirmed_input_animation"]) ?? defaults.textInteraction.outputConfirmedInputAnimation
+                outputConfirmedInputAnimation: boolValue(textInteraction?["output_confirmed_input_animation"]) ?? defaults.textInteraction.outputConfirmedInputAnimation,
+                typewriterSoundEnabled: boolValue(textInteraction?["typewriter_sound_enabled"]) ?? defaults.textInteraction.typewriterSoundEnabled
             ),
             fontName: stringValue(font?["name"]) ?? stringValue(root["font_name"]),
             fontSize: normalizedFontSize(doubleValue(font?["size"]) ?? doubleValue(root["font_size"])),

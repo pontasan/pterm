@@ -511,34 +511,53 @@ final class AppInfrastructureTests: XCTestCase {
     }
 
     func testPtermConfigStoreLoadsConfiguredShellLaunchOrder() throws {
-        try withTemporaryHomeDirectory { _ in
-            PtermDirectories.ensureDirectories()
+        try withTemporaryPtermConfig { configURL in
             let json: [String: Any] = [
                 "shells": [
                     "launch_order": ["/bin/bash", "/bin/sh", "/bin/bash", "relative-shell"]
                 ]
             ]
             let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
-            try AtomicFileWriter.write(data, to: PtermDirectories.config, permissions: 0o600)
+            try AtomicFileWriter.write(data, to: configURL, permissions: 0o600)
 
-            let loaded = PtermConfigStore.load()
+            let loaded = PtermConfigStore.load(from: configURL)
             XCTAssertEqual(loaded.shellLaunch.launchOrder, ["/bin/bash", "/bin/sh"])
         }
     }
 
     func testPtermConfigStoreLoadsOutputConfirmedInputAnimationSetting() throws {
-        try withTemporaryHomeDirectory { _ in
-            PtermDirectories.ensureDirectories()
+        try withTemporaryPtermConfig { configURL in
             let json: [String: Any] = [
                 "text_interaction": [
                     "output_confirmed_input_animation": true
                 ]
             ]
             let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
-            try AtomicFileWriter.write(data, to: PtermDirectories.config, permissions: 0o600)
+            try AtomicFileWriter.write(data, to: configURL, permissions: 0o600)
 
-            let loaded = PtermConfigStore.load()
+            let loaded = PtermConfigStore.load(from: configURL)
             XCTAssertTrue(loaded.textInteraction.outputConfirmedInputAnimation)
+        }
+    }
+
+    func testPtermConfigStoreDefaultsTypewriterSoundToEnabled() {
+        let loaded = PtermConfigStore.load(from: URL(fileURLWithPath: "/nonexistent/config.json"))
+
+        XCTAssertTrue(loaded.textInteraction.typewriterSoundEnabled)
+    }
+
+    func testPtermConfigStoreLoadsTypewriterSoundSetting() throws {
+        try withTemporaryPtermConfig { configURL in
+            let json: [String: Any] = [
+                "text_interaction": [
+                    "typewriter_sound_enabled": false
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try AtomicFileWriter.write(data, to: configURL, permissions: 0o600)
+
+            let loaded = PtermConfigStore.load(from: configURL)
+            XCTAssertFalse(loaded.textInteraction.typewriterSoundEnabled)
         }
     }
 

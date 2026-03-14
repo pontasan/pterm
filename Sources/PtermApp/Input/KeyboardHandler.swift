@@ -10,13 +10,20 @@ import AppKit
 /// - Application cursor mode (DECCKM)
 final class KeyboardHandler {
     private weak var controller: TerminalController?
+    private let inputFeedbackPlayer: TypewriterKeyClicking
+    private let inputFeedbackEnabled: () -> Bool
 
-    init(controller: TerminalController) {
+    init(controller: TerminalController,
+         inputFeedbackPlayer: TypewriterKeyClicking = TypewriterKeyClickPlayerFactory.defaultPlayer,
+         inputFeedbackEnabled: @escaping () -> Bool = { true }) {
         self.controller = controller
+        self.inputFeedbackPlayer = inputFeedbackPlayer
+        self.inputFeedbackEnabled = inputFeedbackEnabled
     }
 
-    func handleKeyDown(event: NSEvent) {
-        guard let controller = controller else { return }
+    @discardableResult
+    func handleKeyDown(event: NSEvent) -> Bool {
+        guard let controller = controller else { return false }
 
         let modifiers = event.modifierFlags
 
@@ -28,22 +35,26 @@ final class KeyboardHandler {
                 // Ctrl+A (0x01) through Ctrl+Z (0x1A)
                 if code >= 0x61 && code <= 0x7A { // a-z
                     controller.sendInput(String(UnicodeScalar(code - 0x60)!))
-                    return
+                    playInputFeedbackIfEnabled()
+                    return true
                 }
                 // Ctrl+[ = ESC (0x1B)
                 if code == 0x5B {
                     controller.sendInput("\u{1B}")
-                    return
+                    playInputFeedbackIfEnabled()
+                    return true
                 }
                 // Ctrl+] = 0x1D
                 if code == 0x5D {
                     controller.sendInput(String(UnicodeScalar(0x1D)!))
-                    return
+                    playInputFeedbackIfEnabled()
+                    return true
                 }
                 // Ctrl+\ = 0x1C
                 if code == 0x5C {
                     controller.sendInput(String(UnicodeScalar(0x1C)!))
-                    return
+                    playInputFeedbackIfEnabled()
+                    return true
                 }
             }
         }
@@ -51,13 +62,18 @@ final class KeyboardHandler {
         // Special keys
         if let specialInput = handleSpecialKey(event: event) {
             controller.sendInput(specialInput)
-            return
+            playInputFeedbackIfEnabled()
+            return true
         }
 
         // Regular text input
         if let characters = event.characters {
             controller.sendInput(characters)
+            playInputFeedbackIfEnabled()
+            return true
         }
+
+        return false
     }
 
     func debugWillTreatAsRegularTextInput(event: NSEvent) -> Bool {
@@ -123,7 +139,13 @@ final class KeyboardHandler {
             return false
         }
 
+        playInputFeedbackIfEnabled()
         return true
+    }
+
+    private func playInputFeedbackIfEnabled() {
+        guard inputFeedbackEnabled() else { return }
+        inputFeedbackPlayer.playKeystroke()
     }
 
     private func handleSpecialKey(event: NSEvent) -> String? {

@@ -26,6 +26,19 @@ func withTemporaryHomeDirectory<T>(_ body: (URL) throws -> T) throws -> T {
     }
 }
 
+func withTemporaryPtermConfig<T>(_ body: (URL) throws -> T) throws -> T {
+    try withTemporaryDirectory { directory in
+        let ptermDirectory = directory.appendingPathComponent(".pterm", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: ptermDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let configURL = ptermDirectory.appendingPathComponent("config.json")
+        return try body(configURL)
+    }
+}
+
 func posixPermissions(of url: URL) throws -> Int {
     let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
     return attributes[.posixPermissions] as? Int ?? 0

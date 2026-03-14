@@ -8,6 +8,14 @@ import XCTest
 
 @MainActor
 final class AppKitComponentTests: XCTestCase {
+    private final class KeyClickSpy: TypewriterKeyClicking {
+        private(set) var playCount = 0
+
+        func playKeystroke() {
+            playCount += 1
+        }
+    }
+
     private static func projectRootURL(filePath: StaticString = #filePath) -> URL {
         URL(fileURLWithPath: "\(filePath)")
             .deletingLastPathComponent()
@@ -46,12 +54,36 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(buttonTitles.contains("◀ Overview"))
     }
 
+    func testTypewriterSoundPlayerFindsBundledAudioFiles() {
+        let player = TypewriterSoundPlayer()
+
+        XCTAssertEqual(player.debugSoundFileCount, 10)
+    }
+
     func testStatusBarViewStartsWithPlaceholderMetrics() {
         let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
         view.layoutSubtreeIfNeeded()
 
         let labels = allSubviews(in: view).compactMap { $0 as? NSTextField }.map(\.stringValue)
         XCTAssertTrue(labels.contains("CPU: --.-% | MEM: -- MB"))
+    }
+
+    func testStatusBarOverviewHintCanBeShown() {
+        let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
+
+        view.setOverviewSelectAllHintVisible(true)
+        view.layoutSubtreeIfNeeded()
+
+        let labels = allSubviews(in: view).compactMap { $0 as? NSTextField }
+        XCTAssertEqual(labels.first(where: { $0.stringValue == "Cmd+A: Show all terminals" })?.isHidden, false)
+        XCTAssertEqual(labels.first(where: { $0.stringValue == "|" && !$0.isHidden })?.isHidden, false)
+    }
+
+    func testStatusBarOverviewHintStartsHidden() {
+        let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
+
+        let labels = allSubviews(in: view).compactMap { $0 as? NSTextField }
+        XCTAssertEqual(labels.first(where: { $0.stringValue == "Cmd+A: Show all terminals" })?.isHidden, true)
     }
 
     func testStatusBarButtonsInvokeCallbacks() {
@@ -267,10 +299,9 @@ final class AppKitComponentTests: XCTestCase {
     }
 
     func testSettingsWindowGeneralSectionShowsLaunchShellListWithDefaultOrder() throws {
-        try withTemporaryHomeDirectory { _ in
-            PtermDirectories.ensureDirectories()
-            try? FileManager.default.removeItem(at: PtermDirectories.config)
-            let controller = SettingsWindowController()
+        try withTemporaryPtermConfig { configURL in
+            try? FileManager.default.removeItem(at: configURL)
+            let controller = SettingsWindowController(configURL: configURL)
             let tableView = try XCTUnwrap(
                 allSubviews(in: controller.window?.contentView)
                     .compactMap { $0 as? NSTableView }
@@ -286,9 +317,8 @@ final class AppKitComponentTests: XCTestCase {
     }
 
     func testSettingsWindowPersistsLaunchShellOrderEdits() throws {
-        try withTemporaryHomeDirectory { _ in
-            PtermDirectories.ensureDirectories()
-            let controller = SettingsWindowController()
+        try withTemporaryPtermConfig { configURL in
+            let controller = SettingsWindowController(configURL: configURL)
             let tableView = try XCTUnwrap(
                 allSubviews(in: controller.window?.contentView)
                     .compactMap { $0 as? NSTableView }
@@ -308,15 +338,14 @@ final class AppKitComponentTests: XCTestCase {
             editedField.stringValue = "/bin/customsh"
             controller.controlTextDidEndEditing(Notification(name: NSControl.textDidEndEditingNotification, object: editedField))
 
-            let loaded = PtermConfigStore.load()
+            let loaded = PtermConfigStore.load(from: configURL)
             XCTAssertEqual(loaded.shellLaunch.launchOrder, ["/bin/customsh", "/bin/bash", "/bin/sh"])
         }
     }
 
     func testSettingsWindowPersistsOutputConfirmedInputAnimationToggle() throws {
-        try withTemporaryHomeDirectory { _ in
-            PtermDirectories.ensureDirectories()
-            let controller = SettingsWindowController()
+        try withTemporaryPtermConfig { configURL in
+            let controller = SettingsWindowController(configURL: configURL)
 
             let checkbox = try XCTUnwrap(
                 allSubviews(in: controller.window?.contentView)
@@ -327,8 +356,28 @@ final class AppKitComponentTests: XCTestCase {
             checkbox.state = .on
             _ = checkbox.target?.perform(checkbox.action, with: checkbox)
 
-            let loaded = PtermConfigStore.load()
+            let loaded = PtermConfigStore.load(from: configURL)
             XCTAssertTrue(loaded.textInteraction.outputConfirmedInputAnimation)
+        }
+    }
+
+    func testSettingsWindowTypewriterSoundToggleDefaultsToOnAndPersists() throws {
+        try withTemporaryPtermConfig { configURL in
+            let controller = SettingsWindowController(configURL: configURL)
+
+            let checkbox = try XCTUnwrap(
+                allSubviews(in: controller.window?.contentView)
+                    .compactMap { $0 as? NSButton }
+                    .first(where: { $0.title == "Typewriter keystroke sounds" })
+            )
+
+            XCTAssertEqual(checkbox.state, .on)
+
+            checkbox.state = .off
+            _ = checkbox.target?.perform(checkbox.action, with: checkbox)
+
+            let loaded = PtermConfigStore.load(from: configURL)
+            XCTAssertFalse(loaded.textInteraction.typewriterSoundEnabled)
         }
     }
 
@@ -470,10 +519,8 @@ final class AppKitComponentTests: XCTestCase {
     }
 
     func testSettingsWindowAppearanceChangesPersistToConfigFile() throws {
-        try withTemporaryHomeDirectory { _ in
-            PtermDirectories.ensureDirectories()
-
-            let controller = SettingsWindowController()
+        try withTemporaryPtermConfig { configURL in
+            let controller = SettingsWindowController(configURL: configURL)
             controller.showWindow()
             let windowContentView = try XCTUnwrap(controller.window?.contentView)
             let tableView = try XCTUnwrap(findSubview(in: windowContentView) { $0 is NSTableView } as? NSTableView)
@@ -513,7 +560,7 @@ final class AppKitComponentTests: XCTestCase {
             slider.doubleValue = 0.42
             _ = slider.target?.perform(slider.action, with: slider)
 
-            let data = try Data(contentsOf: PtermDirectories.config)
+            let data = try Data(contentsOf: configURL)
             let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
             let appearance = try XCTUnwrap(root["appearance"] as? [String: Any])
             let storedForeground = try XCTUnwrap(appearance["terminal_foreground_color"] as? String)
@@ -524,7 +571,7 @@ final class AppKitComponentTests: XCTestCase {
             XCTAssertNotEqual(storedBackground, RGBColor.defaultTerminalBackground.hexString)
             XCTAssertEqual(storedOpacity, 0.42, accuracy: 0.0001)
 
-            let config = PtermConfigStore.load()
+            let config = PtermConfigStore.load(from: configURL)
             XCTAssertEqual(config.terminalAppearance.foreground.hexString, storedForeground)
             XCTAssertEqual(config.terminalAppearance.background.hexString, storedBackground)
             XCTAssertEqual(config.terminalAppearance.backgroundOpacity, 0.42, accuracy: 0.0001)
@@ -532,8 +579,7 @@ final class AppKitComponentTests: XCTestCase {
     }
 
     func testSettingsWindowFactoryResetPreservesUnknownKeysAndRestoresDefaults() throws {
-        try withTemporaryHomeDirectory { _ in
-            PtermDirectories.ensureDirectories()
+        try withTemporaryPtermConfig { configURL in
 
             let seededConfig: [String: Any] = [
                 "term": "vt100",
@@ -575,12 +621,12 @@ final class AppKitComponentTests: XCTestCase {
                 "custom_root_key": "keep"
             ]
             let seededData = try JSONSerialization.data(withJSONObject: seededConfig, options: [.prettyPrinted, .sortedKeys])
-            try AtomicFileWriter.write(seededData, to: PtermDirectories.config, permissions: 0o600)
+            try AtomicFileWriter.write(seededData, to: configURL, permissions: 0o600)
 
-            let controller = SettingsWindowController()
+            let controller = SettingsWindowController(configURL: configURL)
             controller.resetToFactoryDefaults()
 
-            let data = try Data(contentsOf: PtermDirectories.config)
+            let data = try Data(contentsOf: configURL)
             let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
 
             XCTAssertNil(root["term"])
@@ -1378,6 +1424,36 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(view.debugHasKeyboardHandler)
     }
 
+    func testKeyboardHandlerPlaysSoundForControlCharacterInput() throws {
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let spy = KeyClickSpy()
+        let handler = KeyboardHandler(controller: controller, inputFeedbackPlayer: spy)
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.control],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "c",
+            charactersIgnoringModifiers: "c",
+            isARepeat: false,
+            keyCode: 8
+        ))
+
+        XCTAssertTrue(handler.handleKeyDown(event: event))
+        XCTAssertEqual(spy.playCount, 1)
+    }
+
     func testTerminalViewIdlePurgeReleasesKeyboardHandlerAndRecreatesItOnNextInput() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(
@@ -1407,6 +1483,73 @@ final class AppKitComponentTests: XCTestCase {
 
         view.doCommand(by: #selector(NSResponder.insertTab(_:)))
         XCTAssertTrue(view.debugHasKeyboardHandler)
+    }
+
+    func testTerminalViewInsertTextPlaysSoundForCommittedInput() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let spy = KeyClickSpy()
+        view.terminalController = controller
+        view.inputFeedbackPlayer = spy
+
+        view.insertText("a", replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertEqual(spy.playCount, 1)
+    }
+
+    func testTerminalViewInsertTextDoesNotPlaySoundWhenDisabled() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let spy = KeyClickSpy()
+        view.terminalController = controller
+        view.inputFeedbackPlayer = spy
+        view.typewriterSoundEnabled = false
+
+        view.insertText("a", replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertEqual(spy.playCount, 0)
+    }
+
+    func testTerminalViewCommandInputPlaysSoundOnce() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let spy = KeyClickSpy()
+        view.terminalController = controller
+        view.inputFeedbackPlayer = spy
+
+        view.doCommand(by: #selector(NSResponder.insertTab(_:)))
+
+        XCTAssertEqual(spy.playCount, 1)
     }
 
     func testTerminalViewInactiveReleaseReleasesKeyboardHandler() throws {
@@ -6094,9 +6237,8 @@ final class AppKitComponentTests: XCTestCase {
     private func withIsolatedSettingsController<T>(
         _ body: (SettingsWindowController) throws -> T
     ) throws -> T {
-        try withTemporaryHomeDirectory { _ in
-            PtermDirectories.ensureDirectories()
-            return try body(SettingsWindowController())
+        try withTemporaryPtermConfig { configURL in
+            return try body(SettingsWindowController(configURL: configURL))
         }
     }
 

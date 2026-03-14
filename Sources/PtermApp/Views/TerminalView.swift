@@ -90,6 +90,16 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     /// Keyboard handler
     private var keyboardHandler: KeyboardHandler?
+    var inputFeedbackPlayer: TypewriterKeyClicking = TypewriterKeyClickPlayerFactory.defaultPlayer {
+        didSet {
+            keyboardHandler = nil
+        }
+    }
+    var typewriterSoundEnabled: Bool = TextInteractionConfiguration.default.typewriterSoundEnabled {
+        didSet {
+            keyboardHandler = nil
+        }
+    }
 
     /// Callback when user requests to go back to integrated view
     var onBackToIntegrated: (() -> Void)?
@@ -521,7 +531,11 @@ final class TerminalView: MTKView, NSTextInputClient {
             return keyboardHandler
         }
         guard let controller = terminalController else { return nil }
-        let handler = KeyboardHandler(controller: controller)
+        let handler = KeyboardHandler(
+            controller: controller,
+            inputFeedbackPlayer: inputFeedbackPlayer,
+            inputFeedbackEnabled: { [weak self] in self?.typewriterSoundEnabled ?? false }
+        )
         keyboardHandler = handler
         return handler
     }
@@ -1906,6 +1920,9 @@ extension TerminalView {
             }
         }
         controller.sendInput(text)
+        if typewriterSoundEnabled {
+            inputFeedbackPlayer.playKeystroke()
+        }
     }
 
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {

@@ -611,6 +611,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sv.autoresizingMask = [.width, .height]
         sv.shortcutConfiguration = config.shortcuts
         sv.terminalView.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
+        sv.terminalView.typewriterSoundEnabled = config.textInteraction.typewriterSoundEnabled
         sv.terminalView.terminalController = controller
         sv.terminalView.imagePreviewURLProvider = { [weak self] index in
             self?.pastedImageRegistry.url(forPlaceholderIndex: index)
@@ -672,6 +673,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         splitView.autoresizingMask = [.width, .height]
         splitView.shortcutConfiguration = config.shortcuts
         splitView.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
+        splitView.typewriterSoundEnabled = config.textInteraction.typewriterSoundEnabled
         splitView.imagePreviewURLProvider = { [weak self] index in
             self?.pastedImageRegistry.url(forPlaceholderIndex: index)
         }
@@ -1021,14 +1023,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateTitlebarBackButtonVisibility() {
         let shouldShow: Bool
+        let shouldShowOverviewSelectAllHint: Bool
         switch viewMode {
         case .focused, .split:
             shouldShow = true
+            shouldShowOverviewSelectAllHint = false
         case .integrated:
             shouldShow = false
+            shouldShowOverviewSelectAllHint = true
         }
         titlebarBackButton?.isHidden = !shouldShow
         statusBarView?.setBackButtonVisible(shouldShow)
+        statusBarView?.setOverviewSelectAllHintVisible(shouldShowOverviewSelectAllHint)
         layoutTitlebarBackButton()
     }
 
@@ -1056,8 +1062,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenu()
         terminalView?.shortcutConfiguration = config.shortcuts
         terminalView?.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
+        terminalView?.typewriterSoundEnabled = config.textInteraction.typewriterSoundEnabled
         splitContainerView?.shortcutConfiguration = config.shortcuts
         splitContainerView?.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
+        splitContainerView?.typewriterSoundEnabled = config.textInteraction.typewriterSoundEnabled
         integratedView?.shortcutConfiguration = config.shortcuts
         renderer.updateTerminalAppearance(config.terminalAppearance)
 

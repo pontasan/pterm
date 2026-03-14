@@ -47,6 +47,8 @@ bundle:
 	cp Resources/AppIcon.icns $(APP_BUNDLE)/Contents/Resources/AppIcon.icns; \
 	cp Resources/close_icon.png $(APP_BUNDLE)/Contents/Resources/close_icon.png; \
 	cp Resources/close_circle.png $(APP_BUNDLE)/Contents/Resources/close_circle.png; \
+	rm -rf $(APP_BUNDLE)/Contents/Resources/Audio; \
+	cp -R Resources/Audio $(APP_BUNDLE)/Contents/Resources/Audio; \
 	$(METAL_TOOLCHAIN) xcrun -sdk macosx metal -c $(SHADER_DIR)/terminal.metal \
 		-o $(BUILD_DIR)/shaders/terminal.air; \
 	$(METAL_TOOLCHAIN) xcrun -sdk macosx metallib $(BUILD_DIR)/shaders/terminal.air \
@@ -65,6 +67,7 @@ verify-bundle: build
 	@test -f $(APP_BUNDLE)/Contents/Info.plist
 	@test -f $(APP_BUNDLE)/Contents/Resources/default.metallib
 	@test -f $(APP_BUNDLE)/Contents/Resources/AppIcon.icns
+	@test -f $(APP_BUNDLE)/Contents/Resources/Audio/type1.aiff
 	@echo "Bundle structure verified."
 
 # Verify code signature when the app has been signed
