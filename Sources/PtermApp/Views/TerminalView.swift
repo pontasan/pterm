@@ -2125,6 +2125,9 @@ final class TerminalScrollView: NSScrollView {
             terminalView.onBackToIntegrated?()
             return true
         }
+        if terminalView.performKeyEquivalent(with: event) {
+            return true
+        }
         return super.performKeyEquivalent(with: event)
     }
 

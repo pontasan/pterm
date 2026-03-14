@@ -929,6 +929,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         viewMenu.addItem(makeMenuItem(title: "Zoom In", shortcut: .zoomIn))
         viewMenu.addItem(makeMenuItem(title: "Zoom Out", shortcut: .zoomOut))
         viewMenu.addItem(makeMenuItem(title: "Reset to Default Size", shortcut: .zoomReset))
+        viewMenu.addItem(NSMenuItem.separator())
+        viewMenu.addItem(makeMenuItem(title: "Clear Screen", shortcut: .clearScreen))
+        viewMenu.addItem(makeMenuItem(title: "Scroll to Top", shortcut: .scrollToTop))
 
         viewMenu.addItem(NSMenuItem.separator())
 
@@ -1800,6 +1803,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         textView.undoManager?.undo()
+    }
+
+    private func activeTerminalInteractionTarget() -> (controller: TerminalController, view: TerminalView)? {
+        switch viewMode {
+        case .focused(let focusedController):
+            guard let terminalView else { return nil }
+            return (focusedController, terminalView)
+        case .split:
+            guard let controller = splitContainerView?.activeController,
+                  let view = splitContainerView?.activeTerminalView else {
+                return nil
+            }
+            return (controller, view)
+        case .integrated:
+            return nil
+        }
+    }
+
+    @objc func clearActiveTerminalScreen(_ sender: Any?) {
+        guard let target = activeTerminalInteractionTarget() else { return }
+        target.controller.clearScrollback()
+        target.controller.scrollToBottom()
+        target.controller.sendInput("\u{0C}")
+        target.view.clearSelection()
+        (target.view.enclosingScrollView as? TerminalScrollView)?.syncScroller()
+        target.view.updateMarkedTextOverlayPublic()
+        target.view.needsDisplay = true
+    }
+
+    @objc func scrollActiveTerminalToTop(_ sender: Any?) {
+        guard let target = activeTerminalInteractionTarget() else { return }
+        target.controller.scrollToTop()
+        target.view.clearSelection()
+        (target.view.enclosingScrollView as? TerminalScrollView)?.syncScroller()
+        target.view.updateMarkedTextOverlayPublic()
+        target.view.needsDisplay = true
     }
 
     private func promptPassword(title: String, message: String) -> String? {

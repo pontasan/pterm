@@ -27,6 +27,8 @@ enum ShortcutAction: String, CaseIterable {
     case openSettings = "open_settings"
     case newWindow = "new_window"
     case undo = "undo"
+    case clearScreen = "clear_screen"
+    case scrollToTop = "scroll_to_top"
     case zoomIn = "zoom_in"
     case zoomOut = "zoom_out"
     case zoomReset = "zoom_reset"
@@ -128,6 +130,8 @@ struct ShortcutConfiguration {
         .openSettings: .init(primary: command(",")),
         .newWindow: .init(primary: command("n")),
         .undo: .init(primary: command("z")),
+        .clearScreen: .init(primary: command("k")),
+        .scrollToTop: .init(primary: command("l")),
         .zoomIn: .init(primary: command("="), alternates: [shiftCommand("=")]),
         .zoomOut: .init(primary: command("-")),
         .zoomReset: .init(primary: command("0"))
@@ -262,6 +266,10 @@ extension ShortcutAction {
             return #selector(AppDelegate.newWindowReserved(_:))
         case .undo:
             return #selector(AppDelegate.undoTextInput(_:))
+        case .clearScreen:
+            return #selector(AppDelegate.clearActiveTerminalScreen(_:))
+        case .scrollToTop:
+            return #selector(AppDelegate.scrollActiveTerminalToTop(_:))
         case .zoomIn:
             return #selector(AppDelegate.fontSizeIncrease(_:))
         case .zoomOut:

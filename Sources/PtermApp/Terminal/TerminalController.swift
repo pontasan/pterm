@@ -532,7 +532,7 @@ final class TerminalController {
     /// Scroll up (view older content). Returns true if the offset changed.
     @discardableResult
     func scrollUp(lines: Int) -> Bool {
-        lock.withWriteLock {
+        let changed = lock.withWriteLock {
             let maxOffset = scrollback.rowCount
             let newOffset = min(maxOffset, scrollOffset + lines)
             if newOffset != scrollOffset {
@@ -541,12 +541,16 @@ final class TerminalController {
             }
             return false
         }
+        if changed {
+            scheduleMainCallbacks(needsDisplay: true)
+        }
+        return changed
     }
 
     /// Scroll down (view newer content). Returns true if the offset changed.
     @discardableResult
     func scrollDown(lines: Int) -> Bool {
-        lock.withWriteLock {
+        let changed = lock.withWriteLock {
             let newOffset = max(0, scrollOffset - lines)
             if newOffset != scrollOffset {
                 scrollOffset = newOffset
@@ -554,20 +558,47 @@ final class TerminalController {
             }
             return false
         }
+        if changed {
+            scheduleMainCallbacks(needsDisplay: true)
+        }
+        return changed
     }
 
     /// Set the scroll offset to an absolute value (used by NSScroller drag).
     func setScrollOffset(_ offset: Int) {
-        lock.withWriteLock {
+        let changed = lock.withWriteLock {
             let maxOffset = scrollback.rowCount
-            scrollOffset = max(0, min(maxOffset, offset))
+            let newOffset = max(0, min(maxOffset, offset))
+            guard newOffset != scrollOffset else { return false }
+            scrollOffset = newOffset
+            return true
+        }
+        if changed {
+            scheduleMainCallbacks(needsDisplay: true)
         }
     }
 
     /// Scroll to the very bottom (resume normal operation).
     func scrollToBottom() {
-        lock.withWriteLock {
+        let changed = lock.withWriteLock {
+            guard scrollOffset != 0 else { return false }
             scrollOffset = 0
+            return true
+        }
+        if changed {
+            scheduleMainCallbacks(needsDisplay: true)
+        }
+    }
+
+    func scrollToTop() {
+        let changed = lock.withWriteLock {
+            let target = scrollback.rowCount
+            guard scrollOffset != target else { return false }
+            scrollOffset = target
+            return true
+        }
+        if changed {
+            scheduleMainCallbacks(needsDisplay: true)
         }
     }
 

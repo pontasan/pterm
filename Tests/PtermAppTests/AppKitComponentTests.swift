@@ -5532,6 +5532,49 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(renderer.glyphAtlas.scaleFactor, 2.0)
     }
 
+    func testTerminalScrollViewForwardsCommandLToTerminalShortcutHandler() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let scrollView = TerminalScrollView(frame: NSRect(x: 0, y: 0, width: 320, height: 180), renderer: renderer)
+        scrollView.terminalView.terminalController = controller
+
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(scrollView)
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(scrollView.terminalView)
+
+        let spy = ShortcutActionSpy()
+        let originalDelegate = NSApp.delegate
+        NSApp.delegate = spy
+        defer { NSApp.delegate = originalDelegate }
+
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: "l",
+            charactersIgnoringModifiers: "l",
+            isARepeat: false,
+            keyCode: 37
+        ))
+
+        XCTAssertTrue(scrollView.performKeyEquivalent(with: event))
+        XCTAssertTrue(spy.didInvokeScrollToTop)
+    }
+
     func testIntegratedViewDragReorderTerminalAndWorkspaceCallbacks() throws {
         let renderer = try makeRendererWithPipelinesOrSkip()
         let manager = TerminalManager(rows: 24, cols: 80, config: .default)
@@ -6092,6 +6135,14 @@ private final class SaveSpy {
 
     func record(_ text: String) {
         savedTexts.append(text)
+    }
+}
+
+private final class ShortcutActionSpy: NSResponder, NSApplicationDelegate {
+    var didInvokeScrollToTop = false
+
+    @objc func scrollActiveTerminalToTop(_ sender: Any?) {
+        didInvokeScrollToTop = true
     }
 }
 

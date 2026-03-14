@@ -623,6 +623,15 @@ final class AppInfrastructureTests: XCTestCase {
         }
     }
 
+    func testShortcutConfigurationDefaultsIncludeClearScreenAndScrollToTop() {
+        let config = ShortcutConfiguration.default
+
+        XCTAssertEqual(config.binding(for: .clearScreen).primary.menuKeyEquivalent, "k")
+        XCTAssertEqual(config.binding(for: .clearScreen).primary.modifiers, [.command])
+        XCTAssertEqual(config.binding(for: .scrollToTop).primary.menuKeyEquivalent, "l")
+        XCTAssertEqual(config.binding(for: .scrollToTop).primary.modifiers, [.command])
+    }
+
     func testKeyboardShortcutMenuKeyEquivalentMatchesSpecialKeyCodes() {
         let backtick = KeyboardShortcut(modifiers: [.command], trigger: .keyCode(50))
         let escape = KeyboardShortcut(modifiers: [.command], trigger: .keyCode(53))

@@ -635,6 +635,48 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertFalse(controller.scrollDown(lines: 1))
     }
 
+    func testScrollToTopPinsViewportToOldestScrollbackRow() {
+        let controller = makeController()
+        controller.scrollback.appendRow(ArraySlice([Cell(codepoint: 65, attributes: .default, width: 1, isWideContinuation: false)]), isWrapped: false)
+        controller.scrollback.appendRow(ArraySlice([Cell(codepoint: 66, attributes: .default, width: 1, isWideContinuation: false)]), isWrapped: false)
+
+        controller.scrollToTop()
+
+        XCTAssertEqual(controller.withViewport { _, _, offset in offset }, 2)
+    }
+
+    func testScrollToTopEmitsDisplayCallbackWhenOffsetChanges() {
+        let controller = makeController()
+        controller.scrollback.appendRow(ArraySlice([Cell(codepoint: 65, attributes: .default, width: 1, isWideContinuation: false)]), isWrapped: false)
+        var displayCount = 0
+        controller.onNeedsDisplay = { displayCount += 1 }
+
+        controller.scrollToTop()
+        drainMainQueue(testCase: self)
+
+        XCTAssertEqual(displayCount, 1)
+    }
+
+    func testClearScrollbackClearsHistoryAndResetsScrollOffsetWithoutMutatingGrid() {
+        let controller = makeController(rows: 2, cols: 4)
+        controller.scrollback.appendRow(ArraySlice([Cell(codepoint: 88, attributes: .default, width: 1, isWideContinuation: false)]), isWrapped: false)
+        controller.scrollUp(lines: 1)
+        controller.withModel { model in
+            model.grid.setCell(Cell(codepoint: 65, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 0)
+            model.grid.setCell(Cell(codepoint: 66, attributes: .default, width: 1, isWideContinuation: false), at: 1, col: 1)
+        }
+
+        controller.clearScrollback()
+        drainMainQueue(testCase: self)
+
+        XCTAssertEqual(controller.withViewport { _, _, offset in offset }, 0)
+        controller.withModel { model in
+            XCTAssertEqual(model.grid.cell(at: 0, col: 0).codepoint, 65)
+            XCTAssertEqual(model.grid.cell(at: 1, col: 1).codepoint, 66)
+        }
+        XCTAssertEqual(controller.scrollback.rowCount, 0)
+    }
+
     func testFindMatchesIsCaseInsensitiveAndEmptyQueryReturnsNoMatches() {
         let controller = makeController(rows: 1, cols: 8)
         controller.withModel { model in
