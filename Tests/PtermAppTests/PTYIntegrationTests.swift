@@ -484,6 +484,227 @@ final class PTYIntegrationTests: XCTestCase {
         XCTAssertFalse(finalText.contains("\(marker)\(String(format: "%05d", totalLines))"))
     }
 
+    @MainActor
+    func testTerminalControllerRealPTYResizeImmediatelyRewrapsExistingViewportContent() throws {
+        try withTemporaryDirectory { directory in
+            let controller = TerminalController(
+                rows: 6,
+                cols: 10,
+                termEnv: "xterm-256color",
+                textEncoding: .utf8,
+                scrollbackInitialCapacity: 4096,
+                scrollbackMaxCapacity: 4096,
+                fontName: "Menlo",
+                fontSize: 13,
+                initialDirectory: directory.path
+            )
+            defer { controller.stop(waitForExit: true) }
+
+            let logicalText = "ABCDEFGHIJKLMNOPQRSTUVWX"
+            let marker = "__PTERM_WRAP_READY__"
+            let scriptURL = directory.appendingPathComponent("paint.sh")
+            try """
+            printf '\\033[?1049h\\033[H\\033[2J\(logicalText)\\n\(marker)\\n'
+            sleep 1.5
+            """.write(to: scriptURL, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
+
+            let paintedExpectation = expectation(description: "controller-wrap-marker-painted")
+            var markerSeen = false
+
+            controller.onOutputActivity = {
+                guard !markerSeen else { return }
+                if controller.allText().contains(marker) {
+                    markerSeen = true
+                    paintedExpectation.fulfill()
+                }
+            }
+
+            try controller.start()
+            controller.sendInput("stty -echo\n")
+            let echoDisabled = expectation(description: "controller-echo-disabled")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                echoDisabled.fulfill()
+            }
+            wait(for: [echoDisabled], timeout: 1.0)
+            controller.sendInput(". ./paint.sh\n")
+
+            wait(for: [paintedExpectation], timeout: 8.0)
+            drainMainQueue(testCase: self)
+
+            let narrowLines = Self.visibleViewportLines(of: controller, count: 4)
+            XCTAssertEqual(narrowLines[0].trimmingCharacters(in: .whitespaces), "ABCDEFGHIJ")
+            XCTAssertEqual(narrowLines[1].trimmingCharacters(in: .whitespaces), "KLMNOPQRST")
+            XCTAssertEqual(narrowLines[2].trimmingCharacters(in: .whitespaces), "UVWX")
+
+            controller.resize(rows: 6, cols: 40)
+            drainMainQueue(testCase: self)
+
+            let wideLines = Self.visibleViewportLines(of: controller, count: 4)
+            XCTAssertEqual(wideLines[0].trimmingCharacters(in: .whitespaces), logicalText)
+            XCTAssertEqual(wideLines[1].trimmingCharacters(in: .whitespaces), marker)
+            XCTAssertEqual(wideLines[2].trimmingCharacters(in: .whitespaces), "")
+        }
+    }
+
+    @MainActor
+    func testTerminalControllerRealPTYResizeSignalsForegroundProcessGroupWithSIGWINCH() throws {
+        let controller = TerminalController(
+            rows: 6,
+            cols: 20,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        defer { controller.stop(waitForExit: true) }
+
+        let readyMarker = "__WINCH_READY__"
+        let winchMarker = "__WINCH_SEEN__"
+        let readyExpectation = expectation(description: "foreground-process-ready")
+        let winchExpectation = expectation(description: "foreground-process-received-sigwinch")
+        var readySeen = false
+        var winchSeen = false
+
+        controller.onOutputActivity = {
+            let text = controller.allText()
+            if !readySeen, text.contains(readyMarker) {
+                readySeen = true
+                readyExpectation.fulfill()
+            }
+            if !winchSeen, text.contains(winchMarker) {
+                winchSeen = true
+                winchExpectation.fulfill()
+            }
+        }
+
+        try controller.start()
+        controller.sendInput("stty -echo\n")
+        let echoDisabled = expectation(description: "winch-echo-disabled")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            echoDisabled.fulfill()
+        }
+        wait(for: [echoDisabled], timeout: 1.0)
+        controller.sendInput(
+            """
+            /bin/sh -c 'trap "printf \"\(winchMarker)\\\\n\"" WINCH; printf "\(readyMarker)\\n"; while :; do sleep 1; done' &
+            fg %1
+            """
+        )
+
+        wait(for: [readyExpectation], timeout: 8.0)
+        controller.resize(rows: 6, cols: 40)
+        wait(for: [winchExpectation], timeout: 3.0)
+    }
+
+    @MainActor
+    func testTerminalControllerNotifyCurrentSizeChangedSignalsForegroundProcessGroupWithoutGeometryChange() throws {
+        let controller = TerminalController(
+            rows: 6,
+            cols: 20,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        defer { controller.stop(waitForExit: true) }
+
+        let readyMarker = "__NOTIFY_READY__"
+        let winchMarker = "__NOTIFY_WINCH__"
+        let readyExpectation = expectation(description: "foreground-process-ready-notify")
+        let winchExpectation = expectation(description: "foreground-process-received-notify-current-size")
+        var readySeen = false
+        var winchSeen = false
+
+        controller.onOutputActivity = {
+            let text = controller.allText()
+            if !readySeen, text.contains(readyMarker) {
+                readySeen = true
+                readyExpectation.fulfill()
+            }
+            if !winchSeen, text.contains(winchMarker) {
+                winchSeen = true
+                winchExpectation.fulfill()
+            }
+        }
+
+        try controller.start()
+        controller.sendInput("stty -echo\n")
+        let echoDisabled = expectation(description: "notify-echo-disabled")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            echoDisabled.fulfill()
+        }
+        wait(for: [echoDisabled], timeout: 1.0)
+        controller.sendInput(
+            """
+            /bin/sh -c 'trap "printf \"\(winchMarker)\\\\n\"" WINCH; printf "\(readyMarker)\\n"; while :; do sleep 1; done' &
+            fg %1
+            """
+        )
+
+        wait(for: [readyExpectation], timeout: 8.0)
+        controller.notifyCurrentSizeChanged()
+        wait(for: [winchExpectation], timeout: 3.0)
+    }
+
+    @MainActor
+    func testTerminalControllerRepeatedNotifyCurrentSizeChangedDeliversThirdWINCHToForegroundProcessGroup() throws {
+        let controller = TerminalController(
+            rows: 6,
+            cols: 20,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        defer { controller.stop(waitForExit: true) }
+
+        let readyMarker = "__TRIPLE_NOTIFY_READY__"
+        let winchMarker = "__TRIPLE_NOTIFY_WINCH__"
+        let readyExpectation = expectation(description: "foreground-process-ready-triple-notify")
+        let winchExpectation = expectation(description: "foreground-process-received-third-notify")
+        var readySeen = false
+        var winchSeen = false
+
+        controller.onOutputActivity = {
+            let text = controller.allText()
+            if !readySeen, text.contains(readyMarker) {
+                readySeen = true
+                readyExpectation.fulfill()
+            }
+            if !winchSeen, text.contains(winchMarker) {
+                winchSeen = true
+                winchExpectation.fulfill()
+            }
+        }
+
+        try controller.start()
+        controller.sendInput("stty -echo\n")
+        let echoDisabled = expectation(description: "triple-notify-echo-disabled")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            echoDisabled.fulfill()
+        }
+        wait(for: [echoDisabled], timeout: 1.0)
+        controller.sendInput(
+            """
+            /bin/sh -c 'count=0; trap "count=$((count + 1)); if [ \"$count\" -ge 3 ]; then printf \"\(winchMarker)\\\\n\"; fi" WINCH; printf "\(readyMarker)\\n"; while :; do sleep 1; done' &
+            fg %1
+            """
+        )
+
+        wait(for: [readyExpectation], timeout: 8.0)
+        controller.notifyCurrentSizeChanged()
+        controller.notifyCurrentSizeChanged()
+        controller.notifyCurrentSizeChanged()
+        wait(for: [winchExpectation], timeout: 3.0)
+    }
+
     private static func highestStreamingMarker(in text: String, marker: String) -> Int {
         var highest = -1
         var searchStart = text.startIndex
@@ -499,5 +720,41 @@ final class PTYIntegrationTests: XCTestCase {
             searchStart = range.upperBound
         }
         return highest
+    }
+
+    private static func visibleViewportLines(of controller: TerminalController, count: Int) -> [String] {
+        controller.withViewport { model, scrollback, scrollOffset in
+            let rows = min(count, model.rows)
+            let scrollbackRowCount = scrollback.rowCount
+            let firstAbsolute = scrollOffset > 0 ? max(0, scrollbackRowCount - scrollOffset) : scrollbackRowCount
+            return (0..<rows).map { row in
+                let absoluteRow = firstAbsolute + row
+                let cells: [Cell]
+                if absoluteRow < scrollbackRowCount {
+                    cells = scrollback.getRow(at: absoluteRow) ?? []
+                } else {
+                    let gridRow = absoluteRow - scrollbackRowCount
+                    cells = (0..<model.cols).map { model.grid.cell(at: gridRow, col: $0) }
+                }
+                return viewportLineText(cells: cells, cols: model.cols)
+            }
+        }
+    }
+
+    private static func viewportLineText(cells: [Cell], cols: Int) -> String {
+        var text = ""
+        text.reserveCapacity(cols)
+        for col in 0..<cols {
+            let cell = col < cells.count ? cells[col] : .empty
+            if cell.isWideContinuation {
+                continue
+            }
+            guard cell.codepoint != 0, let scalar = UnicodeScalar(cell.codepoint) else {
+                text.append(" ")
+                continue
+            }
+            text.append(Character(scalar))
+        }
+        return text
     }
 }

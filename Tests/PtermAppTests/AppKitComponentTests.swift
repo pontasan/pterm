@@ -8709,6 +8709,486 @@ private extension AppKitComponentTests {
         XCTAssertTrue(container.selectedTerminalIDs.isEmpty)
     }
 
+    func testSplitTerminalContainerImmediatelyResizesControllersWhenGridChanges() throws {
+        let renderer = try makeRendererOrSkip()
+        let controllers = (0..<4).map { index in
+            TerminalController(
+                rows: 4,
+                cols: 12,
+                termEnv: "xterm-256color",
+                textEncoding: .utf8,
+                scrollbackInitialCapacity: 4096,
+                scrollbackMaxCapacity: 4096,
+                fontName: "Menlo",
+                fontSize: 13
+            )
+        }
+        let container = SplitTerminalContainerView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 360),
+            renderer: renderer,
+            controllers: controllers
+        )
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 360),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(container)
+        window.makeKeyAndOrderFront(nil)
+        container.layoutSubtreeIfNeeded()
+
+        let first = try XCTUnwrap(controllers.first)
+        let splitCols = first.withModel { $0.cols }
+        XCTAssertLessThan(splitCols, 40)
+
+        container.updateControllers([first])
+        container.layoutSubtreeIfNeeded()
+
+        let focusedCols = first.withModel { $0.cols }
+        XCTAssertGreaterThan(focusedCols, splitCols)
+    }
+
+    func testSplitTerminalContainerImmediateResizeRewrapsExistingViewportContent() throws {
+        let renderer = try makeRendererOrSkip()
+        let first = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let second = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let container = SplitTerminalContainerView(
+            frame: NSRect(x: 0, y: 0, width: 420, height: 260),
+            renderer: renderer,
+            controllers: [first, second]
+        )
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 260),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(container)
+        window.makeKeyAndOrderFront(nil)
+        container.layoutSubtreeIfNeeded()
+
+        let splitCols = first.withModel { $0.cols }
+        XCTAssertGreaterThanOrEqual(splitCols, 4)
+
+        let logicalText = String((0..<(splitCols + 4)).map { index in
+            Character(UnicodeScalar(65 + (index % 26))!)
+        })
+        seedWrappedViewportContent(first, logicalText: logicalText, splitCols: splitCols)
+
+        let splitLines = visibleViewportLines(of: first, count: 2)
+        XCTAssertEqual(splitLines.first?.trimmingCharacters(in: .whitespaces), String(logicalText.prefix(splitCols)))
+        XCTAssertEqual(splitLines.dropFirst().first?.trimmingCharacters(in: .whitespaces), String(logicalText.dropFirst(splitCols)))
+
+        container.updateControllers([first])
+        container.layoutSubtreeIfNeeded()
+
+        let focusedCols = first.withModel { $0.cols }
+        XCTAssertGreaterThan(focusedCols, splitCols)
+
+        let focusedLines = visibleViewportLines(of: first, count: 2)
+        XCTAssertEqual(focusedLines.first?.trimmingCharacters(in: .whitespaces), logicalText)
+        XCTAssertEqual(focusedLines.dropFirst().first?.trimmingCharacters(in: .whitespaces), "")
+    }
+
+    func testSplitMaximizeImmediatelyRewrapsExistingLivePTYContent() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+
+        try withTemporaryDirectory { directory in
+            let first = try manager.addTerminal(
+                initialDirectory: directory.path,
+                customTitle: "wk",
+                workspaceName: "Alpha",
+                fontName: "Menlo",
+                fontSize: 13
+            )
+            let second = try manager.addTerminal(
+                initialDirectory: directory.path,
+                customTitle: "aws",
+                workspaceName: "Alpha",
+                fontName: "Menlo",
+                fontSize: 13
+            )
+
+            let harness = try makeAppHarness(renderer: renderer, manager: manager)
+            let delegate = harness.delegate
+            let hostedContentView = harness.hostedContentView
+
+            let logicalText = "ABCDEFGHIJKLMNOPQRSTUVWX"
+            let marker = "__PTERM_WRAP_READY__"
+            let scriptURL = directory.appendingPathComponent("paint.sh")
+            try """
+            printf '\\033[?1049h\\033[H\\033[2J\(logicalText)\\n\(marker)\\n'
+            sleep 1.5
+            """.write(to: scriptURL, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
+
+            let markerExpectation = expectation(description: "live split marker visible")
+            var markerSeen = false
+            first.onOutputActivity = {
+                guard !markerSeen else { return }
+                if first.allText().contains(marker) {
+                    markerSeen = true
+                    markerExpectation.fulfill()
+                }
+            }
+
+            delegate.switchToSplit([first, second])
+            let initialSplit = try currentSplitContainer(in: hostedContentView)
+            let splitCols = first.withModel { $0.cols }
+            XCTAssertGreaterThanOrEqual(splitCols, 4)
+
+            first.sendInput("stty -echo\n")
+            let echoDisabled = expectation(description: "live split echo disabled")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                echoDisabled.fulfill()
+            }
+            wait(for: [echoDisabled], timeout: 1.0)
+            first.sendInput(". ./paint.sh\n")
+
+            wait(for: [markerExpectation], timeout: 8.0)
+            drainMainQueue(testCase: self)
+
+            let narrowLines = visibleViewportLines(of: first, count: 4)
+            XCTAssertEqual(narrowLines[0].trimmingCharacters(in: .whitespaces), "ABCDEFGHIJ")
+            XCTAssertEqual(narrowLines[1].trimmingCharacters(in: .whitespaces), "KLMNOPQRST")
+            XCTAssertEqual(narrowLines[2].trimmingCharacters(in: .whitespaces), "UVWX")
+
+            initialSplit.onMaximizeTerminal?(first)
+            drainMainQueue(testCase: self)
+
+            let focusedScrollView = try currentFocusedScrollView(in: hostedContentView)
+            XCTAssertTrue(focusedScrollView.terminalView.terminalController === first)
+
+            let focusedCols = first.withModel { $0.cols }
+            XCTAssertGreaterThan(focusedCols, splitCols)
+
+            let focusedLines = visibleViewportLines(of: first, count: 4)
+            XCTAssertEqual(focusedLines[0].trimmingCharacters(in: .whitespaces), logicalText)
+            XCTAssertEqual(focusedLines[1].trimmingCharacters(in: .whitespaces), marker)
+            XCTAssertEqual(focusedLines[2].trimmingCharacters(in: .whitespaces), "")
+        }
+    }
+
+    func testSplitMaximizeDeliversWideSIGWINCHRepaintToForegroundPTYApp() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+
+        try withTemporaryDirectory { directory in
+            let first = try manager.addTerminal(
+                initialDirectory: directory.path,
+                customTitle: "wk",
+                workspaceName: "Alpha",
+                fontName: "Menlo",
+                fontSize: 13
+            )
+            let second = try manager.addTerminal(
+                initialDirectory: directory.path,
+                customTitle: "aws",
+                workspaceName: "Alpha",
+                fontName: "Menlo",
+                fontSize: 13
+            )
+
+            let harness = try makeAppHarness(renderer: renderer, manager: manager)
+            let delegate = harness.delegate
+            let hostedContentView = harness.hostedContentView
+
+            let scriptURL = directory.appendingPathComponent("winch-repaint.sh")
+            try """
+            print_frame() {
+              cols=$(stty size | awk '{print $2}')
+              printf '\\033[?1049h\\033[H\\033[2JCOLS:%s\\n' "$cols"
+              if [ "$cols" -lt 20 ]; then
+                printf '__NARROW__\\n'
+              else
+                printf '__WIDE__\\n'
+              fi
+            }
+            trap 'print_frame' WINCH
+            print_frame
+            while :; do sleep 1; done
+            """.write(to: scriptURL, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
+
+            let narrowExpectation = expectation(description: "foreground app painted narrow frame")
+            let wideExpectation = expectation(description: "foreground app repainted wide frame after maximize")
+            var narrowSeen = false
+            var wideSeen = false
+
+            first.onOutputActivity = {
+                let text = first.allText()
+                if !narrowSeen, text.contains("__NARROW__") {
+                    narrowSeen = true
+                    narrowExpectation.fulfill()
+                }
+                if narrowSeen, !wideSeen, text.contains("__WIDE__") {
+                    wideSeen = true
+                    wideExpectation.fulfill()
+                }
+            }
+
+            delegate.switchToSplit([first, second])
+            let initialSplit = try currentSplitContainer(in: hostedContentView)
+            let splitCols = first.withModel { $0.cols }
+            XCTAssertLessThan(splitCols, 20)
+
+            first.sendInput("stty -echo\n")
+            let echoDisabled = expectation(description: "winch-live-echo-disabled")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                echoDisabled.fulfill()
+            }
+            wait(for: [echoDisabled], timeout: 1.0)
+            first.sendInput(". ./winch-repaint.sh\n")
+
+            wait(for: [narrowExpectation], timeout: 8.0)
+            drainMainQueue(testCase: self)
+
+            initialSplit.onMaximizeTerminal?(first)
+            drainMainQueue(testCase: self)
+
+            let focusedCols = first.withModel { $0.cols }
+            XCTAssertGreaterThanOrEqual(focusedCols, 20)
+
+            wait(for: [wideExpectation], timeout: 3.0)
+            let focusedLines = visibleViewportLines(of: first, count: 3)
+            XCTAssertEqual(focusedLines[0].trimmingCharacters(in: .whitespaces), "COLS:\(focusedCols)")
+            XCTAssertEqual(focusedLines[1].trimmingCharacters(in: .whitespaces), "__WIDE__")
+        }
+    }
+
+    func testSplitMaximizeDeferredResizeNotificationRepaintsForegroundPTYAppThatSkipsFirstWINCH() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+
+        try withTemporaryDirectory { directory in
+            let first = try manager.addTerminal(
+                initialDirectory: directory.path,
+                customTitle: "wk",
+                workspaceName: "Alpha",
+                fontName: "Menlo",
+                fontSize: 13
+            )
+            let second = try manager.addTerminal(
+                initialDirectory: directory.path,
+                customTitle: "aws",
+                workspaceName: "Alpha",
+                fontName: "Menlo",
+                fontSize: 13
+            )
+
+            let harness = try makeAppHarness(renderer: renderer, manager: manager)
+            let delegate = harness.delegate
+            let hostedContentView = harness.hostedContentView
+
+            let scriptURL = directory.appendingPathComponent("deferred-winch-repaint.sh")
+            try """
+            winch_count=0
+            print_frame() {
+              cols=$(stty size | awk '{print $2}')
+              printf '\\033[?1049h\\033[H\\033[2JCOLS:%s\\n' "$cols"
+              if [ "$cols" -lt 20 ]; then
+                printf '__NARROW__\\n'
+              else
+                printf '__WIDE_AFTER_SECOND_WINCH__\\n'
+              fi
+            }
+            trap 'winch_count=$((winch_count + 1)); if [ "$winch_count" -ge 2 ]; then print_frame; fi' WINCH
+            print_frame
+            while :; do sleep 1; done
+            """.write(to: scriptURL, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
+
+            let narrowExpectation = expectation(description: "foreground app painted narrow frame with deferred-winch script")
+            let wideExpectation = expectation(description: "foreground app repainted on deferred size notification")
+            var narrowSeen = false
+            var wideSeen = false
+
+            first.onOutputActivity = {
+                let text = first.allText()
+                if !narrowSeen, text.contains("__NARROW__") {
+                    narrowSeen = true
+                    narrowExpectation.fulfill()
+                }
+                if narrowSeen, !wideSeen, text.contains("__WIDE_AFTER_SECOND_WINCH__") {
+                    wideSeen = true
+                    wideExpectation.fulfill()
+                }
+            }
+
+            delegate.switchToSplit([first, second])
+            let initialSplit = try currentSplitContainer(in: hostedContentView)
+
+            first.sendInput("stty -echo\n")
+            let echoDisabled = expectation(description: "deferred-winch-live-echo-disabled")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                echoDisabled.fulfill()
+            }
+            wait(for: [echoDisabled], timeout: 1.0)
+            first.sendInput(". ./deferred-winch-repaint.sh\n")
+
+            wait(for: [narrowExpectation], timeout: 8.0)
+            initialSplit.onMaximizeTerminal?(first)
+            wait(for: [wideExpectation], timeout: 3.0)
+        }
+    }
+
+    func testSplitMaximizeDeferredResizeNotificationRepaintsForegroundPTYAppThatSkipsFirstTwoWINCHSignals() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+
+        try withTemporaryDirectory { directory in
+            let first = try manager.addTerminal(
+                initialDirectory: directory.path,
+                customTitle: "wk",
+                workspaceName: "Alpha",
+                fontName: "Menlo",
+                fontSize: 13
+            )
+            let second = try manager.addTerminal(
+                initialDirectory: directory.path,
+                customTitle: "aws",
+                workspaceName: "Alpha",
+                fontName: "Menlo",
+                fontSize: 13
+            )
+
+            let harness = try makeAppHarness(renderer: renderer, manager: manager)
+            let delegate = harness.delegate
+            let hostedContentView = harness.hostedContentView
+
+            let scriptURL = directory.appendingPathComponent("third-winch-repaint.sh")
+            try """
+            winch_count=0
+            print_frame() {
+              cols=$(stty size | awk '{print $2}')
+              printf '\\033[?1049h\\033[H\\033[2JCOLS:%s\\n' "$cols"
+              if [ "$cols" -lt 20 ]; then
+                printf '__NARROW__\\n'
+              else
+                printf '__WIDE_AFTER_THIRD_WINCH__\\n'
+              fi
+            }
+            trap 'winch_count=$((winch_count + 1)); if [ "$winch_count" -ge 3 ]; then print_frame; fi' WINCH
+            print_frame
+            while :; do sleep 1; done
+            """.write(to: scriptURL, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
+
+            let narrowExpectation = expectation(description: "foreground app painted narrow frame with third-winch script")
+            let wideExpectation = expectation(description: "foreground app repainted on third size notification")
+            var narrowSeen = false
+            var wideSeen = false
+
+            first.onOutputActivity = {
+                let text = first.allText()
+                if !narrowSeen, text.contains("__NARROW__") {
+                    narrowSeen = true
+                    narrowExpectation.fulfill()
+                }
+                if narrowSeen, !wideSeen, text.contains("__WIDE_AFTER_THIRD_WINCH__") {
+                    wideSeen = true
+                    wideExpectation.fulfill()
+                }
+            }
+
+            delegate.switchToSplit([first, second])
+            let initialSplit = try currentSplitContainer(in: hostedContentView)
+
+            first.sendInput("stty -echo\n")
+            let echoDisabled = expectation(description: "third-winch-live-echo-disabled")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                echoDisabled.fulfill()
+            }
+            wait(for: [echoDisabled], timeout: 1.0)
+            first.sendInput(". ./third-winch-repaint.sh\n")
+
+            wait(for: [narrowExpectation], timeout: 8.0)
+            initialSplit.onMaximizeTerminal?(first)
+            wait(for: [wideExpectation], timeout: 3.0)
+        }
+    }
+
+    func seedWrappedViewportContent(_ controller: TerminalController, logicalText: String, splitCols: Int) {
+        let scalars = Array(logicalText.unicodeScalars)
+        controller.withModel { model in
+            model.grid.clearAll()
+            for (index, scalar) in scalars.prefix(splitCols).enumerated() {
+                model.grid.setCell(
+                    Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false),
+                    at: 0,
+                    col: index
+                )
+            }
+            let overflow = scalars.dropFirst(splitCols)
+            for (index, scalar) in overflow.enumerated() {
+                model.grid.setCell(
+                    Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false),
+                    at: 1,
+                    col: index
+                )
+            }
+            model.grid.setWrapped(1, true)
+        }
+    }
+
+    func visibleViewportLines(of controller: TerminalController, count: Int) -> [String] {
+        controller.withViewport { model, scrollback, scrollOffset in
+            let rows = min(count, model.rows)
+            let scrollbackRowCount = scrollback.rowCount
+            let firstAbsolute = scrollOffset > 0 ? max(0, scrollbackRowCount - scrollOffset) : scrollbackRowCount
+            return (0..<rows).map { row in
+                let absoluteRow = firstAbsolute + row
+                let cells: [Cell]
+                if absoluteRow < scrollbackRowCount {
+                    cells = scrollback.getRow(at: absoluteRow) ?? []
+                } else {
+                    let gridRow = absoluteRow - scrollbackRowCount
+                    cells = (0..<model.cols).map { model.grid.cell(at: gridRow, col: $0) }
+                }
+                return viewportLineText(cells: cells, cols: model.cols)
+            }
+        }
+    }
+
+    func viewportLineText(cells: [Cell], cols: Int) -> String {
+        var text = ""
+        text.reserveCapacity(cols)
+        for col in 0..<cols {
+            let cell = col < cells.count ? cells[col] : .empty
+            if cell.isWideContinuation {
+                continue
+            }
+            guard cell.codepoint != 0, let scalar = UnicodeScalar(cell.codepoint) else {
+                text.append(" ")
+                continue
+            }
+            text.append(Character(scalar))
+        }
+        return text
+    }
+
     func testTerminalViewCommandIdentityHeaderUsesWorkspaceAndTitle() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(

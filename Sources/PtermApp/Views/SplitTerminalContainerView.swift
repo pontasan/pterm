@@ -267,6 +267,7 @@ final class SplitTerminalContainerView: NSView {
                 width: cellWidth,
                 height: cellHeight
             )
+            scrollView.refreshViewportLayoutAndTerminalSize()
         }
 
         splitRenderView?.frame = bounds
@@ -325,6 +326,17 @@ final class SplitTerminalContainerView: NSView {
             scrollView.terminalView.releaseInactiveRenderingResourcesNow()
         }
         splitRenderView?.releaseInactiveRenderingResourcesNow()
+    }
+
+    func detachControllersForPresentationTransition() {
+        for scrollView in scrollViews {
+            scrollView.terminalView.onBecameFirstResponder = nil
+            scrollView.terminalView.onBackToIntegrated = nil
+            scrollView.terminalView.onCmdClick = nil
+            scrollView.terminalView.onShiftCommandClick = nil
+            scrollView.terminalView.terminalController = nil
+        }
+        splitRenderView?.cellRefs = []
     }
 
     func compactForMemoryPressureNow() {

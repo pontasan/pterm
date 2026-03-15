@@ -790,7 +790,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sv.shortcutConfiguration = config.shortcuts
         sv.terminalView.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
         sv.terminalView.typewriterSoundEnabled = config.textInteraction.typewriterSoundEnabled
-        sv.terminalView.terminalController = controller
         sv.terminalView.imagePreviewURLProvider = { [weak self] index in
             self?.pastedImageRegistry.url(forPlaceholderIndex: index)
         }
@@ -808,6 +807,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sv.terminalView.cmdClickTooltip = "⌘+Click to return to split view"
         }
         presentationHostView().addSubview(sv)
+
+        splitContainerView?.detachControllersForPresentationTransition()
 
         terminalView?.scrubPresentedDrawableForRemoval()
         terminalView?.releaseInactiveRenderingResourcesNow()
@@ -829,6 +830,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         terminalScrollView = sv
         terminalView = sv.terminalView
+        sv.terminalView.terminalController = controller
         suppressVisibleOutputIndicators(for: [controller.id])
         terminalView?.applyAppearanceSettings()
         focusedController = controller

@@ -595,7 +595,17 @@ final class TerminalController {
 
         if rows != oldRows || cols != oldCols {
             pty.resize(rows: UInt16(rows), cols: UInt16(cols))
+            scheduleMainCallbacks(needsDisplay: true, stateChange: true)
         }
+    }
+
+    func notifyCurrentSizeChanged() {
+        let currentSize = lock.withReadLock {
+            (rows: model.rows, cols: model.cols)
+        }
+        guard currentSize.rows > 0, currentSize.cols > 0 else { return }
+        pty.resize(rows: UInt16(currentSize.rows), cols: UInt16(currentSize.cols))
+        scheduleMainCallbacks(needsDisplay: true)
     }
 
     func notifyFocusChanged(_ isFocused: Bool) {

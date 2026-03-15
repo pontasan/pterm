@@ -152,6 +152,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var committedTextPreviewTimer: Timer?
     private var pendingIntentResolutionTimer: Timer?
     private var idleBufferReleaseTimer: Timer?
+    private var deferredResizeNotificationWorkItems: [DispatchWorkItem] = []
     private var markedTextLayer: CATextLayer?
     private var markedTextStorage: NSMutableAttributedString?
     private var markedTextSelection = NSRange(location: NSNotFound, length: 0)
@@ -366,6 +367,7 @@ final class TerminalView: MTKView, NSTextInputClient {
             outputPulseTimer = nil
             pendingIntentResolutionTimer?.invalidate()
             pendingIntentResolutionTimer = nil
+            cancelDeferredResizeNotifications()
             clearCommittedTextPreview()
             isPaused = true
             enableSetNeedsDisplay = false
@@ -394,7 +396,9 @@ final class TerminalView: MTKView, NSTextInputClient {
         applyRenderTargetColorSpace()
         if newScale != renderer.glyphAtlas.scaleFactor {
             renderer.glyphAtlas.updateScaleFactor(newScale)
-            updateTerminalSize()
+            if updateTerminalSize() {
+                scheduleDeferredResizeNotification()
+            }
         }
         let expectedSize = expectedDrawableSize(for: newScale)
         if abs(drawableSize.width - expectedSize.width) > 1 || abs(drawableSize.height - expectedSize.height) > 1 {
@@ -496,7 +500,9 @@ final class TerminalView: MTKView, NSTextInputClient {
         }
         controller.notifyFocusChanged(window?.isKeyWindow == true)
         scrollerSyncPending = true
-        updateTerminalSize()
+        if updateTerminalSize() {
+            scheduleDeferredResizeNotification()
+        }
         updateCursorBlinkTimer()
         updateOutputPulseTimer()
         // When a controller is assigned to a new view (e.g., returning to split view),
@@ -510,6 +516,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         committedTextPreviewTimer?.invalidate()
         pendingIntentResolutionTimer?.invalidate()
         idleBufferReleaseTimer?.invalidate()
+        cancelDeferredResizeNotifications()
         removeWindowObservers()
         hideImagePreview()
         renderer?.removeBuffers(for: self)
@@ -1322,14 +1329,15 @@ final class TerminalView: MTKView, NSTextInputClient {
         requestDisplayUpdate()
     }
 
-    private func updateTerminalSize() {
+    @discardableResult
+    private func updateTerminalSize() -> Bool {
         guard let renderer = renderer,
-              let controller = terminalController else { return }
+              let controller = terminalController else { return false }
 
         let cellW = renderer.glyphAtlas.cellWidth
         let cellH = renderer.glyphAtlas.cellHeight
 
-        guard cellW > 0, cellH > 0 else { return }
+        guard cellW > 0, cellH > 0 else { return false }
 
         let pad = renderer.gridPadding * 2  // padding on both sides
         let cols = max(1, Int((bounds.width - pad) / cellW))
@@ -1339,24 +1347,59 @@ final class TerminalView: MTKView, NSTextInputClient {
             (rows: model.rows, cols: model.cols)
         }
         guard currentSize.rows != rows || currentSize.cols != cols else {
-            return
+            return false
         }
 
         controller.resize(rows: rows, cols: cols)
 
         // Clear selection on resize (grid coordinates change)
         clearSelection()
+        return true
+    }
+
+    private func cancelDeferredResizeNotifications() {
+        deferredResizeNotificationWorkItems.forEach { $0.cancel() }
+        deferredResizeNotificationWorkItems.removeAll()
+    }
+
+    private func scheduleDeferredResizeNotification() {
+        cancelDeferredResizeNotifications()
+        guard let controller = terminalController else { return }
+        let delays: [TimeInterval] = [0.05, 0.20]
+        deferredResizeNotificationWorkItems = delays.map { delay in
+            let workItem = DispatchWorkItem { [weak self, weak controller] in
+                guard let self, let controller, !self.renderingSuppressed else { return }
+                controller.notifyCurrentSizeChanged()
+                self.requestDisplayUpdate()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+            return workItem
+        }
     }
 
     /// Called when font size changes. Recalculates terminal grid dimensions.
     func fontSizeDidChange() {
-        updateTerminalSize()
+        if updateTerminalSize() {
+            scheduleDeferredResizeNotification()
+        }
         updateMarkedTextOverlay()
     }
 
     /// Update only the IME overlay without triggering a terminal resize.
     func updateMarkedTextOverlayPublic() {
         updateMarkedTextOverlay()
+    }
+
+    /// Force a resize pass using the current viewport immediately.
+    /// Split/focused transitions can change width before the next output arrives,
+    /// and we want the PTY rows/cols to match right away.
+    func refreshTerminalLayoutForCurrentBounds() {
+        _ = syncDrawableSizeToBoundsIfNeeded()
+        if updateTerminalSize() {
+            scheduleDeferredResizeNotification()
+        }
+        updateMarkedTextOverlay()
+        requestDisplayUpdate()
     }
 
     static func clampedImagePreviewSize(
@@ -2248,7 +2291,7 @@ final class TerminalScrollView: NSScrollView {
         pinTerminalViewToViewport()
         layoutBackButton()
         lastScrollSyncSignature = nil
-        terminalView?.setNeedsDisplay(terminalView.bounds)
+        terminalView?.refreshTerminalLayoutForCurrentBounds()
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -2271,6 +2314,15 @@ final class TerminalScrollView: NSScrollView {
         if terminalView.frame != targetFrame {
             terminalView.frame = targetFrame
         }
+    }
+
+    /// Force scroll-view geometry and terminal rows/cols to match immediately.
+    func refreshViewportLayoutAndTerminalSize() {
+        documentView?.frame.size.width = bounds.width
+        pinTerminalViewToViewport()
+        lastScrollSyncSignature = nil
+        terminalView.refreshTerminalLayoutForCurrentBounds()
+        syncScroller()
     }
 
     private func layoutBackButton() {

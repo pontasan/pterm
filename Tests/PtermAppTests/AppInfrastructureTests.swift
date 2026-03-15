@@ -92,6 +92,31 @@ final class AppInfrastructureTests: XCTestCase {
         }
     }
 
+    func testTerminalControllerResizeSchedulesDisplayUpdateWithoutWaitingForOutput() {
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 256,
+            scrollbackMaxCapacity: 256,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+
+        let initialVersion = controller.currentRenderContentVersion
+        let displayExpectation = expectation(description: "display request")
+        controller.onNeedsDisplay = {
+            displayExpectation.fulfill()
+        }
+
+        controller.resize(rows: 4, cols: 24)
+
+        wait(for: [displayExpectation], timeout: 1.0)
+        XCTAssertGreaterThan(controller.currentRenderContentVersion, initialVersion)
+        XCTAssertEqual(controller.withModel { $0.cols }, 24)
+    }
+
     func testInitialLaunchDispositionRestoresSessionWithoutForcingIntegratedView() {
         let focusedID = UUID()
         let session = PersistedSessionState(
