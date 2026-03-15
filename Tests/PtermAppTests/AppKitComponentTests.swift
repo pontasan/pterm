@@ -7895,7 +7895,10 @@ final class AppKitComponentTests: XCTestCase {
         let hostedContentView = harness.hostedContentView
 
         let shuffledControllers = [betaSRC, alphaWK, gammaOPS, alphaAWS, betaAPI]
-        let expectedOriginalIDs = AppDelegate.groupedControllersForSplit(shuffledControllers).map(\.id)
+        let expectedOriginalIDs = AppDelegate.groupedControllersForSplit(
+            shuffledControllers,
+            displayOrder: manager.terminals
+        ).map(\.id)
 
         delegate.switchToSplit(shuffledControllers)
         XCTAssertEqual(try currentSplitContainer(in: hostedContentView).controllers.map(\.id), expectedOriginalIDs)
@@ -7904,7 +7907,10 @@ final class AppKitComponentTests: XCTestCase {
 
         let originalSplit = try currentSplitContainer(in: hostedContentView)
         let subsetSelection = [betaSRC, alphaWK, gammaOPS]
-        let expectedSubsetIDs = AppDelegate.groupedControllersForSplit(subsetSelection).map(\.id)
+        let expectedSubsetIDs = AppDelegate.groupedControllersForSplit(
+            subsetSelection,
+            displayOrder: manager.terminals
+        ).map(\.id)
         originalSplit.onCommitSelectedControllers?(subsetSelection)
 
         let subsetSplit = try currentSplitContainer(in: hostedContentView)

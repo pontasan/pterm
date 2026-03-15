@@ -212,18 +212,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    static func groupedControllersForSplit(_ controllers: [TerminalController]) -> [TerminalController] {
-        controllers.sorted { lhs, rhs in
+    static func groupedControllersForSplit(
+        _ controllers: [TerminalController],
+        displayOrder: [TerminalController]
+    ) -> [TerminalController] {
+        let displayOrderIndexByID = Dictionary(
+            uniqueKeysWithValues: displayOrder.enumerated().map { ($0.element.id, $0.offset) }
+        )
+        return controllers.sorted { lhs, rhs in
             let lhsWorkspace = splitOrderingKey(lhs.sessionSnapshot.workspaceName)
             let rhsWorkspace = splitOrderingKey(rhs.sessionSnapshot.workspaceName)
             if lhsWorkspace != rhsWorkspace {
                 return lhsWorkspace < rhsWorkspace
             }
 
-            let lhsTitle = splitOrderingKey(lhs.title)
-            let rhsTitle = splitOrderingKey(rhs.title)
-            if lhsTitle != rhsTitle {
-                return lhsTitle < rhsTitle
+            let lhsDisplayIndex = displayOrderIndexByID[lhs.id] ?? Int.max
+            let rhsDisplayIndex = displayOrderIndexByID[rhs.id] ?? Int.max
+            if lhsDisplayIndex != rhsDisplayIndex {
+                return lhsDisplayIndex < rhsDisplayIndex
             }
 
             return lhs.id.uuidString < rhs.id.uuidString
@@ -856,8 +862,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func switchToSplit(_ controllers: [TerminalController], returnToControllers: [TerminalController]?) {
-        let orderedControllers = Self.groupedControllersForSplit(controllers)
-        let orderedReturnControllers = returnToControllers.map(Self.groupedControllersForSplit)
+        let orderedControllers = Self.groupedControllersForSplit(controllers, displayOrder: manager.terminals)
+        let orderedReturnControllers = returnToControllers.map { Self.groupedControllersForSplit($0, displayOrder: manager.terminals) }
         guard orderedControllers.count >= 2 else {
             if let first = orderedControllers.first {
                 splitOriginControllers = orderedReturnControllers ?? orderedControllers
@@ -912,7 +918,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         splitView.onCommitSelectedControllers = { [weak self] selectedControllers in
             guard let self else { return }
-            let orderedSelection = Self.groupedControllersForSplit(selectedControllers)
+            let orderedSelection = Self.groupedControllersForSplit(selectedControllers, displayOrder: self.manager.terminals)
             guard !orderedSelection.isEmpty else { return }
             let ancestorSplitControllers = orderedReturnControllers ?? orderedControllers
             if orderedSelection.count == 1, let controller = orderedSelection.first {

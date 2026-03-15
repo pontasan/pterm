@@ -200,9 +200,12 @@ final class AppInfrastructureTests: XCTestCase {
             fontName: "Menlo", fontSize: 13, initialDirectory: "/tmp/b2", customTitle: "a-first", workspaceName: "B"
         )
 
-        let grouped = AppDelegate.groupedControllersForSplit([first, second, third, fourth, fifth])
+        let grouped = AppDelegate.groupedControllersForSplit(
+            [first, second, third, fourth, fifth],
+            displayOrder: [first, second, third, fourth, fifth]
+        )
 
-        XCTAssertEqual(grouped.map(\.id), [third, second, fifth, first, fourth].map(\.id))
+        XCTAssertEqual(grouped.map(\.id), [second, third, first, fifth, fourth].map(\.id))
     }
 
     func testMonitoredMetricsPIDsIncludesOnlyAppPIDOutsideIntegratedVisibleActiveState() {
