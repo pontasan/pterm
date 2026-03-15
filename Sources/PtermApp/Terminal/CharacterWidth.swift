@@ -12,6 +12,10 @@ import Foundation
 enum CharacterWidth {
 
     static func width(of codepoint: UInt32) -> Int {
+        if codepoint >= 0x20 && codepoint < 0x7F {
+            return 1
+        }
+
         // C0/C1 control characters
         if codepoint < 0x20 || (codepoint >= 0x7F && codepoint < 0xA0) {
             return -1

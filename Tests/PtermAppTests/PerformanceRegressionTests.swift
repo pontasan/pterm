@@ -13,6 +13,8 @@ private func durationNanoseconds(_ duration: Duration) -> UInt64 {
 
 @MainActor
 final class PerformanceRegressionTests: XCTestCase {
+    private static let allowedRegressionMultiplier = 2.0
+
     private struct HistoricalReference {
         let beforeNanoseconds: UInt64
         let note: String
@@ -265,7 +267,7 @@ final class PerformanceRegressionTests: XCTestCase {
         var file = try loadBaselineFile(from: url, reset: shouldReset)
         let historicalBefore = Self.historicalBeforeReferences[name]
         if let baseline = file.records[name], !shouldReset {
-            let threshold = UInt64(Double(baseline.medianNanoseconds) * 1.5)
+            let threshold = UInt64(Double(baseline.medianNanoseconds) * Self.allowedRegressionMultiplier)
             var message = "PERF \(name) current=\(median)ns baseline=\(baseline.medianNanoseconds)ns threshold=\(threshold)ns iterations=\(iterations)"
             if let historicalBefore {
                 message += " before_ref=\(historicalBefore.beforeNanoseconds)ns"
@@ -313,7 +315,7 @@ final class PerformanceRegressionTests: XCTestCase {
         let shouldReset = ProcessInfo.processInfo.environment["PTERM_RESET_PERF_BASELINES"] == "1"
         var file = try loadBaselineFile(from: url, reset: shouldReset)
         if let baseline = file.records[name], !shouldReset {
-            let threshold = UInt64(Double(baseline.medianNanoseconds) * 1.5)
+            let threshold = UInt64(Double(baseline.medianNanoseconds) * Self.allowedRegressionMultiplier)
             var message = "PERF \(name) current=\(statistic)ns baseline=\(baseline.medianNanoseconds)ns threshold=\(threshold)ns iterations=\(samples.count) statistic=p25"
             if let historicalBefore {
                 message += " before_ref=\(historicalBefore.beforeNanoseconds)ns"

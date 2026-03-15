@@ -149,6 +149,10 @@ final class TerminalTextDecoder {
     func decode(_ input: UnsafeBufferPointer<UInt8>, into output: inout [UInt32]) -> Int {
         switch encoding {
         case .utf8:
+            if utf8Decoder.state == UTF8_ACCEPT,
+               let asciiCount = decodeASCIIIfPossible(input, into: &output) {
+                return asciiCount
+            }
             return utf8_decoder_decode(
                 &utf8Decoder,
                 input.baseAddress,
@@ -159,6 +163,17 @@ final class TerminalTextDecoder {
         case .utf16, .utf16LittleEndian, .utf16BigEndian:
             return decodeUTF16(input, into: &output)
         }
+    }
+
+    private func decodeASCIIIfPossible(_ input: UnsafeBufferPointer<UInt8>, into output: inout [UInt32]) -> Int? {
+        guard input.count <= output.count else { return nil }
+        for byte in input where byte >= 0x80 {
+            return nil
+        }
+        for (index, byte) in input.enumerated() {
+            output[index] = UInt32(byte)
+        }
+        return input.count
     }
 
     private func decodeUTF16(_ input: UnsafeBufferPointer<UInt8>, into output: inout [UInt32]) -> Int {

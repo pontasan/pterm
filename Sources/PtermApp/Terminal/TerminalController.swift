@@ -162,8 +162,7 @@ final class TerminalController {
     private var interruptDiscardingOutput = false
     private var pendingInterruptDrainCompletion: DispatchWorkItem?
     private var renderContentVersion: UInt64 = 0
-    private var outputActivitySuppressedUntil: Date = .distantPast
-    private var interruptCatchUpUntil: Date = .distantPast
+    private var outputActivitySuppressedUntilUptime: TimeInterval = 0
     private let scrollbackCompactionLock = NSLock()
     private var pendingScrollbackCompaction: DispatchWorkItem?
     private let ptyResizeLock = NSLock()
@@ -177,6 +176,8 @@ final class TerminalController {
     private var textExtractionGridRowBuffer: [Cell] = []
     private var textExtractionScrollbackRowBuffer: [Cell] = []
     private var searchColumnBuffer: [Int] = []
+    private var pendingScrollbackRows: [ScrollbackBuffer.BufferedRow] = []
+    private var isBatchingScrollbackDuringPTYParse = false
 
     private let termEnv: String
     private let textEncoding: TerminalTextEncoding
@@ -225,9 +226,7 @@ final class TerminalController {
     }
 
     var isInInterruptCatchUpMode: Bool {
-        callbackLock.withLock {
-            Date() < interruptCatchUpUntil
-        }
+        false
     }
 
     var debugCodepointBufferCapacity: Int {
@@ -353,11 +352,17 @@ final class TerminalController {
         // Wire scrollback: when a line scrolls off the top, store it
         model.onScrollOut = { [weak self] cells, isWrapped in
             guard let self = self else { return }
-            self.scrollback.appendRow(ArraySlice(cells), isWrapped: isWrapped)
+            if self.isBatchingScrollbackDuringPTYParse {
+                self.pendingScrollbackRows.append(
+                    ScrollbackBuffer.BufferedRow(cells: Array(cells), isWrapped: isWrapped)
+                )
+            } else {
+                self.scrollback.appendRow(cells, isWrapped: isWrapped)
 
-            // If user is scrolled back, increment offset to keep viewport stable
-            if self.scrollOffset > 0 {
-                self.scrollOffset += 1
+                // If user is scrolled back, increment offset to keep viewport stable
+                if self.scrollOffset > 0 {
+                    self.scrollOffset += 1
+                }
             }
         }
     }
@@ -524,11 +529,12 @@ final class TerminalController {
     /// Send user keyboard input to the PTY.
     func sendInput(_ data: Data) {
         suppressScrollbackClear = false
+        let now = ProcessInfo.processInfo.systemUptime
         callbackLock.withLock {
             if Self.shouldSuppressOutputActivity(forInput: data) {
-                outputActivitySuppressedUntil = Date().addingTimeInterval(Self.inputEchoSuppressionInterval)
+                outputActivitySuppressedUntilUptime = now + Self.inputEchoSuppressionInterval
             } else {
-                outputActivitySuppressedUntil = .distantPast
+                outputActivitySuppressedUntilUptime = 0
             }
         }
         auditLogger?.recordInput(data)
@@ -552,8 +558,7 @@ final class TerminalController {
     func performInterrupt(controlCharacter: UInt8) {
         callbackLock.withLock {
             interruptDiscardingOutput = true
-            outputActivitySuppressedUntil = .distantPast
-            interruptCatchUpUntil = .distantPast
+            outputActivitySuppressedUntilUptime = 0
         }
         scheduleInterruptDrainCompletion()
         sendControlCharacter(controlCharacter)
@@ -585,11 +590,13 @@ final class TerminalController {
     }
 
     private func processPTYOutput(_ data: Data, recordAudit: Bool) {
+        guard !data.isEmpty else { return }
         cancelPendingScrollbackCompaction()
         if recordAudit {
             auditLogger?.recordOutput(data)
         }
         var clearedScrollback = false
+        var didMutateDisplay = false
         data.withUnsafeBytes { rawPtr in
             guard let ptr = rawPtr.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
                 return
@@ -597,6 +604,12 @@ final class TerminalController {
             let count = rawPtr.count
 
             lock.withWriteLock {
+                isBatchingScrollbackDuringPTYParse = true
+                pendingScrollbackRows.removeAll(keepingCapacity: true)
+                defer {
+                    pendingScrollbackRows.removeAll(keepingCapacity: true)
+                    isBatchingScrollbackDuringPTYParse = false
+                }
                 ensureCodepointBufferCapacity(requiredCount: count)
                 let cpCount = textDecoder.decode(
                     UnsafeBufferPointer(start: ptr, count: count),
@@ -605,7 +618,15 @@ final class TerminalController {
 
                 // Feed codepoints to VT parser (which updates the model)
                 if cpCount > 0 {
-                    vt_parser_feed(&parser, codepointBuffer, cpCount)
+                    codepointBuffer.withUnsafeBufferPointer { buffer in
+                        let decoded = UnsafeBufferPointer(start: buffer.baseAddress, count: cpCount)
+                        if canUseGroundFastPath(decoded) {
+                            model.handleGroundFastPath(decoded)
+                        } else {
+                            vt_parser_feed(&parser, codepointBuffer, cpCount)
+                        }
+                    }
+                    didMutateDisplay = true
                 }
 
                 if parserRequestedScrollbackClear {
@@ -613,17 +634,29 @@ final class TerminalController {
                        (scrollbackPersistenceEnabled && isShuttingDown) {
                         parserRequestedScrollbackClear = false
                     } else {
+                        pendingScrollbackRows.removeAll(keepingCapacity: true)
                         scrollback.clear()
                         scrollOffset = 0
                         parserRequestedScrollbackClear = false
                         clearedScrollback = true
+                        didMutateDisplay = true
+                    }
+                }
+
+                if !pendingScrollbackRows.isEmpty {
+                    scrollback.appendRows(pendingScrollbackRows)
+                    if scrollOffset > 0 {
+                        scrollOffset += pendingScrollbackRows.count
                     }
                 }
             }
         }
 
+        guard didMutateDisplay || clearedScrollback else { return }
+
+        let now = ProcessInfo.processInfo.systemUptime
         let shouldReportOutputActivity = callbackLock.withLock {
-            Date() >= outputActivitySuppressedUntil
+            now >= outputActivitySuppressedUntilUptime
         }
 
         scheduleMainCallbacks(
@@ -632,6 +665,23 @@ final class TerminalController {
             stateChange: clearedScrollback
         )
         scheduleScrollbackCompaction()
+    }
+
+    private func canUseGroundFastPath(_ codepoints: UnsafeBufferPointer<UInt32>) -> Bool {
+        guard parser.state == VT_STATE_GROUND else { return false }
+        for codepoint in codepoints {
+            switch codepoint {
+            case 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F:
+                continue
+            case 0x1B, 0x18, 0x1A, 0x7F:
+                return false
+            case 0x00...0x1F:
+                return false
+            default:
+                continue
+            }
+        }
+        return true
     }
 
     // MARK: - Resize
@@ -1059,13 +1109,7 @@ final class TerminalController {
         let shouldSchedule = callbackLock.withLock {
             if needsDisplay {
                 renderContentVersion &+= 1
-            }
-            if needsDisplay {
-                if Date() < interruptCatchUpUntil {
-                    pendingNeedsDisplay = true
-                } else {
-                    pendingNeedsDisplay = pendingNeedsDisplay || needsDisplay
-                }
+                pendingNeedsDisplay = true
             }
             pendingOutputActivity = pendingOutputActivity || outputActivity
             pendingStateChange = pendingStateChange || stateChange

@@ -10,6 +10,11 @@ import PtermCore
 /// Thread safety: Callers must manage external synchronization.
 /// In practice, the TerminalController lock covers all access.
 final class ScrollbackBuffer {
+    struct BufferedRow {
+        let cells: [Cell]
+        let isWrapped: Bool
+    }
+
     private enum RowEncodingPlan {
         case compactDefault(serializedCount: Int)
         case compactUniformAttributes(sharedAttributes: CellAttributes, serializedCount: Int)
@@ -49,9 +54,20 @@ final class ScrollbackBuffer {
         serializeBufCapacity
     }
 
+    private struct SerializedRowScratch {
+        let plan: RowEncodingPlan
+        let cellCount: Int
+        let byteCount: Int
+        let isWrapped: Bool
+    }
+
     /// Reusable serialization buffer (avoids per-call allocation)
     private var serializeBuf: UnsafeMutablePointer<UInt8>?
     private var serializeBufCapacity: Int = 0
+    private var serializedRowsScratch: [SerializedRowScratch] = []
+    private var rowOffsetsScratch: [UInt32] = []
+    private var rowLengthsScratch: [UInt32] = []
+    private var rowContinuationsScratch: [Bool] = []
     private static let serializationBufferPageSize = 4096
 
     /// Bytes per cell in binary format
@@ -61,6 +77,8 @@ final class ScrollbackBuffer {
     private static let uniformAttributesHeaderBytes = 10
     private static let uniformAttributesTrimmedHeaderBytes = 12
     private static let uniformAttributesBytesPerCell = 5
+    private static let targetBytesPerRowIndexEntry = 128
+    private static let rowIndexReserveSoftLimit = 4096
 
     init(initialCapacity: Int = 64 * 1024 * 1024,
          maxCapacity: Int = 64 * 1024 * 1024,
@@ -82,6 +100,20 @@ final class ScrollbackBuffer {
                 fatalError("Failed to create scrollback buffer with initial capacity \(initialCapacity) and max capacity \(maxCapacity)")
             }
             self.ringBuffer = ringBuffer
+        }
+
+        if let ringBuffer {
+            let estimatedRows = max(
+                Int(RING_BUFFER_MIN_ROWS),
+                min(
+                    maxCapacity / Self.targetBytesPerRowIndexEntry,
+                    Self.rowIndexReserveSoftLimit
+                )
+            )
+            precondition(
+                ring_buffer_reserve_row_index_capacity(ringBuffer, UInt32(estimatedRows)),
+                "Failed to reserve row index capacity \(estimatedRows)"
+            )
         }
     }
 
@@ -106,21 +138,7 @@ final class ScrollbackBuffer {
 
         let cellCount = cells.count
         let encodingPlan = Self.encodingPlan(for: cells)
-        let byteCount: Int
-        switch encodingPlan {
-        case .compactDefault(let serializedCount):
-            let headerBytes = serializedCount == cellCount
-                ? Self.compactRowHeaderBytes
-                : Self.compactTrimmedRowHeaderBytes
-            byteCount = headerBytes + (serializedCount * MemoryLayout<UInt32>.size)
-        case .compactUniformAttributes(_, let serializedCount):
-            let headerBytes = serializedCount == cellCount
-                ? Self.uniformAttributesHeaderBytes
-                : Self.uniformAttributesTrimmedHeaderBytes
-            byteCount = headerBytes + (serializedCount * Self.uniformAttributesBytesPerCell)
-        case .full:
-            byteCount = cellCount * Self.bytesPerCell
-        }
+        let byteCount = Self.serializedByteCount(for: encodingPlan, cellCount: cellCount)
 
         // Ensure serialization buffer is large enough while bounding retained slack.
         if serializeBufCapacity < byteCount || shouldShrinkSerializationBuffer(requiredByteCount: byteCount) {
@@ -128,43 +146,82 @@ final class ScrollbackBuffer {
         }
 
         guard let buf = serializeBuf else { return }
-
-        // Serialize cells into the buffer
-        switch encodingPlan {
-        case .compactDefault(let serializedCount):
-            let trimmed = serializedCount != cellCount
-            buf[0] = trimmed ? RowFormat.compactDefaultTrimmed : RowFormat.compactDefault
-            var offset = trimmed ? Self.compactTrimmedRowHeaderBytes : Self.compactRowHeaderBytes
-            if trimmed {
-                Self.serializeUInt16(UInt16(cellCount), to: buf + 1)
-            }
-            for cell in cells.prefix(serializedCount) {
-                Self.serializeCompactDefaultCell(cell, to: buf + offset)
-                offset += MemoryLayout<UInt32>.size
-            }
-        case .compactUniformAttributes(let sharedAttributes, let serializedCount):
-            let trimmed = serializedCount != cellCount
-            buf[0] = trimmed ? RowFormat.compactUniformAttributesTrimmed : RowFormat.compactUniformAttributes
-            Self.serializeColor(sharedAttributes.foreground, to: buf + 1)
-            Self.serializeColor(sharedAttributes.background, to: buf + 5)
-            buf[9] = Self.serializeAttributeFlags(sharedAttributes)
-            var offset = trimmed ? Self.uniformAttributesTrimmedHeaderBytes : Self.uniformAttributesHeaderBytes
-            if trimmed {
-                Self.serializeUInt16(UInt16(cellCount), to: buf + 10)
-            }
-            for cell in cells.prefix(serializedCount) {
-                Self.serializeCompactUniformAttributeCell(cell, to: buf + offset)
-                offset += Self.uniformAttributesBytesPerCell
-            }
-        case .full:
-            var offset = 0
-            for cell in cells {
-                Self.serializeCell(cell, to: buf + offset)
-                offset += Self.bytesPerCell
-            }
-        }
+        Self.serializeRow(cells, cellCount: cellCount, using: encodingPlan, into: buf)
 
         _ = ring_buffer_append_row(rb, buf, UInt32(byteCount), isWrapped)
+    }
+
+    /// Append multiple rows while reusing the same serialization scratch buffer.
+    func appendRows(_ rows: [BufferedRow]) {
+        guard let rb = ringBuffer, !rows.isEmpty else { return }
+        ensureAppendRowsScratchCapacity(rowCount: rows.count)
+        serializedRowsScratch.removeAll(keepingCapacity: true)
+        var totalByteCount = 0
+        for row in rows {
+            let slice = ArraySlice(row.cells)
+            let cellCount = row.cells.count
+            let plan = Self.encodingPlan(for: slice)
+            let byteCount = Self.serializedByteCount(for: plan, cellCount: cellCount)
+            serializedRowsScratch.append(
+                SerializedRowScratch(
+                    plan: plan,
+                    cellCount: cellCount,
+                    byteCount: byteCount,
+                    isWrapped: row.isWrapped
+                )
+            )
+            totalByteCount += byteCount
+        }
+
+        if serializeBufCapacity < totalByteCount || shouldShrinkSerializationBuffer(requiredByteCount: totalByteCount) {
+            resizeSerializationBuffer(requiredByteCount: totalByteCount)
+        }
+
+        guard let buf = serializeBuf else { return }
+
+        var runningOffset = 0
+        for index in rows.indices {
+            let row = rows[index]
+            let serialized = serializedRowsScratch[index]
+            rowOffsetsScratch[index] = UInt32(runningOffset)
+            rowLengthsScratch[index] = UInt32(serialized.byteCount)
+            rowContinuationsScratch[index] = serialized.isWrapped
+            Self.serializeRow(ArraySlice(row.cells),
+                              cellCount: serialized.cellCount,
+                              using: serialized.plan,
+                              into: buf + runningOffset)
+            runningOffset += serialized.byteCount
+        }
+        rowOffsetsScratch.withUnsafeBufferPointer { offsets in
+            rowLengthsScratch.withUnsafeBufferPointer { lengths in
+                rowContinuationsScratch.withUnsafeBufferPointer { continuations in
+                    _ = ring_buffer_append_rows(
+                        rb,
+                        buf,
+                        offsets.baseAddress,
+                        lengths.baseAddress,
+                        continuations.baseAddress,
+                        UInt32(rows.count)
+                    )
+                }
+            }
+        }
+    }
+
+    private func ensureAppendRowsScratchCapacity(rowCount: Int) {
+        guard rowCount > 0 else { return }
+        if serializedRowsScratch.capacity < rowCount {
+            serializedRowsScratch.reserveCapacity(rowCount)
+        }
+        if rowOffsetsScratch.count < rowCount {
+            rowOffsetsScratch = Array(repeating: 0, count: rowCount)
+        }
+        if rowLengthsScratch.count < rowCount {
+            rowLengthsScratch = Array(repeating: 0, count: rowCount)
+        }
+        if rowContinuationsScratch.count < rowCount {
+            rowContinuationsScratch = Array(repeating: false, count: rowCount)
+        }
     }
 
     /// Get a row of cells from the scrollback buffer.
@@ -365,40 +422,9 @@ final class ScrollbackBuffer {
         let sharedAttributes = first.attributes
         var canUseCompactDefault = true
         var canUseCompactUniform = true
-        var compactDefaultSerializedCount = cells.count
-        var compactUniformSerializedCount = cells.count
-        let uniformBlank = Cell(
-            codepoint: Cell.empty.codepoint,
-            attributes: sharedAttributes,
-            width: Cell.empty.width,
-            isWideContinuation: false
-        )
-
-        var index = cells.count - 1
-        for cell in cells.reversed() {
-            if !isCell(cell, equalTo: .empty) {
-                compactDefaultSerializedCount = index + 1
-                break
-            }
-            compactDefaultSerializedCount = index
-            if index == 0 { break }
-            index -= 1
-        }
-
-        index = cells.count - 1
-        for cell in cells.reversed() {
-            if !isCell(cell, equalTo: uniformBlank) {
-                compactUniformSerializedCount = index + 1
-                break
-            }
-            compactUniformSerializedCount = index
-            if index == 0 { break }
-            index -= 1
-        }
 
         for cell in cells {
-            if canUseCompactDefault &&
-                (cell.attributes != .default || cell.width != 1 || cell.isWideContinuation) {
+            if canUseCompactDefault && !isCompactDefaultCell(cell) {
                 canUseCompactDefault = false
             }
 
@@ -408,6 +434,44 @@ final class ScrollbackBuffer {
 
             if !canUseCompactDefault && !canUseCompactUniform {
                 return .full
+            }
+        }
+
+        var compactDefaultSerializedCount = cells.count
+        var compactUniformSerializedCount = cells.count
+        if canUseCompactDefault || canUseCompactUniform {
+            var sawCompactDefaultContent = false
+            var sawCompactUniformContent = false
+            var index = cells.count - 1
+            for cell in cells.reversed() {
+                if canUseCompactDefault {
+                    if !sawCompactDefaultContent {
+                        if isDefaultBlankCell(cell) {
+                            compactDefaultSerializedCount = index
+                        } else {
+                            compactDefaultSerializedCount = index + 1
+                            sawCompactDefaultContent = true
+                        }
+                    }
+                }
+
+                if canUseCompactUniform {
+                    if !sawCompactUniformContent {
+                        if isUniformBlankCell(cell, sharedAttributes: sharedAttributes) {
+                            compactUniformSerializedCount = index
+                        } else {
+                            compactUniformSerializedCount = index + 1
+                            sawCompactUniformContent = true
+                        }
+                    }
+                }
+
+                if (!canUseCompactDefault || sawCompactDefaultContent) &&
+                    (!canUseCompactUniform || sawCompactUniformContent) {
+                    break
+                }
+                if index == 0 { break }
+                index -= 1
             }
         }
 
@@ -421,6 +485,62 @@ final class ScrollbackBuffer {
             )
         }
         return .full
+    }
+
+    private static func serializedByteCount(for plan: RowEncodingPlan, cellCount: Int) -> Int {
+        switch plan {
+        case .compactDefault(let serializedCount):
+            let headerBytes = serializedCount == cellCount
+                ? compactRowHeaderBytes
+                : compactTrimmedRowHeaderBytes
+            return headerBytes + (serializedCount * MemoryLayout<UInt32>.size)
+        case .compactUniformAttributes(_, let serializedCount):
+            let headerBytes = serializedCount == cellCount
+                ? uniformAttributesHeaderBytes
+                : uniformAttributesTrimmedHeaderBytes
+            return headerBytes + (serializedCount * uniformAttributesBytesPerCell)
+        case .full:
+            return cellCount * bytesPerCell
+        }
+    }
+
+    private static func serializeRow(_ cells: ArraySlice<Cell>,
+                                     cellCount: Int,
+                                     using encodingPlan: RowEncodingPlan,
+                                     into buf: UnsafeMutablePointer<UInt8>) {
+        switch encodingPlan {
+        case .compactDefault(let serializedCount):
+            let trimmed = serializedCount != cellCount
+            buf[0] = trimmed ? RowFormat.compactDefaultTrimmed : RowFormat.compactDefault
+            var offset = trimmed ? compactTrimmedRowHeaderBytes : compactRowHeaderBytes
+            if trimmed {
+                serializeUInt16(UInt16(cellCount), to: buf + 1)
+            }
+            for cell in cells.prefix(serializedCount) {
+                serializeCompactDefaultCell(cell, to: buf + offset)
+                offset += MemoryLayout<UInt32>.size
+            }
+        case .compactUniformAttributes(let sharedAttributes, let serializedCount):
+            let trimmed = serializedCount != cellCount
+            buf[0] = trimmed ? RowFormat.compactUniformAttributesTrimmed : RowFormat.compactUniformAttributes
+            serializeColor(sharedAttributes.foreground, to: buf + 1)
+            serializeColor(sharedAttributes.background, to: buf + 5)
+            buf[9] = serializeAttributeFlags(sharedAttributes)
+            var offset = trimmed ? uniformAttributesTrimmedHeaderBytes : uniformAttributesHeaderBytes
+            if trimmed {
+                serializeUInt16(UInt16(cellCount), to: buf + 10)
+            }
+            for cell in cells.prefix(serializedCount) {
+                serializeCompactUniformAttributeCell(cell, to: buf + offset)
+                offset += uniformAttributesBytesPerCell
+            }
+        case .full:
+            var offset = 0
+            for cell in cells {
+                serializeCell(cell, to: buf + offset)
+                offset += bytesPerCell
+            }
+        }
     }
 
     private static func isCompactDefaultRowFormat(length: Int, firstByte: UInt8) -> Bool {
@@ -452,6 +572,24 @@ final class ScrollbackBuffer {
         cell.attributes == other.attributes &&
         cell.width == other.width &&
         cell.isWideContinuation == other.isWideContinuation
+    }
+
+    private static func isCompactDefaultCell(_ cell: Cell) -> Bool {
+        cell.attributes == .default && cell.width == 1 && !cell.isWideContinuation
+    }
+
+    private static func isDefaultBlankCell(_ cell: Cell) -> Bool {
+        cell.codepoint == Cell.empty.codepoint &&
+        cell.attributes == Cell.empty.attributes &&
+        cell.width == Cell.empty.width &&
+        !cell.isWideContinuation
+    }
+
+    private static func isUniformBlankCell(_ cell: Cell, sharedAttributes: CellAttributes) -> Bool {
+        cell.codepoint == Cell.empty.codepoint &&
+        cell.attributes == sharedAttributes &&
+        cell.width == Cell.empty.width &&
+        !cell.isWideContinuation
     }
 
     private static func serializeUInt16(_ value: UInt16, to ptr: UnsafeMutablePointer<UInt8>) {

@@ -125,6 +125,26 @@ final class TerminalGrid {
             return
         }
 
+        if count == 1 {
+            ensureRowOrderMaterialized()
+            rotateRowOrder(in: top...bottom, leftBy: 1)
+            hasRowPermutation = true
+
+            if top < bottom {
+                var nextWrapped = isWrapped(top + 1)
+                for row in top..<bottom {
+                    let wrapped = nextWrapped
+                    if row + 2 <= bottom {
+                        nextWrapped = isWrapped(row + 2)
+                    }
+                    setWrapped(row, wrapped)
+                }
+            }
+
+            clearRow(bottom)
+            return
+        }
+
         let wrappedFlags = wrappedFlagsArray(startingAt: top, count: regionHeight)
         ensureRowOrderMaterialized()
         rotateRowOrder(in: top...bottom, leftBy: count)

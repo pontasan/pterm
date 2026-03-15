@@ -103,6 +103,23 @@ int64_t ring_buffer_append_row(RingBuffer *rb,
                                bool continuation);
 
 /*
+ * Append multiple rows in one batch.
+ * data_blob: concatenated row bytes
+ * row_offsets: byte offsets into data_blob for each row
+ * row_lengths: byte length for each row
+ * continuations: continuation flag for each row
+ * row_count: number of rows
+ *
+ * Returns the logical row number assigned to the final appended row, or -1 on error.
+ */
+int64_t ring_buffer_append_rows(RingBuffer *rb,
+                                const uint8_t *data_blob,
+                                const uint32_t *row_offsets,
+                                const uint32_t *row_lengths,
+                                const bool *continuations,
+                                uint32_t row_count);
+
+/*
  * Read row data by logical index (0 = oldest visible row).
  * row_index: 0-based index from oldest to newest.
  * out_data: pointer set to the row data (valid until next write or get_row call).
@@ -123,6 +140,9 @@ uint32_t ring_buffer_row_count(const RingBuffer *rb);
 
 /* Get the current row-index capacity. */
 uint32_t ring_buffer_row_index_capacity(const RingBuffer *rb);
+
+/* Ensure the row index can track at least min_row_capacity rows. */
+bool ring_buffer_reserve_row_index_capacity(RingBuffer *rb, uint32_t min_row_capacity);
 
 /* Get the total data capacity in bytes. */
 size_t ring_buffer_capacity(const RingBuffer *rb);

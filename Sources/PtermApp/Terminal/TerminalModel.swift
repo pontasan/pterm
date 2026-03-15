@@ -206,9 +206,33 @@ final class TerminalModel {
         lineFeed()
     }
 
+    /// Fast path for the common "ground-state text stream" case.
+    ///
+    /// When the VT parser is already in ground state and the incoming chunk
+    /// contains only printable characters plus ordinary C0 executes, routing
+    /// through the full C state machine and per-codepoint callback bridge is
+    /// unnecessary overhead. This path preserves the same semantics by
+    /// dispatching directly to the existing print/execute handlers.
+    func handleGroundFastPath(_ codepoints: UnsafeBufferPointer<UInt32>) {
+        for codepoint in codepoints {
+            if codepoint <= 0x1F || codepoint == 0x7F {
+                handleExecute(codepoint)
+            } else {
+                handlePrint(codepoint)
+            }
+        }
+    }
+
     private func handlePrint(_ codepoint: UInt32) {
-        let translatedCodepoint = translateCharacterSet(codepoint)
-        let width = CharacterWidth.width(of: translatedCodepoint)
+        let translatedCodepoint: UInt32
+        let width: Int
+        if g0Charset == .ascii && g1Charset == .ascii && codepoint >= 0x20 && codepoint < 0x7F {
+            translatedCodepoint = codepoint
+            width = 1
+        } else {
+            translatedCodepoint = translateCharacterSet(codepoint)
+            width = CharacterWidth.width(of: translatedCodepoint)
+        }
         guard width >= 0 else { return } // Non-printable
 
         // Handle pending wrap
@@ -230,6 +254,27 @@ final class TerminalModel {
             } else {
                 cursor.col = cols - charWidth
             }
+        }
+
+        if charWidth == 1 {
+            let cell = Cell(
+                codepoint: translatedCodepoint,
+                attributes: cursor.attributes,
+                width: 1,
+                isWideContinuation: false
+            )
+            grid.setCell(cell, at: cursor.row, col: cursor.col)
+
+            cursor.col += 1
+            if cursor.col >= cols {
+                if cursor.autoWrapMode {
+                    cursor.pendingWrap = true
+                    cursor.col = cols - 1
+                } else {
+                    cursor.col = cols - 1
+                }
+            }
+            return
         }
 
         // Write the cell

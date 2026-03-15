@@ -248,6 +248,12 @@ static bool ring_buffer_copy_row_bytes(const RingBuffer *rb,
     return true;
 }
 
+static bool ring_buffer_append_row_internal(RingBuffer *rb,
+                                            const uint8_t *data,
+                                            uint32_t length,
+                                            bool continuation,
+                                            bool *did_evict_out);
+
 static void ring_buffer_release_copy_buf(RingBuffer *rb) {
     if (!rb) return;
     free(rb->copy_buf);
@@ -731,38 +737,63 @@ void ring_buffer_destroy_and_unlink(RingBuffer *rb) {
  * Evict oldest rows until at least `needed` bytes are free.
  * This is how the ring buffer enforces memory limits.
  */
-static void ring_buffer_evict(RingBuffer *rb, size_t needed) {
+static bool ring_buffer_evict(RingBuffer *rb, size_t needed) {
+    bool evicted = false;
     while (rb->row_count > 0 && rb->bytes_used + needed > rb->data_capacity) {
         uint32_t head_idx = rb->row_head % rb->row_capacity;
         rb->bytes_used -= rb->rows[head_idx].length;
         rb->rows[head_idx].length = 0;
         rb->row_head++;
         rb->row_count--;
+        evicted = true;
     }
+    return evicted;
 }
 
 int64_t ring_buffer_append_row(RingBuffer *rb,
                                const uint8_t *data, uint32_t length,
                                bool continuation) {
-    if (!rb || !data) return -1;
+    bool did_evict = false;
+    if (!ring_buffer_append_row_internal(rb, data, length, continuation, &did_evict)) {
+        return -1;
+    }
+    if (did_evict) {
+        ring_buffer_maybe_shrink(rb);
+        ring_buffer_maybe_shrink_rows(rb);
+    }
+    if (rb->flags & RING_FLAG_MMAP) {
+        ring_buffer_sync_header(rb);
+    }
+
+    return (int64_t)(rb->row_tail - 1);
+}
+
+static bool ring_buffer_append_row_internal(RingBuffer *rb,
+                                            const uint8_t *data,
+                                            uint32_t length,
+                                            bool continuation,
+                                            bool *did_evict_out) {
+    if (!rb || !data || !did_evict_out) return false;
+    *did_evict_out = false;
+
     if (!(rb->flags & RING_FLAG_MMAP) && !rb->data) {
         rb->data = calloc(1, rb->data_capacity);
         if (!rb->data) {
-            return -1;
+            return false;
         }
     }
     if (!(rb->flags & RING_FLAG_MMAP) && !rb->rows) {
         rb->rows = calloc(rb->row_capacity, sizeof(RingRowEntry));
         if (!rb->rows) {
-            return -1;
+            return false;
         }
     }
 
-    if ((size_t)length > rb->max_data_capacity) return -1;
+    if ((size_t)length > rb->max_data_capacity) return false;
 
     if ((rb->flags & RING_FLAG_MMAP) && (rb->data_capacity == 0 || rb->row_capacity == 0)) {
         if (!ring_buffer_resize_mmap(rb, rb->initial_data_capacity, rb->initial_row_capacity)) {
-            return -1;
+            return false;
         }
     }
 
@@ -772,25 +803,23 @@ int64_t ring_buffer_append_row(RingBuffer *rb,
             ? required_capacity
             : rb->data_capacity;
         if (grow_target > rb->data_capacity && !ring_buffer_grow_if_needed(rb, grow_target)) {
-            return -1;
+            return false;
         }
         if ((size_t)length > rb->data_capacity && !ring_buffer_grow_if_needed(rb, (size_t)length)) {
-            return -1;
+            return false;
         }
     }
 
-    /* Evict old rows to make space */
-    ring_buffer_evict(rb, (size_t)length);
+    bool did_evict = ring_buffer_evict(rb, (size_t)length);
 
-    /* Also evict if row index is full */
     if (rb->row_count >= rb->row_capacity && !ring_buffer_grow_rows_if_needed(rb, rb->row_count + 1)) {
         uint32_t head_idx = rb->row_head % rb->row_capacity;
         rb->bytes_used -= rb->rows[head_idx].length;
         rb->row_head++;
         rb->row_count--;
+        did_evict = true;
     }
 
-    /* Write data, handling wrap-around */
     size_t first_part = rb->data_capacity - rb->write_offset;
     if ((size_t)length <= first_part) {
         memcpy(rb->data + rb->write_offset, data, length);
@@ -799,21 +828,50 @@ int64_t ring_buffer_append_row(RingBuffer *rb,
         memcpy(rb->data, data + first_part, (size_t)length - first_part);
     }
 
-    /* Record row in index */
     uint32_t tail_idx = rb->row_tail % rb->row_capacity;
     rb->rows[tail_idx].offset = (uint32_t)rb->write_offset;
     rb->rows[tail_idx].length = length;
     rb->rows[tail_idx].flags = continuation ? 1 : 0;
     memset(rb->rows[tail_idx].reserved, 0, sizeof(rb->rows[tail_idx].reserved));
 
-    /* Advance write pointer */
     rb->write_offset = (rb->write_offset + (size_t)length) % rb->data_capacity;
     rb->bytes_used += (size_t)length;
     rb->row_tail++;
     rb->row_count++;
-    ring_buffer_maybe_shrink(rb);
-    ring_buffer_maybe_shrink_rows(rb);
-    ring_buffer_sync_header(rb);
+    *did_evict_out = did_evict;
+    return true;
+}
+
+int64_t ring_buffer_append_rows(RingBuffer *rb,
+                                const uint8_t *data_blob,
+                                const uint32_t *row_offsets,
+                                const uint32_t *row_lengths,
+                                const bool *continuations,
+                                uint32_t row_count) {
+    if (!rb || !data_blob || !row_offsets || !row_lengths || !continuations || row_count == 0) {
+        return -1;
+    }
+
+    bool any_evict = false;
+    for (uint32_t i = 0; i < row_count; i++) {
+        bool did_evict = false;
+        if (!ring_buffer_append_row_internal(rb,
+                                             data_blob + row_offsets[i],
+                                             row_lengths[i],
+                                             continuations[i],
+                                             &did_evict)) {
+            return -1;
+        }
+        any_evict = any_evict || did_evict;
+    }
+
+    if (any_evict) {
+        ring_buffer_maybe_shrink(rb);
+        ring_buffer_maybe_shrink_rows(rb);
+    }
+    if (rb->flags & RING_FLAG_MMAP) {
+        ring_buffer_sync_header(rb);
+    }
 
     return (int64_t)(rb->row_tail - 1);
 }
@@ -863,6 +921,44 @@ uint32_t ring_buffer_row_count(const RingBuffer *rb) {
 
 uint32_t ring_buffer_row_index_capacity(const RingBuffer *rb) {
     return rb ? rb->row_capacity : 0;
+}
+
+bool ring_buffer_reserve_row_index_capacity(RingBuffer *rb, uint32_t min_row_capacity) {
+    if (!rb) return false;
+    if (min_row_capacity < RING_BUFFER_MIN_ROWS) {
+        min_row_capacity = RING_BUFFER_MIN_ROWS;
+    }
+    if (min_row_capacity > RING_BUFFER_MAX_ROWS) {
+        return false;
+    }
+    if (min_row_capacity <= rb->row_capacity) {
+        if (min_row_capacity > rb->initial_row_capacity) {
+            rb->initial_row_capacity = min_row_capacity;
+            ring_buffer_sync_header(rb);
+        }
+        return true;
+    }
+
+    if (!(rb->flags & RING_FLAG_MMAP) && !rb->rows) {
+        rb->initial_row_capacity = min_row_capacity;
+        rb->row_capacity = min_row_capacity;
+        return true;
+    }
+
+    if ((rb->flags & RING_FLAG_MMAP) && rb->data_capacity == 0 && rb->row_capacity == 0) {
+        rb->initial_row_capacity = min_row_capacity;
+        ring_buffer_sync_header(rb);
+        return true;
+    }
+
+    if (!ring_buffer_grow_rows_if_needed(rb, min_row_capacity)) {
+        return false;
+    }
+    if (min_row_capacity > rb->initial_row_capacity) {
+        rb->initial_row_capacity = min_row_capacity;
+        ring_buffer_sync_header(rb);
+    }
+    return true;
 }
 
 size_t ring_buffer_capacity(const RingBuffer *rb) {
