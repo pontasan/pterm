@@ -267,6 +267,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         let fontName: String
         let fontSize: CGFloat
         let scaleFactor: CGFloat
+        let atlasRevision: UInt64
     }
 
     /// Terminal manager
@@ -603,6 +604,23 @@ final class IntegratedView: MTKView, NSDraggingSource {
                 color: Self.uiSecondaryTitleTextColor(alpha: 1.0)
             )
         }
+    }
+
+    func debugCachedTextWidthForTesting(
+        text: String,
+        scaleFactor: Float = 2.0,
+        glyphScale: Float = 0.8
+    ) -> Float {
+        cachedTextVertices(
+            for: text,
+            scaleFactor: scaleFactor,
+            glyphScale: glyphScale,
+            color: Self.uiSecondaryTitleTextColor(alpha: 1.0)
+        ).width
+    }
+
+    func debugReconcileTextVertexCacheForTesting() {
+        invalidateTextVertexCacheIfNeeded()
     }
 
     func debugAppendTransientTextVertices(
@@ -1574,7 +1592,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
         let signature = TextAtlasSignature(
             fontName: renderer.glyphAtlas.fontName,
             fontSize: renderer.glyphAtlas.fontSize,
-            scaleFactor: renderer.glyphAtlas.scaleFactor
+            scaleFactor: renderer.glyphAtlas.scaleFactor,
+            atlasRevision: renderer.glyphAtlas.atlasRevision
         )
         guard textAtlasSignature != signature else { return }
         textAtlasSignature = signature
@@ -3946,17 +3965,28 @@ extension IntegratedView: MTKViewDelegate {
         let textY: Float = 0
         var vertices: [Float] = []
         vertices.reserveCapacity(chars.count * 72)
+        var columnOffset: Float = 0
 
-        for (index, scalar) in chars.enumerated() {
+        for scalar in chars {
             let cp = scalar.value
+            let characterWidth = max(CharacterWidth.width(of: cp), 1)
+            let x = columnOffset
             guard cp > 0x20,
                   let glyph = renderer.glyphAtlas.glyphInfo(for: cp),
                   glyph.pixelWidth > 0 else {
+                columnOffset += Float(characterWidth) * cellW
                 continue
             }
 
-            let x = Float(index) * cellW
-            let glyphX = x + glyph.cellOffsetX * glyphScale
+            let glyphX = x + (
+                characterWidth == 1
+                    ? glyph.cellOffsetX * glyphScale
+                    : MetalRenderer.wideGlyphOffsetX(
+                        glyph,
+                        spanWidth: Float(characterWidth) * cellW,
+                        singleCellWidth: cellW
+                    )
+            )
             let baselineScreenY = textY + cellH - Float(renderer.glyphAtlas.baseline) * scaleFactor * glyphScale
             let glyphY = baselineScreenY - glyph.baselineOffset * glyphScale
             let glyphW = Float(glyph.pixelWidth) * glyphScale
@@ -3970,9 +4000,10 @@ extension IntegratedView: MTKViewDelegate {
                 fg: color,
                 bg: (0, 0, 0, 0)
             )
+            columnOffset += Float(characterWidth) * cellW
         }
 
-        let glyphWidth = Float(chars.count) * cellW
+        let glyphWidth = columnOffset
         guard !vertices.isEmpty else {
             return CachedTextVertices(
                 vertices: Array(vertices),

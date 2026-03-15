@@ -31,15 +31,20 @@ focused terminal view および split view で、現在見ている terminal が
 - 仕様上、この 2 つは別物として扱うこと
 - `return split` を持たない通常 split では、`Cmd+Click` は terminal 最大化として扱うこと
 - `return split` を持つ派生 split では、`Cmd+Click` は terminal 最大化ではなく `return split` への復帰として扱うこと
-- focused view も、split 由来である場合は `return split` を 1 つ保持できること
-- split 由来の focused view では、`Cmd+Click` は常に `return split` への復帰として扱うこと
+- focused view は、split 由来である場合に「いまいた split」と「その split が持つ return split」の 2 つを保持できること
+- split 由来の focused view では、`Cmd+Click` は常に「いまいた split」への復帰として扱うこと
 
 ### 派生 split の生成規則
 
-- `Shift+Cmd+Click` による subset split は、元になった split 全体を `return split` として保持すること
-- split 由来の focused view から `Cmd+T` で新しい terminal を追加して split を作る場合、新しい split は現在表示用の split とは別に、元の split を `return split` として保持すること
-- すでに `return split` を持つ派生 split 上で `Cmd+T` を実行した場合、新しい split は現在の controllers を更新しても、`return split` は上書きせず引き継ぐこと
-- すでに `return split` を持つ派生 split から terminal を maximize して focused view に入った場合も、その focused view は同じ `return split` を引き継ぐこと
+- 最初に通常 split から派生 split を作るとき、その通常 split を「始祖 split」として `return split` に記録すること
+- いったん `return split` を持つ派生 split になった後は、`Shift+Cmd+Click` や `Cmd+T` でさらに派生 split を作っても、`return split` は常に最初に記録された始祖 split を維持すること
+- つまり `A -> B -> C -> D` と派生した場合でも、`B`, `C`, `D` はすべて `A` を `return split` として持つこと
+- split 由来の focused view は、「いま表示していた split」と、その split が持つ始祖 split を保持すること
+- split 由来の focused view から `Cmd+T` で派生 split を作る場合、その新しい split は focused 元の split ではなく、保持していた始祖 split を `return split` として持つこと
+- 派生 split 内で `Cmd+T` により terminal が追加された場合、その terminal は現在 split だけでなく始祖 split にも反映されること
+- 派生 split / focused split lineage 内で `Cmd+W` や `exit` により terminal が消えた場合、現在 split だけでなく始祖 split からも同じ terminal が除去されること
+- terminal 削除の結果として現在 split が成立しなくなっても、始祖 split に terminal が残っている限り overview に戻ってはならないこと
+- overview に戻ってよいのは、始祖 split に属する terminal が 1 つも残っていない場合だけであること
 
 ### 期待される代表遷移
 
@@ -47,8 +52,11 @@ focused terminal view および split view で、現在見ている terminal が
 - `通常 split -> Shift+Cmd+Click(複数選択) -> 派生 split` になった時点で、`Cmd+Click` の意味は `Return to split` に変わること
 - `通常 split -> maximize -> Cmd+T -> 派生 split` になった時点で、`Cmd+Click` の意味は `Return to split` に変わること
 - `通常 split -> Shift+Cmd+Click(複数選択) -> 派生 split -> Cmd+T` のあとも、`Cmd+Click` の意味は `Return to split` のままであること
-- `通常 split -> Shift+Cmd+Click(複数選択) -> 派生 split -> maximize -> Cmd+Click` で、subset split ではなく元の split 全体へ戻ること
-- `通常 split -> maximize -> Cmd+T -> 派生 split -> Cmd+Click` で、2 terminal の派生 split ではなく元の split 全体へ戻ること
+- `通常 split A -> Shift+Cmd+Click(複数選択) -> 派生 split B -> Cmd+Click` で、`A` に戻ること
+- `通常 split A -> Shift+Cmd+Click(複数選択) -> 派生 split B -> Shift+Cmd+Click(複数選択) -> 派生 split C -> Cmd+Click` でも、`A` に戻ること
+- `通常 split A -> Shift+Cmd+Click(複数選択) -> 派生 split B -> Shift+Cmd+Click(複数選択) -> 派生 split C -> Shift+Cmd+Click(複数選択) -> 派生 split D -> Cmd+Click` でも、`A` に戻ること
+- `通常 split A -> 派生 split B -> maximize -> focused -> Cmd+Click` では、`B` に戻ること
+- その `B` で `Cmd+Click` した時に、`A` に戻ること
 
 ## Cmd 入力の検出
 
@@ -77,11 +85,12 @@ focused terminal view および split view で、現在見ている terminal が
 
 - ステータスバー左側には、既存の `Overview` / `Edit Notes` に加えて、以下の操作案内を表示すること
 - `Cmd: Show identities`
+- split view では `Shift+Cmd+Click: Multi-select terminals` を表示すること
 - `Cmd+Click` の案内は presentation に応じて動的に切り替えること
 - 親 split を持たない split view では `Cmd+Click: Maximize terminal`
 - 既存 split から派生した split view では `Cmd+Click: Return to split`
 - split 由来の focused view では `Cmd+Click: Return to split`
-- overview および通常の focused view では `Cmd+Click` 案内を表示しないこと
+- overview および通常の focused view では `Shift+Cmd+Click` / `Cmd+Click` 案内を表示しないこと
 - これらの案内は `|` セパレータで区切ること
 
 ## 回帰要件
@@ -89,8 +98,12 @@ focused terminal view および split view で、現在見ている terminal が
 - split view でワークスペース単位の隣接配置が崩れないこと
 - 見出し文字列が focused / split の両方で正しく生成されること
 - split view の `Shift+Cmd+Click` 複数選択が `Cmd` release でのみ commit されること
-- 複数 workspace / 複数 terminal を含む split から subset split を作っても、`Cmd+Click` の戻り先が元の split 全体で安定すること
-- split 由来の focused view から `Cmd+T` した場合も、`return split` lineage が失われないこと
-- 派生 split からさらに `Cmd+T` した場合も、`return split` lineage が上書きされないこと
+- split view のステータスバーに `Shift+Cmd+Click: Multi-select terminals` が表示され、focused / overview では表示されないこと
+- 複数 workspace / 複数 terminal を含む split から subset split を繰り返し作っても、`Cmd+Click` の戻り先が常に最初の split で安定すること
+- split 由来の focused view から `Cmd+T` した場合も、保持していた始祖 split が失われないこと
+- 派生 split からさらに `Cmd+T` / `Shift+Cmd+Click` した場合も、始祖 split の記録が上書きで失われないこと
+- 派生 split で追加した terminal が `Cmd+Click` で始祖 split に戻った時にも見えていること
+- 派生 split の terminal を `Cmd+W` / `exit` で減らした時、始祖 split に terminal が残っていれば overview ではなく残存 terminal を使って split / focused を再構成すること
+- 始祖 split の最後の terminal が消えた時にだけ overview に戻ること
 - `Cmd` 押下表示機能の追加で、既存ショートカットの挙動を壊さないこと
 - ステータスバー案内追加で、Overview ボタンの表示/非表示やメトリクス右寄せを壊さないこと

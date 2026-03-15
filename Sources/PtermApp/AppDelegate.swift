@@ -149,6 +149,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Controllers saved when maximizing a terminal from split view (for restore)
     private var splitOriginControllers: [TerminalController]?
+    /// Root split saved alongside `splitOriginControllers` for focused return flows.
+    private var splitOriginAncestorControllers: [TerminalController]?
     /// Controllers saved when the current split itself should return to a previous split.
     private var splitReturnControllers: [TerminalController]?
 
@@ -226,6 +228,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             return lhs.id.uuidString < rhs.id.uuidString
         }
+    }
+
+    private func filteredLiveControllers(_ controllers: [TerminalController]?) -> [TerminalController]? {
+        guard let controllers else { return nil }
+        let liveControllersByID = Dictionary(uniqueKeysWithValues: manager.terminals.map { ($0.id, $0) })
+        let filtered = controllers.compactMap { liveControllersByID[$0.id] }
+        return filtered.isEmpty ? nil : filtered
+    }
+
+    private func controllersAppendingIfNeeded(
+        _ controller: TerminalController,
+        to controllers: [TerminalController]?
+    ) -> [TerminalController]? {
+        guard var controllers else { return nil }
+        if controllers.contains(where: { $0.id == controller.id }) == false {
+            controllers.append(controller)
+        }
+        return controllers
     }
 
     private static func splitOrderingKey(_ value: String) -> String {
@@ -680,46 +700,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scheduleVisibleOutputIndicatorResumeIfNeeded()
         syncVisibleTerminalOutputIndicators()
 
+        splitOriginControllers = filteredLiveControllers(splitOriginControllers)
+        splitOriginAncestorControllers = filteredLiveControllers(splitOriginAncestorControllers)
+        splitReturnControllers = filteredLiveControllers(splitReturnControllers)
+
         let wasIntegrated = {
             if case .integrated = viewMode { return true }
             return false
         }()
 
-        let currentPresentation: TerminalListPresentation
         switch viewMode {
         case .integrated:
-            currentPresentation = .integrated
+            break
         case .focused(let controller):
-            currentPresentation = .focused(controller.id)
-        case .split(let controllers):
-            currentPresentation = .split(controllers.map(\.id))
-        }
-
-        let nextPresentation = Self.reconcilePresentationAfterTerminalListChange(
-            currentPresentation: currentPresentation,
-            remainingTerminalIDs: manager.terminals.map(\.id)
-        )
-
-        switch nextPresentation {
-        case .integrated:
-            if case .integrated = viewMode {
-                break
-            }
-            switchToIntegrated()
-        case .focused(let id):
-            guard let controller = manager.terminals.first(where: { $0.id == id }) else {
+            if let liveFocusedController = manager.terminals.first(where: { $0.id == controller.id }) {
+                switchToFocused(liveFocusedController)
+            } else if let originControllers = splitOriginControllers {
+                if originControllers.count >= 2 {
+                    switchToSplit(originControllers, returnToControllers: splitOriginAncestorControllers)
+                } else if let first = originControllers.first {
+                    let ancestorControllers = splitOriginAncestorControllers
+                    splitOriginControllers = ancestorControllers ?? originControllers
+                    splitOriginAncestorControllers = ancestorControllers
+                    switchToFocused(first)
+                } else {
+                    switchToIntegrated()
+                }
+            } else if let ancestorControllers = splitOriginAncestorControllers {
+                if ancestorControllers.count >= 2 {
+                    switchToSplit(ancestorControllers)
+                } else if let first = ancestorControllers.first {
+                    splitOriginControllers = nil
+                    splitOriginAncestorControllers = nil
+                    switchToFocused(first)
+                } else {
+                    switchToIntegrated()
+                }
+            } else {
                 switchToIntegrated()
-                break
             }
-            switchToFocused(controller)
-        case .split(let ids):
-            let controllers = ids.compactMap { id in
-                manager.terminals.first(where: { $0.id == id })
-            }
-            if controllers.count >= 2 {
-                switchToSplit(controllers)
-            } else if let first = controllers.first {
+        case .split(let controllers):
+            let liveControllersByID = Dictionary(uniqueKeysWithValues: manager.terminals.map { ($0.id, $0) })
+            let currentSplitControllers = controllers.compactMap { liveControllersByID[$0.id] }
+            let ancestorSplitControllers = splitReturnControllers
+
+            if currentSplitControllers.count >= 2 {
+                switchToSplit(currentSplitControllers, returnToControllers: ancestorSplitControllers)
+            } else if currentSplitControllers.count == 1, let first = currentSplitControllers.first {
+                splitOriginControllers = ancestorSplitControllers ?? currentSplitControllers
+                splitOriginAncestorControllers = ancestorSplitControllers
                 switchToFocused(first)
+            } else if let ancestorSplitControllers {
+                if ancestorSplitControllers.count >= 2 {
+                    switchToSplit(ancestorSplitControllers)
+                } else if let first = ancestorSplitControllers.first {
+                    splitOriginControllers = nil
+                    splitOriginAncestorControllers = nil
+                    switchToFocused(first)
+                } else {
+                    switchToIntegrated()
+                }
             } else {
                 switchToIntegrated()
             }
@@ -760,7 +800,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sv.terminalView.onCmdClick = { [weak self] in
             guard let self, let controllers = self.splitOriginControllers else { return }
             self.splitOriginControllers = nil
-            self.switchToSplit(controllers)
+            let ancestorControllers = self.splitOriginAncestorControllers
+            self.splitOriginAncestorControllers = nil
+            self.switchToSplit(controllers, returnToControllers: ancestorControllers)
         }
         if splitOriginControllers != nil {
             sv.terminalView.cmdClickTooltip = "⌘+Click to return to split view"
@@ -815,7 +857,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let orderedReturnControllers = returnToControllers.map(Self.groupedControllersForSplit)
         guard orderedControllers.count >= 2 else {
             if let first = orderedControllers.first {
-                splitOriginControllers = orderedReturnControllers
+                splitOriginControllers = orderedReturnControllers ?? orderedControllers
+                splitOriginAncestorControllers = orderedReturnControllers
                 switchToFocused(first)
             } else {
                 switchToIntegrated()
@@ -847,7 +890,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : "⌘+Click to return to previous split view"
         splitView.onMaximizeTerminal = { [weak self] controller in
             guard let self else { return }
-            self.splitOriginControllers = orderedReturnControllers ?? orderedControllers
+            self.splitOriginControllers = orderedControllers
+            self.splitOriginAncestorControllers = orderedReturnControllers
             self.switchToFocused(controller)
         }
         splitView.onCommandClickTerminal = { [weak self] controller in
@@ -856,6 +900,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.switchToSplit(returnControllers)
             } else {
                 self.splitOriginControllers = orderedControllers
+                self.splitOriginAncestorControllers = nil
                 self.switchToFocused(controller)
             }
         }
@@ -863,12 +908,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             let orderedSelection = Self.groupedControllersForSplit(selectedControllers)
             guard !orderedSelection.isEmpty else { return }
-            let parentSplitControllers = orderedControllers
+            let ancestorSplitControllers = orderedReturnControllers ?? orderedControllers
             if orderedSelection.count == 1, let controller = orderedSelection.first {
-                self.splitOriginControllers = parentSplitControllers
+                self.splitOriginControllers = orderedControllers
+                self.splitOriginAncestorControllers = orderedReturnControllers
                 self.switchToFocused(controller)
             } else {
-                self.switchToSplit(orderedSelection, returnToControllers: parentSplitControllers)
+                self.switchToSplit(orderedSelection, returnToControllers: ancestorSplitControllers)
             }
         }
         presentationHostView().addSubview(splitView)
@@ -895,6 +941,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         splitContainerView?.applyAppearanceSettings()
         splitReturnControllers = orderedReturnControllers
         splitOriginControllers = nil
+        splitOriginAncestorControllers = nil
         viewMode = .split(orderedControllers)
         applyAppearanceSettingsToVisibleViews()
         updateTitlebarBackButtonVisibility()
@@ -943,6 +990,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminalView = nil
         focusedController = nil
         splitOriginControllers = nil
+        splitOriginAncestorControllers = nil
         splitReturnControllers = nil
         hideSearchBar()
 
@@ -1476,23 +1524,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func newTerminal(_ sender: Any?) {
         let shortcutContext: (workspaceName: String, displayedControllers: [TerminalController])?
-        let returnToControllers: [TerminalController]?
         switch viewMode {
         case .focused(let controller):
             shortcutContext = Self.newTerminalShortcutContext(
                 focusedController: controller,
                 splitControllers: []
             )
-            returnToControllers = splitOriginControllers
         case .split(let controllers):
             shortcutContext = Self.newTerminalShortcutContext(
                 focusedController: nil,
                 splitControllers: controllers
             )
-            returnToControllers = splitReturnControllers
         case .integrated:
             shortcutContext = nil
-            returnToControllers = nil
         }
 
         guard let shortcutContext,
@@ -1502,7 +1546,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               ) else {
             return
         }
-        switchToSplit(shortcutContext.displayedControllers + [newController], returnToControllers: returnToControllers)
+        let effectiveReturnControllers: [TerminalController]?
+        switch viewMode {
+        case .focused:
+            effectiveReturnControllers = controllersAppendingIfNeeded(
+                newController,
+                to: splitOriginAncestorControllers ?? splitOriginControllers
+            )
+        case .split(let controllers):
+            effectiveReturnControllers = controllersAppendingIfNeeded(
+                newController,
+                to: splitReturnControllers ?? controllers
+            )
+        case .integrated:
+            effectiveReturnControllers = nil
+        }
+        switchToSplit(shortcutContext.displayedControllers + [newController], returnToControllers: effectiveReturnControllers)
     }
 
     @objc func backToIntegratedView(_ sender: Any?) {
@@ -2340,17 +2399,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshStatusBarCommandHints() {
+        let multiSelectHint: String?
         let commandClickHint: String?
         switch viewMode {
         case .split:
+            multiSelectHint = "Shift+Cmd+Click: Multi-select terminals"
             commandClickHint = splitReturnControllers == nil
                 ? "Cmd+Click: Maximize terminal"
                 : "Cmd+Click: Return to split"
         case .focused:
+            multiSelectHint = nil
             commandClickHint = splitOriginControllers == nil ? nil : "Cmd+Click: Return to split"
         case .integrated:
+            multiSelectHint = nil
             commandClickHint = nil
         }
+        statusBarView?.setMultiSelectHint(multiSelectHint)
         statusBarView?.setCommandClickHint(commandClickHint)
     }
 
@@ -2361,6 +2425,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.manager = manager
         self.windowHostedContentView = hostedContentView
         self.statusBarView = StatusBarView(frame: .zero)
+        self.manager.onListChanged = { [weak self] in
+            self?.handleTerminalListChanged()
+        }
     }
 
     func debugStatusBarCommandClickHintForTesting() -> String? {
@@ -2368,6 +2435,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .compactMap { $0 as? NSTextField }
             .first(where: { $0.identifier?.rawValue == "statusbar.commandClickHint" && !$0.isHidden })?
             .stringValue
+    }
+
+    func debugStatusBarMultiSelectHintForTesting() -> String? {
+        statusBarView.subviews
+            .compactMap { $0 as? NSTextField }
+            .first(where: { $0.identifier?.rawValue == "statusbar.multiSelectHint" && !$0.isHidden })?
+            .stringValue
+    }
+
+    func debugCurrentFocusedControllerIDForTesting() -> UUID? {
+        guard case .focused(let controller) = viewMode else { return nil }
+        return controller.id
+    }
+
+    func debugCurrentSplitControllerIDsForTesting() -> [UUID]? {
+        guard case .split(let controllers) = viewMode else { return nil }
+        return controllers.map(\.id)
+    }
+
+    func debugSplitReturnControllerIDsForTesting() -> [UUID]? {
+        splitReturnControllers?.map(\.id)
+    }
+
+    func debugIsIntegratedForTesting() -> Bool {
+        if case .integrated = viewMode {
+            return true
+        }
+        return false
     }
 
     private func contentHostView() -> NSView {

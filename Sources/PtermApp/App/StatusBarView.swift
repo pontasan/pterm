@@ -18,8 +18,11 @@ final class StatusBarView: NSView {
     private let noteButton: NSButton
     private let commandHintSeparatorLabel: NSTextField
     private let commandHintLabel: NSTextField
+    private let multiSelectHintSeparatorLabel: NSTextField
+    private let multiSelectHintLabel: NSTextField
     private let commandClickHintSeparatorLabel: NSTextField
     private let commandClickHintLabel: NSTextField
+    private var multiSelectHintText: String?
     private var commandClickHintText: String?
     private var style: Style = .solid
     var onBackToIntegrated: (() -> Void)?
@@ -31,6 +34,8 @@ final class StatusBarView: NSView {
         noteButton = NSButton(title: "Edit Notes", target: nil, action: nil)
         commandHintSeparatorLabel = NSTextField(labelWithString: "|")
         commandHintLabel = NSTextField(labelWithString: "Cmd: Show identities")
+        multiSelectHintSeparatorLabel = NSTextField(labelWithString: "|")
+        multiSelectHintLabel = NSTextField(labelWithString: "")
         commandClickHintSeparatorLabel = NSTextField(labelWithString: "|")
         commandClickHintLabel = NSTextField(labelWithString: "")
         super.init(frame: frameRect)
@@ -87,6 +92,19 @@ final class StatusBarView: NSView {
         commandHintLabel.identifier = NSUserInterfaceItemIdentifier("statusbar.commandHint")
         addSubview(commandHintLabel)
 
+        multiSelectHintSeparatorLabel.textColor = NSColor(calibratedWhite: 0.4, alpha: 1)
+        multiSelectHintSeparatorLabel.font = font
+        multiSelectHintSeparatorLabel.identifier = NSUserInterfaceItemIdentifier("statusbar.multiSelectSeparator")
+        multiSelectHintSeparatorLabel.isHidden = true
+        addSubview(multiSelectHintSeparatorLabel)
+
+        multiSelectHintLabel.textColor = NSColor(calibratedWhite: 0.6, alpha: 1)
+        multiSelectHintLabel.font = font
+        multiSelectHintLabel.lineBreakMode = .byTruncatingTail
+        multiSelectHintLabel.identifier = NSUserInterfaceItemIdentifier("statusbar.multiSelectHint")
+        multiSelectHintLabel.isHidden = true
+        addSubview(multiSelectHintLabel)
+
         commandClickHintSeparatorLabel.textColor = NSColor(calibratedWhite: 0.4, alpha: 1)
         commandClickHintSeparatorLabel.font = font
         commandClickHintSeparatorLabel.identifier = NSUserInterfaceItemIdentifier("statusbar.commandClickSeparator")
@@ -128,7 +146,7 @@ final class StatusBarView: NSView {
         let spacing: CGFloat = 6
 
         // Left side: [backButton] [separator] [noteButton] [separator] [Cmd hint]
-        //            [separator] [Cmd+Click hint]
+        //            [separator] [Shift+Cmd+Click hint] [separator] [Cmd+Click hint]
         var x = inset
 
         if !backButton.isHidden {
@@ -152,6 +170,16 @@ final class StatusBarView: NSView {
         commandHintLabel.sizeToFit()
         commandHintLabel.frame = NSRect(x: x, y: vertInset, width: commandHintLabel.frame.width, height: height)
         x = commandHintLabel.frame.maxX + spacing
+
+        if !multiSelectHintLabel.isHidden {
+            multiSelectHintSeparatorLabel.sizeToFit()
+            multiSelectHintSeparatorLabel.frame = NSRect(x: x, y: vertInset, width: multiSelectHintSeparatorLabel.frame.width, height: height)
+            x = multiSelectHintSeparatorLabel.frame.maxX + spacing
+
+            multiSelectHintLabel.sizeToFit()
+            multiSelectHintLabel.frame = NSRect(x: x, y: vertInset, width: multiSelectHintLabel.frame.width, height: height)
+            x = multiSelectHintLabel.frame.maxX + spacing
+        }
 
         if !commandClickHintLabel.isHidden {
             commandClickHintSeparatorLabel.sizeToFit()
@@ -217,6 +245,16 @@ final class StatusBarView: NSView {
         commandClickHintLabel.stringValue = commandClickHintText ?? ""
         commandClickHintLabel.isHidden = !visible
         commandClickHintSeparatorLabel.isHidden = !visible
+        needsLayout = true
+    }
+
+    func setMultiSelectHint(_ text: String?) {
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let visible = !(trimmed?.isEmpty ?? true)
+        multiSelectHintText = visible ? trimmed : nil
+        multiSelectHintLabel.stringValue = multiSelectHintText ?? ""
+        multiSelectHintLabel.isHidden = !visible
+        multiSelectHintSeparatorLabel.isHidden = !visible
         needsLayout = true
     }
 

@@ -26,6 +26,7 @@ final class GlyphAtlas {
     /// atlas does not pay for a second dictionary keyed by the same codepoints.
     private(set) var glyphCache: [UInt32: GlyphInfo] = [:]
     private var accessGeneration: UInt64 = 0
+    private(set) var atlasRevision: UInt64 = 0
 
     /// Font reference
     private var ctFont: CTFont
@@ -369,6 +370,7 @@ final class GlyphAtlas {
         atlasDimension = initialAtlasDimension
         calculateCellMetrics()
         texture = nil
+        atlasRevision &+= 1
     }
 
     @discardableResult
@@ -418,6 +420,7 @@ final class GlyphAtlas {
         rowHeight = 0
         calculateCellMetrics()
         texture = nil
+        atlasRevision &+= 1
         guard !required.isEmpty else { return }
         for codepoint in required.sorted() {
             _ = rasterizeGlyph(codepoint: codepoint, allowAtlasGrowth: true)

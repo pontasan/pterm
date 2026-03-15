@@ -42,7 +42,7 @@ final class MetalRenderer {
         round(value)
     }
 
-    private static func wideGlyphOffsetX(
+    static func wideGlyphOffsetX(
         _ glyph: GlyphAtlas.GlyphInfo,
         spanWidth: Float,
         singleCellWidth: Float
@@ -2000,14 +2000,26 @@ final class MetalRenderer {
         let glyphCellHeight = Float(glyphAtlas.cellHeight) * scaleFactor * glyphScale
         let originY = y + max(0, floor((headerHeight - glyphCellHeight) * 0.5))
         var cursorX = x
+        let singleCellAdvance = Float(glyphAtlas.cellWidth) * scaleFactor * glyphScale
 
         for scalar in fullText.unicodeScalars {
+            let characterWidth = max(CharacterWidth.width(of: scalar.value), 1)
+            let cellAdvance = Float(characterWidth) * singleCellAdvance
+
             guard let glyph = glyphAtlas.glyphInfo(for: scalar.value), glyph.pixelWidth > 0 else {
-                cursorX += Float(glyphAtlas.cellWidth) * scaleFactor * glyphScale
+                cursorX += cellAdvance
                 continue
             }
 
-            let glyphX = cursorX + glyph.cellOffsetX * glyphScale
+            let glyphX = cursorX + (
+                characterWidth == 1
+                    ? glyph.cellOffsetX * glyphScale
+                    : Self.wideGlyphOffsetX(
+                        glyph,
+                        spanWidth: cellAdvance,
+                        singleCellWidth: singleCellAdvance
+                    )
+            )
             let baselineY = originY + glyphCellHeight - Float(glyphAtlas.baseline) * scaleFactor * glyphScale
             let glyphY = baselineY - glyph.baselineOffset * glyphScale
             addQuad(
@@ -2039,7 +2051,7 @@ final class MetalRenderer {
                     bg: (0, 0, 0, 0)
                 )
             }
-            cursorX += Float(glyphAtlas.cellWidth) * scaleFactor * glyphScale
+            cursorX += cellAdvance
         }
     }
 
@@ -2049,12 +2061,27 @@ final class MetalRenderer {
         scaleFactor: Float,
         glyphScale: Float
     ) -> String {
-        let cellAdvance = Float(glyphAtlas.cellWidth) * scaleFactor * glyphScale
-        guard cellAdvance > 0 else { return text }
-        let maxGlyphCount = max(0, Int(floor(availableWidth / cellAdvance)))
-        guard text.count > maxGlyphCount, maxGlyphCount > 0 else { return text }
-        guard maxGlyphCount > 1 else { return String(text.prefix(maxGlyphCount)) }
-        return String(text.prefix(maxGlyphCount - 1)) + "…"
+        let singleCellAdvance = Float(glyphAtlas.cellWidth) * scaleFactor * glyphScale
+        guard singleCellAdvance > 0 else { return text }
+
+        let ellipsis = "…"
+        let ellipsisWidth = Float(max(CharacterWidth.width(of: 0x2026), 1)) * singleCellAdvance
+        var consumedWidth: Float = 0
+        var scalars: [Unicode.Scalar] = []
+        let allScalars = Array(text.unicodeScalars)
+
+        for (index, scalar) in allScalars.enumerated() {
+            let scalarWidth = Float(max(CharacterWidth.width(of: scalar.value), 1)) * singleCellAdvance
+            let remainingCount = allScalars.count - index - 1
+            let reservedWidth = remainingCount > 0 ? ellipsisWidth : 0
+            guard consumedWidth + scalarWidth + reservedWidth <= availableWidth else { break }
+            scalars.append(scalar)
+            consumedWidth += scalarWidth
+        }
+
+        guard scalars.count < allScalars.count else { return text }
+        guard !scalars.isEmpty else { return availableWidth >= ellipsisWidth ? ellipsis : "" }
+        return String(String.UnicodeScalarView(scalars)) + ellipsis
     }
 
     private func headerOverlayHeight(scaleFactor: Float) -> Float {
