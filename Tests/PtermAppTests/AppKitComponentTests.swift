@@ -7157,32 +7157,23 @@ final class AppKitComponentTests: XCTestCase {
         rootView.wantsLayer = true
         window.contentView = rootView
 
-        delegate.setValue(window, forKey: "window")
-        delegate.setValue(renderer, forKey: "renderer")
-        delegate.setValue(manager, forKey: "manager")
-
         let hostedContentView = NSView(frame: rootView.bounds)
         hostedContentView.autoresizingMask = [.width, .height]
         hostedContentView.wantsLayer = true
         rootView.addSubview(hostedContentView)
-        delegate.setValue(hostedContentView, forKey: "windowHostedContentView")
+        delegate.configureForTesting(window: window, renderer: renderer, manager: manager, hostedContentView: hostedContentView)
 
         window.makeKeyAndOrderFront(nil)
 
-        let switchToSplit = Selector(("switchToSplit:"))
-        typealias SplitIMP = @convention(c) (AnyObject, Selector, NSArray) -> Void
-        let implementation = unsafeBitCast(delegate.method(for: switchToSplit), to: SplitIMP.self)
-
-        implementation(delegate, switchToSplit, [first, second])
+        delegate.switchToSplit([first, second])
         let splitCountAfterFirst = allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.count
         XCTAssertEqual(splitCountAfterFirst, 1)
 
-        implementation(delegate, switchToSplit, [first, second, third])
+        delegate.switchToSplit([first, second, third])
         let splitContainers = allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }
         XCTAssertEqual(splitContainers.count, 1)
 
-        let backSelector = #selector(AppDelegate.backToIntegratedView(_:))
-        _ = delegate.perform(backSelector, with: nil)
+        delegate.backToIntegratedView(nil)
         let remainingSplitContainers = allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }
         XCTAssertTrue(remainingSplitContainers.isEmpty)
     }

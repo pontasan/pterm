@@ -754,7 +754,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         requestSessionPersist()
     }
 
-    private func switchToSplit(_ controllers: [TerminalController]) {
+    func switchToSplit(_ controllers: [TerminalController]) {
         guard controllers.count >= 2 else {
             if let first = controllers.first {
                 switchToFocused(first)
@@ -2219,6 +2219,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowRootContentView = rootView
         windowHostedContentView = hostedContentView
         windowPresentationHostView = presentationHostView
+    }
+
+    /// Inject dependencies for unit tests (only visible via @testable import).
+    func configureForTesting(window: NSWindow, renderer: MetalRenderer, manager: TerminalManager, hostedContentView: NSView) {
+        self.window = window
+        self.renderer = renderer
+        self.manager = manager
+        self.windowHostedContentView = hostedContentView
+        self.statusBarView = StatusBarView(frame: .zero)
     }
 
     private func contentHostView() -> NSView {
