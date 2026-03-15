@@ -2309,9 +2309,6 @@ final class TerminalScrollView: NSScrollView {
     /// back to a scrollOffset for the terminal's virtual scrollback.
     @objc private func scrollViewDidScroll(_ notification: Notification) {
         guard !isSyncing else { return }
-        // When rendering is suppressed (split view), SplitRenderView owns the render loop.
-        // The clip view position is stale and must not feed back into scrollOffset.
-        guard !terminalView.renderingSuppressed else { return }
         guard let controller = terminalView.terminalController else { return }
 
         let viewportHeight = bounds.height
@@ -2328,6 +2325,10 @@ final class TerminalScrollView: NSScrollView {
         lastScrollSyncSignature = nil
 
         pinTerminalViewToViewport()
+        if terminalView.renderingSuppressed,
+           let splitContainer = terminalView.enclosingScrollView?.superview as? SplitTerminalContainerView {
+            splitContainer.requestRender()
+        }
     }
 
     // MARK: - First Responder

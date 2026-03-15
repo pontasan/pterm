@@ -265,6 +265,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
+    static func shouldReinsertSubview(
+        _ subview: NSView,
+        below sibling: NSView,
+        in parent: NSView
+    ) -> Bool {
+        guard subview.superview === parent else { return true }
+        guard let subviewIndex = parent.subviews.firstIndex(of: subview),
+              let siblingIndex = parent.subviews.firstIndex(of: sibling) else {
+            return true
+        }
+        return subviewIndex >= siblingIndex
+    }
+
     static func shouldPromoteOutputActivityToVisibleIndicator(
         terminalHasEverBeenIdle: Bool,
         secondsSinceLastResize: TimeInterval
@@ -2715,10 +2728,9 @@ extension AppDelegate: NSWindowDelegate {
                 }
                 if let glassView = windowBackgroundGlassView as? NSGlassEffectView {
                     glassView.tintColor = nil
-                    if glassView.superview !== rootView {
-                        rootView?.addSubview(glassView, positioned: .below, relativeTo: hostedContentView)
-                    } else {
-                        rootView?.addSubview(glassView, positioned: .below, relativeTo: hostedContentView)
+                    if let rootView,
+                       Self.shouldReinsertSubview(glassView, below: hostedContentView, in: rootView) {
+                        rootView.addSubview(glassView, positioned: .below, relativeTo: hostedContentView)
                     }
                     glassView.frame = rootView?.bounds ?? .zero
                     glassView.isHidden = false

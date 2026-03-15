@@ -3589,6 +3589,79 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(scrollViews.allSatisfy { $0.terminalView.drawableSize == .zero })
     }
 
+    func testSplitTerminalContainerRequestRenderSyncsNativeScrollerToControllerOffset() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        for rowIndex in 0..<24 {
+            controller.scrollback.appendRow(ArraySlice("ROW\(rowIndex)".unicodeScalars.map {
+                Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+            }), isWrapped: false)
+        }
+        let split = SplitTerminalContainerView(
+            frame: NSRect(x: 0, y: 0, width: 400, height: 300),
+            renderer: renderer,
+            controllers: [controller]
+        )
+        split.layoutSubtreeIfNeeded()
+        guard let scrollView = allSubviews(in: split).compactMap({ $0 as? TerminalScrollView }).first else {
+            XCTFail("TerminalScrollView missing")
+            return
+        }
+
+        controller.setScrollOffset(8)
+        split.requestRender()
+
+        XCTAssertGreaterThan(scrollView.contentView.bounds.origin.y, 0)
+    }
+
+    func testSplitTerminalScrollerDragFeedsBackIntoControllerScrollOffset() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        for rowIndex in 0..<24 {
+            controller.scrollback.appendRow(ArraySlice("ROW\(rowIndex)".unicodeScalars.map {
+                Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+            }), isWrapped: false)
+        }
+        let split = SplitTerminalContainerView(
+            frame: NSRect(x: 0, y: 0, width: 400, height: 300),
+            renderer: renderer,
+            controllers: [controller]
+        )
+        split.layoutSubtreeIfNeeded()
+        guard let scrollView = allSubviews(in: split).compactMap({ $0 as? TerminalScrollView }).first else {
+            XCTFail("TerminalScrollView missing")
+            return
+        }
+
+        scrollView.syncScroller()
+        let initialOffset = controller.withViewport { _, _, scrollOffset in scrollOffset }
+        let targetY = scrollView.documentView!.frame.height - scrollView.bounds.height
+        scrollView.contentView.setBoundsOrigin(NSPoint(x: 0, y: max(0, targetY)))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+
+        let updatedOffset = controller.withViewport { _, _, scrollOffset in scrollOffset }
+        XCTAssertNotEqual(initialOffset, updatedOffset)
+        XCTAssertEqual(updatedOffset, 0)
+    }
+
     func testSplitTerminalContainerUpdateControllersRebuildsSubviewCount() throws {
         let renderer = try makeRendererOrSkip()
         let initial = (0..<2).map { index in

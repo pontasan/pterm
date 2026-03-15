@@ -249,6 +249,7 @@ final class SplitTerminalContainerView: NSView {
     }
 
     func requestRender() {
+        scrollViews.forEach { $0.syncScroller() }
         splitRenderView?.requestRender()
     }
 

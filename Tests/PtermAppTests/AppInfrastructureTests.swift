@@ -174,6 +174,37 @@ final class AppInfrastructureTests: XCTestCase {
         )
     }
 
+    func testGlassSubviewReinsertPolicySkipsNoOpReorderWhenAlreadyBelowHostedContent() {
+        let parent = NSView(frame: .init(x: 0, y: 0, width: 100, height: 100))
+        let glass = NSView(frame: parent.bounds)
+        let hosted = NSView(frame: parent.bounds)
+        parent.addSubview(glass)
+        parent.addSubview(hosted)
+
+        XCTAssertFalse(AppDelegate.shouldReinsertSubview(glass, below: hosted, in: parent))
+    }
+
+    func testGlassSubviewReinsertPolicyRequestsReorderWhenGlassIsAboveHostedContent() {
+        let parent = NSView(frame: .init(x: 0, y: 0, width: 100, height: 100))
+        let hosted = NSView(frame: parent.bounds)
+        let glass = NSView(frame: parent.bounds)
+        parent.addSubview(hosted)
+        parent.addSubview(glass)
+
+        XCTAssertTrue(AppDelegate.shouldReinsertSubview(glass, below: hosted, in: parent))
+    }
+
+    func testGlassSubviewReinsertPolicyRequestsAttachWhenGlassHasDifferentParent() {
+        let parent = NSView(frame: .init(x: 0, y: 0, width: 100, height: 100))
+        let otherParent = NSView(frame: parent.bounds)
+        let glass = NSView(frame: parent.bounds)
+        let hosted = NSView(frame: parent.bounds)
+        otherParent.addSubview(glass)
+        parent.addSubview(hosted)
+
+        XCTAssertTrue(AppDelegate.shouldReinsertSubview(glass, below: hosted, in: parent))
+    }
+
     func testRefreshCurrentDirectoriesRefreshesEachUniqueControllerOnce() {
         var refreshCalls: [UUID] = []
         let first = TerminalController(
