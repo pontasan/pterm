@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import PtermCore
+import Dispatch
 
 /// Coordinates PTY, VT parser, terminal model, and ring buffer.
 ///
@@ -36,6 +37,52 @@ final class TerminalController {
         let absoluteRow: Int
         let startCol: Int
         let endCol: Int
+    }
+
+    /// A frozen copy of the current viewport state for benchmarks and diagnostics.
+    ///
+    /// This snapshot is intentionally broad and includes enough data for
+    /// diagnostics that need to inspect the whole viewport source state.
+    struct ViewportSnapshot {
+        let rows: Int
+        let cols: Int
+        let cursor: CursorState
+        let scrollOffset: Int
+        let scrollbackRowCount: Int
+        let grid: TerminalGrid
+        let scrollbackRows: [[Cell]]
+        let scrollbackRowHasData: [Bool]
+    }
+
+    struct RenderRowSnapshot {
+        let cells: [Cell]
+    }
+
+    /// The minimum self-contained state required to render one frame safely.
+    ///
+    /// The lock protects consistency while we read shared terminal state. Once
+    /// this snapshot has been assembled, rendering must not touch `model`,
+    /// `scrollback`, or `scrollOffset` again. That lets us release the read lock
+    /// before the expensive vertex-building and Metal work starts, while still
+    /// guaranteeing that every field below comes from the same logical instant.
+    ///
+    /// Included on purpose:
+    /// - `rows` / `cols`: geometry and selection bounds
+    /// - `cursor`: cursor visibility, shape, and position for the same frame
+    /// - `scrollOffset`: cursor suppression and viewport mode
+    /// - `firstVisibleAbsoluteRow`: maps search matches onto the frozen rows
+    /// - `visibleRows`: the exact cells the renderer may inspect
+    ///
+    /// Omitted on purpose:
+    /// - non-visible scrollback/grid rows, because the renderer should not read
+    ///   data it cannot draw for the current frame
+    struct RenderSnapshot {
+        let rows: Int
+        let cols: Int
+        let cursor: CursorState
+        let scrollOffset: Int
+        let firstVisibleAbsoluteRow: Int
+        let visibleRows: [RenderRowSnapshot]
     }
 
     /// Terminal model (grid + cursor + state)
@@ -718,6 +765,68 @@ final class TerminalController {
         }
     }
 
+    func snapshotViewport() -> ViewportSnapshot {
+        lock.withReadLock {
+            let rows = model.rows
+            let cols = model.cols
+            let scrollbackRowCount = scrollback.rowCount
+            let offset = scrollOffset
+            let grid = model.grid.snapshot()
+
+            var scrollbackRows: [[Cell]] = []
+            var scrollbackRowHasData: [Bool] = []
+            if offset > 0 {
+                scrollbackRows = Array(repeating: [], count: rows)
+                scrollbackRowHasData = Array(repeating: false, count: rows)
+                let firstAbsolute = max(0, scrollbackRowCount - offset)
+                for row in 0..<rows {
+                    let absoluteRow = firstAbsolute + row
+                    guard absoluteRow >= 0, absoluteRow < scrollbackRowCount else { continue }
+                    var rowBuffer: [Cell] = []
+                    scrollbackRowHasData[row] = scrollback.getRow(at: absoluteRow, into: &rowBuffer)
+                    scrollbackRows[row] = rowBuffer
+                }
+            }
+
+            return ViewportSnapshot(
+                rows: rows,
+                cols: cols,
+                cursor: model.cursor,
+                scrollOffset: offset,
+                scrollbackRowCount: scrollbackRowCount,
+                grid: grid,
+                scrollbackRows: scrollbackRows,
+                scrollbackRowHasData: scrollbackRowHasData
+            )
+        }
+    }
+
+    func captureRenderSnapshot() -> RenderSnapshot {
+        lock.withReadLock {
+            let rows = model.rows
+            let cols = model.cols
+            let cursor = model.cursor
+            let offset = scrollOffset
+            let visibleRows = visibleRowsLocked()
+            let firstVisibleAbsoluteRow = offset > 0
+                ? max(0, scrollback.rowCount - offset)
+                : scrollback.rowCount
+
+            let renderRows = visibleRows.map { row in
+                RenderRowSnapshot(cells: row.cells)
+            }
+
+            return RenderSnapshot(
+                rows: rows,
+                cols: cols,
+                cursor: cursor,
+                scrollOffset: offset,
+                firstVisibleAbsoluteRow: firstVisibleAbsoluteRow,
+                visibleRows: renderRows
+            )
+        }
+    }
+
     func selectedText(for selection: TerminalSelection) -> String {
         lock.withReadLock {
             let rows = visibleRowsLocked()
@@ -1072,6 +1181,42 @@ final class TerminalController {
         }
     }
 
+    func debugProcessPTYOutputForTesting(_ data: Data, recordAudit: Bool = false) {
+        processPTYOutput(data, recordAudit: recordAudit)
+    }
+
+    func debugMeasureWriteLockContentionForTesting(readHoldNanoseconds: UInt64) -> UInt64 {
+        let writerReady = DispatchSemaphore(value: 0)
+        let writerFinished = DispatchSemaphore(value: 0)
+        let resultLock = NSLock()
+        var waitNanoseconds: UInt64 = 0
+
+        lock.withReadLock {
+            DispatchQueue.global(qos: .userInitiated).async {
+                writerReady.signal()
+                let start = ContinuousClock.now
+                self.lock.withWriteLock { }
+                let duration = start.duration(to: .now)
+                resultLock.lock()
+                waitNanoseconds = Self.nanoseconds(for: duration)
+                resultLock.unlock()
+                writerFinished.signal()
+            }
+
+            writerReady.wait()
+            if readHoldNanoseconds > 0 {
+                let seconds = Double(readHoldNanoseconds) / 1_000_000_000
+                Thread.sleep(forTimeInterval: seconds)
+            }
+        }
+
+        writerFinished.wait()
+        resultLock.lock()
+        let measured = waitNanoseconds
+        resultLock.unlock()
+        return measured
+    }
+
     private func ensureCodepointBufferCapacity(requiredCount: Int) {
         guard requiredCount > codepointBuffer.count else { return }
         let minimum = max(Self.minimumCodepointBufferCapacity, requiredCount)
@@ -1210,6 +1355,13 @@ final class TerminalController {
 
     private static func suggestedSearchReserveCapacity(scrollbackRows: Int) -> Int {
         min(maxSearchReserveCapacity, max(16, scrollbackRows / 4))
+    }
+
+    private static func nanoseconds(for duration: Duration) -> UInt64 {
+        let components = duration.components
+        let seconds = UInt64(max(components.seconds, 0))
+        let attoseconds = UInt64(max(components.attoseconds, 0))
+        return seconds * 1_000_000_000 + attoseconds / 1_000_000_000
     }
 
     private static func displayDirectoryName(for path: String) -> String {

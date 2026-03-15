@@ -14,6 +14,12 @@ final class TerminalGrid {
     /// Cell storage: row-major order
     private var cells: [Cell]
 
+    /// Logical row -> physical storage row mapping.
+    /// Scroll operations rotate this indirection instead of physically
+    /// copying every row's cells on each line feed.
+    private var rowOrder: [Int]
+    private var hasRowPermutation = false
+
     /// Per-row wrap flags packed into 64-bit words.
     private var lineWrappedWords: [UInt64]
 
@@ -33,6 +39,7 @@ final class TerminalGrid {
         self.cols = cols
         self.scrollBottom = rows - 1
         self.cells = Array(repeating: Cell.empty, count: rows * cols)
+        self.rowOrder = []
         self.lineWrappedWords = Array(repeating: 0, count: Self.wrapWordCount(for: rows))
     }
 
@@ -43,13 +50,13 @@ final class TerminalGrid {
         guard row >= 0, row < rows, col >= 0, col < cols else {
             return Cell.empty
         }
-        return cells[row * cols + col]
+        return cells[cellIndex(row: row, col: col)]
     }
 
     /// Set cell at (row, col). No-op if out of bounds.
     func setCell(_ cell: Cell, at row: Int, col: Int) {
         guard row >= 0, row < rows, col >= 0, col < cols else { return }
-        cells[row * cols + col] = cell
+        cells[cellIndex(row: row, col: col)] = cell
     }
 
     // MARK: - Wrap Flag
@@ -79,8 +86,9 @@ final class TerminalGrid {
         guard row >= 0, row < rows else { return }
         let start = max(0, fromCol)
         let end = min(cols, toCol + 1)
+        let offset = rowBaseOffset(for: row)
         for col in start..<end {
-            cells[row * cols + col] = Cell.empty
+            cells[offset + col] = Cell.empty
         }
     }
 
@@ -95,6 +103,8 @@ final class TerminalGrid {
     /// Clear entire grid.
     func clearAll() {
         cells = Array(repeating: Cell.empty, count: rows * cols)
+        rowOrder.removeAll(keepingCapacity: true)
+        hasRowPermutation = false
         resetWrapStorage(for: rows)
     }
 
@@ -115,13 +125,13 @@ final class TerminalGrid {
             return
         }
 
-        // Move lines up
+        let wrappedFlags = wrappedFlagsArray(startingAt: top, count: regionHeight)
+        ensureRowOrderMaterialized()
+        rotateRowOrder(in: top...bottom, leftBy: count)
+        hasRowPermutation = true
+
         for row in top...(bottom - count) {
-            let srcOffset = (row + count) * cols
-            let dstOffset = row * cols
-            cells.replaceSubrange(dstOffset..<(dstOffset + cols),
-                                  with: cells[srcOffset..<(srcOffset + cols)])
-            setWrapped(row, isWrapped(row + count))
+            setWrapped(row, wrappedFlags[row - top + count])
         }
 
         // Clear newly exposed lines at bottom
@@ -145,13 +155,13 @@ final class TerminalGrid {
             return
         }
 
-        // Move lines down (iterate from bottom to avoid overwrite)
-        for row in stride(from: bottom, through: top + count, by: -1) {
-            let srcOffset = (row - count) * cols
-            let dstOffset = row * cols
-            cells.replaceSubrange(dstOffset..<(dstOffset + cols),
-                                  with: cells[srcOffset..<(srcOffset + cols)])
-            setWrapped(row, isWrapped(row - count))
+        let wrappedFlags = wrappedFlagsArray(startingAt: top, count: regionHeight)
+        ensureRowOrderMaterialized()
+        rotateRowOrder(in: top...bottom, rightBy: count)
+        hasRowPermutation = true
+
+        for row in (top + count)...bottom {
+            setWrapped(row, wrappedFlags[row - top - count])
         }
 
         // Clear newly exposed lines at top
@@ -272,6 +282,8 @@ final class TerminalGrid {
         self.rows = newRows
         self.cols = newCols
         self.cells = newCells
+        self.rowOrder.removeAll(keepingCapacity: true)
+        self.hasRowPermutation = false
         self.setWrappedFlags(newWrapped)
         self.scrollTop = 0
         self.scrollBottom = newRows - 1
@@ -285,6 +297,8 @@ final class TerminalGrid {
     private func resizeRowsOnly(newRows: Int, cursorRow: Int, cursorCol: Int) -> ResizeResult {
         var newCursorRow = cursorRow
         var trimmedRows: [TrimmedRow] = []
+        var logicalRows = (0..<rows).map { Array(rowCells($0)) }
+        var wrappedFlags = wrappedFlagsArray(startingAt: 0, count: rows)
 
         if newRows < rows {
             // Shrinking: if cursor is below new bottom, scroll content up
@@ -292,31 +306,32 @@ final class TerminalGrid {
                 let scrollAmount = cursorRow - newRows + 1
                 // Capture rows being scrolled out
                 for i in 0..<scrollAmount {
-                    let start = i * cols
-                    let rowCells = Array(cells[start..<(start + cols)])
-                    trimmedRows.append(TrimmedRow(cells: rowCells, isWrapped: isWrapped(i)))
+                    trimmedRows.append(TrimmedRow(cells: logicalRows[i], isWrapped: wrappedFlags[i]))
                 }
-                cells.removeFirst(scrollAmount * cols)
-                var newWrapped = wrappedFlagsArray(startingAt: scrollAmount, count: rows - scrollAmount)
-                cells.append(contentsOf:
-                    Array(repeating: Cell.empty, count: scrollAmount * cols))
-                newWrapped.append(contentsOf: Array(repeating: false, count: scrollAmount))
-                setWrappedFlags(newWrapped)
+                let existingRows = Array(logicalRows[scrollAmount..<rows])
+                let paddingRows = Array(
+                    repeating: Array(repeating: Cell.empty, count: cols),
+                    count: scrollAmount
+                )
+                logicalRows = existingRows + paddingRows
+                wrappedFlags = Array(wrappedFlags[scrollAmount..<rows]) + Array(repeating: false, count: scrollAmount)
                 newCursorRow -= scrollAmount
             }
             // Trim to newRows
-            cells = Array(cells.prefix(newRows * cols))
-            setWrappedFlags(wrappedFlagsArray(startingAt: 0, count: newRows))
+            logicalRows = Array(logicalRows.prefix(newRows))
+            wrappedFlags = Array(wrappedFlags.prefix(newRows))
         } else if newRows > rows {
             // Growing: add empty rows at bottom
             let padRows = newRows - rows
-            cells.append(contentsOf:
-                Array(repeating: Cell.empty, count: padRows * cols))
-            var newWrapped = wrappedFlagsArray(startingAt: 0, count: rows)
-            newWrapped.append(contentsOf: Array(repeating: false, count: padRows))
-            setWrappedFlags(newWrapped)
+            logicalRows.append(contentsOf:
+                Array(repeating: Array(repeating: Cell.empty, count: cols), count: padRows))
+            wrappedFlags.append(contentsOf: Array(repeating: false, count: padRows))
         }
 
+        cells = logicalRows.flatMap { $0 }
+        rowOrder.removeAll(keepingCapacity: true)
+        hasRowPermutation = false
+        setWrappedFlags(wrappedFlags)
         self.rows = newRows
         self.scrollTop = 0
         self.scrollBottom = newRows - 1
@@ -334,8 +349,7 @@ final class TerminalGrid {
         var currentLine = [Cell]()
 
         for row in 0..<rows {
-            let offset = row * cols
-            let rowCells = Array(cells[offset..<(offset + cols)])
+            let rowCells = Array(rowCells(row))
 
             if row == 0 || !isWrapped(row) {
                 // Start of a new logical line
@@ -417,14 +431,14 @@ final class TerminalGrid {
     /// Get raw cell data for a row (for ring buffer storage).
     func rowCells(_ row: Int) -> ArraySlice<Cell> {
         guard row >= 0, row < rows else { return [] }
-        let start = row * cols
+        let start = rowBaseOffset(for: row)
         return cells[start..<(start + cols)]
     }
 
     /// Insert blank cells at column, shifting existing cells right.
     func insertBlanks(row: Int, col: Int, count: Int) {
         guard row >= 0, row < rows, col >= 0, col < cols else { return }
-        let offset = row * cols
+        let offset = rowBaseOffset(for: row)
         let shift = min(count, cols - col)
 
         // Shift cells right
@@ -441,7 +455,7 @@ final class TerminalGrid {
     /// Delete cells at column, shifting remaining cells left.
     func deleteCells(row: Int, col: Int, count: Int) {
         guard row >= 0, row < rows, col >= 0, col < cols else { return }
-        let offset = row * cols
+        let offset = rowBaseOffset(for: row)
         let shift = min(count, cols - col)
 
         // Shift cells left
@@ -485,5 +499,67 @@ final class TerminalGrid {
             wrappedFlags.append(isWrapped(row))
         }
         return wrappedFlags
+    }
+
+    // MARK: - Snapshot
+
+    /// Return an immutable copy of the grid contents for diagnostics and benchmarks.
+    func snapshot() -> TerminalGrid {
+        let copy = TerminalGrid(rows: rows, cols: cols)
+        copy.cells = cells
+        copy.hasRowPermutation = hasRowPermutation
+        if hasRowPermutation {
+            copy.rowOrder = rowOrder
+        }
+        copy.lineWrappedWords = lineWrappedWords
+        copy.scrollTop = scrollTop
+        copy.scrollBottom = scrollBottom
+        return copy
+    }
+
+    private func physicalRow(for logicalRow: Int) -> Int {
+        guard hasRowPermutation else { return logicalRow }
+        return rowOrder[logicalRow]
+    }
+
+    private func ensureRowOrderMaterialized() {
+        guard !hasRowPermutation, rowOrder.isEmpty else { return }
+        rowOrder = Array(0..<rows)
+    }
+
+    private func rowBaseOffset(for row: Int) -> Int {
+        physicalRow(for: row) * cols
+    }
+
+    private func cellIndex(row: Int, col: Int) -> Int {
+        rowBaseOffset(for: row) + col
+    }
+
+    private func rotateRowOrder(in range: ClosedRange<Int>, leftBy amount: Int) {
+        var segment = Array(rowOrder[range])
+        segment.rotateLeft(by: amount)
+        rowOrder.replaceSubrange(range, with: segment)
+    }
+
+    private func rotateRowOrder(in range: ClosedRange<Int>, rightBy amount: Int) {
+        var segment = Array(rowOrder[range])
+        segment.rotateRight(by: amount)
+        rowOrder.replaceSubrange(range, with: segment)
+    }
+}
+
+private extension Array where Element == Int {
+    mutating func rotateLeft(by rawAmount: Int) {
+        guard !isEmpty else { return }
+        let amount = rawAmount % count
+        guard amount > 0 else { return }
+        self = Array(self[amount...]) + self[..<amount]
+    }
+
+    mutating func rotateRight(by rawAmount: Int) {
+        guard !isEmpty else { return }
+        let amount = rawAmount % count
+        guard amount > 0 else { return }
+        rotateLeft(by: count - amount)
     }
 }

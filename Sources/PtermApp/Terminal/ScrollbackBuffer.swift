@@ -10,6 +10,12 @@ import PtermCore
 /// Thread safety: Callers must manage external synchronization.
 /// In practice, the TerminalController lock covers all access.
 final class ScrollbackBuffer {
+    private enum RowEncodingPlan {
+        case compactDefault(serializedCount: Int)
+        case compactUniformAttributes(sharedAttributes: CellAttributes, serializedCount: Int)
+        case full
+    }
+
     private enum RowFormat {
         static let compactDefault = UInt8(0x01)
         static let compactUniformAttributes = UInt8(0x02)
@@ -99,27 +105,20 @@ final class ScrollbackBuffer {
         guard let rb = ringBuffer else { return }
 
         let cellCount = cells.count
-        let usesCompactDefaultFormat = Self.canUseCompactDefaultRowFormat(for: cells)
-        let usesCompactUniformAttributesFormat = !usesCompactDefaultFormat &&
-            Self.canUseCompactUniformAttributesRowFormat(for: cells)
-        let compactDefaultSerializedCount = usesCompactDefaultFormat
-            ? Self.trimmedCompactDefaultCellCount(for: cells)
-            : 0
-        let compactUniformSerializedCount = usesCompactUniformAttributesFormat
-            ? Self.trimmedCompactUniformCellCount(for: cells)
-            : 0
+        let encodingPlan = Self.encodingPlan(for: cells)
         let byteCount: Int
-        if usesCompactDefaultFormat {
-            let headerBytes = compactDefaultSerializedCount == cellCount
+        switch encodingPlan {
+        case .compactDefault(let serializedCount):
+            let headerBytes = serializedCount == cellCount
                 ? Self.compactRowHeaderBytes
                 : Self.compactTrimmedRowHeaderBytes
-            byteCount = headerBytes + (compactDefaultSerializedCount * MemoryLayout<UInt32>.size)
-        } else if usesCompactUniformAttributesFormat {
-            let headerBytes = compactUniformSerializedCount == cellCount
+            byteCount = headerBytes + (serializedCount * MemoryLayout<UInt32>.size)
+        case .compactUniformAttributes(_, let serializedCount):
+            let headerBytes = serializedCount == cellCount
                 ? Self.uniformAttributesHeaderBytes
                 : Self.uniformAttributesTrimmedHeaderBytes
-            byteCount = headerBytes + (compactUniformSerializedCount * Self.uniformAttributesBytesPerCell)
-        } else {
+            byteCount = headerBytes + (serializedCount * Self.uniformAttributesBytesPerCell)
+        case .full:
             byteCount = cellCount * Self.bytesPerCell
         }
 
@@ -131,21 +130,21 @@ final class ScrollbackBuffer {
         guard let buf = serializeBuf else { return }
 
         // Serialize cells into the buffer
-        if usesCompactDefaultFormat {
-            let trimmed = compactDefaultSerializedCount != cellCount
+        switch encodingPlan {
+        case .compactDefault(let serializedCount):
+            let trimmed = serializedCount != cellCount
             buf[0] = trimmed ? RowFormat.compactDefaultTrimmed : RowFormat.compactDefault
             var offset = trimmed ? Self.compactTrimmedRowHeaderBytes : Self.compactRowHeaderBytes
             if trimmed {
                 Self.serializeUInt16(UInt16(cellCount), to: buf + 1)
             }
-            for cell in cells.prefix(compactDefaultSerializedCount) {
+            for cell in cells.prefix(serializedCount) {
                 Self.serializeCompactDefaultCell(cell, to: buf + offset)
                 offset += MemoryLayout<UInt32>.size
             }
-        } else if usesCompactUniformAttributesFormat {
-            let trimmed = compactUniformSerializedCount != cellCount
+        case .compactUniformAttributes(let sharedAttributes, let serializedCount):
+            let trimmed = serializedCount != cellCount
             buf[0] = trimmed ? RowFormat.compactUniformAttributesTrimmed : RowFormat.compactUniformAttributes
-            let sharedAttributes = cells.first?.attributes ?? .default
             Self.serializeColor(sharedAttributes.foreground, to: buf + 1)
             Self.serializeColor(sharedAttributes.background, to: buf + 5)
             buf[9] = Self.serializeAttributeFlags(sharedAttributes)
@@ -153,11 +152,11 @@ final class ScrollbackBuffer {
             if trimmed {
                 Self.serializeUInt16(UInt16(cellCount), to: buf + 10)
             }
-            for cell in cells.prefix(compactUniformSerializedCount) {
+            for cell in cells.prefix(serializedCount) {
                 Self.serializeCompactUniformAttributeCell(cell, to: buf + offset)
                 offset += Self.uniformAttributesBytesPerCell
             }
-        } else {
+        case .full:
             var offset = 0
             for cell in cells {
                 Self.serializeCell(cell, to: buf + offset)
@@ -360,27 +359,68 @@ final class ScrollbackBuffer {
         }
     }
 
-    private static func canUseCompactDefaultRowFormat(for cells: ArraySlice<Cell>) -> Bool {
-        for cell in cells {
-            guard cell.attributes == .default,
-                  cell.width == 1,
-                  !cell.isWideContinuation else {
-                return false
-            }
-        }
-        return true
-    }
+    private static func encodingPlan(for cells: ArraySlice<Cell>) -> RowEncodingPlan {
+        guard let first = cells.first else { return .full }
 
-    private static func canUseCompactUniformAttributesRowFormat(for cells: ArraySlice<Cell>) -> Bool {
-        guard let sharedAttributes = cells.first?.attributes else {
-            return false
+        let sharedAttributes = first.attributes
+        var canUseCompactDefault = true
+        var canUseCompactUniform = true
+        var compactDefaultSerializedCount = cells.count
+        var compactUniformSerializedCount = cells.count
+        let uniformBlank = Cell(
+            codepoint: Cell.empty.codepoint,
+            attributes: sharedAttributes,
+            width: Cell.empty.width,
+            isWideContinuation: false
+        )
+
+        var index = cells.count - 1
+        for cell in cells.reversed() {
+            if !isCell(cell, equalTo: .empty) {
+                compactDefaultSerializedCount = index + 1
+                break
+            }
+            compactDefaultSerializedCount = index
+            if index == 0 { break }
+            index -= 1
         }
+
+        index = cells.count - 1
+        for cell in cells.reversed() {
+            if !isCell(cell, equalTo: uniformBlank) {
+                compactUniformSerializedCount = index + 1
+                break
+            }
+            compactUniformSerializedCount = index
+            if index == 0 { break }
+            index -= 1
+        }
+
         for cell in cells {
-            guard cell.attributes == sharedAttributes else {
-                return false
+            if canUseCompactDefault &&
+                (cell.attributes != .default || cell.width != 1 || cell.isWideContinuation) {
+                canUseCompactDefault = false
+            }
+
+            if canUseCompactUniform && cell.attributes != sharedAttributes {
+                canUseCompactUniform = false
+            }
+
+            if !canUseCompactDefault && !canUseCompactUniform {
+                return .full
             }
         }
-        return true
+
+        if canUseCompactDefault {
+            return .compactDefault(serializedCount: compactDefaultSerializedCount)
+        }
+        if canUseCompactUniform {
+            return .compactUniformAttributes(
+                sharedAttributes: sharedAttributes,
+                serializedCount: compactUniformSerializedCount
+            )
+        }
+        return .full
     }
 
     private static func isCompactDefaultRowFormat(length: Int, firstByte: UInt8) -> Bool {
@@ -407,42 +447,11 @@ final class ScrollbackBuffer {
         return (length - headerBytes) % uniformAttributesBytesPerCell == 0
     }
 
-    private static func trimmedCompactDefaultCellCount(for cells: ArraySlice<Cell>) -> Int {
-        trimTrailingCellCount(for: cells) { cell in
-            isCell(cell, equalTo: .empty)
-        }
-    }
-
-    private static func trimmedCompactUniformCellCount(for cells: ArraySlice<Cell>) -> Int {
-        guard let sharedAttributes = cells.first?.attributes else { return 0 }
-        let blank = Cell(
-            codepoint: Cell.empty.codepoint,
-            attributes: sharedAttributes,
-            width: Cell.empty.width,
-            isWideContinuation: false
-        )
-        return trimTrailingCellCount(for: cells) { cell in
-            isCell(cell, equalTo: blank)
-        }
-    }
-
     private static func isCell(_ cell: Cell, equalTo other: Cell) -> Bool {
         cell.codepoint == other.codepoint &&
         cell.attributes == other.attributes &&
         cell.width == other.width &&
         cell.isWideContinuation == other.isWideContinuation
-    }
-
-    private static func trimTrailingCellCount(
-        for cells: ArraySlice<Cell>,
-        isTrimmable: (Cell) -> Bool
-    ) -> Int {
-        var keptCount = cells.count
-        for cell in cells.reversed() {
-            guard isTrimmable(cell) else { break }
-            keptCount -= 1
-        }
-        return max(0, keptCount)
     }
 
     private static func serializeUInt16(_ value: UInt16, to ptr: UnsafeMutablePointer<UInt8>) {

@@ -223,6 +223,23 @@ final class TerminalView: MTKView, NSTextInputClient {
         hideImagePreview()
     }
 
+    func debugRenderFrameToTextureForTesting(_ texture: MTLTexture) {
+        guard let controller = terminalController,
+              let renderer else { return }
+        let committedTextPreviews = activeCommittedTextPreviewOverlays()
+        let suppressCursorBlink =
+            !committedTextPreviews.isEmpty || !pendingCommittedTextIntents.isEmpty || hasMarkedText()
+        let snapshot = controller.captureRenderSnapshot()
+
+        renderer.debugRenderToTextureForTesting(
+            snapshot: snapshot,
+            texture: texture,
+            selection: selection,
+            transientTextOverlays: committedTextPreviews,
+            suppressCursorBlink: suppressCursorBlink
+        )
+    }
+
     @discardableResult
     func handlePriorityInterruptShortcut() -> Bool {
         guard let controller = terminalController else { return false }
@@ -2065,16 +2082,20 @@ extension TerminalView: MTKViewDelegate {
         let border = effectiveBorderConfig()
         let committedTextPreviews = activeCommittedTextPreviewOverlays()
         let suppressCursorBlink = !committedTextPreviews.isEmpty || !pendingCommittedTextIntents.isEmpty || hasMarkedText()
-        controller.withViewport { model, scrollback, scrollOffset in
-            renderer.render(model: model, scrollback: scrollback,
-                          scrollOffset: scrollOffset, selection: selection,
-                          searchHighlight: highlight, linkUnderline: linkUL,
-                          borderConfig: border,
-                          headerOverlayConfig: commandIdentityHeaderConfig(),
-                          transientTextOverlays: committedTextPreviews,
-                          suppressCursorBlink: suppressCursorBlink,
-                          in: view)
-        }
+        // Capture the exact visible frame under the controller read lock, then
+        // release the lock before vertex building and Metal submission.
+        let snapshot = controller.captureRenderSnapshot()
+        renderer.render(
+            snapshot: snapshot,
+            selection: selection,
+            searchHighlight: highlight,
+            linkUnderline: linkUL,
+            borderConfig: border,
+            headerOverlayConfig: commandIdentityHeaderConfig(),
+            transientTextOverlays: committedTextPreviews,
+            suppressCursorBlink: suppressCursorBlink,
+            in: view
+        )
         lastDrawnRenderContentVersion = currentVersion
         scheduleIdleBufferRelease()
 

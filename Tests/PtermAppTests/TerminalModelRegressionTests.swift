@@ -773,7 +773,7 @@ final class TerminalModelRegressionTests: XCTestCase {
     func testTerminalModelLineFeedAtBottomScrollsOutWrappedState() {
         let harness = TerminalModelHarness(rows: 2, cols: 2)
         var scrolled: [([Cell], Bool)] = []
-        harness.model.onScrollOut = { scrolled.append(($0, $1)) }
+        harness.model.onScrollOut = { scrolled.append((Array($0), $1)) }
 
         harness.feed("ABCD")
         harness.feed("E")

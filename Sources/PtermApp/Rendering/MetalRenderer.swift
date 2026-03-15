@@ -797,6 +797,142 @@ final class MetalRenderer {
         commandBuffer.commit()
     }
 
+    func render(snapshot: TerminalController.RenderSnapshot,
+                selection: TerminalSelection?,
+                searchHighlight: SearchHighlight? = nil,
+                linkUnderline: LinkUnderline? = nil,
+                borderConfig: BorderConfig? = nil,
+                headerOverlayConfig: HeaderOverlayConfig? = nil,
+                transientTextOverlays: [TransientTextOverlay] = [],
+                suppressCursorBlink: Bool = false,
+                in view: MTKView) {
+        guard let drawable = view.currentDrawable,
+              let renderPassDescriptor = view.currentRenderPassDescriptor,
+              let commandBuffer = commandQueue.makeCommandBuffer() else {
+            return
+        }
+
+        let drawableSize = view.drawableSize
+        let vp = SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height))
+        var uniforms = MetalUniforms(
+            viewportSize: vp,
+            positionOffset: .zero,
+            cursorOpacity: (snapshot.scrollOffset == 0 && snapshot.cursor.visible) ? 1.0 : 0.0,
+            cursorBlink: (snapshot.cursor.blinking && !suppressCursorBlink) ? 1.0 : 0.0,
+            time: Float(CACurrentMediaTime() - startTime)
+        )
+
+        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].clearColor = terminalClearColor
+
+        let bs = bufferSet(for: view)
+        let sf = Float(glyphAtlas.scaleFactor)
+        let vd = buildVertexData(
+            snapshot: snapshot,
+            selection: selection,
+            searchHighlight: searchHighlight,
+            linkUnderline: linkUnderline,
+            transientTextOverlays: transientTextOverlays,
+            scaleFactor: sf,
+            bufferSet: bs
+        )
+
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(
+            descriptor: renderPassDescriptor) else {
+            return
+        }
+
+        if !vd.bgVertices.isEmpty, let pipeline = bgPipeline,
+           let buf = updateVertexBuffer(&bs.bgBuffer, vertices: vd.bgVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: vd.bgVertices.count / floatsPerVertex)
+        }
+
+        if !vd.glyphVertices.isEmpty, let pipeline = glyphPipelineForCurrentOutput(),
+           let atlas = glyphAtlas.texture,
+           let buf = updateVertexBuffer(&bs.glyphBuffer, vertices: vd.glyphVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.setFragmentTexture(atlas, index: 0)
+            encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: vd.glyphVertices.count / floatsPerVertex)
+        }
+
+        if !vd.cursorVertices.isEmpty, let pipeline = cursorPipeline,
+           let buf = updateVertexBuffer(&bs.cursorBuffer, vertices: vd.cursorVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: vd.cursorVertices.count / floatsPerVertex)
+        }
+
+        if !vd.overlayVertices.isEmpty, let pipeline = overlayPipeline,
+           let buf = updateVertexBuffer(&bs.overlayBuffer, vertices: vd.overlayVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buf, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: vd.overlayVertices.count / floatsPerVertex)
+        }
+
+        if let border = borderConfig, let pipeline = overlayPipeline {
+            var bv: [Float] = []
+            let vw = vp.x
+            let vh = vp.y
+            let bw = border.width * Float(glyphAtlas.scaleFactor)
+            let c = border.color
+            addQuad(to: &bv, x: 0, y: 0, w: vw, h: bw, tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            addQuad(to: &bv, x: 0, y: vh - bw, w: vw, h: bw, tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            addQuad(to: &bv, x: 0, y: bw, w: bw, h: vh - 2 * bw, tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            addQuad(to: &bv, x: vw - bw, y: bw, w: bw, h: vh - 2 * bw, tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            if let buf = updateVertexBuffer(&bs.borderBuffer, vertices: bv) {
+                encoder.setRenderPipelineState(pipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: bv.count / floatsPerVertex)
+            }
+        }
+
+        if let headerOverlayConfig, let overlayPipeline, let glyphPipeline = glyphPipelineForCurrentOutput(),
+           let atlas = glyphAtlas.texture {
+            let headerVertices = headerOverlayVertices(
+                config: headerOverlayConfig,
+                frame: CGRect(origin: .zero, size: CGSize(width: CGFloat(vp.x / sf), height: CGFloat(vp.y / sf))),
+                scaleFactor: sf
+            )
+            if !headerVertices.overlay.isEmpty,
+               let buf = makeTemporaryBuffer(vertices: headerVertices.overlay) {
+                encoder.setRenderPipelineState(overlayPipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: headerVertices.overlay.count / floatsPerVertex)
+            }
+            if !headerVertices.glyphs.isEmpty,
+               let buf = makeTemporaryBuffer(vertices: headerVertices.glyphs) {
+                encoder.setRenderPipelineState(glyphPipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.setFragmentTexture(atlas, index: 0)
+                encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: headerVertices.glyphs.count / floatsPerVertex)
+            }
+        }
+
+        encoder.endEncoding()
+        commandBuffer.present(drawable)
+        commandBuffer.commit()
+    }
+
     // MARK: - Vertex Building
 
     private func buildVertexData(model: TerminalModel, scrollback: ScrollbackBuffer,
@@ -1111,6 +1247,279 @@ final class MetalRenderer {
         return vd
     }
 
+    private func buildVertexData(snapshot: TerminalController.RenderSnapshot,
+                                 selection: TerminalSelection?,
+                                 searchHighlight: SearchHighlight? = nil,
+                                 linkUnderline: LinkUnderline? = nil,
+                                 transientTextOverlays: [TransientTextOverlay] = [],
+                                 scaleFactor: Float,
+                                 bufferSet: ViewBufferSet) -> VertexData {
+        let vd = bufferSet.terminalVertexScratch
+        vd.reset()
+        var cachedGlyphs: [UInt32: GlyphAtlas.GlyphInfo] = [:]
+        var missingGlyphs: Set<UInt32> = []
+
+        let cellW = Float(glyphAtlas.cellWidth) * scaleFactor
+        let cellH = Float(glyphAtlas.cellHeight) * scaleFactor
+        let padX = Float(gridPadding) * scaleFactor
+        let padY = Float(gridPadding) * scaleFactor
+        let lineThickness = max(1.0, scaleFactor)
+        let cursorThickness = max(1.0, scaleFactor * 2.0)
+
+        let viewRows = snapshot.rows
+        let viewCols = snapshot.cols
+        let approximateCellCount = max(1, viewRows * viewCols)
+        vd.bgVertices.reserveCapacity(approximateCellCount * floatsPerQuad)
+        vd.glyphVertices.reserveCapacity(approximateCellCount * floatsPerQuad * 2)
+        vd.cursorVertices.reserveCapacity(floatsPerQuad)
+        vd.overlayVertices.reserveCapacity(approximateCellCount * floatsPerQuad * 2)
+
+        // Keep the per-view scratch arrays alive on the active render path so
+        // idle/inactive cleanup can reclaim them deterministically. Tests also
+        // assert that these reusable buffers exist after a rendered frame.
+        prepareTerminalScrollbackRowsScratch(in: bufferSet, rowCount: viewRows)
+        for row in 0..<viewRows {
+            bufferSet.terminalScrollbackRowsScratch[row] = snapshot.visibleRows[row].cells
+            bufferSet.terminalScrollbackRowHasData[row] = true
+        }
+
+        @inline(__always)
+        func glyphInfo(for codepoint: UInt32) -> GlyphAtlas.GlyphInfo? {
+            if let cached = cachedGlyphs[codepoint] {
+                return cached
+            }
+            if missingGlyphs.contains(codepoint) {
+                return nil
+            }
+            if let glyph = glyphAtlas.glyphInfo(for: codepoint) {
+                cachedGlyphs[codepoint] = glyph
+                return glyph
+            }
+            missingGlyphs.insert(codepoint)
+            return nil
+        }
+
+        prepareTerminalSearchMatchesScratch(in: bufferSet, rowCount: viewRows)
+        if let sh = searchHighlight {
+            for (i, match) in sh.matches.enumerated() {
+                let visibleRow = match.absoluteRow - snapshot.firstVisibleAbsoluteRow
+                guard visibleRow >= 0, visibleRow < viewRows else { continue }
+                bufferSet.terminalSearchMatchesScratch[visibleRow].append(
+                    SearchMatchSpan(start: match.startCol, end: match.endCol, isCurrent: sh.currentIndex == i)
+                )
+            }
+        }
+
+        for row in 0..<viewRows {
+            let rowSnapshot = snapshot.visibleRows[row]
+            let rowMatches = bufferSet.terminalSearchMatchesScratch[row]
+            var currentMatchIndex = 0
+            let selectedColumnRange: ClosedRange<Int>? = {
+                guard let selection else { return nil }
+                let start = selection.start
+                let end = selection.end
+                switch selection.mode {
+                case .normal:
+                    guard row >= start.row, row <= end.row else { return nil }
+                    if start.row == end.row {
+                        return start.col...end.col
+                    }
+                    if row == start.row {
+                        return start.col...Int.max
+                    }
+                    if row == end.row {
+                        return Int.min...end.col
+                    }
+                    return Int.min...Int.max
+                case .rectangular:
+                    guard row >= start.row, row <= end.row else { return nil }
+                    return start.col...end.col
+                }
+            }()
+
+            for col in 0..<viewCols {
+                let transientTextOverlayCoversCell = transientTextOverlays.contains {
+                    $0.masksGridGlyphs &&
+                    row == $0.row &&
+                    col >= $0.col &&
+                    col < ($0.col + $0.columnWidth)
+                }
+
+                let cell = col < rowSnapshot.cells.count ? rowSnapshot.cells[col] : .empty
+
+                if cell.isWideContinuation { continue }
+
+                let x = padX + Float(col) * cellW
+                let y = padY + Float(row) * cellH
+                let w = cellW * Float(max(1, cell.width))
+                let h = cellH
+
+                var fgColor: (r: Float, g: Float, b: Float)
+                var bgColor: (r: Float, g: Float, b: Float, a: Float)
+
+                let isSelected = selectedColumnRange?.contains(col) ?? false
+                let usesDefaultBackground = cell.attributes.background.isDefaultColor
+
+                var searchMatchType: Int = 0
+                while currentMatchIndex < rowMatches.count && col > rowMatches[currentMatchIndex].end {
+                    currentMatchIndex += 1
+                }
+                if currentMatchIndex < rowMatches.count {
+                    let match = rowMatches[currentMatchIndex]
+                    if col >= match.start && col <= match.end {
+                        searchMatchType = match.isCurrent ? 2 : 1
+                    }
+                }
+
+                if cell.attributes.inverse != isSelected {
+                    fgColor = resolveBackgroundColorAsForeground(cell.attributes.background)
+                    bgColor = resolveForegroundColorAsBackground(cell.attributes.foreground)
+                } else {
+                    fgColor = resolveForegroundColor(for: cell)
+                    bgColor = resolveBackgroundColor(cell.attributes.background)
+                }
+
+                if searchMatchType == 2 {
+                    bgColor = (0.90, 0.60, 0.10, 1.0)
+                    fgColor = (0.0, 0.0, 0.0)
+                } else if searchMatchType == 1 {
+                    bgColor = (0.55, 0.45, 0.10, 1.0)
+                    fgColor = (0.0, 0.0, 0.0)
+                }
+
+                if cell.attributes.hidden {
+                    fgColor = (bgColor.r, bgColor.g, bgColor.b)
+                } else if cell.attributes.dim && searchMatchType == 0 {
+                    fgColor = (fgColor.r * 0.66, fgColor.g * 0.66, fgColor.b * 0.66)
+                }
+
+                let needsBackgroundQuad =
+                    isSelected ||
+                    searchMatchType > 0 ||
+                    (cell.attributes.inverse != isSelected) ||
+                    !usesDefaultBackground
+                if needsBackgroundQuad {
+                    addQuad(to: &vd.bgVertices, x: x, y: y, w: w, h: h,
+                            tx: 0, ty: 0, tw: 0, th: 0,
+                            fg: (bgColor.r, bgColor.g, bgColor.b, bgColor.a),
+                            bg: (bgColor.r, bgColor.g, bgColor.b, bgColor.a))
+                }
+
+                if transientTextOverlayCoversCell {
+                    // Keep the layout/background space, but defer visible glyphs to the transient overlay.
+                } else if renderBlockElementIfNeeded(
+                    codepoint: cell.codepoint,
+                    x: x, y: y, w: w, h: h,
+                    color: fgColor,
+                    vertices: &vd.overlayVertices
+                ) {
+                    // no-op
+                } else if cell.codepoint > 0x20,
+                          let glyph = glyphInfo(for: cell.codepoint),
+                          glyph.pixelWidth > 0 {
+
+                    let rawGlyphX: Float
+                    if cell.width == 1 {
+                        rawGlyphX = x + glyph.cellOffsetX
+                    } else {
+                        rawGlyphX = x + Self.wideGlyphOffsetX(
+                            glyph,
+                            spanWidth: w,
+                            singleCellWidth: cellW
+                        )
+                    }
+                    let baselineScreenY = y + cellH - Float(glyphAtlas.baseline) * scaleFactor
+                    let rawGlyphY = baselineScreenY - glyph.baselineOffset
+                    let shouldSnapGlyphPosition = !glyphAtlas.usesOversampledRasterizationForCurrentDisplay
+                    let glyphX = shouldSnapGlyphPosition ? Self.snapToPixel(rawGlyphX) : rawGlyphX
+                    let glyphY = shouldSnapGlyphPosition ? Self.snapToPixel(rawGlyphY) : rawGlyphY
+                    let glyphW = Float(glyph.pixelWidth)
+                    let glyphH = Float(glyph.pixelHeight)
+
+                    addQuad(to: &vd.glyphVertices,
+                            x: glyphX, y: glyphY, w: glyphW, h: glyphH,
+                            tx: glyph.textureX, ty: glyph.textureY,
+                            tw: glyph.textureW, th: glyph.textureH,
+                            fg: (fgColor.r, fgColor.g, fgColor.b, 1),
+                            bg: (0, 0, 0, 0))
+
+                    if cell.attributes.bold {
+                        let boldOffset = max(1.0, ceil(scaleFactor * 0.5))
+                        addQuad(to: &vd.glyphVertices,
+                                x: glyphX + boldOffset, y: glyphY, w: glyphW, h: glyphH,
+                                tx: glyph.textureX, ty: glyph.textureY,
+                                tw: glyph.textureW, th: glyph.textureH,
+                                fg: (fgColor.r, fgColor.g, fgColor.b, 1),
+                                bg: (0, 0, 0, 0))
+                    }
+                }
+
+                if cell.attributes.underline {
+                    let underlineY = y + h - lineThickness
+                    addQuad(to: &vd.overlayVertices, x: x, y: underlineY, w: w, h: lineThickness,
+                            tx: 0, ty: 0, tw: 0, th: 0,
+                            fg: (fgColor.r, fgColor.g, fgColor.b, 1),
+                            bg: (fgColor.r, fgColor.g, fgColor.b, 1))
+                }
+
+                if cell.attributes.strikethrough {
+                    let strikeY = y + (h * 0.5) - (lineThickness * 0.5)
+                    addQuad(to: &vd.overlayVertices, x: x, y: strikeY, w: w, h: lineThickness,
+                            tx: 0, ty: 0, tw: 0, th: 0,
+                            fg: (fgColor.r, fgColor.g, fgColor.b, 1),
+                            bg: (fgColor.r, fgColor.g, fgColor.b, 1))
+                }
+
+                if let link = linkUnderline,
+                   row == link.row && col >= link.startCol && col <= link.endCol {
+                    let underlineY = y + h - lineThickness
+                    addQuad(to: &vd.overlayVertices, x: x, y: underlineY, w: w, h: lineThickness,
+                            tx: 0, ty: 0, tw: 0, th: 0,
+                            fg: (0.4, 0.6, 1.0, 1.0),
+                            bg: (0.4, 0.6, 1.0, 1.0))
+                }
+            }
+        }
+
+        if snapshot.scrollOffset == 0 && snapshot.cursor.visible {
+            let cursorOverlay = transientTextOverlays.last { $0.cursorRow != nil && $0.cursorCol != nil }
+            let cursorCol = cursorOverlay?.cursorCol.map { min(max($0, 0), max(viewCols - 1, 0)) } ?? snapshot.cursor.col
+            let cursorRow = cursorOverlay?.cursorRow.map { min(max($0, 0), max(viewRows - 1, 0)) } ?? snapshot.cursor.row
+            let cx = padX + Float(cursorCol) * cellW
+            let cy = padY + Float(cursorRow) * cellH
+            let cursorColor: (Float, Float, Float, Float) = (0.8, 0.8, 0.8, 1)
+
+            switch snapshot.cursor.shape {
+            case .block:
+                addQuad(to: &vd.cursorVertices, x: cx, y: cy, w: cellW, h: cellH,
+                        tx: 0, ty: 0, tw: 0, th: 0,
+                        fg: cursorColor, bg: cursorColor)
+            case .underline:
+                addQuad(to: &vd.cursorVertices, x: cx, y: cy + cellH - cursorThickness,
+                        w: cellW, h: cursorThickness,
+                        tx: 0, ty: 0, tw: 0, th: 0,
+                        fg: cursorColor, bg: cursorColor)
+            case .bar:
+                addQuad(to: &vd.cursorVertices, x: cx, y: cy,
+                        w: cursorThickness, h: cellH,
+                        tx: 0, ty: 0, tw: 0, th: 0,
+                        fg: cursorColor, bg: cursorColor)
+            }
+        }
+
+        for transientTextOverlay in transientTextOverlays {
+            appendTransientTextOverlay(
+                transientTextOverlay,
+                scaleFactor: scaleFactor,
+                cachedGlyphs: &cachedGlyphs,
+                missingGlyphs: &missingGlyphs,
+                to: &vd.glyphVertices
+            )
+        }
+
+        return vd
+    }
+
     func debugBuildVertexDataForTesting(
         model: TerminalModel,
         scrollback: ScrollbackBuffer,
@@ -1122,6 +1531,22 @@ final class MetalRenderer {
             model: model,
             scrollback: scrollback,
             scrollOffset: scrollOffset,
+            selection: selection,
+            searchHighlight: nil,
+            linkUnderline: nil,
+            transientTextOverlays: transientTextOverlays,
+            scaleFactor: Float(glyphAtlas.scaleFactor),
+            bufferSet: ViewBufferSet()
+        )
+    }
+
+    func debugBuildVertexDataForTesting(
+        snapshot: TerminalController.RenderSnapshot,
+        selection: TerminalSelection? = nil,
+        transientTextOverlays: [TransientTextOverlay] = []
+    ) -> VertexData {
+        buildVertexData(
+            snapshot: snapshot,
             selection: selection,
             searchHighlight: nil,
             linkUnderline: nil,
@@ -1213,6 +1638,191 @@ final class MetalRenderer {
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexData.overlayVertices.count / floatsPerVertex)
         }
+
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+    }
+
+    func debugRenderToTextureForTesting(
+        snapshot: TerminalController.RenderSnapshot,
+        texture: MTLTexture,
+        selection: TerminalSelection? = nil,
+        transientTextOverlays: [TransientTextOverlay] = [],
+        suppressCursorBlink: Bool = true
+    ) {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            return
+        }
+
+        let renderPassDescriptor = MTLRenderPassDescriptor()
+        renderPassDescriptor.colorAttachments[0].texture = texture
+        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].storeAction = .store
+        renderPassDescriptor.colorAttachments[0].clearColor = terminalClearColor
+
+        let viewportSize = SIMD2<Float>(Float(texture.width), Float(texture.height))
+        var uniforms = MetalUniforms(
+            viewportSize: viewportSize,
+            positionOffset: .zero,
+            cursorOpacity: (snapshot.scrollOffset == 0 && snapshot.cursor.visible) ? 1.0 : 0.0,
+            cursorBlink: (snapshot.cursor.blinking && !suppressCursorBlink) ? 1.0 : 0.0,
+            time: Float(CACurrentMediaTime() - startTime)
+        )
+        let bufferSet = ViewBufferSet()
+        let scaleFactor = Float(glyphAtlas.scaleFactor)
+        let vertexData = buildVertexData(
+            snapshot: snapshot,
+            selection: selection,
+            transientTextOverlays: transientTextOverlays,
+            scaleFactor: scaleFactor,
+            bufferSet: bufferSet
+        )
+
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+            return
+        }
+
+        if !vertexData.bgVertices.isEmpty,
+           let pipeline = bgPipeline,
+           let buffer = makeTemporaryBuffer(vertices: vertexData.bgVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexData.bgVertices.count / floatsPerVertex)
+        }
+
+        if !vertexData.glyphVertices.isEmpty,
+           let pipeline = glyphPipelineForCurrentOutput(),
+           let atlas = glyphAtlas.texture,
+           let buffer = makeTemporaryBuffer(vertices: vertexData.glyphVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.setFragmentTexture(atlas, index: 0)
+            encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexData.glyphVertices.count / floatsPerVertex)
+        }
+
+        if !vertexData.cursorVertices.isEmpty,
+           let pipeline = cursorPipeline,
+           let buffer = makeTemporaryBuffer(vertices: vertexData.cursorVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexData.cursorVertices.count / floatsPerVertex)
+        }
+
+        if !vertexData.overlayVertices.isEmpty,
+           let pipeline = overlayPipeline,
+           let buffer = makeTemporaryBuffer(vertices: vertexData.overlayVertices) {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexData.overlayVertices.count / floatsPerVertex)
+        }
+
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+    }
+
+    func debugRenderSplitCellToTextureForTesting(
+        model: TerminalModel,
+        scrollback: ScrollbackBuffer,
+        texture: MTLTexture,
+        scrollOffset: Int = 0,
+        selection: TerminalSelection? = nil,
+        borderConfig: BorderConfig? = nil,
+        transientTextOverlays: [TransientTextOverlay] = [],
+        suppressCursorBlink: Bool = true,
+        cellRect: NSRect? = nil
+    ) {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            return
+        }
+
+        let renderPassDescriptor = MTLRenderPassDescriptor()
+        renderPassDescriptor.colorAttachments[0].texture = texture
+        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].storeAction = .store
+        renderPassDescriptor.colorAttachments[0].clearColor = terminalClearColor
+
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+            return
+        }
+
+        let debugView = MTKView(
+            frame: NSRect(x: 0, y: 0, width: texture.width, height: texture.height),
+            device: device
+        )
+        debugView.colorPixelFormat = Self.renderTargetPixelFormat
+        let targetRect = cellRect ?? NSRect(x: 0, y: 0, width: texture.width, height: texture.height)
+        renderSplitCell(
+            model: model,
+            scrollback: scrollback,
+            scrollOffset: scrollOffset,
+            selection: selection,
+            borderConfig: borderConfig,
+            transientTextOverlays: transientTextOverlays,
+            suppressCursorBlink: suppressCursorBlink,
+            encoder: encoder,
+            viewportSize: SIMD2<Float>(Float(texture.width), Float(texture.height)),
+            cellRect: targetRect,
+            scaleFactor: Float(glyphAtlas.scaleFactor),
+            in: debugView
+        )
+
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+    }
+
+    func debugRenderSplitCellToTextureForTesting(
+        snapshot: TerminalController.RenderSnapshot,
+        texture: MTLTexture,
+        selection: TerminalSelection? = nil,
+        borderConfig: BorderConfig? = nil,
+        transientTextOverlays: [TransientTextOverlay] = [],
+        suppressCursorBlink: Bool = true,
+        cellRect: NSRect? = nil,
+        bufferOwner: MTKView? = nil
+    ) {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            return
+        }
+
+        let renderPassDescriptor = MTLRenderPassDescriptor()
+        renderPassDescriptor.colorAttachments[0].texture = texture
+        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].storeAction = .store
+        renderPassDescriptor.colorAttachments[0].clearColor = terminalClearColor
+
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+            return
+        }
+
+        let debugView = bufferOwner ?? {
+            let view = MTKView(
+                frame: NSRect(x: 0, y: 0, width: texture.width, height: texture.height),
+                device: device
+            )
+            view.colorPixelFormat = Self.renderTargetPixelFormat
+            return view
+        }()
+        let targetRect = cellRect ?? NSRect(x: 0, y: 0, width: texture.width, height: texture.height)
+        renderSplitCell(
+            snapshot: snapshot,
+            selection: selection,
+            borderConfig: borderConfig,
+            transientTextOverlays: transientTextOverlays,
+            suppressCursorBlink: suppressCursorBlink,
+            encoder: encoder,
+            viewportSize: SIMD2<Float>(Float(texture.width), Float(texture.height)),
+            cellRect: targetRect,
+            scaleFactor: Float(glyphAtlas.scaleFactor),
+            in: debugView
+        )
 
         encoder.endEncoding()
         commandBuffer.commit()
@@ -1404,18 +2014,21 @@ final class MetalRenderer {
                                         tx: Float, ty: Float,
                                         linearFG: (r: Float, g: Float, b: Float, a: Float),
                                         linearBG: (r: Float, g: Float, b: Float, a: Float)) {
-        vertices.append(x)
-        vertices.append(y)
-        vertices.append(tx)
-        vertices.append(ty)
-        vertices.append(linearFG.r)
-        vertices.append(linearFG.g)
-        vertices.append(linearFG.b)
-        vertices.append(linearFG.a)
-        vertices.append(linearBG.r)
-        vertices.append(linearBG.g)
-        vertices.append(linearBG.b)
-        vertices.append(linearBG.a)
+        withUnsafeTemporaryAllocation(of: Float.self, capacity: floatsPerVertex) { buffer in
+            buffer[0] = x
+            buffer[1] = y
+            buffer[2] = tx
+            buffer[3] = ty
+            buffer[4] = linearFG.r
+            buffer[5] = linearFG.g
+            buffer[6] = linearFG.b
+            buffer[7] = linearFG.a
+            buffer[8] = linearBG.r
+            buffer[9] = linearBG.g
+            buffer[10] = linearBG.b
+            buffer[11] = linearBG.a
+            vertices.append(contentsOf: buffer)
+        }
     }
 
     /// Add a quad (2 triangles = 6 vertices) to the vertex array.
@@ -1427,16 +2040,32 @@ final class MetalRenderer {
                         bg: (r: Float, g: Float, b: Float, a: Float)) {
         let linearFG = Self.linearizeSRGBColor(r: fg.r, g: fg.g, b: fg.b, a: fg.a)
         let linearBG = Self.linearizeSRGBColor(r: bg.r, g: bg.g, b: bg.b, a: bg.a)
+        withUnsafeTemporaryAllocation(of: Float.self, capacity: floatsPerQuad) { buffer in
+            @inline(__always)
+            func writeVertex(_ vertexIndex: Int, _ vx: Float, _ vy: Float, _ vtx: Float, _ vty: Float) {
+                let base = vertexIndex * floatsPerVertex
+                buffer[base] = vx
+                buffer[base + 1] = vy
+                buffer[base + 2] = vtx
+                buffer[base + 3] = vty
+                buffer[base + 4] = linearFG.r
+                buffer[base + 5] = linearFG.g
+                buffer[base + 6] = linearFG.b
+                buffer[base + 7] = linearFG.a
+                buffer[base + 8] = linearBG.r
+                buffer[base + 9] = linearBG.g
+                buffer[base + 10] = linearBG.b
+                buffer[base + 11] = linearBG.a
+            }
 
-        // Triangle 1: top-left, top-right, bottom-left
-        appendVertexLinearized(to: &vertices, x: x, y: y, tx: tx, ty: ty, linearFG: linearFG, linearBG: linearBG)
-        appendVertexLinearized(to: &vertices, x: x + w, y: y, tx: tx + tw, ty: ty, linearFG: linearFG, linearBG: linearBG)
-        appendVertexLinearized(to: &vertices, x: x, y: y + h, tx: tx, ty: ty + th, linearFG: linearFG, linearBG: linearBG)
-
-        // Triangle 2: top-right, bottom-right, bottom-left
-        appendVertexLinearized(to: &vertices, x: x + w, y: y, tx: tx + tw, ty: ty, linearFG: linearFG, linearBG: linearBG)
-        appendVertexLinearized(to: &vertices, x: x + w, y: y + h, tx: tx + tw, ty: ty + th, linearFG: linearFG, linearBG: linearBG)
-        appendVertexLinearized(to: &vertices, x: x, y: y + h, tx: tx, ty: ty + th, linearFG: linearFG, linearBG: linearBG)
+            writeVertex(0, x, y, tx, ty)
+            writeVertex(1, x + w, y, tx + tw, ty)
+            writeVertex(2, x, y + h, tx, ty + th)
+            writeVertex(3, x + w, y, tx + tw, ty)
+            writeVertex(4, x + w, y + h, tx + tw, ty + th)
+            writeVertex(5, x, y + h, tx, ty + th)
+            vertices.append(contentsOf: buffer)
+        }
     }
 
     // MARK: - Public API for IntegratedView
@@ -1935,6 +2564,143 @@ final class MetalRenderer {
                 encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
                 encoder.drawPrimitives(type: .triangle, vertexStart: 0,
                                       vertexCount: headerVertices.glyphs.count / floatsPerVertex)
+            }
+        }
+    }
+
+    func renderSplitCell(snapshot: TerminalController.RenderSnapshot,
+                         selection: TerminalSelection?,
+                         searchHighlight: SearchHighlight? = nil,
+                         linkUnderline: LinkUnderline? = nil,
+                         borderConfig: BorderConfig? = nil,
+                         headerOverlayConfig: HeaderOverlayConfig? = nil,
+                         transientTextOverlays: [TransientTextOverlay] = [],
+                         suppressCursorBlink: Bool = false,
+                         encoder: MTLRenderCommandEncoder,
+                         viewportSize: SIMD2<Float>,
+                         cellRect: NSRect,
+                         scaleFactor: Float,
+                         in view: MTKView) {
+        let vd = buildVertexData(
+            snapshot: snapshot,
+            selection: selection,
+            searchHighlight: searchHighlight,
+            linkUnderline: linkUnderline,
+            transientTextOverlays: transientTextOverlays,
+            scaleFactor: scaleFactor,
+            bufferSet: bufferSet(for: view)
+        )
+        let offsetX = Float(cellRect.origin.x) * scaleFactor
+        let offsetY = Float(cellRect.origin.y) * scaleFactor
+        let cellPixelW = Float(cellRect.width) * scaleFactor
+        let cellPixelH = Float(cellRect.height) * scaleFactor
+
+        let drawableW = Int(viewportSize.x)
+        let drawableH = Int(viewportSize.y)
+        let sx = max(0, min(Int(offsetX), drawableW - 1))
+        let sy = max(0, min(Int(offsetY), drawableH - 1))
+        let sw = max(1, min(Int(cellPixelW), drawableW - sx))
+        let sh = max(1, min(Int(cellPixelH), drawableH - sy))
+        let scissor = MTLScissorRect(x: sx, y: sy, width: sw, height: sh)
+        encoder.setScissorRect(scissor)
+
+        var uniforms = MetalUniforms(
+            viewportSize: viewportSize,
+            positionOffset: SIMD2<Float>(offsetX, offsetY),
+            cursorOpacity: (snapshot.scrollOffset == 0 && snapshot.cursor.visible) ? 1.0 : 0.0,
+            cursorBlink: (snapshot.cursor.blinking && !suppressCursorBlink) ? 1.0 : 0.0,
+            time: Float(CACurrentMediaTime() - startTime)
+        )
+
+        if !vd.bgVertices.isEmpty, let pipeline = bgPipeline {
+            if let buf = makeTemporaryBuffer(vertices: vd.bgVertices) {
+                encoder.setRenderPipelineState(pipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: vd.bgVertices.count / floatsPerVertex)
+            }
+        }
+
+        if !vd.glyphVertices.isEmpty, let pipeline = glyphPipelineForCurrentOutput(),
+           let atlas = glyphAtlas.texture {
+            if let buf = makeTemporaryBuffer(vertices: vd.glyphVertices) {
+                encoder.setRenderPipelineState(pipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.setFragmentTexture(atlas, index: 0)
+                encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: vd.glyphVertices.count / floatsPerVertex)
+            }
+        }
+
+        if !vd.cursorVertices.isEmpty, let pipeline = cursorPipeline {
+            if let buf = makeTemporaryBuffer(vertices: vd.cursorVertices) {
+                encoder.setRenderPipelineState(pipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: vd.cursorVertices.count / floatsPerVertex)
+            }
+        }
+
+        if !vd.overlayVertices.isEmpty, let pipeline = overlayPipeline {
+            if let buf = makeTemporaryBuffer(vertices: vd.overlayVertices) {
+                encoder.setRenderPipelineState(pipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: vd.overlayVertices.count / floatsPerVertex)
+            }
+        }
+
+        if let border = borderConfig, let pipeline = overlayPipeline {
+            var bv: [Float] = []
+            let bw = border.width * scaleFactor
+            let c = border.color
+            addQuad(to: &bv, x: 0, y: 0, w: cellPixelW, h: bw,
+                    tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            addQuad(to: &bv, x: 0, y: cellPixelH - bw, w: cellPixelW, h: bw,
+                    tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            addQuad(to: &bv, x: 0, y: bw, w: bw, h: cellPixelH - 2 * bw,
+                    tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            addQuad(to: &bv, x: cellPixelW - bw, y: bw, w: bw, h: cellPixelH - 2 * bw,
+                    tx: 0, ty: 0, tw: 0, th: 0, fg: c, bg: (0, 0, 0, 0))
+            if let buf = makeTemporaryBuffer(vertices: bv) {
+                encoder.setRenderPipelineState(pipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: bv.count / floatsPerVertex)
+            }
+        }
+
+        if let headerOverlayConfig, let overlayPipeline, let glyphPipeline = glyphPipelineForCurrentOutput(),
+           let atlas = glyphAtlas.texture {
+            let headerVertices = headerOverlayVertices(
+                config: headerOverlayConfig,
+                frame: CGRect(origin: .zero, size: cellRect.size),
+                scaleFactor: scaleFactor
+            )
+            if !headerVertices.overlay.isEmpty,
+               let buf = makeTemporaryBuffer(vertices: headerVertices.overlay) {
+                encoder.setRenderPipelineState(overlayPipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: headerVertices.overlay.count / floatsPerVertex)
+            }
+            if !headerVertices.glyphs.isEmpty,
+               let buf = makeTemporaryBuffer(vertices: headerVertices.glyphs) {
+                encoder.setRenderPipelineState(glyphPipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.setFragmentTexture(atlas, index: 0)
+                encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                       vertexCount: headerVertices.glyphs.count / floatsPerVertex)
             }
         }
     }

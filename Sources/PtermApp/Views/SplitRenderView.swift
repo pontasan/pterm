@@ -131,6 +131,49 @@ final class SplitRenderView: MTKView {
         releaseIdleReusableBuffersNow()
     }
 
+    func debugRenderFrameToTextureForTesting(_ texture: MTLTexture) {
+        guard let commandBuffer = renderer.commandQueue.makeCommandBuffer() else {
+            return
+        }
+
+        let renderPassDescriptor = MTLRenderPassDescriptor()
+        renderPassDescriptor.colorAttachments[0].texture = texture
+        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].storeAction = .store
+        renderPassDescriptor.colorAttachments[0].clearColor = renderer.terminalClearColor
+
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+            return
+        }
+
+        let viewportSize = SIMD2<Float>(Float(texture.width), Float(texture.height))
+        let scaleFactor = Float(renderer.glyphAtlas.scaleFactor)
+        for ref in cellRefs {
+            guard let terminalView = ref.terminalView else { continue }
+            let selection = terminalView.selection
+            let border = borderConfigProvider?(terminalView)
+            // Freeze each cell's visible terminal state before the expensive
+            // shared render pass so PTY writers are not blocked by vertex work.
+            let snapshot = ref.controller.captureRenderSnapshot()
+            renderer.renderSplitCell(
+                snapshot: snapshot,
+                selection: selection,
+                borderConfig: border,
+                transientTextOverlays: [],
+                suppressCursorBlink: false,
+                encoder: encoder,
+                viewportSize: viewportSize,
+                cellRect: ref.frame,
+                scaleFactor: scaleFactor,
+                in: self
+            )
+        }
+
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+    }
+
     func scrubPresentedDrawableForRemoval() {
         ensureDrawableStorageAllocatedIfNeeded()
         guard let metalLayer = layer as? CAMetalLayer,
@@ -282,23 +325,22 @@ extension SplitRenderView: MTKViewDelegate {
                 height: ref.frame.height
             )
 
-            ref.controller.withViewport { model, scrollback, scrollOffset in
-                renderer.renderSplitCell(
-                    model: model,
-                    scrollback: scrollback,
-                    scrollOffset: scrollOffset,
-                    selection: selection,
-                    borderConfig: border,
-                    headerOverlayConfig: headerOverlay,
-                    transientTextOverlays: transientTextOverlays,
-                    suppressCursorBlink: suppressCursorBlink,
-                    encoder: encoder,
-                    viewportSize: viewportSize,
-                    cellRect: flippedRect,
-                    scaleFactor: sf,
-                    in: view
-                )
-            }
+            // The snapshot must be captured before rendering so split terminals
+            // all read coherent controller state without holding locks in Metal work.
+            let snapshot = ref.controller.captureRenderSnapshot()
+            renderer.renderSplitCell(
+                snapshot: snapshot,
+                selection: selection,
+                borderConfig: border,
+                headerOverlayConfig: headerOverlay,
+                transientTextOverlays: transientTextOverlays,
+                suppressCursorBlink: suppressCursorBlink,
+                encoder: encoder,
+                viewportSize: viewportSize,
+                cellRect: flippedRect,
+                scaleFactor: sf,
+                in: view
+            )
         }
 
         encoder.endEncoding()

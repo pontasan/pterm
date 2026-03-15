@@ -54,7 +54,7 @@ final class TerminalModel {
     private var activeCharsetIsG1 = false
 
     /// Callback when a line scrolls off the top of the screen (for scrollback)
-    var onScrollOut: ((_ cells: [Cell], _ isWrapped: Bool) -> Void)?
+    var onScrollOut: ((_ cells: ArraySlice<Cell>, _ isWrapped: Bool) -> Void)?
 
     /// Callback when title changes
     var onTitleChange: ((String) -> Void)?
@@ -306,7 +306,7 @@ final class TerminalModel {
         if cursor.row == grid.scrollBottom {
             // At bottom of scroll region: scroll up
             // Save the line being scrolled out
-            let scrolledRow = Array(grid.rowCells(grid.scrollTop))
+            let scrolledRow = grid.rowCells(grid.scrollTop)
             let isWrapped = grid.isWrapped(grid.scrollTop)
             onScrollOut?(scrolledRow, isWrapped)
             grid.scrollUp(count: 1)
@@ -1014,7 +1014,7 @@ final class TerminalModel {
 
         // Save trimmed rows to scrollback before they are lost
         for trimmed in result.trimmedRows {
-            onScrollOut?(trimmed.cells, trimmed.isWrapped)
+            onScrollOut?(ArraySlice(trimmed.cells), trimmed.isWrapped)
         }
 
         // Alternate grid doesn't need cursor-aware re-wrap
