@@ -49,6 +49,46 @@ Run tests:
 make test
 ```
 
+## Profile Directory
+
+By default, pterm stores its persistent state under `~/.pterm`.
+
+This profile root contains:
+
+- `config.json`
+- `sessions/`
+- `sessions/scrollback/`
+- `workspaces/`
+- `audit/`
+- `files/`
+- `lock`
+
+If no launch option is provided, pterm always uses `~/.pterm`.
+
+You can override the profile root at launch time with:
+
+- `--user-data-dir <directory>`
+
+This means: “treat this directory as the pterm profile root instead of `~/.pterm`.”
+
+Examples:
+
+open .build/pterm.app --args --user-data-dir /tmp/.pterm_profile_dev
+```
+
+Or launch the app binary directly:
+
+```bash
+.build/pterm.app/Contents/MacOS/PtermApp --user-data-dir /tmp/.pterm_profile_dev
+```
+
+This is useful for:
+
+- isolated test runs
+- temporary debugging profiles
+- running multiple independent pterm environments
+- Chrome-style external profile directory management
+
 Profile CPU hot paths:
 
 ```bash

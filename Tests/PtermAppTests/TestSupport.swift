@@ -26,15 +26,38 @@ func withTemporaryHomeDirectory<T>(_ body: (URL) throws -> T) throws -> T {
     }
 }
 
-func withTemporaryPtermConfig<T>(_ body: (URL) throws -> T) throws -> T {
+func withTemporaryPtermProfile<T>(_ body: (URL) throws -> T) throws -> T {
     try withTemporaryDirectory { directory in
-        let ptermDirectory = directory.appendingPathComponent(".pterm", isDirectory: true)
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "")
+        let profileRoot = directory.appendingPathComponent(
+            ".pterm_\(timestamp)_\(UUID().uuidString.prefix(8))",
+            isDirectory: true
+        )
+        precondition(
+            !FileManager.default.fileExists(atPath: profileRoot.path),
+            "Temporary pterm profile root must start from a fresh path"
+        )
         try FileManager.default.createDirectory(
-            at: ptermDirectory,
+            at: profileRoot,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        let configURL = ptermDirectory.appendingPathComponent("config.json")
+        return try PtermDirectories.withBaseDirectory(profileRoot) {
+            try body(profileRoot)
+        }
+    }
+}
+
+func withTemporaryPtermConfig<T>(_ body: (URL) throws -> T) throws -> T {
+    try withTemporaryPtermProfile { profileRoot in
+        let configURL = profileRoot.appendingPathComponent("config.json")
+        precondition(
+            !FileManager.default.fileExists(atPath: configURL.path),
+            "Temporary pterm config must not reuse a pre-existing file"
+        )
+        try "{}".write(to: configURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
         return try body(configURL)
     }
 }

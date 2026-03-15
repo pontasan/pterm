@@ -5,6 +5,93 @@ import XCTest
 @testable import PtermApp
 
 final class AppInfrastructureTests: XCTestCase {
+    func testLaunchOptionsParseChromeStyleProfileDirectoryEqualsForm() throws {
+        let cwd = URL(fileURLWithPath: "/tmp/current", isDirectory: true)
+        let options = try LaunchOptions.parse(
+            arguments: ["--user-data-dir=profiles/run-01"],
+            currentDirectory: cwd
+        )
+
+        XCTAssertEqual(
+            options.profileRoot,
+            cwd.appendingPathComponent("profiles/run-01", isDirectory: true).standardizedFileURL
+        )
+    }
+
+    func testLaunchOptionsParseUserDataDirSeparateArgumentAndExpandTilde() throws {
+        let options = try LaunchOptions.parse(arguments: ["--user-data-dir", "~/tmp-pterm-profile"])
+        let expected = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("tmp-pterm-profile", isDirectory: true)
+            .standardizedFileURL
+
+        XCTAssertEqual(options.profileRoot, expected)
+    }
+
+    func testLaunchOptionsRejectsMissingProfileRootValue() {
+        XCTAssertThrowsError(try LaunchOptions.parse(arguments: ["--user-data-dir"])) { error in
+            XCTAssertEqual(error as? LaunchOptionsError, .missingValue("--user-data-dir"))
+        }
+    }
+
+    func testLaunchOptionsRejectsDuplicateProfileRootOptions() {
+        XCTAssertThrowsError(
+            try LaunchOptions.parse(arguments: ["--user-data-dir=/tmp/one", "--user-data-dir=/tmp/two"])
+        ) { error in
+            XCTAssertEqual(error as? LaunchOptionsError, .duplicateProfileRootOption)
+        }
+    }
+
+    func testPtermDirectoriesOverrideRebindsAllDerivedLocations() throws {
+        let originalBase = PtermDirectories.base
+        let originalConfig = PtermDirectories.config
+        let originalSessions = PtermDirectories.sessions
+
+        try withTemporaryDirectory { directory in
+            let profileRoot = directory.appendingPathComponent(".pterm_test_profile", isDirectory: true)
+            PtermDirectories.withBaseDirectory(profileRoot) {
+                XCTAssertEqual(PtermDirectories.base, profileRoot.standardizedFileURL)
+                XCTAssertEqual(PtermDirectories.config, profileRoot.appendingPathComponent("config.json"))
+                XCTAssertEqual(PtermDirectories.files, profileRoot.appendingPathComponent("files"))
+                XCTAssertEqual(PtermDirectories.sessions, profileRoot.appendingPathComponent("sessions"))
+                XCTAssertEqual(
+                    PtermDirectories.sessionScrollback,
+                    profileRoot.appendingPathComponent("sessions").appendingPathComponent("scrollback")
+                )
+                XCTAssertEqual(PtermDirectories.audit, profileRoot.appendingPathComponent("audit"))
+                XCTAssertEqual(PtermDirectories.workspaces, profileRoot.appendingPathComponent("workspaces"))
+                XCTAssertTrue(PtermDirectories.isUsingOverriddenBaseDirectory)
+            }
+        }
+
+        XCTAssertEqual(PtermDirectories.base, originalBase)
+        XCTAssertEqual(PtermDirectories.config, originalConfig)
+        XCTAssertEqual(PtermDirectories.sessions, originalSessions)
+        XCTAssertFalse(PtermDirectories.isUsingOverriddenBaseDirectory)
+    }
+
+    func testWithTemporaryPtermConfigOverridesProfileRootForEntirePtermTree() throws {
+        try withTemporaryPtermConfig { configURL in
+            XCTAssertEqual(configURL, PtermDirectories.config)
+            XCTAssertTrue(PtermDirectories.base.lastPathComponent.hasPrefix(".pterm_"))
+            XCTAssertTrue(PtermDirectories.base.path.hasPrefix(NSTemporaryDirectory()))
+            PtermDirectories.ensureDirectories()
+            XCTAssertTrue(FileManager.default.fileExists(atPath: PtermDirectories.files.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: PtermDirectories.sessions.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: PtermDirectories.workspaces.path))
+        }
+
+        XCTAssertFalse(PtermDirectories.isUsingOverriddenBaseDirectory)
+    }
+
+    func testWithTemporaryPtermConfigCreatesFreshConfigFileInsideTemporaryProfileRoot() throws {
+        try withTemporaryPtermConfig { configURL in
+            XCTAssertTrue(FileManager.default.fileExists(atPath: configURL.path))
+            XCTAssertTrue(configURL.path.hasPrefix(PtermDirectories.base.path))
+            XCTAssertEqual(try String(contentsOf: configURL, encoding: .utf8), "{}")
+            XCTAssertEqual(try posixPermissions(of: configURL), 0o600)
+        }
+    }
+
     func testInitialLaunchDispositionRestoresSessionWithoutForcingIntegratedView() {
         let focusedID = UUID()
         let session = PersistedSessionState(

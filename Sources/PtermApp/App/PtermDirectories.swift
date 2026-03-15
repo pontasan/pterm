@@ -1,12 +1,20 @@
 import Foundation
 
-/// Manages the ~/.pterm/ directory structure.
+/// Manages the pterm profile directory structure.
 ///
-/// Ensures all required directories exist with proper permissions (0700).
+/// The default profile root is ~/.pterm, but tests and alternate launch modes can
+/// override the root directory so all config/state files resolve beneath a different
+/// profile path. Ensures all required directories exist with proper permissions (0700).
 enum PtermDirectories {
-    /// Base directory: ~/.pterm/
+    private static let overrideLock = NSLock()
+    private static var overriddenBaseDirectory: URL?
+
+    /// Base directory: ~/.pterm/ unless explicitly overridden.
     static var base: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".pterm")
+        overrideLock.lock()
+        let overridden = overriddenBaseDirectory
+        overrideLock.unlock()
+        return (overridden ?? defaultBaseDirectory()).standardizedFileURL
     }
 
     /// Config file: ~/.pterm/config.json
@@ -27,6 +35,32 @@ enum PtermDirectories {
 
     /// Workspace data: ~/.pterm/workspaces/
     static var workspaces: URL { base.appendingPathComponent("workspaces") }
+
+    static var isUsingOverriddenBaseDirectory: Bool {
+        overrideLock.lock()
+        let overridden = overriddenBaseDirectory != nil
+        overrideLock.unlock()
+        return overridden
+    }
+
+    static func setBaseDirectory(_ directory: URL?) {
+        overrideLock.lock()
+        overriddenBaseDirectory = directory?.standardizedFileURL
+        overrideLock.unlock()
+    }
+
+    static func withBaseDirectory<T>(_ directory: URL, _ body: () throws -> T) rethrows -> T {
+        overrideLock.lock()
+        let previous = overriddenBaseDirectory
+        overriddenBaseDirectory = directory.standardizedFileURL
+        overrideLock.unlock()
+        defer {
+            overrideLock.lock()
+            overriddenBaseDirectory = previous
+            overrideLock.unlock()
+        }
+        return try body()
+    }
 
     /// Ensure all directories exist with correct permissions.
     static func ensureDirectories() {
@@ -56,5 +90,9 @@ enum PtermDirectories {
                 // Non-fatal: permissions may already be correct
             }
         }
+    }
+
+    private static func defaultBaseDirectory() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".pterm", isDirectory: true)
     }
 }

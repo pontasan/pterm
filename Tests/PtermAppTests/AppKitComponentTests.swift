@@ -695,7 +695,7 @@ final class AppKitComponentTests: XCTestCase {
             XCTAssertNil(audit["encryption"])
             XCTAssertEqual(audit["preserved_audit_key"] as? String, "keep")
 
-            let loaded = PtermConfigStore.load()
+            let loaded = PtermConfigStore.load(from: configURL)
             XCTAssertEqual(loaded.term, PtermConfig.default.term)
             XCTAssertEqual(loaded.textEncoding, PtermConfig.default.textEncoding)
             XCTAssertEqual(loaded.shellLaunch, PtermConfig.default.shellLaunch)

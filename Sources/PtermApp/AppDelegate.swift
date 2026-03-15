@@ -2243,7 +2243,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func relaunchApplication() {
         let bundleURL = Bundle.main.bundleURL
-        NSWorkspace.shared.openApplication(at: bundleURL, configuration: NSWorkspace.OpenConfiguration())
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.arguments = Array(ProcessInfo.processInfo.arguments.dropFirst())
+        NSWorkspace.shared.openApplication(at: bundleURL, configuration: configuration)
         NSApp.terminate(nil)
     }
 
