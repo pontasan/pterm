@@ -1932,15 +1932,13 @@ extension TerminalView: MTKViewDelegate {
         let border = effectiveBorderConfig()
         let committedTextPreviews = activeCommittedTextPreviewOverlays()
         let suppressCursorBlink = !committedTextPreviews.isEmpty || !pendingCommittedTextIntents.isEmpty || hasMarkedText()
-        controller.withViewport { model, scrollback, scrollOffset in
-            renderer.render(model: model, scrollback: scrollback,
-                          scrollOffset: scrollOffset, selection: selection,
-                          searchHighlight: highlight, linkUnderline: linkUL,
-                          borderConfig: border,
-                          transientTextOverlays: committedTextPreviews,
-                          suppressCursorBlink: suppressCursorBlink,
-                          in: view)
-        }
+        let snapshot = controller.snapshotViewport()
+        renderer.render(snapshot: snapshot, selection: selection,
+                        searchHighlight: highlight, linkUnderline: linkUL,
+                        borderConfig: border,
+                        transientTextOverlays: committedTextPreviews,
+                        suppressCursorBlink: suppressCursorBlink,
+                        in: view)
         lastDrawnRenderContentVersion = currentVersion
         scheduleIdleBufferRelease()
 

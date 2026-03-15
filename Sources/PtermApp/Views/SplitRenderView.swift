@@ -280,22 +280,19 @@ extension SplitRenderView: MTKViewDelegate {
                 height: ref.frame.height
             )
 
-            ref.controller.withViewport { model, scrollback, scrollOffset in
-                renderer.renderSplitCell(
-                    model: model,
-                    scrollback: scrollback,
-                    scrollOffset: scrollOffset,
-                    selection: selection,
-                    borderConfig: border,
-                    transientTextOverlays: transientTextOverlays,
-                    suppressCursorBlink: suppressCursorBlink,
-                    encoder: encoder,
-                    viewportSize: viewportSize,
-                    cellRect: flippedRect,
-                    scaleFactor: sf,
-                    in: view
-                )
-            }
+            let snapshot = ref.controller.snapshotViewport()
+            renderer.renderSplitCell(
+                snapshot: snapshot,
+                selection: selection,
+                borderConfig: border,
+                transientTextOverlays: transientTextOverlays,
+                suppressCursorBlink: suppressCursorBlink,
+                encoder: encoder,
+                viewportSize: viewportSize,
+                cellRect: flippedRect,
+                scaleFactor: sf,
+                in: view
+            )
         }
 
         encoder.endEncoding()

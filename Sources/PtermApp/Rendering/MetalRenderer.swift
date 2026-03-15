@@ -643,8 +643,8 @@ final class MetalRenderer {
         let alpha: Float
     }
 
-    func render(model: TerminalModel, scrollback: ScrollbackBuffer,
-                scrollOffset: Int, selection: TerminalSelection?,
+    func render(snapshot: TerminalController.ViewportSnapshot,
+                selection: TerminalSelection?,
                 searchHighlight: SearchHighlight? = nil,
                 linkUnderline: LinkUnderline? = nil,
                 borderConfig: BorderConfig? = nil,
@@ -663,8 +663,8 @@ final class MetalRenderer {
         var uniforms = MetalUniforms(
             viewportSize: vp,
             positionOffset: .zero,
-            cursorOpacity: (scrollOffset == 0 && model.cursor.visible) ? 1.0 : 0.0,
-            cursorBlink: (model.cursor.blinking && !suppressCursorBlink) ? 1.0 : 0.0,
+            cursorOpacity: (snapshot.scrollOffset == 0 && snapshot.cursor.visible) ? 1.0 : 0.0,
+            cursorBlink: (snapshot.cursor.blinking && !suppressCursorBlink) ? 1.0 : 0.0,
             time: Float(CACurrentMediaTime() - startTime)
         )
 
@@ -677,7 +677,7 @@ final class MetalRenderer {
 
         // Build vertex data using the atlas's scale factor.
         let sf = Float(glyphAtlas.scaleFactor)
-        let vd = buildVertexData(model: model, scrollback: scrollback, scrollOffset: scrollOffset,
+        let vd = buildVertexData(snapshot: snapshot,
                                  selection: selection, searchHighlight: searchHighlight,
                                  linkUnderline: linkUnderline, transientTextOverlays: transientTextOverlays,
                                  scaleFactor: sf,
@@ -763,8 +763,8 @@ final class MetalRenderer {
 
     // MARK: - Vertex Building
 
-    private func buildVertexData(model: TerminalModel, scrollback: ScrollbackBuffer,
-                                  scrollOffset: Int, selection: TerminalSelection?,
+    private func buildVertexData(snapshot: TerminalController.ViewportSnapshot,
+                                  selection: TerminalSelection?,
                                   searchHighlight: SearchHighlight? = nil,
                                   linkUnderline: LinkUnderline? = nil,
                                   transientTextOverlays: [TransientTextOverlay] = [],
@@ -782,9 +782,9 @@ final class MetalRenderer {
         let lineThickness = max(1.0, scaleFactor)
         let cursorThickness = max(1.0, scaleFactor * 2.0)
 
-        let viewRows = model.rows
-        let viewCols = model.cols
-        let sbCount = scrollback.rowCount
+        let viewRows = snapshot.rows
+        let viewCols = snapshot.cols
+        let sbCount = snapshot.scrollbackRowCount
         let approximateCellCount = max(1, viewRows * viewCols)
         // Reserve close to worst-case visible geometry up front so hot redraw paths
         // don't repeatedly grow the backing arrays while streaming output.
@@ -794,22 +794,18 @@ final class MetalRenderer {
         vd.overlayVertices.reserveCapacity(approximateCellCount * floatsPerQuad * 2)
 
         // Pre-fetch scrollback rows that are visible in the viewport.
-        // Each row is fetched once and reused for all columns.
+        // Rows were already fetched under the lock into the snapshot; copy them here.
         prepareTerminalScrollbackRowsScratch(in: bufferSet, rowCount: viewRows)
-        if scrollOffset > 0 {
-            let firstAbsolute = max(0, sbCount - scrollOffset)
+        if snapshot.scrollOffset > 0 {
             for viewRow in 0..<viewRows {
-                let absRow = firstAbsolute + viewRow
-                if absRow >= 0 && absRow < sbCount {
-                    bufferSet.terminalScrollbackRowHasData[viewRow] = scrollback.getRow(
-                        at: absRow,
-                        into: &bufferSet.terminalScrollbackRowsScratch[viewRow]
-                    )
+                if viewRow < snapshot.scrollbackRows.count {
+                    bufferSet.terminalScrollbackRowHasData[viewRow] = snapshot.scrollbackRowHasData[viewRow]
+                    bufferSet.terminalScrollbackRowsScratch[viewRow] = snapshot.scrollbackRows[viewRow]
                 }
             }
         }
 
-        let firstAbsolute = scrollOffset > 0 ? max(0, sbCount - scrollOffset) : sbCount
+        let firstAbsolute = snapshot.scrollOffset > 0 ? max(0, sbCount - snapshot.scrollOffset) : sbCount
 
         @inline(__always)
         func glyphInfo(for codepoint: UInt32) -> GlyphAtlas.GlyphInfo? {
@@ -884,7 +880,7 @@ final class MetalRenderer {
                 if let sbRow = scrollbackRow {
                     cell = col < sbRow.count ? sbRow[col] : .empty
                 } else {
-                    cell = model.grid.cell(at: gridRow, col: col)
+                    cell = snapshot.grid.cell(at: gridRow, col: col)
                 }
 
                 // Skip continuation cells of wide characters
@@ -1033,17 +1029,16 @@ final class MetalRenderer {
                 }
             }
         }
-
         // Cursor (only visible when not scrolled back)
-        if scrollOffset == 0 && model.cursor.visible {
+        if snapshot.scrollOffset == 0 && snapshot.cursor.visible {
             let cursorOverlay = transientTextOverlays.last { $0.cursorRow != nil && $0.cursorCol != nil }
-            let cursorCol = cursorOverlay?.cursorCol.map { min(max($0, 0), max(viewCols - 1, 0)) } ?? model.cursor.col
-            let cursorRow = cursorOverlay?.cursorRow.map { min(max($0, 0), max(viewRows - 1, 0)) } ?? model.cursor.row
+            let cursorCol = cursorOverlay?.cursorCol.map { min(max($0, 0), max(viewCols - 1, 0)) } ?? snapshot.cursor.col
+            let cursorRow = cursorOverlay?.cursorRow.map { min(max($0, 0), max(viewRows - 1, 0)) } ?? snapshot.cursor.row
             let cx = padX + Float(cursorCol) * cellW
             let cy = padY + Float(cursorRow) * cellH
             let cursorColor: (Float, Float, Float, Float) = (0.8, 0.8, 0.8, 1)
 
-            switch model.cursor.shape {
+            switch snapshot.cursor.shape {
             case .block:
                 addQuad(to: &vd.cursorVertices, x: cx, y: cy, w: cellW, h: cellH,
                        tx: 0, ty: 0, tw: 0, th: 0,
@@ -1082,10 +1077,33 @@ final class MetalRenderer {
         selection: TerminalSelection? = nil,
         transientTextOverlays: [TransientTextOverlay] = []
     ) -> VertexData {
-        buildVertexData(
-            model: model,
-            scrollback: scrollback,
+        let sbCount = scrollback.rowCount
+        var sbRows: [[Cell]] = []
+        var sbHasData: [Bool] = []
+        if scrollOffset > 0 {
+            sbRows = Array(repeating: [], count: model.rows)
+            sbHasData = Array(repeating: false, count: model.rows)
+            let firstAbsolute = max(0, sbCount - scrollOffset)
+            for viewRow in 0..<model.rows {
+                let absRow = firstAbsolute + viewRow
+                if absRow >= 0 && absRow < sbCount {
+                    sbRows[viewRow] = scrollback.getRow(at: absRow) ?? []
+                    sbHasData[viewRow] = !sbRows[viewRow].isEmpty
+                }
+            }
+        }
+        let snapshot = TerminalController.ViewportSnapshot(
+            rows: model.rows,
+            cols: model.cols,
+            cursor: model.cursor,
             scrollOffset: scrollOffset,
+            scrollbackRowCount: sbCount,
+            grid: model.grid.snapshot(),
+            scrollbackRows: sbRows,
+            scrollbackRowHasData: sbHasData
+        )
+        return buildVertexData(
+            snapshot: snapshot,
             selection: selection,
             searchHighlight: nil,
             linkUnderline: nil,
@@ -1115,6 +1133,31 @@ final class MetalRenderer {
         renderPassDescriptor.colorAttachments[0].clearColor = terminalClearColor
 
         let viewportSize = SIMD2<Float>(Float(texture.width), Float(texture.height))
+        let sbCount = scrollback.rowCount
+        var sbRows: [[Cell]] = []
+        var sbHasData: [Bool] = []
+        if scrollOffset > 0 {
+            sbRows = Array(repeating: [], count: model.rows)
+            sbHasData = Array(repeating: false, count: model.rows)
+            let firstAbsolute = max(0, sbCount - scrollOffset)
+            for viewRow in 0..<model.rows {
+                let absRow = firstAbsolute + viewRow
+                if absRow >= 0 && absRow < sbCount {
+                    sbRows[viewRow] = scrollback.getRow(at: absRow) ?? []
+                    sbHasData[viewRow] = !sbRows[viewRow].isEmpty
+                }
+            }
+        }
+        let debugSnapshot = TerminalController.ViewportSnapshot(
+            rows: model.rows,
+            cols: model.cols,
+            cursor: model.cursor,
+            scrollOffset: scrollOffset,
+            scrollbackRowCount: sbCount,
+            grid: model.grid.snapshot(),
+            scrollbackRows: sbRows,
+            scrollbackRowHasData: sbHasData
+        )
         var uniforms = MetalUniforms(
             viewportSize: viewportSize,
             positionOffset: .zero,
@@ -1125,9 +1168,7 @@ final class MetalRenderer {
         let bufferSet = ViewBufferSet()
         let scaleFactor = Float(glyphAtlas.scaleFactor)
         let vertexData = buildVertexData(
-            model: model,
-            scrollback: scrollback,
-            scrollOffset: scrollOffset,
+            snapshot: debugSnapshot,
             selection: selection,
             transientTextOverlays: transientTextOverlays,
             scaleFactor: scaleFactor,
@@ -1757,8 +1798,8 @@ final class MetalRenderer {
     ///
     /// Vertex positions from buildVertexData are offset by cellRect's origin.
     /// A scissor rect clips rendering to the cell bounds.
-    func renderSplitCell(model: TerminalModel, scrollback: ScrollbackBuffer,
-                         scrollOffset: Int, selection: TerminalSelection?,
+    func renderSplitCell(snapshot: TerminalController.ViewportSnapshot,
+                         selection: TerminalSelection?,
                          searchHighlight: SearchHighlight? = nil,
                          linkUnderline: LinkUnderline? = nil,
                          borderConfig: BorderConfig? = nil,
@@ -1770,7 +1811,7 @@ final class MetalRenderer {
                          scaleFactor: Float,
                          in view: MTKView) {
         // Build vertex data at full size (positions relative to (0,0))
-        let vd = buildVertexData(model: model, scrollback: scrollback, scrollOffset: scrollOffset,
+        let vd = buildVertexData(snapshot: snapshot,
                                  selection: selection, searchHighlight: searchHighlight,
                                  linkUnderline: linkUnderline, transientTextOverlays: transientTextOverlays,
                                  scaleFactor: scaleFactor,
@@ -1795,8 +1836,8 @@ final class MetalRenderer {
         var uniforms = MetalUniforms(
             viewportSize: viewportSize,
             positionOffset: SIMD2<Float>(offsetX, offsetY),
-            cursorOpacity: (scrollOffset == 0 && model.cursor.visible) ? 1.0 : 0.0,
-            cursorBlink: (model.cursor.blinking && !suppressCursorBlink) ? 1.0 : 0.0,
+            cursorOpacity: (snapshot.scrollOffset == 0 && snapshot.cursor.visible) ? 1.0 : 0.0,
+            cursorBlink: (snapshot.cursor.blinking && !suppressCursorBlink) ? 1.0 : 0.0,
             time: Float(CACurrentMediaTime() - startTime)
         )
 

@@ -12,10 +12,10 @@ final class TerminalGrid {
     private(set) var cols: Int
 
     /// Cell storage: row-major order
-    private var cells: [Cell]
+    fileprivate var cells: [Cell]
 
     /// Per-row wrap flags packed into 64-bit words.
-    private var lineWrappedWords: [UInt64]
+    fileprivate var lineWrappedWords: [UInt64]
 
     /// Snapshot of per-row wrap flags for local transforms and tests.
     var lineWrapped: [Bool] {
@@ -464,5 +464,17 @@ final class TerminalGrid {
             wrappedFlags.append(isWrapped(row))
         }
         return wrappedFlags
+    }
+
+    // MARK: - Snapshot
+
+    /// Return a frozen copy of this grid for lock-free rendering.
+    func snapshot() -> TerminalGrid {
+        let copy = TerminalGrid(rows: rows, cols: cols)
+        copy.cells = cells
+        copy.lineWrappedWords = lineWrappedWords
+        copy.scrollTop = scrollTop
+        copy.scrollBottom = scrollBottom
+        return copy
     }
 }
