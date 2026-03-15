@@ -77,6 +77,8 @@ final class TerminalView: MTKView, NSTextInputClient {
     var onBecameFirstResponder: (() -> Void)?
     /// Callback when user Cmd+clicks (maximize/restore in split view)
     var onCmdClick: (() -> Void)?
+    /// Callback when user Shift+Cmd+clicks in split view to stage terminals for reselection.
+    var onShiftCommandClick: (() -> Void)?
     /// Tooltip shown when hovering over this terminal (e.g., Cmd+click hint).
     var cmdClickTooltip: String? {
         didSet { toolTip = cmdClickTooltip }
@@ -113,6 +115,12 @@ final class TerminalView: MTKView, NSTextInputClient {
         didSet {
             guard isOutputActive != oldValue else { return }
             updateOutputPulseTimer()
+            requestDisplayUpdate()
+        }
+    }
+    private var commandModifierActive = false {
+        didSet {
+            guard commandModifierActive != oldValue else { return }
             requestDisplayUpdate()
         }
     }
@@ -655,6 +663,38 @@ final class TerminalView: MTKView, NSTextInputClient {
         return borderConfig
     }
 
+    private func commandIdentityHeaderConfig() -> MetalRenderer.HeaderOverlayConfig? {
+        guard commandModifierActive,
+              let controller = terminalController else {
+            return nil
+        }
+        let workspace = controller.sessionSnapshot.workspaceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = controller.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let identity = workspace.isEmpty ? title : "\(workspace) - \(title)"
+        guard !identity.isEmpty else { return nil }
+
+        let style = WorkspaceIdentityColor.headerStyle(for: workspace.isEmpty ? title : workspace)
+        return MetalRenderer.HeaderOverlayConfig(
+            text: identity,
+            backgroundColor: style.background,
+            accentColor: style.accent,
+            textColor: style.text,
+            usesBoldText: true
+        )
+    }
+
+    func setCommandModifierActive(_ active: Bool) {
+        commandModifierActive = active
+    }
+
+    func debugSetCommandModifierActive(_ active: Bool) {
+        setCommandModifierActive(active)
+    }
+
+    func debugCommandIdentityHeaderText() -> String? {
+        commandIdentityHeaderConfig()?.text
+    }
+
     // MARK: - Grid Position from Mouse
 
     /// Convert a mouse event location (in view coordinates) to a grid position.
@@ -717,6 +757,12 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     override func flagsChanged(with event: NSEvent) {
+        let commandHeld = event.modifierFlags.contains(.command)
+        commandModifierActive = commandHeld
+        if renderingSuppressed,
+           let splitContainer = enclosingScrollView?.superview as? SplitTerminalContainerView {
+            splitContainer.setCommandModifierActive(commandHeld)
+        }
         updateLinkHover(with: event)
     }
 
@@ -811,6 +857,11 @@ final class TerminalView: MTKView, NSTextInputClient {
 
         if event.modifierFlags.contains(.command) {
             if handleDetectedLinkClick(event) {
+                return
+            }
+            if event.modifierFlags.contains(.shift),
+               let onShiftCommandClick {
+                onShiftCommandClick()
                 return
             }
             if let onCmdClick {
@@ -1937,6 +1988,7 @@ extension TerminalView: MTKViewDelegate {
                           scrollOffset: scrollOffset, selection: selection,
                           searchHighlight: highlight, linkUnderline: linkUL,
                           borderConfig: border,
+                          headerOverlayConfig: commandIdentityHeaderConfig(),
                           transientTextOverlays: committedTextPreviews,
                           suppressCursorBlink: suppressCursorBlink,
                           in: view)

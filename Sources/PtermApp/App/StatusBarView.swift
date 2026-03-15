@@ -16,6 +16,11 @@ final class StatusBarView: NSView {
     private let backButton: NSButton
     private let separatorLabel: NSTextField
     private let noteButton: NSButton
+    private let commandHintSeparatorLabel: NSTextField
+    private let commandHintLabel: NSTextField
+    private let commandClickHintSeparatorLabel: NSTextField
+    private let commandClickHintLabel: NSTextField
+    private var commandClickHintText: String?
     private var style: Style = .solid
     var onBackToIntegrated: (() -> Void)?
     var onOpenNote: (() -> Void)?
@@ -24,11 +29,17 @@ final class StatusBarView: NSView {
         backButton = NSButton(title: "◀ Overview", target: nil, action: nil)
         separatorLabel = NSTextField(labelWithString: "|")
         noteButton = NSButton(title: "Edit Notes", target: nil, action: nil)
+        commandHintSeparatorLabel = NSTextField(labelWithString: "|")
+        commandHintLabel = NSTextField(labelWithString: "Cmd: Show identities")
+        commandClickHintSeparatorLabel = NSTextField(labelWithString: "|")
+        commandClickHintLabel = NSTextField(labelWithString: "")
         super.init(frame: frameRect)
         backButton.target = self
         backButton.action = #selector(backButtonClicked)
+        backButton.identifier = NSUserInterfaceItemIdentifier("statusbar.backButton")
         noteButton.target = self
         noteButton.action = #selector(noteButtonClicked)
+        noteButton.identifier = NSUserInterfaceItemIdentifier("statusbar.noteButton")
 
         wantsLayer = true
         applyCurrentStyle()
@@ -55,6 +66,7 @@ final class StatusBarView: NSView {
         separatorLabel.textColor = NSColor(calibratedWhite: 0.4, alpha: 1)
         separatorLabel.font = font
         separatorLabel.isHidden = true
+        separatorLabel.identifier = NSUserInterfaceItemIdentifier("statusbar.overviewSeparator")
         addSubview(separatorLabel)
 
         noteButton.bezelStyle = .recessed
@@ -64,15 +76,42 @@ final class StatusBarView: NSView {
         noteButton.toolTip = "Edit Notes"
         addSubview(noteButton)
 
+        commandHintSeparatorLabel.textColor = NSColor(calibratedWhite: 0.4, alpha: 1)
+        commandHintSeparatorLabel.font = font
+        commandHintSeparatorLabel.identifier = NSUserInterfaceItemIdentifier("statusbar.commandSeparator")
+        addSubview(commandHintSeparatorLabel)
+
+        commandHintLabel.textColor = NSColor(calibratedWhite: 0.6, alpha: 1)
+        commandHintLabel.font = font
+        commandHintLabel.lineBreakMode = .byTruncatingTail
+        commandHintLabel.identifier = NSUserInterfaceItemIdentifier("statusbar.commandHint")
+        addSubview(commandHintLabel)
+
+        commandClickHintSeparatorLabel.textColor = NSColor(calibratedWhite: 0.4, alpha: 1)
+        commandClickHintSeparatorLabel.font = font
+        commandClickHintSeparatorLabel.identifier = NSUserInterfaceItemIdentifier("statusbar.commandClickSeparator")
+        addSubview(commandClickHintSeparatorLabel)
+
+        commandClickHintLabel.textColor = NSColor(calibratedWhite: 0.6, alpha: 1)
+        commandClickHintLabel.font = font
+        commandClickHintLabel.lineBreakMode = .byTruncatingTail
+        commandClickHintLabel.identifier = NSUserInterfaceItemIdentifier("statusbar.commandClickHint")
+        commandClickHintLabel.isHidden = true
+        addSubview(commandClickHintLabel)
+
+        commandClickHintSeparatorLabel.isHidden = true
+
         overviewHintLabel.textColor = NSColor(calibratedWhite: 0.55, alpha: 1)
         overviewHintLabel.font = font
         overviewHintLabel.lineBreakMode = .byTruncatingTail
         overviewHintLabel.isHidden = true
+        overviewHintLabel.identifier = NSUserInterfaceItemIdentifier("statusbar.overviewHint")
         addSubview(overviewHintLabel)
 
         overviewHintSeparatorLabel.textColor = NSColor(calibratedWhite: 0.4, alpha: 1)
         overviewHintSeparatorLabel.font = font
         overviewHintSeparatorLabel.isHidden = true
+        overviewHintSeparatorLabel.identifier = NSUserInterfaceItemIdentifier("statusbar.overviewHintSeparator")
         addSubview(overviewHintSeparatorLabel)
     }
 
@@ -88,8 +127,8 @@ final class StatusBarView: NSView {
         let height = bounds.height - vertInset * 2
         let spacing: CGFloat = 6
 
-        // Left side: [backButton] [separator] [noteButton] when back is visible
-        //            [noteButton] when back is hidden
+        // Left side: [backButton] [separator] [noteButton] [separator] [Cmd hint]
+        //            [separator] [Cmd+Click hint]
         var x = inset
 
         if !backButton.isHidden {
@@ -104,6 +143,24 @@ final class StatusBarView: NSView {
 
         noteButton.sizeToFit()
         noteButton.frame = NSRect(x: x, y: vertInset, width: noteButton.frame.width, height: height)
+        x = noteButton.frame.maxX + spacing
+
+        commandHintSeparatorLabel.sizeToFit()
+        commandHintSeparatorLabel.frame = NSRect(x: x, y: vertInset, width: commandHintSeparatorLabel.frame.width, height: height)
+        x = commandHintSeparatorLabel.frame.maxX + spacing
+
+        commandHintLabel.sizeToFit()
+        commandHintLabel.frame = NSRect(x: x, y: vertInset, width: commandHintLabel.frame.width, height: height)
+        x = commandHintLabel.frame.maxX + spacing
+
+        if !commandClickHintLabel.isHidden {
+            commandClickHintSeparatorLabel.sizeToFit()
+            commandClickHintSeparatorLabel.frame = NSRect(x: x, y: vertInset, width: commandClickHintSeparatorLabel.frame.width, height: height)
+            x = commandClickHintSeparatorLabel.frame.maxX + spacing
+
+            commandClickHintLabel.sizeToFit()
+            commandClickHintLabel.frame = NSRect(x: x, y: vertInset, width: commandClickHintLabel.frame.width, height: height)
+        }
 
         // Right side: metrics
         let metricsX = bounds.width - inset - metricsLabelWidth
@@ -150,6 +207,16 @@ final class StatusBarView: NSView {
     func setOverviewSelectAllHintVisible(_ visible: Bool) {
         overviewHintLabel.isHidden = !visible
         overviewHintSeparatorLabel.isHidden = !visible
+        needsLayout = true
+    }
+
+    func setCommandClickHint(_ text: String?) {
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let visible = !(trimmed?.isEmpty ?? true)
+        commandClickHintText = visible ? trimmed : nil
+        commandClickHintLabel.stringValue = commandClickHintText ?? ""
+        commandClickHintLabel.isHidden = !visible
+        commandClickHintSeparatorLabel.isHidden = !visible
         needsLayout = true
     }
 

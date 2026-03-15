@@ -14,6 +14,8 @@ final class SplitTerminalContainerView: NSView {
     private let renderer: MetalRenderer
     private(set) var controllers: [TerminalController]
     private var activeOutputTerminalIDs: Set<UUID> = []
+    private(set) var selectedTerminalIDs: Set<UUID> = []
+    private var commandModifierActive = false
     private var scrollViews: [TerminalScrollView] = []
     /// Single MTKView overlay that renders all terminal cells.
     /// Avoids macOS CAMetalLayer compositing issues with multiple Metal layers.
@@ -42,9 +44,16 @@ final class SplitTerminalContainerView: NSView {
     var onBackToIntegrated: (() -> Void)?
     var onActiveControllerChange: ((TerminalController) -> Void)?
     var onMaximizeTerminal: ((TerminalController) -> Void)?
+    var onCommandClickTerminal: ((TerminalController) -> Void)?
+    var onCommitSelectedControllers: (([TerminalController]) -> Void)?
     var imagePreviewURLProvider: ((Int) -> URL?)? {
         didSet {
             scrollViews.forEach { $0.terminalView.imagePreviewURLProvider = imagePreviewURLProvider }
+        }
+    }
+    var commandClickTooltip: String = "⌘+Click to maximize this terminal" {
+        didSet {
+            scrollViews.forEach { $0.toolTip = commandClickTooltip }
         }
     }
 
@@ -101,6 +110,10 @@ final class SplitTerminalContainerView: NSView {
     /// Compute border config for each cell: white for unfocused, blue for focused.
     private func borderConfig(for terminalView: TerminalView) -> MetalRenderer.BorderConfig? {
         if let controller = terminalView.terminalController,
+           selectedTerminalIDs.contains(controller.id) {
+            return Self.blueBorder
+        }
+        if let controller = terminalView.terminalController,
            activeOutputTerminalIDs.contains(controller.id) {
             let pulse = Float(0.475 + 0.325 * sin(CACurrentMediaTime() * 3.0))
             return MetalRenderer.BorderConfig(
@@ -111,6 +124,23 @@ final class SplitTerminalContainerView: NSView {
         guard scrollViews.count > 1 else { return nil }
         let firstResponder = window?.firstResponder
         return (firstResponder === terminalView) ? Self.blueBorder : Self.whiteBorder
+    }
+
+    private func headerOverlayConfig(for controller: TerminalController) -> MetalRenderer.HeaderOverlayConfig? {
+        guard commandModifierActive else { return nil }
+        let workspace = controller.sessionSnapshot.workspaceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = controller.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let identity = workspace.isEmpty ? title : "\(workspace) - \(title)"
+        guard !identity.isEmpty else { return nil }
+
+        let style = WorkspaceIdentityColor.headerStyle(for: workspace.isEmpty ? title : workspace)
+        return MetalRenderer.HeaderOverlayConfig(
+            text: identity,
+            backgroundColor: style.background,
+            accentColor: style.accent,
+            textColor: style.text,
+            usesBoldText: true
+        )
     }
 
     func setActiveOutputTerminalIDs(_ terminalIDs: Set<UUID>) {
@@ -128,6 +158,7 @@ final class SplitTerminalContainerView: NSView {
         splitRenderView = nil
         scrollViews.forEach { $0.removeFromSuperview() }
         scrollViews.removeAll()
+        selectedTerminalIDs.removeAll()
 
         // Phase 1: Create scroll views WITHOUT assigning controllers.
         // This avoids premature terminal resizes with incorrect (full-window) bounds.
@@ -164,9 +195,17 @@ final class SplitTerminalContainerView: NSView {
             }
             scrollView.terminalView.onCmdClick = { [weak self, weak controller] in
                 guard let self, let controller else { return }
-                self.onMaximizeTerminal?(controller)
+                if let onCommandClickTerminal = self.onCommandClickTerminal {
+                    onCommandClickTerminal(controller)
+                } else {
+                    self.onMaximizeTerminal?(controller)
+                }
             }
-            scrollView.toolTip = "⌘+Click to maximize this terminal"
+            scrollView.terminalView.onShiftCommandClick = { [weak self, weak controller] in
+                guard let self, let controller else { return }
+                self.toggleSplitSelection(for: controller)
+            }
+            scrollView.toolTip = commandClickTooltip
         }
 
         // Phase 4: Create single-MTKView overlay on top of all scroll views.
@@ -175,6 +214,9 @@ final class SplitTerminalContainerView: NSView {
         overlay.delegate = overlay
         overlay.borderConfigProvider = { [weak self] tv in
             self?.borderConfig(for: tv)
+        }
+        overlay.headerOverlayConfigProvider = { [weak self] controller in
+            self?.headerOverlayConfig(for: controller)
         }
         addSubview(overlay)
         splitRenderView = overlay
@@ -253,6 +295,19 @@ final class SplitTerminalContainerView: NSView {
         splitRenderView?.requestRender()
     }
 
+    func setCommandModifierActive(_ active: Bool) {
+        if commandModifierActive && !active && !selectedTerminalIDs.isEmpty {
+            commitSelectedControllers()
+        }
+        guard commandModifierActive != active else { return }
+        commandModifierActive = active
+        requestRender()
+    }
+
+    func debugIdentityHeaderText(for controller: TerminalController) -> String? {
+        headerOverlayConfig(for: controller)?.text
+    }
+
     func scrubPresentedDrawableForRemoval() {
         splitRenderView?.scrubPresentedDrawableForRemoval()
     }
@@ -282,5 +337,22 @@ final class SplitTerminalContainerView: NSView {
 
     @objc private func backButtonPressed(_ sender: Any?) {
         onBackToIntegrated?()
+    }
+
+    private func toggleSplitSelection(for controller: TerminalController) {
+        if selectedTerminalIDs.contains(controller.id) {
+            selectedTerminalIDs.remove(controller.id)
+        } else {
+            selectedTerminalIDs.insert(controller.id)
+        }
+        requestRender()
+    }
+
+    private func commitSelectedControllers() {
+        let selected = controllers.filter { selectedTerminalIDs.contains($0.id) }
+        selectedTerminalIDs.removeAll()
+        requestRender()
+        guard !selected.isEmpty else { return }
+        onCommitSelectedControllers?(selected)
     }
 }

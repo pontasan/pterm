@@ -53,6 +53,8 @@ final class AppKitComponentTests: XCTestCase {
         let buttonTitles = view.subviews.compactMap { $0 as? NSButton }.map(\.title)
         XCTAssertTrue(buttonTitles.contains("Edit Notes"))
         XCTAssertTrue(buttonTitles.contains("◀ Overview"))
+        XCTAssertTrue(labels.contains("Cmd: Show identities"))
+        XCTAssertFalse(labels.contains("Cmd+Click: Return to split"))
     }
 
     func testTypewriterSoundPlayerFindsBundledAudioFiles() {
@@ -122,9 +124,12 @@ final class AppKitComponentTests: XCTestCase {
 
     func testStatusBarBackButtonVisibilityTogglesOverviewControls() {
         let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
-        let labels = view.subviews.compactMap { $0 as? NSTextField }
-        let separator = labels.first(where: { $0.stringValue == "|" })
-        let overview = view.subviews.compactMap { $0 as? NSButton }.first(where: { $0.title == "◀ Overview" })
+        let separator = allSubviews(in: view)
+            .compactMap { $0 as? NSTextField }
+            .first(where: { $0.identifier?.rawValue == "statusbar.overviewSeparator" })
+        let overview = allSubviews(in: view)
+            .compactMap { $0 as? NSButton }
+            .first(where: { $0.identifier?.rawValue == "statusbar.backButton" })
 
         XCTAssertEqual(overview?.isHidden, true)
         XCTAssertEqual(separator?.isHidden, true)
@@ -136,9 +141,12 @@ final class AppKitComponentTests: XCTestCase {
 
     func testStatusBarBackButtonCanBeHiddenAgainAfterShowing() {
         let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
-        let labels = allSubviews(in: view).compactMap { $0 as? NSTextField }
-        let separator = labels.first(where: { $0.stringValue == "|" })
-        let overview = allSubviews(in: view).compactMap { $0 as? NSButton }.first(where: { $0.title == "◀ Overview" })
+        let separator = allSubviews(in: view)
+            .compactMap { $0 as? NSTextField }
+            .first(where: { $0.identifier?.rawValue == "statusbar.overviewSeparator" })
+        let overview = allSubviews(in: view)
+            .compactMap { $0 as? NSButton }
+            .first(where: { $0.identifier?.rawValue == "statusbar.backButton" })
 
         view.setBackButtonVisible(true)
         view.setBackButtonVisible(false)
@@ -152,8 +160,8 @@ final class AppKitComponentTests: XCTestCase {
         let buttons = allSubviews(in: view).compactMap { $0 as? NSButton }
         let labels = allSubviews(in: view).compactMap { $0 as? NSTextField }
 
-        XCTAssertEqual(buttons.first(where: { $0.title == "◀ Overview" })?.isHidden, true)
-        XCTAssertEqual(labels.first(where: { $0.stringValue == "|" })?.isHidden, true)
+        XCTAssertEqual(buttons.first(where: { $0.identifier?.rawValue == "statusbar.backButton" })?.isHidden, true)
+        XCTAssertEqual(labels.first(where: { $0.identifier?.rawValue == "statusbar.overviewSeparator" })?.isHidden, true)
     }
 
     func testStatusBarCanSwitchToTranslucentBackground() {
@@ -4051,6 +4059,40 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertNotNil(buttons.first(where: { $0.title == "Edit Notes" }))
     }
 
+    func testStatusBarShowsCommandHintsAfterEditNotes() {
+        let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 700, height: 24))
+        view.layoutSubtreeIfNeeded()
+
+        let labels = allSubviews(in: view).compactMap { $0 as? NSTextField }
+        XCTAssertNotNil(labels.first(where: { $0.identifier?.rawValue == "statusbar.commandHint" && $0.stringValue == "Cmd: Show identities" }))
+        XCTAssertNil(labels.first(where: { $0.identifier?.rawValue == "statusbar.commandClickHint" && !$0.isHidden }))
+    }
+
+    func testStatusBarCommandClickHintCanBeShownAndHidden() {
+        let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 700, height: 24))
+
+        view.setCommandClickHint("Cmd+Click: Maximize terminal")
+        view.layoutSubtreeIfNeeded()
+
+        let labels = allSubviews(in: view).compactMap { $0 as? NSTextField }
+        XCTAssertEqual(
+            labels.first(where: { $0.identifier?.rawValue == "statusbar.commandClickHint" })?.stringValue,
+            "Cmd+Click: Maximize terminal"
+        )
+        XCTAssertEqual(
+            labels.first(where: { $0.identifier?.rawValue == "statusbar.commandClickHint" })?.isHidden,
+            false
+        )
+
+        view.setCommandClickHint(nil)
+        view.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(
+            labels.first(where: { $0.identifier?.rawValue == "statusbar.commandClickHint" })?.isHidden,
+            true
+        )
+    }
+
     func testStatusBarMetricsRoundToNearestWholeValues() {
         let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
         view.updateCpuUsage(percent: 12.6)
@@ -6565,6 +6607,111 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(Set(multiSelectedIDs), Set(manager.terminals.map(\.id)))
     }
 
+    func testIntegratedViewShiftCommandSelectionCommitsMultiSelectOnCommandRelease() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        _ = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), fontName: "Menlo", fontSize: 13)
+        _ = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), fontName: "Menlo", fontSize: 13)
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), renderer: renderer, manager: manager)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 540),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        window.makeKeyAndOrderFront(nil)
+        renderFrame(for: view)
+
+        let layouts = try XCTUnwrap(reflectedWorkspaceLayouts(from: view).first)
+        let firstPoint = try XCTUnwrap(layouts.terminals.first?.thumbnail.center)
+        let secondPoint = try XCTUnwrap(layouts.terminals.dropFirst().first?.thumbnail.center)
+
+        var multiSelectedIDs: [UUID] = []
+        view.onMultiSelect = { multiSelectedIDs = $0.map(\.id) }
+        var selectedTerminalID: UUID?
+        view.onSelectTerminal = { selectedTerminalID = $0.id }
+
+        let firstDown = try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: firstPoint, in: view, window: window, modifiers: [.shift, .command]))
+        let firstUp = try XCTUnwrap(makeMouseEvent(type: .leftMouseUp, point: firstPoint, in: view, window: window, modifiers: [.shift, .command]))
+        let secondDown = try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: secondPoint, in: view, window: window, modifiers: [.shift, .command]))
+        let secondUp = try XCTUnwrap(makeMouseEvent(type: .leftMouseUp, point: secondPoint, in: view, window: window, modifiers: [.shift, .command]))
+        view.mouseDown(with: firstDown)
+        view.mouseUp(with: firstUp)
+        view.mouseDown(with: secondDown)
+        view.mouseUp(with: secondUp)
+
+        XCTAssertNil(selectedTerminalID)
+        XCTAssertTrue(multiSelectedIDs.isEmpty)
+
+        view.flagsChanged(with: try XCTUnwrap(makeFlagsEvent(window: window, modifiers: [.command])))
+        XCTAssertTrue(multiSelectedIDs.isEmpty)
+        XCTAssertEqual(Set(view.selectedTerminals), Set(manager.terminals.map(\.id)))
+
+        view.flagsChanged(with: try XCTUnwrap(makeFlagsEvent(window: window, modifiers: [])))
+        XCTAssertEqual(Set(multiSelectedIDs), Set(manager.terminals.map(\.id)))
+        XCTAssertTrue(view.selectedTerminals.isEmpty)
+    }
+
+    func testIntegratedViewShiftCommandSelectionSingleTerminalFallsBackToFocusedSelectionOnCommandRelease() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let terminal = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), fontName: "Menlo", fontSize: 13)
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), renderer: renderer, manager: manager)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 540),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        window.makeKeyAndOrderFront(nil)
+        renderFrame(for: view)
+
+        let layout = try XCTUnwrap(reflectedWorkspaceLayouts(from: view).first?.terminals.first)
+        var eagerSelectedID: UUID?
+        view.onSelectTerminal = { eagerSelectedID = $0.id }
+        let down = try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: layout.thumbnail.center, in: view, window: window, modifiers: [.shift, .command]))
+        let up = try XCTUnwrap(makeMouseEvent(type: .leftMouseUp, point: layout.thumbnail.center, in: view, window: window, modifiers: [.shift, .command]))
+        view.mouseDown(with: down)
+        view.mouseUp(with: up)
+        XCTAssertNil(eagerSelectedID)
+
+        var selectedID: UUID?
+        view.onSelectTerminal = { selectedID = $0.id }
+        view.flagsChanged(with: try XCTUnwrap(makeFlagsEvent(window: window, modifiers: [])))
+
+        XCTAssertEqual(selectedID, terminal.id)
+        XCTAssertTrue(view.selectedTerminals.isEmpty)
+    }
+
+    func testIntegratedViewShiftCommandClickDoesNotImmediatelyNavigateOnMouseUp() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let terminal = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), fontName: "Menlo", fontSize: 13)
+        _ = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), fontName: "Menlo", fontSize: 13)
+        let view = IntegratedView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), renderer: renderer, manager: manager)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 540),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        window.makeKeyAndOrderFront(nil)
+        renderFrame(for: view)
+
+        let layout = try XCTUnwrap(reflectedWorkspaceLayouts(from: view).first?.terminals.first)
+        var selectedID: UUID?
+        view.onSelectTerminal = { selectedID = $0.id }
+
+        view.mouseDown(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: layout.thumbnail.center, in: view, window: window, modifiers: [.shift, .command])))
+        view.mouseUp(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseUp, point: layout.thumbnail.center, in: view, window: window, modifiers: [.shift, .command])))
+
+        XCTAssertNil(selectedID)
+        XCTAssertEqual(view.selectedTerminals, [terminal.id])
+    }
+
     func testIntegratedViewThumbnailClickClearsExistingSelectionAndInvokesSelectCallback() throws {
         let renderer = try makeRendererWithPipelinesOrSkip()
         let manager = TerminalManager(rows: 24, cols: 80, config: .default)
@@ -7256,9 +7403,252 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(remainingSplitContainers.isEmpty)
     }
 
+    func testSplitSubsetSelectionMaximizeReturnsToOriginalSplit() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let first = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let second = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let third = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+
+        let delegate = AppDelegate()
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 640))
+        window.testBackingScaleFactor = 2.0
+        let rootView = NSView(frame: window.frame)
+        rootView.wantsLayer = true
+        window.contentView = rootView
+
+        let hostedContentView = NSView(frame: rootView.bounds)
+        hostedContentView.autoresizingMask = [.width, .height]
+        hostedContentView.wantsLayer = true
+        rootView.addSubview(hostedContentView)
+        delegate.configureForTesting(window: window, renderer: renderer, manager: manager, hostedContentView: hostedContentView)
+
+        window.makeKeyAndOrderFront(nil)
+
+        delegate.switchToSplit([first, second, third])
+        let initialSplit = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+        let expectedOriginalIDs = initialSplit.controllers.map(\.id)
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Maximize terminal")
+
+        initialSplit.onCommitSelectedControllers?([first, second])
+
+        let subsetSplit = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+        XCTAssertEqual(Set(subsetSplit.controllers.map(\.id)), Set([first.id, second.id]))
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Return to split")
+
+        subsetSplit.onCommandClickTerminal?(first)
+        let restoredBySplitClick = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+        XCTAssertEqual(restoredBySplitClick.controllers.map(\.id), expectedOriginalIDs)
+
+        restoredBySplitClick.onCommitSelectedControllers?([first, second])
+        let subsetSplitAgain = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+
+        subsetSplitAgain.onCommandClickTerminal?(first)
+        let restoredBySecondSplitClick = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+        XCTAssertEqual(restoredBySecondSplitClick.controllers.map(\.id), expectedOriginalIDs)
+
+        restoredBySecondSplitClick.onCommitSelectedControllers?([first, second])
+        let subsetSplitForFocusedReturn = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+
+        subsetSplitForFocusedReturn.onMaximizeTerminal?(first)
+
+        let focusedScrollView = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? TerminalScrollView }.first)
+        focusedScrollView.terminalView.onCmdClick?()
+
+        let restoredSplit = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+        XCTAssertEqual(restoredSplit.controllers.map(\.id), expectedOriginalIDs)
+    }
+
+    func testNewTerminalFromFocusedSplitLineageReturnsToOriginalSplit() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let first = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let second = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let third = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+
+        let delegate = AppDelegate()
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 640))
+        window.testBackingScaleFactor = 2.0
+        let rootView = NSView(frame: window.frame)
+        rootView.wantsLayer = true
+        window.contentView = rootView
+
+        let hostedContentView = NSView(frame: rootView.bounds)
+        hostedContentView.autoresizingMask = [.width, .height]
+        hostedContentView.wantsLayer = true
+        rootView.addSubview(hostedContentView)
+        delegate.configureForTesting(window: window, renderer: renderer, manager: manager, hostedContentView: hostedContentView)
+
+        window.makeKeyAndOrderFront(nil)
+
+        delegate.switchToSplit([first, second, third])
+        let initialSplit = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+        let expectedOriginalIDs = initialSplit.controllers.map(\.id)
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Maximize terminal")
+
+        initialSplit.onMaximizeTerminal?(first)
+        delegate.newTerminal(nil)
+
+        let derivedSplit = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+        XCTAssertEqual(derivedSplit.controllers.count, 2)
+        XCTAssertTrue(derivedSplit.controllers.map(\.id).contains(first.id))
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Return to split")
+
+        derivedSplit.onCommandClickTerminal?(first)
+        let restoredBySplitClick = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+        XCTAssertEqual(restoredBySplitClick.controllers.map(\.id), expectedOriginalIDs)
+
+        restoredBySplitClick.onMaximizeTerminal?(first)
+        delegate.newTerminal(nil)
+        let derivedSplitForFocusedReturn = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+        derivedSplitForFocusedReturn.onMaximizeTerminal?(first)
+
+        let focusedScrollView = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? TerminalScrollView }.first)
+        focusedScrollView.terminalView.onCmdClick?()
+
+        let restoredSplit = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+        XCTAssertEqual(restoredSplit.controllers.map(\.id), expectedOriginalIDs)
+    }
+
+    func testNewTerminalFromDerivedSplitPreservesReturnToOriginalSplit() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let first = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let second = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let third = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+
+        let delegate = AppDelegate()
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 640))
+        window.testBackingScaleFactor = 2.0
+        let rootView = NSView(frame: window.frame)
+        rootView.wantsLayer = true
+        window.contentView = rootView
+
+        let hostedContentView = NSView(frame: rootView.bounds)
+        hostedContentView.autoresizingMask = [.width, .height]
+        hostedContentView.wantsLayer = true
+        rootView.addSubview(hostedContentView)
+        delegate.configureForTesting(window: window, renderer: renderer, manager: manager, hostedContentView: hostedContentView)
+
+        window.makeKeyAndOrderFront(nil)
+
+        delegate.switchToSplit([first, second, third])
+        let initialSplit = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+        let expectedOriginalIDs = initialSplit.controllers.map(\.id)
+
+        initialSplit.onCommitSelectedControllers?([first, second])
+        let derivedSplit = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Return to split")
+
+        delegate.newTerminal(nil)
+        let expandedDerivedSplit = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Return to split")
+        XCTAssertEqual(expandedDerivedSplit.controllers.count, 3)
+
+        expandedDerivedSplit.onCommandClickTerminal?(first)
+        let restoredSplit = try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+        XCTAssertEqual(restoredSplit.controllers.map(\.id), expectedOriginalIDs)
+    }
+
+    func testSplitLineageScenarioMatrixPreservesReturnTargetsAcrossWorkspaces() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+
+        let alphaAWS = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), customTitle: "aws", workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let alphaWK = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), customTitle: "wk", workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let betaSRC = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), customTitle: "src", workspaceName: "Beta", fontName: "Menlo", fontSize: 13)
+        let betaAPI = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), customTitle: "api", workspaceName: "Beta", fontName: "Menlo", fontSize: 13)
+        let gammaOPS = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), customTitle: "ops", workspaceName: "Gamma", fontName: "Menlo", fontSize: 13)
+
+        let harness = try makeAppHarness(renderer: renderer, manager: manager)
+        let delegate = harness.delegate
+        let hostedContentView = harness.hostedContentView
+
+        let shuffledControllers = [betaSRC, alphaWK, gammaOPS, alphaAWS, betaAPI]
+        let expectedOriginalIDs = AppDelegate.groupedControllersForSplit(shuffledControllers).map(\.id)
+
+        delegate.switchToSplit(shuffledControllers)
+        XCTAssertEqual(try currentSplitContainer(in: hostedContentView).controllers.map(\.id), expectedOriginalIDs)
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Maximize terminal")
+
+        let originalSplit = try currentSplitContainer(in: hostedContentView)
+        let subsetSelection = [betaSRC, alphaWK, gammaOPS]
+        let expectedSubsetIDs = AppDelegate.groupedControllersForSplit(subsetSelection).map(\.id)
+        originalSplit.onCommitSelectedControllers?(subsetSelection)
+
+        let subsetSplit = try currentSplitContainer(in: hostedContentView)
+        XCTAssertEqual(subsetSplit.controllers.map(\.id), expectedSubsetIDs)
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Return to split")
+
+        subsetSplit.onMaximizeTerminal?(alphaWK)
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Return to split")
+        try currentFocusedScrollView(in: hostedContentView).terminalView.onCmdClick?()
+        XCTAssertEqual(try currentSplitContainer(in: hostedContentView).controllers.map(\.id), expectedOriginalIDs)
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Maximize terminal")
+
+        try currentSplitContainer(in: hostedContentView).onCommitSelectedControllers?(subsetSelection)
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Return to split")
+        delegate.newTerminal(nil)
+
+        let expandedSubsetSplit = try currentSplitContainer(in: hostedContentView)
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Return to split")
+        XCTAssertEqual(expandedSubsetSplit.controllers.count, expectedSubsetIDs.count + 1)
+        XCTAssertTrue(Set(expectedSubsetIDs).isSubset(of: Set(expandedSubsetSplit.controllers.map(\.id))))
+
+        expandedSubsetSplit.onCommandClickTerminal?(alphaWK)
+        XCTAssertEqual(try currentSplitContainer(in: hostedContentView).controllers.map(\.id), expectedOriginalIDs)
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Maximize terminal")
+
+        try currentSplitContainer(in: hostedContentView).onMaximizeTerminal?(betaAPI)
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Return to split")
+        delegate.newTerminal(nil)
+
+        let focusedDerivedSplit = try currentSplitContainer(in: hostedContentView)
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Return to split")
+        XCTAssertEqual(focusedDerivedSplit.controllers.count, 2)
+        XCTAssertTrue(focusedDerivedSplit.controllers.map(\.id).contains(betaAPI.id))
+
+        focusedDerivedSplit.onCommandClickTerminal?(betaAPI)
+        XCTAssertEqual(try currentSplitContainer(in: hostedContentView).controllers.map(\.id), expectedOriginalIDs)
+        XCTAssertEqual(delegate.debugStatusBarCommandClickHintForTesting(), "Cmd+Click: Maximize terminal")
+    }
+
     private func allSubviews(in view: NSView?) -> [NSView] {
         guard let view else { return [] }
         return [view] + view.subviews.flatMap { allSubviews(in: $0) }
+    }
+
+    private func makeAppHarness(
+        renderer: MetalRenderer,
+        manager: TerminalManager
+    ) throws -> (delegate: AppDelegate, window: TestScaleWindow, hostedContentView: NSView) {
+        let delegate = AppDelegate()
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 640))
+        window.testBackingScaleFactor = 2.0
+        let rootView = NSView(frame: window.frame)
+        rootView.wantsLayer = true
+        window.contentView = rootView
+
+        let hostedContentView = NSView(frame: rootView.bounds)
+        hostedContentView.autoresizingMask = [.width, .height]
+        hostedContentView.wantsLayer = true
+        rootView.addSubview(hostedContentView)
+        delegate.configureForTesting(window: window, renderer: renderer, manager: manager, hostedContentView: hostedContentView)
+
+        window.makeKeyAndOrderFront(nil)
+        return (delegate, window, hostedContentView)
+    }
+
+    private func currentSplitContainer(in hostedContentView: NSView) throws -> SplitTerminalContainerView {
+        try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+    }
+
+    private func currentFocusedScrollView(in hostedContentView: NSView) throws -> TerminalScrollView {
+        try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? TerminalScrollView }.first)
     }
 
     private func makeSharedRenderTexture(renderer: MetalRenderer, width: Int, height: Int) -> MTLTexture? {
@@ -7740,6 +8130,172 @@ private struct ReflectedThumbnailLayout {
     let thumbnail: NSRect
     let title: NSRect
     let workspace: String
+}
+
+private extension AppKitComponentTests {
+    func testSplitTerminalContainerShiftCommandClickStagesSelectionWithoutImmediateMaximize() throws {
+        let renderer = try makeRendererOrSkip()
+        let first = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/split-a",
+            customTitle: "a",
+            workspaceName: "WG"
+        )
+        let second = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/split-b",
+            customTitle: "b",
+            workspaceName: "WG"
+        )
+        let container = SplitTerminalContainerView(
+            frame: NSRect(x: 0, y: 0, width: 420, height: 260),
+            renderer: renderer,
+            controllers: [first, second]
+        )
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 260),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(container)
+        window.makeKeyAndOrderFront(nil)
+        container.layoutSubtreeIfNeeded()
+        container.setCommandModifierActive(true)
+
+        var maximizedID: UUID?
+        container.onMaximizeTerminal = { maximizedID = $0.id }
+
+        let scrollView = try XCTUnwrap(container.subviews.compactMap { $0 as? TerminalScrollView }.first)
+        let point = NSPoint(x: scrollView.frame.midX, y: scrollView.frame.midY)
+        let down = try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: point, in: container, window: window, modifiers: [.shift, .command]))
+        scrollView.terminalView.mouseDown(with: down)
+
+        XCTAssertNil(maximizedID)
+        XCTAssertEqual(container.selectedTerminalIDs, [first.id])
+    }
+
+    func testSplitTerminalContainerCommitsShiftCommandSelectionOnCommandRelease() throws {
+        let renderer = try makeRendererOrSkip()
+        let first = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/split-a",
+            customTitle: "a",
+            workspaceName: "WG"
+        )
+        let second = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/split-b",
+            customTitle: "b",
+            workspaceName: "WG"
+        )
+        let container = SplitTerminalContainerView(
+            frame: NSRect(x: 0, y: 0, width: 420, height: 260),
+            renderer: renderer,
+            controllers: [first, second]
+        )
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 260),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(container)
+        window.makeKeyAndOrderFront(nil)
+        container.layoutSubtreeIfNeeded()
+        container.setCommandModifierActive(true)
+
+        var committedIDs: [UUID] = []
+        container.onCommitSelectedControllers = { committedIDs = $0.map(\.id) }
+
+        let scrollViews = container.subviews.compactMap { $0 as? TerminalScrollView }
+        for scrollView in scrollViews {
+            let point = NSPoint(x: scrollView.frame.midX, y: scrollView.frame.midY)
+            let down = try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: point, in: container, window: window, modifiers: [.shift, .command]))
+            scrollView.terminalView.mouseDown(with: down)
+        }
+
+        XCTAssertEqual(Set(container.selectedTerminalIDs), Set([first.id, second.id]))
+        container.setCommandModifierActive(false)
+
+        XCTAssertEqual(Set(committedIDs), Set([first.id, second.id]))
+        XCTAssertTrue(container.selectedTerminalIDs.isEmpty)
+    }
+
+    func testTerminalViewCommandIdentityHeaderUsesWorkspaceAndTitle() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/header",
+            customTitle: "aws",
+            workspaceName: "Workgroup"
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 240), renderer: renderer)
+        view.terminalController = controller
+
+        XCTAssertNil(view.debugCommandIdentityHeaderText())
+        view.debugSetCommandModifierActive(true)
+        XCTAssertEqual(view.debugCommandIdentityHeaderText(), "Workgroup - aws")
+    }
+
+    func testSplitTerminalContainerCommandIdentityHeaderUsesWorkspaceAndTitle() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/split-header",
+            customTitle: "wk",
+            workspaceName: "Ops"
+        )
+        let container = SplitTerminalContainerView(
+            frame: NSRect(x: 0, y: 0, width: 420, height: 260),
+            renderer: renderer,
+            controllers: [controller]
+        )
+
+        XCTAssertNil(container.debugIdentityHeaderText(for: controller))
+        container.setCommandModifierActive(true)
+        XCTAssertEqual(container.debugIdentityHeaderText(for: controller), "Ops - wk")
+    }
 }
 
 private final class TestScaleWindow: NSWindow {

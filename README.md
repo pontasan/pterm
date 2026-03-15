@@ -12,6 +12,7 @@ A fast, secure, and memory-efficient terminal emulator for macOS.
 - **Shell flexibility** — Defaults to your system shell (typically zsh), with automatic fallback to bash and sh.
 - **Full IME support** — Japanese and other multi-byte input via macOS Input Methods with correct cursor positioning.
 - **Workspace management** — Organize terminals into named workspaces with persistent notes.
+- **Workspace identity overlays** — Hold `Cmd` to reveal deterministic workspace/title headers for focused and split terminals.
 - **Dark theme** — Black background, optimized for CLI tools like Claude Code.
 - **Code signed and notarized** — Distributed with Developer ID signature and Apple notarization for Gatekeeper compatibility.
 - **Zero external dependencies** — Built entirely on macOS system frameworks (AppKit, Metal, Security). No third-party libraries.

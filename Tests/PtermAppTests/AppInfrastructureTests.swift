@@ -61,6 +61,38 @@ final class AppInfrastructureTests: XCTestCase {
         )
     }
 
+    func testGroupedControllersForSplitOrdersControllersDeterministicallyByWorkspaceThenTitle() {
+        let first = TerminalController(
+            rows: 4, cols: 12, termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 1024, scrollbackMaxCapacity: 1024,
+            fontName: "Menlo", fontSize: 13, initialDirectory: "/tmp/a1", customTitle: "z-last", workspaceName: "B"
+        )
+        let second = TerminalController(
+            rows: 4, cols: 12, termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 1024, scrollbackMaxCapacity: 1024,
+            fontName: "Menlo", fontSize: 13, initialDirectory: "/tmp/b1", customTitle: "b-middle", workspaceName: "A"
+        )
+        let third = TerminalController(
+            rows: 4, cols: 12, termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 1024, scrollbackMaxCapacity: 1024,
+            fontName: "Menlo", fontSize: 13, initialDirectory: "/tmp/a2", customTitle: "a-first", workspaceName: "A"
+        )
+        let fourth = TerminalController(
+            rows: 4, cols: 12, termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 1024, scrollbackMaxCapacity: 1024,
+            fontName: "Menlo", fontSize: 13, initialDirectory: "/tmp/c1", customTitle: "a-first", workspaceName: "C"
+        )
+        let fifth = TerminalController(
+            rows: 4, cols: 12, termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 1024, scrollbackMaxCapacity: 1024,
+            fontName: "Menlo", fontSize: 13, initialDirectory: "/tmp/b2", customTitle: "a-first", workspaceName: "B"
+        )
+
+        let grouped = AppDelegate.groupedControllersForSplit([first, second, third, fourth, fifth])
+
+        XCTAssertEqual(grouped.map(\.id), [third, second, fifth, first, fourth].map(\.id))
+    }
+
     func testMonitoredMetricsPIDsIncludesOnlyAppPIDOutsideIntegratedVisibleActiveState() {
         let controller = TerminalController(
             rows: 24,

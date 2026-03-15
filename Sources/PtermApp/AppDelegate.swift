@@ -19,6 +19,7 @@ private extension String {
 final class PtermWindow: NSWindow {
     var onBackToIntegratedShortcut: (() -> Void)?
     var onInterruptShortcut: (() -> Bool)?
+    var onCommandModifierChange: ((Bool) -> Void)?
     private static let supportedModifierMask: NSEvent.ModifierFlags = [.command, .shift, .option, .control]
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -30,6 +31,9 @@ final class PtermWindow: NSWindow {
     }
 
     override func sendEvent(_ event: NSEvent) {
+        if event.type == .flagsChanged {
+            onCommandModifierChange?(event.modifierFlags.intersection(Self.supportedModifierMask).contains(.command))
+        }
         if event.type == .keyDown, isInterruptShortcut(event), onInterruptShortcut?() == true {
             return
         }
@@ -84,6 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var configWatchSource: DispatchSourceFileSystemObject?
     private var pendingConfigReload: DispatchWorkItem?
     private var backShortcutMonitor: Any?
+    private var commandIdentityModifierMonitor: Any?
     private var titlebarBackButton: NSButton?
 
     private var metricsMonitor: ProcessMetricsMonitor?
@@ -144,6 +149,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Controllers saved when maximizing a terminal from split view (for restore)
     private var splitOriginControllers: [TerminalController]?
+    /// Controllers saved when the current split itself should return to a previous split.
+    private var splitReturnControllers: [TerminalController]?
 
     /// View mode
     private enum ViewMode {
@@ -201,6 +208,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return .integrated
         }
+    }
+
+    static func groupedControllersForSplit(_ controllers: [TerminalController]) -> [TerminalController] {
+        controllers.sorted { lhs, rhs in
+            let lhsWorkspace = splitOrderingKey(lhs.sessionSnapshot.workspaceName)
+            let rhsWorkspace = splitOrderingKey(rhs.sessionSnapshot.workspaceName)
+            if lhsWorkspace != rhsWorkspace {
+                return lhsWorkspace < rhsWorkspace
+            }
+
+            let lhsTitle = splitOrderingKey(lhs.title)
+            let rhsTitle = splitOrderingKey(rhs.title)
+            if lhsTitle != rhsTitle {
+                return lhsTitle < rhsTitle
+            }
+
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+    }
+
+    private static func splitOrderingKey(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: Locale(identifier: "en_US_POSIX"))
     }
 
     static func statusBarMetrics(
@@ -450,6 +481,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appWindow.onInterruptShortcut = { [weak self] in
             self?.handleHighPriorityInterruptShortcut() ?? false
         }
+        appWindow.onCommandModifierChange = { [weak self] isHeld in
+            self?.setCommandIdentityHeadersVisible(isHeld)
+        }
         window = appWindow
         window.center()
         window.title = "pterm"
@@ -523,6 +557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cleanupService.start()
         clipboardCleanupService = cleanupService
         installBackShortcutMonitor()
+        installCommandIdentityModifierMonitor()
 
         // Setup menu
         setupMenu()
@@ -583,6 +618,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         try? sessionStore.markCleanShutdown()
         singleInstanceLock.release()
+        removeCommandIdentityModifierMonitor()
         return .terminateNow
     }
 
@@ -754,12 +790,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         suppressVisibleOutputIndicators(for: [controller.id])
         terminalView?.applyAppearanceSettings()
         focusedController = controller
+        splitReturnControllers = nil
 
         viewMode = .focused(controller)
         applyAppearanceSettingsToVisibleViews()
         updateTitlebarBackButtonVisibility()
         refreshMetricsMonitoringState()
         refreshStatusBarMetrics()
+        refreshStatusBarCommandHints()
+        setCommandIdentityHeadersVisible(currentCommandModifierHeld())
         window.makeFirstResponder(sv.terminalView)
         sv.terminalView.syncScaleFactorIfNeeded()
 
@@ -768,8 +807,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func switchToSplit(_ controllers: [TerminalController]) {
-        guard controllers.count >= 2 else {
-            if let first = controllers.first {
+        switchToSplit(controllers, returnToControllers: nil)
+    }
+
+    private func switchToSplit(_ controllers: [TerminalController], returnToControllers: [TerminalController]?) {
+        let orderedControllers = Self.groupedControllersForSplit(controllers)
+        let orderedReturnControllers = returnToControllers.map(Self.groupedControllersForSplit)
+        guard orderedControllers.count >= 2 else {
+            if let first = orderedControllers.first {
+                splitOriginControllers = orderedReturnControllers
                 switchToFocused(first)
             } else {
                 switchToIntegrated()
@@ -777,11 +823,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        Self.refreshCurrentDirectories(for: controllers)
+        Self.refreshCurrentDirectories(for: orderedControllers)
 
         let splitView = SplitTerminalContainerView(frame: presentationHostView().bounds,
                                                    renderer: renderer,
-                                                   controllers: controllers)
+                                                   controllers: orderedControllers)
         splitView.autoresizingMask = [.width, .height]
         splitView.shortcutConfiguration = config.shortcuts
         splitView.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
@@ -795,10 +841,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         splitView.onBackToIntegrated = { [weak self] in
             self?.switchToIntegrated()
         }
+        splitView.commandClickTooltip =
+            orderedReturnControllers == nil
+            ? "⌘+Click to maximize this terminal"
+            : "⌘+Click to return to previous split view"
         splitView.onMaximizeTerminal = { [weak self] controller in
             guard let self else { return }
-            self.splitOriginControllers = controllers
+            self.splitOriginControllers = orderedReturnControllers ?? orderedControllers
             self.switchToFocused(controller)
+        }
+        splitView.onCommandClickTerminal = { [weak self] controller in
+            guard let self else { return }
+            if let returnControllers = orderedReturnControllers {
+                self.switchToSplit(returnControllers)
+            } else {
+                self.splitOriginControllers = orderedControllers
+                self.switchToFocused(controller)
+            }
+        }
+        splitView.onCommitSelectedControllers = { [weak self] selectedControllers in
+            guard let self else { return }
+            let orderedSelection = Self.groupedControllersForSplit(selectedControllers)
+            guard !orderedSelection.isEmpty else { return }
+            let parentSplitControllers = orderedControllers
+            if orderedSelection.count == 1, let controller = orderedSelection.first {
+                self.splitOriginControllers = parentSplitControllers
+                self.switchToFocused(controller)
+            } else {
+                self.switchToSplit(orderedSelection, returnToControllers: parentSplitControllers)
+            }
         }
         presentationHostView().addSubview(splitView)
 
@@ -820,14 +891,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hideSearchBar()
 
         splitContainerView = splitView
-        suppressVisibleOutputIndicators(for: controllers.map(\.id))
+        suppressVisibleOutputIndicators(for: orderedControllers.map(\.id))
         splitContainerView?.applyAppearanceSettings()
+        splitReturnControllers = orderedReturnControllers
         splitOriginControllers = nil
-        viewMode = .split(controllers)
+        viewMode = .split(orderedControllers)
         applyAppearanceSettingsToVisibleViews()
         updateTitlebarBackButtonVisibility()
         refreshMetricsMonitoringState()
         refreshStatusBarMetrics()
+        refreshStatusBarCommandHints()
+        setCommandIdentityHeadersVisible(currentCommandModifierHeld())
         if let activeController = splitView.activeController {
             applyRendererSettings(for: activeController)
         }
@@ -869,6 +943,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminalView = nil
         focusedController = nil
         splitOriginControllers = nil
+        splitReturnControllers = nil
         hideSearchBar()
 
         viewMode = .integrated
@@ -877,6 +952,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateTitlebarBackButtonVisibility()
         refreshMetricsMonitoringState()
         refreshStatusBarMetrics()
+        refreshStatusBarCommandHints()
+        setCommandIdentityHeadersVisible(false)
         window.makeFirstResponder(iv)
 
         updateWindowTitle()
@@ -1181,6 +1258,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func installCommandIdentityModifierMonitor() {
+        removeCommandIdentityModifierMonitor()
+        commandIdentityModifierMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] _ in
+            guard let self else { return }
+            self.setCommandIdentityHeadersVisible(self.currentCommandModifierHeld())
+        }
+    }
+
+    private func removeCommandIdentityModifierMonitor() {
+        if let commandIdentityModifierMonitor {
+            NSEvent.removeMonitor(commandIdentityModifierMonitor)
+            self.commandIdentityModifierMonitor = nil
+        }
+    }
+
     private func installTitlebarBackButton() {
         guard let titlebarView = window.standardWindowButton(.closeButton)?.superview else { return }
         let button = NSButton(title: "▦", target: self, action: #selector(backToIntegratedView(_:)))
@@ -1384,19 +1476,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func newTerminal(_ sender: Any?) {
         let shortcutContext: (workspaceName: String, displayedControllers: [TerminalController])?
+        let returnToControllers: [TerminalController]?
         switch viewMode {
         case .focused(let controller):
             shortcutContext = Self.newTerminalShortcutContext(
                 focusedController: controller,
                 splitControllers: []
             )
+            returnToControllers = splitOriginControllers
         case .split(let controllers):
             shortcutContext = Self.newTerminalShortcutContext(
                 focusedController: nil,
                 splitControllers: controllers
             )
+            returnToControllers = splitReturnControllers
         case .integrated:
             shortcutContext = nil
+            returnToControllers = nil
         }
 
         guard let shortcutContext,
@@ -1406,7 +1502,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               ) else {
             return
         }
-        switchToSplit(shortcutContext.displayedControllers + [newController])
+        switchToSplit(shortcutContext.displayedControllers + [newController], returnToControllers: returnToControllers)
     }
 
     @objc func backToIntegratedView(_ sender: Any?) {
@@ -2234,6 +2330,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowPresentationHostView = presentationHostView
     }
 
+    private func currentCommandModifierHeld() -> Bool {
+        CGEventSource.flagsState(.combinedSessionState).contains(.maskCommand)
+    }
+
+    private func setCommandIdentityHeadersVisible(_ visible: Bool) {
+        terminalView?.setCommandModifierActive(visible)
+        splitContainerView?.setCommandModifierActive(visible)
+    }
+
+    private func refreshStatusBarCommandHints() {
+        let commandClickHint: String?
+        switch viewMode {
+        case .split:
+            commandClickHint = splitReturnControllers == nil
+                ? "Cmd+Click: Maximize terminal"
+                : "Cmd+Click: Return to split"
+        case .focused:
+            commandClickHint = splitOriginControllers == nil ? nil : "Cmd+Click: Return to split"
+        case .integrated:
+            commandClickHint = nil
+        }
+        statusBarView?.setCommandClickHint(commandClickHint)
+    }
+
     /// Inject dependencies for unit tests (only visible via @testable import).
     func configureForTesting(window: NSWindow, renderer: MetalRenderer, manager: TerminalManager, hostedContentView: NSView) {
         self.window = window
@@ -2241,6 +2361,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.manager = manager
         self.windowHostedContentView = hostedContentView
         self.statusBarView = StatusBarView(frame: .zero)
+    }
+
+    func debugStatusBarCommandClickHintForTesting() -> String? {
+        statusBarView.subviews
+            .compactMap { $0 as? NSTextField }
+            .first(where: { $0.identifier?.rawValue == "statusbar.commandClickHint" && !$0.isHidden })?
+            .stringValue
     }
 
     private func contentHostView() -> NSView {
@@ -2623,6 +2750,7 @@ extension AppDelegate: NSWindowDelegate {
 
     @objc func applicationDidResignActive(_ notification: Notification) {
         refreshMetricsMonitoringState()
+        setCommandIdentityHeadersVisible(currentCommandModifierHeld())
         // Switching to another app should not tear down visible render resources.
         // Doing so forces glyph atlas / buffer reconstruction on the first frame
         // after reactivation, which can expose transient corruption before the
@@ -2632,16 +2760,19 @@ extension AppDelegate: NSWindowDelegate {
 
     @objc func applicationDidBecomeActive(_ notification: Notification) {
         refreshMetricsMonitoringState()
+        setCommandIdentityHeadersVisible(currentCommandModifierHeld())
         restoreVisibleRenderingResourcesIfNeeded()
     }
 
     @objc func applicationDidHide(_ notification: Notification) {
         stopMetricsMonitor()
+        setCommandIdentityHeadersVisible(currentCommandModifierHeld())
         releaseInactiveRenderingResourcesNow()
     }
 
     @objc func applicationDidUnhide(_ notification: Notification) {
         refreshMetricsMonitoringState()
+        setCommandIdentityHeadersVisible(currentCommandModifierHeld())
         restoreVisibleRenderingResourcesIfNeeded()
     }
 

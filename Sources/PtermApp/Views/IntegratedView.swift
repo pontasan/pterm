@@ -25,8 +25,8 @@ final class ScrollDocumentView: NSView {
 ///
 /// Each thumbnail renders its terminal content at full PTY grid resolution,
 /// scaled down by the GPU to fit the thumbnail cell. Clicking a thumbnail
-/// switches to the focused (occupied) view. Shift+click enables multi-select
-/// for split display.
+/// switches to the focused (occupied) view. Shift+click enables multi-select,
+/// and Shift+Cmd+click commits the selected set to split view when Cmd is released.
 final class IntegratedView: MTKView, NSDraggingSource {
     static func overviewBackgroundClearColor() -> MTLClearColor {
         MTLClearColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0)
@@ -291,10 +291,17 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     /// Whether the Shift key is currently held (for showing select/deselect buttons)
     private var isShiftDown = false
+    private var isCommandDown = false
+    private enum SelectionCommitTrigger {
+        case shiftRelease
+        case commandRelease
+    }
+    private var selectionCommitTrigger: SelectionCommitTrigger?
 
     /// Resets multi-select state (e.g. when returning to integrated view).
     func clearSelection() {
         selectedTerminals.removeAll()
+        selectionCommitTrigger = nil
         setNeedsDisplay(bounds)
     }
 
@@ -1836,6 +1843,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
                     for tl in workspace.terminals {
                         selectedTerminals.insert(tl.controller.id)
                     }
+                    selectionCommitTrigger = .shiftRelease
                     setNeedsDisplay(bounds)
                     return
                 }
@@ -1843,6 +1851,9 @@ final class IntegratedView: MTKView, NSDraggingSource {
                 if hasSelection && workspace.deselectFrame.contains(point) {
                     for tl in workspace.terminals {
                         selectedTerminals.remove(tl.controller.id)
+                    }
+                    if selectedTerminals.isEmpty {
+                        selectionCommitTrigger = nil
                     }
                     setNeedsDisplay(bounds)
                     return
@@ -1855,14 +1866,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
             let controller = cachedFlattenedThumbnails[idx].controller
             mouseDownTerminal = controller
 
-            if event.modifierFlags.contains(.shift) {
-                // Multi-select with Shift: toggle selection (immediate)
-                if selectedTerminals.contains(controller.id) {
-                    selectedTerminals.remove(controller.id)
-                } else {
-                    selectedTerminals.insert(controller.id)
-                }
-                setNeedsDisplay(bounds)
+            if handleModifierDrivenSelection(for: controller, modifiers: event.modifierFlags) {
                 mouseDownTerminal = nil  // Don't navigate on mouse up
             }
             // Non-shift click: navigation deferred to mouseUp
@@ -1886,6 +1890,10 @@ final class IntegratedView: MTKView, NSDraggingSource {
         }
         guard let controller = mouseDownTerminal else { return }
 
+        if handleModifierDrivenSelection(for: controller, modifiers: event.modifierFlags) {
+            return
+        }
+
         // Navigate only if the click lands on the thumbnail content area (not the title bar)
         let point = convert(event.locationInWindow, from: nil)
         if let idx = thumbnailIndex(at: point) {
@@ -1898,22 +1906,54 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
     override func flagsChanged(with event: NSEvent) {
         let shiftNow = event.modifierFlags.contains(.shift)
+        let commandNow = event.modifierFlags.contains(.command)
         if shiftNow != isShiftDown {
             isShiftDown = shiftNow
             setNeedsDisplay(bounds)
         }
+        isCommandDown = commandNow
 
-        // Detect Shift key release: commit multi-selection
-        if !shiftNow && !selectedTerminals.isEmpty {
-            let selected = manager.terminals.filter { selectedTerminals.contains($0.id) }
-            selectedTerminals.removeAll()
-            if selected.count >= 2 {
-                onMultiSelect?(selected)
-            } else if let single = selected.first {
-                onSelectTerminal?(single)
-            }
+        let shouldCommitSelection: Bool
+        switch selectionCommitTrigger {
+        case .shiftRelease:
+            shouldCommitSelection = !shiftNow && !selectedTerminals.isEmpty
+        case .commandRelease:
+            shouldCommitSelection = !commandNow && !selectedTerminals.isEmpty
+        case nil:
+            shouldCommitSelection = false
+        }
+
+        if shouldCommitSelection {
+            commitSelectedTerminals()
         }
         super.flagsChanged(with: event)
+    }
+
+    private func commitSelectedTerminals() {
+        let selected = manager.terminals.filter { selectedTerminals.contains($0.id) }
+        selectedTerminals.removeAll()
+        selectionCommitTrigger = nil
+        if selected.count >= 2 {
+            onMultiSelect?(selected)
+        } else if let single = selected.first {
+            onSelectTerminal?(single)
+        } else {
+            setNeedsDisplay(bounds)
+        }
+    }
+
+    @discardableResult
+    private func handleModifierDrivenSelection(for controller: TerminalController, modifiers: NSEvent.ModifierFlags) -> Bool {
+        guard modifiers.contains(.shift) else { return false }
+        if selectedTerminals.contains(controller.id) {
+            selectedTerminals.remove(controller.id)
+        } else {
+            selectedTerminals.insert(controller.id)
+        }
+        let shouldCommitOnCommandRelease = modifiers.contains(.command)
+        selectionCommitTrigger = selectedTerminals.isEmpty ? nil : (shouldCommitOnCommandRelease ? .commandRelease : .shiftRelease)
+        setNeedsDisplay(bounds)
+        return true
     }
 
     override func scrollWheel(with event: NSEvent) {

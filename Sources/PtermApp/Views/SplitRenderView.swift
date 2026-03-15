@@ -23,6 +23,7 @@ final class SplitRenderView: MTKView {
     var cellRefs: [CellRef] = []
     /// Closure to compute border config for a TerminalView each frame.
     var borderConfigProvider: ((TerminalView) -> MetalRenderer.BorderConfig?)?
+    var headerOverlayConfigProvider: ((TerminalController) -> MetalRenderer.HeaderOverlayConfig?)?
     var hasActiveOutput: Bool = false {
         didSet {
             guard hasActiveOutput != oldValue else { return }
@@ -266,6 +267,7 @@ extension SplitRenderView: MTKViewDelegate {
             // Read live state from TerminalView each frame
             let selection = ref.terminalView?.selection
             let border = ref.terminalView.flatMap { borderConfigProvider?($0) }
+            let headerOverlay = headerOverlayConfigProvider?(ref.controller)
             let transientTextOverlays = ref.terminalView?.activeCommittedTextPreviewOverlays() ?? []
             let suppressCursorBlink =
                 !transientTextOverlays.isEmpty ||
@@ -287,6 +289,7 @@ extension SplitRenderView: MTKViewDelegate {
                     scrollOffset: scrollOffset,
                     selection: selection,
                     borderConfig: border,
+                    headerOverlayConfig: headerOverlay,
                     transientTextOverlays: transientTextOverlays,
                     suppressCursorBlink: suppressCursorBlink,
                     encoder: encoder,

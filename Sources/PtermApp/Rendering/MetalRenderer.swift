@@ -161,6 +161,14 @@ final class MetalRenderer {
         let width: Float
     }
 
+    struct HeaderOverlayConfig {
+        let text: String
+        let backgroundColor: (Float, Float, Float, Float)
+        let accentColor: (Float, Float, Float, Float)
+        let textColor: (Float, Float, Float, Float)
+        let usesBoldText: Bool
+    }
+
     /// Keyed by view's ObjectIdentifier to give each MTKView its own buffers.
     private var viewBuffers: [ObjectIdentifier: ViewBufferSet] = [:]
 
@@ -648,6 +656,7 @@ final class MetalRenderer {
                 searchHighlight: SearchHighlight? = nil,
                 linkUnderline: LinkUnderline? = nil,
                 borderConfig: BorderConfig? = nil,
+                headerOverlayConfig: HeaderOverlayConfig? = nil,
                 transientTextOverlays: [TransientTextOverlay] = [],
                 suppressCursorBlink: Bool = false,
                 in view: MTKView) {
@@ -753,6 +762,33 @@ final class MetalRenderer {
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
                 encoder.drawPrimitives(type: .triangle, vertexStart: 0,
                                       vertexCount: bv.count / floatsPerVertex)
+            }
+        }
+
+        if let headerOverlayConfig, let overlayPipeline, let glyphPipeline = glyphPipelineForCurrentOutput(),
+           let atlas = glyphAtlas.texture {
+            let headerVertices = headerOverlayVertices(
+                config: headerOverlayConfig,
+                frame: CGRect(origin: .zero, size: CGSize(width: CGFloat(vp.x / sf), height: CGFloat(vp.y / sf))),
+                scaleFactor: sf
+            )
+            if !headerVertices.overlay.isEmpty,
+               let buf = makeTemporaryBuffer(vertices: headerVertices.overlay) {
+                encoder.setRenderPipelineState(overlayPipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                      vertexCount: headerVertices.overlay.count / floatsPerVertex)
+            }
+            if !headerVertices.glyphs.isEmpty,
+               let buf = makeTemporaryBuffer(vertices: headerVertices.glyphs) {
+                encoder.setRenderPipelineState(glyphPipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.setFragmentTexture(atlas, index: 0)
+                encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                      vertexCount: headerVertices.glyphs.count / floatsPerVertex)
             }
         }
 
@@ -1762,6 +1798,7 @@ final class MetalRenderer {
                          searchHighlight: SearchHighlight? = nil,
                          linkUnderline: LinkUnderline? = nil,
                          borderConfig: BorderConfig? = nil,
+                         headerOverlayConfig: HeaderOverlayConfig? = nil,
                          transientTextOverlays: [TransientTextOverlay] = [],
                          suppressCursorBlink: Bool = false,
                          encoder: MTLRenderCommandEncoder,
@@ -1873,6 +1910,159 @@ final class MetalRenderer {
                                       vertexCount: bv.count / floatsPerVertex)
             }
         }
+
+        if let headerOverlayConfig, let overlayPipeline, let glyphPipeline = glyphPipelineForCurrentOutput(),
+           let atlas = glyphAtlas.texture {
+            let headerVertices = headerOverlayVertices(
+                config: headerOverlayConfig,
+                frame: CGRect(origin: .zero, size: cellRect.size),
+                scaleFactor: scaleFactor
+            )
+            if !headerVertices.overlay.isEmpty,
+               let buf = makeTemporaryBuffer(vertices: headerVertices.overlay) {
+                encoder.setRenderPipelineState(overlayPipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                      vertexCount: headerVertices.overlay.count / floatsPerVertex)
+            }
+            if !headerVertices.glyphs.isEmpty,
+               let buf = makeTemporaryBuffer(vertices: headerVertices.glyphs) {
+                encoder.setRenderPipelineState(glyphPipeline)
+                encoder.setVertexBuffer(buf, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+                encoder.setFragmentTexture(atlas, index: 0)
+                encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                      vertexCount: headerVertices.glyphs.count / floatsPerVertex)
+            }
+        }
+    }
+
+    private func headerOverlayVertices(
+        config: HeaderOverlayConfig,
+        frame: CGRect,
+        scaleFactor: Float
+    ) -> (overlay: [Float], glyphs: [Float]) {
+        guard !config.text.isEmpty else { return ([], []) }
+
+        var overlayVertices: [Float] = []
+        var glyphVertices: [Float] = []
+        overlayVertices.reserveCapacity(floatsPerQuad * 2)
+
+        let x = Float(frame.origin.x) * scaleFactor
+        let y = Float(frame.origin.y) * scaleFactor
+        let w = Float(frame.width) * scaleFactor
+        let headerHeight = headerOverlayHeight(scaleFactor: scaleFactor)
+        addQuad(
+            to: &overlayVertices,
+            x: x,
+            y: y,
+            w: w,
+            h: headerHeight,
+            tx: 0, ty: 0, tw: 0, th: 0,
+            fg: config.backgroundColor,
+            bg: (0, 0, 0, 0)
+        )
+
+        appendHeaderTextVertices(
+            text: config.text,
+            x: x + headerHorizontalPadding(scaleFactor: scaleFactor),
+            y: y,
+            availableWidth: max(0, w - headerHorizontalPadding(scaleFactor: scaleFactor) * 2),
+            headerHeight: headerHeight,
+            scaleFactor: scaleFactor,
+            glyphScale: 0.82,
+            color: config.textColor,
+            usesBoldText: config.usesBoldText,
+            to: &glyphVertices
+        )
+
+        return (overlayVertices, glyphVertices)
+    }
+
+    private func appendHeaderTextVertices(
+        text: String,
+        x: Float,
+        y: Float,
+        availableWidth: Float,
+        headerHeight: Float,
+        scaleFactor: Float,
+        glyphScale: Float,
+        color: (Float, Float, Float, Float),
+        usesBoldText: Bool,
+        to target: inout [Float]
+    ) {
+        guard availableWidth > 0 else { return }
+        let fullText = truncatedHeaderText(text, availableWidth: availableWidth, scaleFactor: scaleFactor, glyphScale: glyphScale)
+        guard !fullText.isEmpty else { return }
+
+        let glyphCellHeight = Float(glyphAtlas.cellHeight) * scaleFactor * glyphScale
+        let originY = y + max(0, floor((headerHeight - glyphCellHeight) * 0.5))
+        var cursorX = x
+
+        for scalar in fullText.unicodeScalars {
+            guard let glyph = glyphAtlas.glyphInfo(for: scalar.value), glyph.pixelWidth > 0 else {
+                cursorX += Float(glyphAtlas.cellWidth) * scaleFactor * glyphScale
+                continue
+            }
+
+            let glyphX = cursorX + glyph.cellOffsetX * glyphScale
+            let baselineY = originY + glyphCellHeight - Float(glyphAtlas.baseline) * scaleFactor * glyphScale
+            let glyphY = baselineY - glyph.baselineOffset * glyphScale
+            addQuad(
+                to: &target,
+                x: glyphX,
+                y: glyphY,
+                w: Float(glyph.pixelWidth) * glyphScale,
+                h: Float(glyph.pixelHeight) * glyphScale,
+                tx: glyph.textureX,
+                ty: glyph.textureY,
+                tw: glyph.textureW,
+                th: glyph.textureH,
+                fg: color,
+                bg: (0, 0, 0, 0)
+            )
+            if usesBoldText {
+                let boldOffset = max(1.0, ceil(scaleFactor * 0.4))
+                addQuad(
+                    to: &target,
+                    x: glyphX + boldOffset,
+                    y: glyphY,
+                    w: Float(glyph.pixelWidth) * glyphScale,
+                    h: Float(glyph.pixelHeight) * glyphScale,
+                    tx: glyph.textureX,
+                    ty: glyph.textureY,
+                    tw: glyph.textureW,
+                    th: glyph.textureH,
+                    fg: color,
+                    bg: (0, 0, 0, 0)
+                )
+            }
+            cursorX += Float(glyphAtlas.cellWidth) * scaleFactor * glyphScale
+        }
+    }
+
+    private func truncatedHeaderText(
+        _ text: String,
+        availableWidth: Float,
+        scaleFactor: Float,
+        glyphScale: Float
+    ) -> String {
+        let cellAdvance = Float(glyphAtlas.cellWidth) * scaleFactor * glyphScale
+        guard cellAdvance > 0 else { return text }
+        let maxGlyphCount = max(0, Int(floor(availableWidth / cellAdvance)))
+        guard text.count > maxGlyphCount, maxGlyphCount > 0 else { return text }
+        guard maxGlyphCount > 1 else { return String(text.prefix(maxGlyphCount)) }
+        return String(text.prefix(maxGlyphCount - 1)) + "…"
+    }
+
+    private func headerOverlayHeight(scaleFactor: Float) -> Float {
+        ceil((Float(glyphAtlas.cellHeight) + 6.0) * scaleFactor)
+    }
+
+    private func headerHorizontalPadding(scaleFactor: Float) -> Float {
+        max(scaleFactor * 6.0, scaleFactor)
     }
 
     private func prepareTerminalScrollbackRowsScratch(in bufferSet: ViewBufferSet, rowCount: Int) {
