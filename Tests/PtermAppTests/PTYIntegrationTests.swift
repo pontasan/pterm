@@ -600,6 +600,50 @@ final class PTYIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminalControllerResizeRoundTripKeepsCompletedOutput() throws {
+        let controller = TerminalController(
+            rows: 24,
+            cols: 57,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        defer { controller.stop(waitForExit: true) }
+
+        try controller.start()
+        controller.sendInput("i=1; while [ $i -le 10 ]; do printf '%03d\\n' \"$i\"; i=$((i+1)); done\n")
+
+        let completedExpectation = expectation(description: "completed output available before resize round trip")
+        let completionDeadline = Date().addingTimeInterval(8.0)
+        func pollCompletedOutput() {
+            let text = controller.allText()
+            if text.contains("001"),
+               text.contains("010"),
+               text.contains("009"),
+               text.contains("while [ $i -le 10 ]") {
+                completedExpectation.fulfill()
+                return
+            }
+            if Date() < completionDeadline {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: pollCompletedOutput)
+            }
+        }
+        DispatchQueue.main.async(execute: pollCompletedOutput)
+        wait(for: [completedExpectation], timeout: 8.5)
+        drainMainQueue(testCase: self)
+
+        let baseline = controller.allText()
+        controller.resize(rows: 24, cols: 120)
+        controller.resize(rows: 24, cols: 57)
+        drainMainQueue(testCase: self)
+
+        XCTAssertEqual(controller.allText(), baseline)
+    }
+
+    @MainActor
     func testTerminalControllerNotifyCurrentSizeChangedSignalsForegroundProcessGroupWithoutGeometryChange() throws {
         let controller = TerminalController(
             rows: 6,

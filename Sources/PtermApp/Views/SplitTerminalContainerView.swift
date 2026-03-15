@@ -330,11 +330,7 @@ final class SplitTerminalContainerView: NSView {
 
     func detachControllersForPresentationTransition() {
         for scrollView in scrollViews {
-            scrollView.terminalView.onBecameFirstResponder = nil
-            scrollView.terminalView.onBackToIntegrated = nil
-            scrollView.terminalView.onCmdClick = nil
-            scrollView.terminalView.onShiftCommandClick = nil
-            scrollView.terminalView.terminalController = nil
+            scrollView.terminalView.detachControllerForPresentationTransition()
         }
         splitRenderView?.cellRefs = []
     }

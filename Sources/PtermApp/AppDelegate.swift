@@ -784,6 +784,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Self.refreshCurrentDirectories(for: [controller])
         applyRendererSettings(for: controller)
 
+        splitContainerView?.detachControllersForPresentationTransition()
+        terminalView?.detachControllerForPresentationTransition()
+
         // Create focused terminal view wrapped in scroll view
         let sv = TerminalScrollView(frame: presentationHostView().bounds, renderer: renderer)
         sv.autoresizingMask = [.width, .height]
@@ -807,8 +810,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sv.terminalView.cmdClickTooltip = "⌘+Click to return to split view"
         }
         presentationHostView().addSubview(sv)
-
-        splitContainerView?.detachControllersForPresentationTransition()
 
         terminalView?.scrubPresentedDrawableForRemoval()
         terminalView?.releaseInactiveRenderingResourcesNow()
@@ -869,6 +870,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         Self.refreshCurrentDirectories(for: orderedControllers)
+
+        terminalView?.detachControllerForPresentationTransition()
+        splitContainerView?.detachControllersForPresentationTransition()
 
         let splitView = SplitTerminalContainerView(frame: presentationHostView().bounds,
                                                    renderer: renderer,
@@ -939,6 +943,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hideSearchBar()
 
         splitContainerView = splitView
+        presentationHostView().layoutSubtreeIfNeeded()
+        splitView.layoutSubtreeIfNeeded()
+        splitView.syncScaleFactorIfNeeded()
         suppressVisibleOutputIndicators(for: orderedControllers.map(\.id))
         splitContainerView?.applyAppearanceSettings()
         splitReturnControllers = orderedReturnControllers
@@ -963,6 +970,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func switchToIntegrated() {
         Self.refreshCurrentDirectories(for: manager.terminals)
+
+        terminalView?.detachControllerForPresentationTransition()
+        splitContainerView?.detachControllersForPresentationTransition()
 
         // Show integrated view
         let iv: IntegratedView

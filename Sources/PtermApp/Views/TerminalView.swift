@@ -14,6 +14,11 @@ final class TerminalView: MTKView, NSTextInputClient {
         static let pendingIntentTimeout: CFTimeInterval = 0.60
     }
 
+    private enum ResizeNotificationMode {
+        case immediateOnly
+        case immediateAndDeferred
+    }
+
     private struct MouseReportingState {
         let mode: TerminalModel.MouseReportingMode
         let protocolMode: TerminalModel.MouseProtocol
@@ -45,7 +50,14 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     /// Terminal controller for this view
     var terminalController: TerminalController? {
-        didSet { setupController() }
+        willSet {
+            guard terminalController !== newValue else { return }
+            teardownController()
+        }
+        didSet {
+            guard terminalController !== oldValue else { return }
+            setupController()
+        }
     }
 
     /// Metal renderer
@@ -180,6 +192,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     var debugPendingCommittedTextIntentCount: Int { pendingCommittedTextIntents.count }
     var debugHasPendingIntentResolutionTimer: Bool { pendingIntentResolutionTimer != nil }
     var debugLastPendingCommittedTextIntentText: String? { pendingCommittedTextIntents.last?.text }
+    var debugDeferredResizeNotificationCount: Int { deferredResizeNotificationWorkItems.count }
 
     private func queueInputFeedbackIfEnabled() {
         guard typewriterSoundEnabled else { return }
@@ -396,9 +409,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         applyRenderTargetColorSpace()
         if newScale != renderer.glyphAtlas.scaleFactor {
             renderer.glyphAtlas.updateScaleFactor(newScale)
-            if updateTerminalSize() {
-                scheduleDeferredResizeNotification()
-            }
+            updateTerminalSize(notificationMode: .immediateAndDeferred)
         }
         let expectedSize = expectedDrawableSize(for: newScale)
         if abs(drawableSize.width - expectedSize.width) > 1 || abs(drawableSize.height - expectedSize.height) > 1 {
@@ -466,6 +477,11 @@ final class TerminalView: MTKView, NSTextInputClient {
     func releaseInactiveRenderingResourcesNow() {
         idleBufferReleaseTimer?.invalidate()
         idleBufferReleaseTimer = nil
+        committedTextPreviewTimer?.invalidate()
+        committedTextPreviewTimer = nil
+        pendingIntentResolutionTimer?.invalidate()
+        pendingIntentResolutionTimer = nil
+        cancelDeferredResizeNotifications()
         renderer?.releaseTerminalBuffers(for: self)
         _ = renderer?.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
         keyboardHandler = nil
@@ -475,6 +491,14 @@ final class TerminalView: MTKView, NSTextInputClient {
         outputPulseTimer = nil
         clearCommittedTextPreview()
         drawableSize = .zero
+    }
+
+    func detachControllerForPresentationTransition() {
+        onBecameFirstResponder = nil
+        onBackToIntegrated = nil
+        onCmdClick = nil
+        onShiftCommandClick = nil
+        terminalController = nil
     }
 
     func compactForMemoryPressureNow() {
@@ -488,6 +512,12 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     // MARK: - Setup
 
+    private func teardownController() {
+        cancelDeferredResizeNotifications()
+        terminalController?.onNeedsDisplay = nil
+        keyboardHandler = nil
+    }
+
     private func setupController() {
         guard let controller = terminalController else { return }
         keyboardHandler = nil
@@ -500,9 +530,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         }
         controller.notifyFocusChanged(window?.isKeyWindow == true)
         scrollerSyncPending = true
-        if updateTerminalSize() {
-            scheduleDeferredResizeNotification()
-        }
+        updateTerminalSize(notificationMode: .immediateOnly)
         updateCursorBlinkTimer()
         updateOutputPulseTimer()
         // When a controller is assigned to a new view (e.g., returning to split view),
@@ -1315,7 +1343,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         super.setFrameSize(newSize)
         hideImagePreview()
         _ = syncDrawableSizeToBoundsIfNeeded()
-        updateTerminalSize()
+        updateTerminalSize(notificationMode: .immediateOnly)
         updateMarkedTextOverlay()
         requestDisplayUpdate()
     }
@@ -1324,7 +1352,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         super.setBoundsSize(newSize)
         hideImagePreview()
         _ = syncDrawableSizeToBoundsIfNeeded()
-        updateTerminalSize()
+        updateTerminalSize(notificationMode: .immediateOnly)
         updateMarkedTextOverlay()
         requestDisplayUpdate()
     }
@@ -1357,6 +1385,19 @@ final class TerminalView: MTKView, NSTextInputClient {
         return true
     }
 
+    @discardableResult
+    private func updateTerminalSize(notificationMode: ResizeNotificationMode) -> Bool {
+        let changed = updateTerminalSize()
+        guard changed else { return false }
+        switch notificationMode {
+        case .immediateOnly:
+            cancelDeferredResizeNotifications()
+        case .immediateAndDeferred:
+            scheduleDeferredResizeNotification()
+        }
+        return true
+    }
+
     private func cancelDeferredResizeNotifications() {
         deferredResizeNotificationWorkItems.forEach { $0.cancel() }
         deferredResizeNotificationWorkItems.removeAll()
@@ -1379,9 +1420,7 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     /// Called when font size changes. Recalculates terminal grid dimensions.
     func fontSizeDidChange() {
-        if updateTerminalSize() {
-            scheduleDeferredResizeNotification()
-        }
+        updateTerminalSize(notificationMode: .immediateAndDeferred)
         updateMarkedTextOverlay()
     }
 
@@ -1395,9 +1434,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     /// and we want the PTY rows/cols to match right away.
     func refreshTerminalLayoutForCurrentBounds() {
         _ = syncDrawableSizeToBoundsIfNeeded()
-        if updateTerminalSize() {
-            scheduleDeferredResizeNotification()
-        }
+        updateTerminalSize(notificationMode: .immediateOnly)
         updateMarkedTextOverlay()
         requestDisplayUpdate()
     }

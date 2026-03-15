@@ -119,6 +119,9 @@ final class TerminalController {
     private var interruptCatchUpUntil: Date = .distantPast
     private let scrollbackCompactionLock = NSLock()
     private var pendingScrollbackCompaction: DispatchWorkItem?
+    private let ptyResizeLock = NSLock()
+    private var pendingPTYResizeWorkItem: DispatchWorkItem?
+    private var appliedPTYSize: (rows: Int, cols: Int)?
 
     /// Decode buffer for UTF-8 -> codepoints.
     /// Starts empty and grows on demand so idle terminals do not pay a
@@ -146,6 +149,7 @@ final class TerminalController {
     private static let maxSearchReserveCapacity = 4 * 1024
     private static let inputEchoSuppressionInterval: TimeInterval = 0.35
     private static let interruptDrainQuietPeriod: TimeInterval = 0.10
+    private static let ptyResizeCoalescingDelay: TimeInterval = 0.05
 
     var persistedSettings: PersistedTerminalSettings {
         PersistedTerminalSettings(
@@ -241,6 +245,7 @@ final class TerminalController {
     }
 
     deinit {
+        cancelPendingPTYResize()
         cancelPendingScrollbackCompaction()
         pty.stop()
         vt_parser_destroy(&parser)
@@ -332,9 +337,13 @@ final class TerminalController {
             initialDirectory: initialDirectory,
             shellLaunchOrder: shellLaunchOrder
         )
+        ptyResizeLock.withLock {
+            appliedPTYSize = (r, c)
+        }
     }
 
     func stop(waitForExit: Bool = false) {
+        cancelPendingPTYResize()
         lock.withWriteLock {
             isShuttingDown = true
             releaseScratchStorageNow()
@@ -594,17 +603,21 @@ final class TerminalController {
         }
 
         if rows != oldRows || cols != oldCols {
-            pty.resize(rows: UInt16(rows), cols: UInt16(cols))
+            scheduleCoalescedPTYResize(rows: rows, cols: cols)
             scheduleMainCallbacks(needsDisplay: true, stateChange: true)
         }
     }
 
     func notifyCurrentSizeChanged() {
+        cancelPendingPTYResize()
         let currentSize = lock.withReadLock {
             (rows: model.rows, cols: model.cols)
         }
         guard currentSize.rows > 0, currentSize.cols > 0 else { return }
         pty.resize(rows: UInt16(currentSize.rows), cols: UInt16(currentSize.cols))
+        ptyResizeLock.withLock {
+            appliedPTYSize = currentSize
+        }
         scheduleMainCallbacks(needsDisplay: true)
     }
 
@@ -1072,6 +1085,42 @@ final class TerminalController {
     private func shrinkIdleCodepointBufferIfNeeded() {
         guard !codepointBuffer.isEmpty else { return }
         codepointBuffer.removeAll(keepingCapacity: false)
+    }
+
+    private func scheduleCoalescedPTYResize(rows: Int, cols: Int) {
+        cancelPendingPTYResize()
+        var workItem: DispatchWorkItem?
+        workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.ptyResizeLock.withLock {
+                let alreadyApplied = self.appliedPTYSize?.rows == rows &&
+                    self.appliedPTYSize?.cols == cols
+                if !alreadyApplied {
+                    self.pty.resize(rows: UInt16(rows), cols: UInt16(cols))
+                    self.appliedPTYSize = (rows, cols)
+                }
+                if self.pendingPTYResizeWorkItem === workItem {
+                    self.pendingPTYResizeWorkItem = nil
+                }
+            }
+        }
+        guard let workItem else { return }
+        ptyResizeLock.withLock {
+            pendingPTYResizeWorkItem = workItem
+        }
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.ptyResizeCoalescingDelay,
+            execute: workItem
+        )
+    }
+
+    private func cancelPendingPTYResize() {
+        let pending = ptyResizeLock.withLock { () -> DispatchWorkItem? in
+            let workItem = pendingPTYResizeWorkItem
+            pendingPTYResizeWorkItem = nil
+            return workItem
+        }
+        pending?.cancel()
     }
 
     private func shrinkIdleExtractionScratchIfNeeded() {

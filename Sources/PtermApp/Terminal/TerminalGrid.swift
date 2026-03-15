@@ -226,8 +226,29 @@ final class TerminalGrid {
         }
 
         // 4. Trim or pad to newRows
-        let totalRows = newCells.count / newCols
+        var totalRows = newCells.count / newCols
         var trimmedRows: [TrimmedRow] = []
+
+        // When a wider viewport introduced trailing padding rows below the
+        // cursor, consume those rows first on shrink before pushing actual
+        // terminal content into scrollback.
+        while totalRows > newRows,
+              totalRows - 1 > newCursorRow,
+              !newWrapped.isEmpty {
+            let lastRowIndex = totalRows - 1
+            let start = lastRowIndex * newCols
+            let rowCells = newCells[start..<(start + newCols)]
+            let isBlankPaddingRow = !newWrapped[lastRowIndex] && rowCells.allSatisfy { cell in
+                cell.codepoint == Cell.empty.codepoint &&
+                cell.attributes == Cell.empty.attributes &&
+                cell.width == Cell.empty.width &&
+                cell.isWideContinuation == Cell.empty.isWideContinuation
+            }
+            guard isBlankPaddingRow else { break }
+            newCells.removeLast(newCols)
+            newWrapped.removeLast()
+            totalRows -= 1
+        }
 
         if totalRows > newRows {
             // Capture excess rows from the top before discarding

@@ -3876,6 +3876,42 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertGreaterThan(view.drawableSize.height, 0)
     }
 
+    func testTerminalViewInactiveReleaseCancelsDeferredResize() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 6,
+            cols: 24,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 200), renderer: renderer)
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        window.makeKeyAndOrderFront(nil)
+        view.terminalController = controller
+
+        let initialSize = controller.withModel { model in
+            (rows: model.rows, cols: model.cols)
+        }
+        renderer.updateFontSize(28)
+        view.fontSizeDidChange()
+        let resizedSize = controller.withModel { model in
+            (rows: model.rows, cols: model.cols)
+        }
+        XCTAssertNotEqual(resizedSize.rows, initialSize.rows)
+        XCTAssertNotEqual(resizedSize.cols, initialSize.cols)
+        XCTAssertEqual(view.debugDeferredResizeNotificationCount, 2)
+
+        view.releaseInactiveRenderingResourcesNow()
+        XCTAssertEqual(view.debugDeferredResizeNotificationCount, 0)
+    }
+
     func testTerminalViewMemoryPressureCompactionReleasesReusableBuffersWithoutDiscardingVisibleDrawable() throws {
         let renderer = try makeRendererWithPipelinesOrSkip()
         let controller = TerminalController(
@@ -8422,6 +8458,73 @@ final class AppKitComponentTests: XCTestCase {
         }
     }
 
+    func testSplitMaximizeReturnKeepsCompletedOutput() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+
+        try withTemporaryDirectory { directory in
+            let first = try manager.addTerminal(
+                initialDirectory: directory.path,
+                customTitle: "wk",
+                workspaceName: "Alpha",
+                fontName: "Menlo",
+                fontSize: 13
+            )
+            let second = try manager.addTerminal(
+                initialDirectory: directory.path,
+                customTitle: "aws",
+                workspaceName: "Alpha",
+                fontName: "Menlo",
+                fontSize: 13
+            )
+
+            let harness = try makeAppHarness(renderer: renderer, manager: manager)
+            let delegate = harness.delegate
+            let hostedContentView = harness.hostedContentView
+
+            delegate.switchToSplit([first, second])
+            let split = try currentSplitContainer(in: hostedContentView)
+
+            first.sendInput("i=1; while [ $i -le 10 ]; do printf '%03d\\n' \"$i\"; i=$((i+1)); done\n")
+            let completedExpectation = expectation(description: "command finished in narrow split terminal")
+            let completionDeadline = Date().addingTimeInterval(8.0)
+            func pollForCompletedCommand() {
+                let text = first.allText()
+                if text.contains("001"),
+                   text.contains("010"),
+                   text.contains("009"),
+                   text.contains("while [ $i -le 10 ]") {
+                    completedExpectation.fulfill()
+                    return
+                }
+                if Date() < completionDeadline {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: pollForCompletedCommand)
+                }
+            }
+            DispatchQueue.main.async(execute: pollForCompletedCommand)
+            wait(for: [completedExpectation], timeout: 8.5)
+            drainMainQueue(testCase: self)
+
+            let baselineText = normalizedTerminalText(first.allText())
+            let baselineViewport = visibleViewportLines(of: first, count: 40)
+
+            split.onMaximizeTerminal?(first)
+            drainMainQueue(testCase: self)
+            try currentFocusedScrollView(in: hostedContentView).terminalView.onCmdClick?()
+            drainMainQueue(testCase: self)
+
+            let settleExpectation = expectation(description: "split restore settled")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.40) {
+                settleExpectation.fulfill()
+            }
+            wait(for: [settleExpectation], timeout: 1.0)
+
+            XCTAssertEqual(normalizedTerminalText(first.allText()), baselineText)
+            XCTAssertEqual(visibleViewportLines(of: first, count: 40), baselineViewport)
+        }
+    }
+
 }
 
 private struct ReflectedWorkspaceLayout {
@@ -9170,6 +9273,14 @@ private extension AppKitComponentTests {
                 return viewportLineText(cells: cells, cols: model.cols)
             }
         }
+    }
+
+    func normalizedTerminalText(_ text: String) -> String {
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty {
+            lines.removeLast()
+        }
+        return lines.joined(separator: "\n")
     }
 
     func viewportLineText(cells: [Cell], cols: Int) -> String {
