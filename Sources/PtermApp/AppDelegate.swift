@@ -1,5 +1,6 @@
 import AppKit
 import MetalKit
+import QuartzCore
 
 private extension String {
     func appendLine(to url: URL) throws {
@@ -79,6 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowBackgroundGlassView: NSView?
     private var windowRootContentView: NSView!
     private var windowHostedContentView: NSView!
+    private var windowPresentationHostView: NSView!
     private var configWatchSource: DispatchSourceFileSystemObject?
     private var pendingConfigReload: DispatchWorkItem?
     private var backShortcutMonitor: Any?
@@ -693,18 +695,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Self.refreshCurrentDirectories(for: [controller])
         applyRendererSettings(for: controller)
 
-        // Remove integrated view
-        integratedView?.releaseInactiveRenderingResourcesNow()
-        integratedView?.removeFromSuperview()
-        integratedView = nil
-        scrollbarOverlay?.removeFromSuperview()
-        scrollbarOverlay = nil
-        splitContainerView?.releaseInactiveRenderingResourcesNow()
-        splitContainerView?.removeFromSuperview()
-        splitContainerView = nil
-
         // Create focused terminal view wrapped in scroll view
-        let sv = TerminalScrollView(frame: availableContentFrame(), renderer: renderer)
+        let sv = TerminalScrollView(frame: presentationHostView().bounds, renderer: renderer)
         sv.autoresizingMask = [.width, .height]
         sv.shortcutConfiguration = config.shortcuts
         sv.terminalView.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
@@ -724,7 +716,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if splitOriginControllers != nil {
             sv.terminalView.cmdClickTooltip = "⌘+Click to return to split view"
         }
-        contentHostView().addSubview(sv)
+        presentationHostView().addSubview(sv)
+
+        terminalView?.scrubPresentedDrawableForRemoval()
+        terminalView?.releaseInactiveRenderingResourcesNow()
+        terminalScrollView?.removeFromSuperview()
+        terminalScrollView = nil
+        terminalView = nil
+        focusedController = nil
+        hideSearchBar()
+
+        integratedView?.releaseInactiveRenderingResourcesNow()
+        integratedView?.removeFromSuperview()
+        integratedView = nil
+        scrollbarOverlay?.removeFromSuperview()
+        scrollbarOverlay = nil
+        splitContainerView?.scrubPresentedDrawableForRemoval()
+        splitContainerView?.releaseInactiveRenderingResourcesNow()
+        splitContainerView?.removeFromSuperview()
+        splitContainerView = nil
+
         terminalScrollView = sv
         terminalView = sv.terminalView
         suppressVisibleOutputIndicators(for: [controller.id])
@@ -755,19 +766,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Self.refreshCurrentDirectories(for: controllers)
 
-        integratedView?.releaseInactiveRenderingResourcesNow()
-        integratedView?.removeFromSuperview()
-        integratedView = nil
-        scrollbarOverlay?.removeFromSuperview()
-        scrollbarOverlay = nil
-        terminalView?.releaseInactiveRenderingResourcesNow()
-        terminalScrollView?.removeFromSuperview()
-        terminalScrollView = nil
-        terminalView = nil
-        focusedController = nil
-        hideSearchBar()
-
-        let splitView = SplitTerminalContainerView(frame: availableContentFrame(),
+        let splitView = SplitTerminalContainerView(frame: presentationHostView().bounds,
                                                    renderer: renderer,
                                                    controllers: controllers)
         splitView.autoresizingMask = [.width, .height]
@@ -788,7 +787,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.splitOriginControllers = controllers
             self.switchToFocused(controller)
         }
-        contentHostView().addSubview(splitView)
+        presentationHostView().addSubview(splitView)
+
+        integratedView?.releaseInactiveRenderingResourcesNow()
+        integratedView?.removeFromSuperview()
+        integratedView = nil
+        scrollbarOverlay?.removeFromSuperview()
+        scrollbarOverlay = nil
+        splitContainerView?.scrubPresentedDrawableForRemoval()
+        splitContainerView?.releaseInactiveRenderingResourcesNow()
+        splitContainerView?.removeFromSuperview()
+        splitContainerView = nil
+        terminalView?.scrubPresentedDrawableForRemoval()
+        terminalView?.releaseInactiveRenderingResourcesNow()
+        terminalScrollView?.removeFromSuperview()
+        terminalScrollView = nil
+        terminalView = nil
+        focusedController = nil
+        hideSearchBar()
+
         splitContainerView = splitView
         suppressVisibleOutputIndicators(for: controllers.map(\.id))
         splitContainerView?.applyAppearanceSettings()
@@ -810,36 +827,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func switchToIntegrated() {
         Self.refreshCurrentDirectories(for: manager.terminals)
-        // Remove focused terminal scroll view
-        terminalView?.releaseInactiveRenderingResourcesNow()
-        terminalScrollView?.removeFromSuperview()
-        terminalScrollView = nil
-        splitContainerView?.releaseInactiveRenderingResourcesNow()
-        splitContainerView?.removeFromSuperview()
-        splitContainerView = nil
-        scrollbarOverlay?.removeFromSuperview()
-        scrollbarOverlay = nil
-        terminalView = nil
-        focusedController = nil
-        splitOriginControllers = nil
-        hideSearchBar()
 
         // Show integrated view
         let iv: IntegratedView
         if let existing = integratedView {
             iv = existing
         } else {
-            iv = makeIntegratedView(frame: availableContentFrame())
+            iv = makeIntegratedView(frame: presentationHostView().bounds)
             integratedView = iv
         }
 
-        iv.frame = availableContentFrame()
+        iv.frame = presentationHostView().bounds
         iv.clearSelection()
         syncIntegratedWorkspaceNames()
-        contentHostView().addSubview(iv)
+        presentationHostView().addSubview(iv)
         setupScrollbarOverlay(for: iv)
         iv.invalidateDynamicThumbnailCaches()
         activeOutputTerminalIDs.forEach { _ = iv.setTerminalOutputActive($0, isActive: true) }
+
+        terminalView?.scrubPresentedDrawableForRemoval()
+        terminalView?.releaseInactiveRenderingResourcesNow()
+        terminalScrollView?.removeFromSuperview()
+        terminalScrollView = nil
+        splitContainerView?.scrubPresentedDrawableForRemoval()
+        splitContainerView?.releaseInactiveRenderingResourcesNow()
+        splitContainerView?.removeFromSuperview()
+        splitContainerView = nil
+        terminalView = nil
+        focusedController = nil
+        splitOriginControllers = nil
+        hideSearchBar()
+
         viewMode = .integrated
         applyAppearanceSettingsToVisibleViews()
         iv.syncScaleFactorIfNeeded()
@@ -2191,19 +2209,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hostedContentView.wantsLayer = true
         rootView.addSubview(hostedContentView)
 
+        let presentationHostView = NSView(frame: hostedContentView.bounds)
+        presentationHostView.autoresizingMask = [.width, .height]
+        presentationHostView.wantsLayer = true
+        presentationHostView.layer?.backgroundColor = NSColor.clear.cgColor
+        hostedContentView.addSubview(presentationHostView)
+
         window.contentView = rootView
         windowRootContentView = rootView
         windowHostedContentView = hostedContentView
+        windowPresentationHostView = presentationHostView
     }
 
     private func contentHostView() -> NSView {
         windowHostedContentView ?? window.contentView!
     }
 
+    private func presentationHostView() -> NSView {
+        windowPresentationHostView ?? contentHostView()
+    }
+
     private func normalizeHostedContentFrame() {
         guard let rootView = windowRootContentView else { return }
         windowHostedContentView.frame = rootView.bounds
         windowHostedContentView.autoresizingMask = [.width, .height]
+        windowPresentationHostView?.frame = availableContentFrame()
+        windowPresentationHostView?.autoresizingMask = [.width, .height]
     }
 
     @objc private func activateFromSecondaryInstance(_ notification: Notification) {
@@ -2367,7 +2398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupScrollbarOverlay(for iv: IntegratedView) {
         scrollbarOverlay?.removeFromSuperview()
-        let overlay = ScrollbarOverlayView(frame: iv.frame)
+        let overlay = ScrollbarOverlayView(frame: presentationHostView().bounds)
         overlay.autoresizingMask = [.width, .height]
         overlay.drawsBackground = false
         overlay.backgroundColor = .clear
@@ -2375,10 +2406,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlay.hasHorizontalScroller = false
         overlay.autohidesScrollers = true
         // Flipped document view so scroll starts from the top
-        let docView = ScrollDocumentView(frame: NSRect(x: 0, y: 0, width: iv.bounds.width, height: iv.bounds.height))
+        let docView = ScrollDocumentView(frame: NSRect(x: 0, y: 0, width: presentationHostView().bounds.width, height: presentationHostView().bounds.height))
         overlay.documentView = docView
         overlay.contentView.postsBoundsChangedNotifications = true
-        contentHostView().addSubview(overlay)
+        presentationHostView().addSubview(overlay)
         iv.companionScrollView = overlay
         scrollbarOverlay = overlay
     }
@@ -2522,9 +2553,12 @@ extension AppDelegate: NSWindowDelegate {
         layoutTitlebarBackButton()
         statusBarView.frame = statusBarFrame()
         searchBarView?.frame = searchBarFrame()
-        terminalScrollView?.frame = availableContentFrame()
-        splitContainerView?.frame = availableContentFrame()
-        integratedView?.frame = availableContentFrame()
+        windowPresentationHostView?.frame = availableContentFrame()
+        let presentationBounds = presentationHostView().bounds
+        terminalScrollView?.frame = presentationBounds
+        splitContainerView?.frame = presentationBounds
+        integratedView?.frame = presentationBounds
+        scrollbarOverlay?.frame = presentationBounds
         let contentBounds = availableContentFrame()
         let cols = max(1, Int((contentBounds.width - pad) / renderer.glyphAtlas.cellWidth))
         let rows = max(1, Int((contentBounds.height - pad) / renderer.glyphAtlas.cellHeight))

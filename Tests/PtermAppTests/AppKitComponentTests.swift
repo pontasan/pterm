@@ -7142,6 +7142,51 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertLessThan(integratedView.drawableSize.height, overviewDrawableSizeAtScale2.height)
     }
 
+    func testSplitToSplitTransitionDoesNotAccumulateSplitContainers() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let first = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let second = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let third = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+
+        let delegate = AppDelegate()
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 640))
+        window.testBackingScaleFactor = 2.0
+        let rootView = NSView(frame: window.frame)
+        rootView.wantsLayer = true
+        window.contentView = rootView
+
+        delegate.setValue(window, forKey: "window")
+        delegate.setValue(renderer, forKey: "renderer")
+        delegate.setValue(manager, forKey: "manager")
+
+        let hostedContentView = NSView(frame: rootView.bounds)
+        hostedContentView.autoresizingMask = [.width, .height]
+        hostedContentView.wantsLayer = true
+        rootView.addSubview(hostedContentView)
+        delegate.setValue(hostedContentView, forKey: "windowHostedContentView")
+
+        window.makeKeyAndOrderFront(nil)
+
+        let switchToSplit = Selector(("switchToSplit:"))
+        typealias SplitIMP = @convention(c) (AnyObject, Selector, NSArray) -> Void
+        let implementation = unsafeBitCast(delegate.method(for: switchToSplit), to: SplitIMP.self)
+
+        implementation(delegate, switchToSplit, [first, second])
+        let splitCountAfterFirst = allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.count
+        XCTAssertEqual(splitCountAfterFirst, 1)
+
+        implementation(delegate, switchToSplit, [first, second, third])
+        let splitContainers = allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }
+        XCTAssertEqual(splitContainers.count, 1)
+
+        let backSelector = #selector(AppDelegate.backToIntegratedView(_:))
+        _ = delegate.perform(backSelector, with: nil)
+        let remainingSplitContainers = allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }
+        XCTAssertTrue(remainingSplitContainers.isEmpty)
+    }
+
     private func allSubviews(in view: NSView?) -> [NSView] {
         guard let view else { return [] }
         return [view] + view.subviews.flatMap { allSubviews(in: $0) }

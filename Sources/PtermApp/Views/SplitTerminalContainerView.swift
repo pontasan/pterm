@@ -252,6 +252,10 @@ final class SplitTerminalContainerView: NSView {
         splitRenderView?.requestRender()
     }
 
+    func scrubPresentedDrawableForRemoval() {
+        splitRenderView?.scrubPresentedDrawableForRemoval()
+    }
+
     func releaseInactiveRenderingResourcesNow() {
         for scrollView in scrollViews {
             scrollView.terminalView.releaseInactiveRenderingResourcesNow()
