@@ -853,7 +853,6 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     override func mouseDown(with event: NSEvent) {
         hideImagePreview()
-        window?.makeFirstResponder(self)
 
         if event.modifierFlags.contains(.command) {
             if handleDetectedLinkClick(event) {
@@ -864,11 +863,14 @@ final class TerminalView: MTKView, NSTextInputClient {
                 onShiftCommandClick()
                 return
             }
+            window?.makeFirstResponder(self)
             if let onCmdClick {
                 onCmdClick()
                 return
             }
         }
+
+        window?.makeFirstResponder(self)
 
         if sendMouseEventIfNeeded(event, phase: .down, buttonOverride: 0) {
             return

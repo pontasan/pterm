@@ -16,6 +16,7 @@ final class SplitTerminalContainerView: NSView {
     private var activeOutputTerminalIDs: Set<UUID> = []
     private(set) var selectedTerminalIDs: Set<UUID> = []
     private var commandModifierActive = false
+    private var stagedSelectionModeActive = false
     private var scrollViews: [TerminalScrollView] = []
     /// Single MTKView overlay that renders all terminal cells.
     /// Avoids macOS CAMetalLayer compositing issues with multiple Metal layers.
@@ -122,6 +123,9 @@ final class SplitTerminalContainerView: NSView {
             )
         }
         guard scrollViews.count > 1 else { return nil }
+        if commandModifierActive || stagedSelectionModeActive {
+            return Self.whiteBorder
+        }
         let firstResponder = window?.firstResponder
         return (firstResponder === terminalView) ? Self.blueBorder : Self.whiteBorder
     }
@@ -159,6 +163,7 @@ final class SplitTerminalContainerView: NSView {
         scrollViews.forEach { $0.removeFromSuperview() }
         scrollViews.removeAll()
         selectedTerminalIDs.removeAll()
+        stagedSelectionModeActive = false
 
         // Phase 1: Create scroll views WITHOUT assigning controllers.
         // This avoids premature terminal resizes with incorrect (full-window) bounds.
@@ -299,6 +304,9 @@ final class SplitTerminalContainerView: NSView {
         if commandModifierActive && !active && !selectedTerminalIDs.isEmpty {
             commitSelectedControllers()
         }
+        if !active {
+            stagedSelectionModeActive = false
+        }
         guard commandModifierActive != active else { return }
         commandModifierActive = active
         requestRender()
@@ -340,6 +348,7 @@ final class SplitTerminalContainerView: NSView {
     }
 
     private func toggleSplitSelection(for controller: TerminalController) {
+        stagedSelectionModeActive = true
         if selectedTerminalIDs.contains(controller.id) {
             selectedTerminalIDs.remove(controller.id)
         } else {
@@ -351,8 +360,16 @@ final class SplitTerminalContainerView: NSView {
     private func commitSelectedControllers() {
         let selected = controllers.filter { selectedTerminalIDs.contains($0.id) }
         selectedTerminalIDs.removeAll()
+        stagedSelectionModeActive = false
         requestRender()
         guard !selected.isEmpty else { return }
         onCommitSelectedControllers?(selected)
+    }
+
+    func debugBorderConfig(for controller: TerminalController) -> MetalRenderer.BorderConfig? {
+        guard let terminalView = scrollViews.first(where: { $0.terminalView.terminalController?.id == controller.id })?.terminalView else {
+            return nil
+        }
+        return borderConfig(for: terminalView)
     }
 }

@@ -22,7 +22,7 @@ enum WorkspaceIdentityColor {
         )
 
         return HeaderStyle(
-            background: (background.0, background.1, background.2, 0.95),
+            background: (background.0, background.1, background.2, 1.0),
             accent: (accentRGB.0, accentRGB.1, accentRGB.2, 0.78),
             text: readableForeground(for: background)
         )

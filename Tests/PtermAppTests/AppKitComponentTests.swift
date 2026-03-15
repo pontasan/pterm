@@ -8556,6 +8556,159 @@ private extension AppKitComponentTests {
         XCTAssertTrue(container.selectedTerminalIDs.isEmpty)
     }
 
+    func testSplitTerminalContainerShiftCommandDeselectClearsBlueSelectionBorderImmediately() throws {
+        let renderer = try makeRendererOrSkip()
+        let first = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/split-a",
+            customTitle: "a",
+            workspaceName: "WG"
+        )
+        let second = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/split-b",
+            customTitle: "b",
+            workspaceName: "WG"
+        )
+        let container = SplitTerminalContainerView(
+            frame: NSRect(x: 0, y: 0, width: 420, height: 260),
+            renderer: renderer,
+            controllers: [first, second]
+        )
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 260),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(container)
+        window.makeKeyAndOrderFront(nil)
+        container.layoutSubtreeIfNeeded()
+        container.setCommandModifierActive(true)
+
+        let scrollView = try XCTUnwrap(container.subviews.compactMap { $0 as? TerminalScrollView }.first)
+        let point = NSPoint(x: scrollView.frame.midX, y: scrollView.frame.midY)
+        let down = try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: point, in: container, window: window, modifiers: [.shift, .command]))
+
+        scrollView.terminalView.mouseDown(with: down)
+        XCTAssertEqual(container.selectedTerminalIDs, [first.id])
+        XCTAssertEqual(container.debugBorderConfig(for: first)?.width, 2)
+
+        scrollView.terminalView.mouseDown(with: down)
+        XCTAssertTrue(container.selectedTerminalIDs.isEmpty)
+        XCTAssertEqual(container.debugBorderConfig(for: first)?.width, 1)
+    }
+
+    func testSplitTerminalContainerShiftCommandClickDoesNotChangeFirstResponder() throws {
+        let renderer = try makeRendererOrSkip()
+        let first = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let second = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let container = SplitTerminalContainerView(
+            frame: NSRect(x: 0, y: 0, width: 420, height: 260),
+            renderer: renderer,
+            controllers: [first, second]
+        )
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 260),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(container)
+        window.makeKeyAndOrderFront(nil)
+        container.layoutSubtreeIfNeeded()
+        let scrollViews = container.subviews.compactMap { $0 as? TerminalScrollView }
+        let initialFirstResponder = try XCTUnwrap(scrollViews.last?.terminalView)
+        window.makeFirstResponder(initialFirstResponder)
+        container.setCommandModifierActive(true)
+
+        let clickTarget: TerminalScrollView = try XCTUnwrap(scrollViews.first)
+        let point = NSPoint(x: clickTarget.frame.midX, y: clickTarget.frame.midY)
+        let down = try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: point, in: container, window: window, modifiers: [.shift, .command]))
+
+        clickTarget.terminalView.mouseDown(with: down)
+
+        XCTAssertTrue(window.firstResponder === initialFirstResponder)
+        XCTAssertEqual(container.selectedTerminalIDs, Set([first.id]))
+    }
+
+    func testSplitTerminalContainerCommandModeSuppressesFocusedBlueBorderWhenNothingIsSelected() throws {
+        let renderer = try makeRendererOrSkip()
+        let first = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let second = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let container = SplitTerminalContainerView(
+            frame: NSRect(x: 0, y: 0, width: 420, height: 260),
+            renderer: renderer,
+            controllers: [first, second]
+        )
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 260),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(container)
+        window.makeKeyAndOrderFront(nil)
+        container.layoutSubtreeIfNeeded()
+        let scrollViews = container.subviews.compactMap { $0 as? TerminalScrollView }
+        let focused = try XCTUnwrap(scrollViews.first?.terminalView)
+        window.makeFirstResponder(focused)
+
+        XCTAssertEqual(container.debugBorderConfig(for: first)?.width, 2)
+
+        container.setCommandModifierActive(true)
+
+        XCTAssertEqual(container.debugBorderConfig(for: first)?.width, 1)
+        XCTAssertTrue(container.selectedTerminalIDs.isEmpty)
+    }
+
     func testTerminalViewCommandIdentityHeaderUsesWorkspaceAndTitle() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(
