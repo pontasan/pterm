@@ -3651,8 +3651,13 @@ final class AppKitComponentTests: XCTestCase {
             return
         }
 
+        // Scroll up so there is room to scroll back down
+        controller.setScrollOffset(10)
         scrollView.syncScroller()
         let initialOffset = controller.withViewport { _, _, scrollOffset in scrollOffset }
+        XCTAssertEqual(initialOffset, 10)
+
+        // Simulate dragging scroller to bottom
         let targetY = scrollView.documentView!.frame.height - scrollView.bounds.height
         scrollView.contentView.setBoundsOrigin(NSPoint(x: 0, y: max(0, targetY)))
         scrollView.reflectScrolledClipView(scrollView.contentView)
