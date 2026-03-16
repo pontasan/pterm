@@ -205,6 +205,30 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(responses, ["\u{1B}]52;p;aGVsbG8=\u{07}"])
     }
 
+    func testTerminalModelShiftOutAndShiftInSwitchBetweenG1AndG0Charsets() {
+        let harness = TerminalModelHarness(rows: 2, cols: 4)
+
+        harness.feed("\u{1B})A") // G1 = British
+        harness.feed(codepoints: [0x0E, 0x23, 0x0F, 0x23]) // SO '#' SI '#'
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0x00A3)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 1).codepoint, 0x23)
+    }
+
+    func testTerminalModelVT100CharsetDesignationSupportsDECSpecialGraphicsInG0AndG1() {
+        let harness = TerminalModelHarness(rows: 2, cols: 4)
+
+        harness.feed("\u{1B}(0")
+        harness.feed("q")
+        harness.feed("\u{1B}(B")
+        harness.feed("\u{1B})0")
+        harness.feed(codepoints: [0x0E])
+        harness.feed("x")
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0x2500)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 1).codepoint, 0x2502)
+    }
+
     func testTerminalModelOSC0UpdatesTitle() {
         let harness = TerminalModelHarness()
         var titles: [String] = []
@@ -441,14 +465,14 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertTrue(responses.isEmpty)
     }
 
-    func testTerminalModelPrimaryDeviceAttributesAdvertiseVT220ClassTerminal() {
+    func testTerminalModelPrimaryDeviceAttributesAdvertiseVT420ClassTerminal() {
         let harness = TerminalModelHarness()
         var responses: [String] = []
         harness.model.onResponse = { responses.append($0) }
 
         harness.feed("\u{1B}[c")
 
-        XCTAssertEqual(responses, ["\u{1B}[?62;1;2;6;8;9;15c"])
+        XCTAssertEqual(responses, ["\u{1B}[?64;1;2;6;8;9;15c"])
     }
 
     func testTerminalModelSecondaryDeviceAttributesEmitFirmwareStyleResponse() {
@@ -1301,6 +1325,26 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(responses, ["\u{1B}[?27;1;0;0n"])
     }
 
+    func testTerminalModelVT320DSRLocatorStatusReportsNoLocator() {
+        let harness = TerminalModelHarness()
+        var responses: [String] = []
+        harness.model.onResponse = { responses.append($0) }
+
+        harness.feed("\u{1B}[?55n")
+
+        XCTAssertEqual(responses, ["\u{1B}[?53n"])
+    }
+
+    func testTerminalModelVT320DSRIdentifyLocatorReportsCannotIdentify() {
+        let harness = TerminalModelHarness()
+        var responses: [String] = []
+        harness.model.onResponse = { responses.append($0) }
+
+        harness.feed("\u{1B}[?56n")
+
+        XCTAssertEqual(responses, ["\u{1B}[?57;0n"])
+    }
+
     func testTerminalModelVT220DSRPrinterStatusReportsNoPrinter() {
         let harness = TerminalModelHarness()
         var responses: [String] = []
@@ -1319,6 +1363,48 @@ final class TerminalModelRegressionTests: XCTestCase {
         harness.feed("\u{1B}[?25n")
 
         XCTAssertEqual(responses, ["\u{1B}[?20n"])
+    }
+
+    func testTerminalModelVT420DSRDataIntegrityReportsNoErrors() {
+        let harness = TerminalModelHarness()
+        var responses: [String] = []
+        harness.model.onResponse = { responses.append($0) }
+
+        harness.feed("\u{1B}[?75n")
+
+        XCTAssertEqual(responses, ["\u{1B}[?70n"])
+    }
+
+    func testTerminalModelVT420DSRMultiSessionReportsNotReady() {
+        let harness = TerminalModelHarness()
+        var responses: [String] = []
+        harness.model.onResponse = { responses.append($0) }
+
+        harness.feed("\u{1B}[?85n")
+
+        XCTAssertEqual(responses, ["\u{1B}[?83n"])
+    }
+
+    func testTerminalModelVT420DSRMacroSpaceReportsSupportedResponse() {
+        let harness = TerminalModelHarness()
+        var responses: [String] = []
+        harness.model.onResponse = { responses.append($0) }
+
+        harness.feed("\u{1B}[?62n")
+
+        XCTAssertEqual(responses, ["\u{1B}[0*{"])
+    }
+
+    func testTerminalModelVT420DECXCPRIncludesPageNumber() {
+        let harness = TerminalModelHarness(rows: 4, cols: 8)
+        harness.model.cursor.row = 2
+        harness.model.cursor.col = 3
+        var responses: [String] = []
+        harness.model.onResponse = { responses.append($0) }
+
+        harness.feed("\u{1B}[?6n")
+
+        XCTAssertEqual(responses, ["\u{1B}[?3;4;1R"])
     }
 
     func testTerminalModelS8C1TEmits8BitCSIResponsesUntilS7C1TResetsMode() {
@@ -1395,6 +1481,45 @@ final class TerminalModelRegressionTests: XCTestCase {
 
         XCTAssertEqual(responses.count, 1)
         XCTAssertEqual(String(data: responses[0], encoding: .isoLatin1), "\u{1B}P1$r\"q\u{1B}\\")
+    }
+
+    func testTerminalModelTertiaryDeviceAttributesReturnsHexUnitID() {
+        let harness = TerminalModelHarness(rows: 3, cols: 8)
+        var responses: [Data] = []
+        harness.model.onResponseData = { responses.append($0) }
+
+        harness.feed("\u{1B}[=c")
+
+        XCTAssertEqual(responses.count, 1)
+        XCTAssertEqual(String(data: responses[0], encoding: .isoLatin1), "\u{1B}P!|00000000\u{1B}\\")
+    }
+
+    func testTerminalModelDECRQSSReportsCurrentCursorStyle() {
+        let harness = TerminalModelHarness(rows: 3, cols: 8)
+        var responses: [Data] = []
+        harness.model.onResponseData = { responses.append($0) }
+
+        harness.feed("\u{1B}[6 q")
+        harness.feed("\u{1B}P$q q\u{1B}\\")
+
+        XCTAssertEqual(responses.count, 1)
+        XCTAssertEqual(String(data: responses[0], encoding: .isoLatin1), "\u{1B}P1$r6 q\u{1B}\\")
+    }
+
+    func testTerminalModelDECSNLSRequestsResizeAndDECRQSSReportsConfiguredLineCount() {
+        let harness = TerminalModelHarness(rows: 24, cols: 80)
+        var responses: [Data] = []
+        var characterResize: (Int, Int)?
+        harness.model.onResponseData = { responses.append($0) }
+        harness.model.onWindowResizeRequest = { characterResize = ($0, $1) }
+
+        harness.feed("\u{1B}[48*|")
+        harness.feed("\u{1B}P$q*|\u{1B}\\")
+
+        XCTAssertEqual(characterResize?.0, 48)
+        XCTAssertEqual(characterResize?.1, 80)
+        XCTAssertEqual(responses.count, 1)
+        XCTAssertEqual(String(data: responses[0], encoding: .isoLatin1), "\u{1B}P1$r48*|\u{1B}\\")
     }
 
     func testTerminalModelDECRQPSRAndDECRQTSREmitDCSReports() {

@@ -284,6 +284,11 @@ final class PTYIntegrationTests: XCTestCase {
             }
 
             try controller.start()
+            try Self.waitForTerminalText(
+                controller,
+                toContain: "%",
+                timeout: 8.0
+            )
             controller.sendInput(
                 "'\(Self.shellSingleQuoted(kittenPath))' __benchmark__ --repetitions 1 2>&1 | tee '\(Self.shellSingleQuoted(outputPath))'; "
                 + "printf '\(doneMarker)\\n'; "
@@ -426,6 +431,16 @@ final class PTYIntegrationTests: XCTestCase {
                 toContain: "Enter choice number (0 - 7):",
                 timeout: 10.0
             )
+            sendChoice("6")
+            try Self.waitForTerminalText(controller, toContain: "Push <RETURN>", timeout: 10.0)
+            XCTAssertFalse(controller.allText().localizedCaseInsensitiveContains("failed"), "Tertiary DA should not fail.\n\(controller.allText())")
+            pressReturn()
+
+            try Self.waitForTerminalText(
+                controller,
+                toContain: "Enter choice number (0 - 7):",
+                timeout: 10.0
+            )
             sendChoice("7")
             try Self.waitForTerminalText(controller, toContain: "Push <RETURN>", timeout: 10.0)
             XCTAssertFalse(controller.allText().contains("Bad format"), "DECREQTPARM should not report a bad format.\n\(controller.allText())")
@@ -463,6 +478,7 @@ final class PTYIntegrationTests: XCTestCase {
             XCTAssertTrue(replayLog.contains("Device Status Report (DSR)"))
             XCTAssertTrue(replayLog.contains("Primary Device Attributes (DA)"))
             XCTAssertTrue(replayLog.contains("Secondary Device Attributes (DA)"))
+            XCTAssertTrue(replayLog.contains("Tertiary Device Attributes (DA)"))
             XCTAssertTrue(replayLog.contains("Request Terminal Parameters (DECREQTPARM)"))
             XCTAssertFalse(replayLog.contains("Unknown response"), "vttest replay log=\n\(replayLog)")
             XCTAssertFalse(replayLog.contains("Bad format"), "vttest replay log=\n\(replayLog)")
@@ -760,6 +776,381 @@ final class PTYIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminalControllerRealPTYVttestScreenFeaturesReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-screen-features.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\r") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+                let terminalTail = { String(controller.allText().suffix(1600)) }
+                let advancePastScreenScenario: (TimeInterval) throws -> Void = { timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if tail.contains("Enter choice number (0 - 12):") {
+                            return
+                        }
+                        pressReturn()
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out advancing screen features replay. Tail=\n\(terminalTail())")
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("2")
+                try advancePastScreenScenario(80.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    @MainActor
+    func testTerminalControllerRealPTYVttestCursorMovementsReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-cursor-movements.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+                let terminalTail = { String(controller.allText().suffix(1600)) }
+                let advancePastCursorScenario: (TimeInterval) throws -> Void = { timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if tail.contains("Enter choice number (0 - 12):") {
+                            return
+                        }
+                        pressReturn()
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out advancing cursor movements replay. Tail=\n\(terminalTail())")
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("1")
+                try Self.waitForTerminalText(controller, toContain: "The screen should be cleared", timeout: 10.0)
+                try advancePastCursorScenario(80.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("tst_movements"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    func testTerminalControllerRealPTYVttestDoubleSizedCharactersReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-double-sized.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+                let terminalTail = { String(controller.allText().suffix(1600)) }
+                let advancePastDoubleSizeScenario: (TimeInterval) throws -> Void = { timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if tail.contains("Enter choice number (0 - 12):") {
+                            return
+                        }
+                        pressReturn()
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out advancing double-sized replay. Tail=\n\(terminalTail())")
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("4")
+                try advancePastDoubleSizeScenario(60.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    @MainActor
+    func testTerminalControllerRealPTYVttestResetReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-reset.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+                let terminalTail = { String(controller.allText().suffix(1600)) }
+                let advancePastScenario: ([String], TimeInterval) throws -> Void = { menuNeedles, timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if menuNeedles.contains(where: { tail.contains($0) }) {
+                            return
+                        }
+                        pressReturn()
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out advancing reset replay. Tail=\n\(terminalTail())")
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("10")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 3):", timeout: 10.0)
+
+                sendChoice("1")
+                try Self.waitForTerminalText(controller, toContain: "The terminal will now be RESET.", timeout: 10.0)
+                try advancePastScenario(["Enter choice number (0 - 3):"], 20.0)
+
+                sendChoice("2")
+                try Self.waitForTerminalText(controller, toContain: "built-in confidence test", timeout: 10.0)
+                try advancePastScenario(["Enter choice number (0 - 3):"], 20.0)
+
+                sendChoice("3")
+                try Self.waitForTerminalText(controller, toContain: "The terminal will now soft-reset", timeout: 10.0)
+                try advancePastScenario(["Enter choice number (0 - 3):"], 20.0)
+
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("Test of reset and self-test"))
+                XCTAssertTrue(replayLog.contains("Reset to Initial State (RIS)"))
+                XCTAssertTrue(replayLog.contains("Invoke Terminal Test (DECTST)"))
+                XCTAssertTrue(replayLog.contains("Soft Terminal Reset (DECSTR)"))
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    @MainActor
+    func testTerminalControllerRealPTYVttestKeyboardLEDLightsReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-keyboard-led-lights.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+                let terminalTail = { String(controller.allText().suffix(1400)) }
+                let advancePastKeyboardScenario: ([String], TimeInterval) throws -> Void = { menuNeedles, timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if menuNeedles.contains(where: { tail.contains($0) }) {
+                            return
+                        }
+                        if tail.contains("Push <RETURN>") {
+                            pressReturn()
+                        }
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out advancing keyboard replay. Tail=\n\(terminalTail())")
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("5")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 9):", timeout: 10.0)
+
+                sendChoice("1")
+                try Self.waitForTerminalText(controller, toContain: "These LEDs", timeout: 10.0)
+                try advancePastKeyboardScenario(["Enter choice number (0 - 9):"], 20.0)
+
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("Test of keyboard"))
+                XCTAssertTrue(replayLog.contains("LED Lights"))
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    func testTerminalControllerRealPTYVttestVT102FeaturesReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-vt102-features.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+                let terminalTail = { String(controller.allText().suffix(1400)) }
+                let advancePastVT102Scenario: (TimeInterval) throws -> Void = { timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if tail.contains("Enter choice number (0 - 12):") {
+                            return
+                        }
+                        pressReturn()
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out advancing VT102 features replay. Tail=\n\(terminalTail())")
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("8")
+                try Self.waitForTerminalText(controller, toContain: "Screen accordion test", timeout: 10.0)
+                try advancePastVT102Scenario(40.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("Test of VT102 features"))
+                XCTAssertTrue(replayLog.contains("Screen accordion test"))
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    @MainActor
     func testTerminalControllerRealPTYVttestVT220ControlsReplayCompletes() throws {
         guard let vttestPath = Self.findExecutable(named: "vttest") else {
             throw XCTSkip("vttest is not installed in this environment")
@@ -1005,6 +1396,129 @@ final class PTYIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminalControllerRealPTYVttestVT100CharsetReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-charsets-vt100.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("3")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 13):", timeout: 10.0)
+
+                sendChoice("8")
+                try Self.waitForTerminalText(controller, toContain: "These are the installed character sets.", timeout: 10.0)
+                try Self.waitForTerminalText(controller, toContain: "Push <RETURN>", timeout: 10.0)
+                pressReturn()
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 13):", timeout: 10.0)
+
+                sendChoice("9")
+                try Self.waitForTerminalText(controller, toContain: "These are the G0 and G1 character sets.", timeout: 10.0)
+                try Self.waitForTerminalText(controller, toContain: "Push <RETURN>", timeout: 10.0)
+                pressReturn()
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 13):", timeout: 10.0)
+
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("Test VT100 Character Sets"))
+                XCTAssertTrue(replayLog.contains("Test Shift In/Shift Out (SI/SO)"))
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    @MainActor
+    func testTerminalControllerRealPTYVttestCharsetSelectionReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-charsets-selection.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("3")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 13):", timeout: 10.0)
+
+                sendChoice("1")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 13):", timeout: 10.0)
+
+                for item in ["4", "5", "6", "7"] {
+                    sendChoice(item)
+                    try Self.waitForTerminalText(controller, toContain: "Choose character-set:", timeout: 10.0)
+                    sendChoice("1")
+                    try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 13):", timeout: 10.0)
+                }
+
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("Character-Set Tests"))
+                XCTAssertTrue(replayLog.contains("Reset (G0 ASCII, G1 Latin-1, no NRC mode)"))
+                XCTAssertTrue(replayLog.contains("Specify G0"))
+                XCTAssertTrue(replayLog.contains("Specify G1"))
+                XCTAssertTrue(replayLog.contains("Specify G2"))
+                XCTAssertTrue(replayLog.contains("Specify G3"))
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
     func testTerminalControllerRealPTYVttestSetupDetectsVT420OperatingLevel() throws {
         guard let vttestPath = Self.findExecutable(named: "vttest") else {
             throw XCTSkip("vttest is not installed in this environment")
@@ -1041,6 +1555,74 @@ final class PTYIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminalControllerRealPTYVttestSetupReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-setup-replay.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    controller.sendInput("\n")
+                }
+                let terminalTail = { String(controller.allText().suffix(1600)) }
+                let advanceToSetupMenu: (TimeInterval) throws -> Void = { timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if tail.contains("Select a number to modify it:") {
+                            return
+                        }
+                        if tail.contains("Push <RETURN>") {
+                            controller.sendInput("\n")
+                        }
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out returning to setup menu. Tail=\n\(terminalTail())")
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("12")
+                try Self.waitForTerminalText(controller, toContain: "Select a number to modify it:", timeout: 10.0)
+
+                for item in 1...8 {
+                    sendChoice(String(item))
+                    try advanceToSetupMenu(10.0)
+                }
+
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("Modify test-parameters"))
+                XCTAssertTrue(replayLog.contains("Operating level"))
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    @MainActor
     func testTerminalControllerRealPTYVttestVT320TerminalStateReportReplayCompletes() throws {
         guard let vttestPath = Self.findExecutable(named: "vttest") else {
             throw XCTSkip("vttest is not installed in this environment")
@@ -1070,7 +1652,6 @@ final class PTYIntegrationTests: XCTestCase {
                     controller.sendInput(choice)
                     pressReturn()
                 }
-
                 try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
                 sendChoice("11")
                 try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
@@ -1099,6 +1680,90 @@ final class PTYIntegrationTests: XCTestCase {
 
                 let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
                 XCTAssertTrue(replayLog.contains("Testing Terminal State Reports (DECRQTSR/DECTSR)"))
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    @MainActor
+    func testTerminalControllerRealPTYVttestVT320DeviceStatusReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-vt320-device-status.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+                let terminalTail = { String(controller.allText().suffix(1400)) }
+                let advancePastHoldToMenu: ([String], TimeInterval) throws -> Void = { menuNeedles, timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if menuNeedles.contains(where: { tail.contains($0) }) {
+                            return
+                        }
+                        if tail.contains("Push <RETURN>") {
+                            pressReturn()
+                        }
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out advancing past hold to menu \(menuNeedles). Tail=\n\(terminalTail())")
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("11")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("2")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 6):", timeout: 10.0)
+                sendChoice("5")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 6):", timeout: 10.0)
+                sendChoice("2")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 7):", timeout: 10.0)
+
+                for item in ["2", "3", "4", "5", "6", "7"] {
+                    sendChoice(item)
+                    try Self.waitForTerminalText(controller, toContain: "Push <RETURN>", timeout: 10.0)
+                    try advancePastHoldToMenu(["Enter choice number (0 - 7):"], 10.0)
+                }
+
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 6):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 6):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("VT320 Device Status Reports (DSR)"))
+                XCTAssertTrue(replayLog.contains("Test Locator Status"))
+                XCTAssertTrue(replayLog.contains("Identify Locator"))
+                XCTAssertTrue(replayLog.contains("Test Extended Cursor-Position (DECXCPR)"))
                 XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
                 XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
             }
@@ -1135,26 +1800,111 @@ final class PTYIntegrationTests: XCTestCase {
                     controller.sendInput(choice)
                     pressReturn()
                 }
+                let terminalTail = { String(controller.allText().suffix(1200)) }
+                let waitForTail: (String, TimeInterval) throws -> Void = { needle, timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        if terminalTail().contains(needle) {
+                            return
+                        }
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out waiting for terminal tail to contain '\(needle)'. Tail=\n\(terminalTail())")
+                }
 
+                try waitForTail("Enter choice number (0 - 12):", 10.0)
+                sendChoice("11")
+                try waitForTail("Enter choice number (0 - 8):", 10.0)
+                sendChoice("2")
+                try waitForTail("Enter choice number (0 - 6):", 10.0)
+                sendChoice("5")
+                try waitForTail("Enter choice number (0 - 6):", 10.0)
+                sendChoice("3")
+                try waitForTail("Enter choice number (0 - 6):", 10.0)
+                sendChoice("6")
+                try waitForTail("Enter choice number (0 - 11):", 10.0)
+
+                for item in 1...11 {
+                    sendChoice(String(item))
+                    try waitForTail("Testing DECRQSS:", 10.0)
+                    try waitForTail("Push <RETURN>", 10.0)
+                    pressReturn()
+                    try waitForTail("Enter choice number (0 - 11):", 10.0)
+                }
+
+                sendChoice("0")
+                try waitForTail("Enter choice number (0 - 6):", 10.0)
+                sendChoice("0")
+                try waitForTail("Enter choice number (0 - 6):", 10.0)
+                sendChoice("0")
+                try waitForTail("Enter choice number (0 - 6):", 10.0)
+                sendChoice("0")
+                try waitForTail("Enter choice number (0 - 8):", 10.0)
+                sendChoice("0")
+                try waitForTail("Enter choice number (0 - 12):", 10.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("VT320 Status-String Reports"), replayLog)
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    @MainActor
+    func testTerminalControllerRealPTYVttestVT320CursorMovementReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-vt320-cursor.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
                 try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
                 sendChoice("11")
                 try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
                 sendChoice("2")
                 try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 6):", timeout: 10.0)
-                sendChoice("5")
-                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 6):", timeout: 10.0)
-                sendChoice("5")
-                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 11):", timeout: 10.0)
+                sendChoice("2")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 4):", timeout: 10.0)
 
-                for item in 1...11 {
-                    sendChoice(String(item))
-                    try Self.waitForTerminalText(controller, toContain: "Push <RETURN>", timeout: 10.0)
-                    pressReturn()
-                    try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 11):", timeout: 10.0)
-                }
+                sendChoice("1")
+                try Self.waitForTerminalText(controller, toContain: "Test Pan down (SU)", timeout: 10.0)
+                try Self.waitForTerminalText(controller, toContain: "There should be a horizontal row of *'s above, on the top row.", timeout: 10.0)
+                try Self.waitForTerminalText(controller, toContain: "Push <RETURN>", timeout: 10.0)
+                pressReturn()
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 4):", timeout: 10.0)
 
-                sendChoice("0")
-                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 6):", timeout: 10.0)
+                sendChoice("2")
+                try Self.waitForTerminalText(controller, toContain: "Test Pan up (SD)", timeout: 10.0)
+                try Self.waitForTerminalText(controller, toContain: "There should be a horizontal row of *'s above, just above the message.", timeout: 10.0)
+                try Self.waitForTerminalText(controller, toContain: "Push <RETURN>", timeout: 10.0)
+                pressReturn()
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 4):", timeout: 10.0)
+
                 sendChoice("0")
                 try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 6):", timeout: 10.0)
                 sendChoice("0")
@@ -1165,7 +1915,522 @@ final class PTYIntegrationTests: XCTestCase {
                 controller.sendInput("exit\n")
 
                 let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
-                XCTAssertTrue(replayLog.contains("VT320 Status-String Reports"), replayLog)
+                XCTAssertTrue(replayLog.contains("Test Pan down (SU)"))
+                XCTAssertTrue(replayLog.contains("Test Pan up (SD)"))
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    @MainActor
+    func testTerminalControllerRealPTYVttestVT320ScreenDisplayReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-vt320-screen.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+                let terminalTail = { String(controller.allText().suffix(1200)) }
+                let waitForAnyTail: ([String], TimeInterval) throws -> String = { needles, timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if let match = needles.first(where: { tail.contains($0) }) {
+                            return match
+                        }
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out waiting for terminal tail to contain one of \(needles). Tail=\n\(terminalTail())")
+                    return needles[0]
+                }
+                let advancePastHoldToMenu: ([String], TimeInterval) throws -> Void = { menuNeedles, timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if menuNeedles.contains(where: { tail.contains($0) }) {
+                            return
+                        }
+                        if tail.contains("Push <RETURN>") {
+                            pressReturn()
+                        }
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out advancing past hold to menu \(menuNeedles). Tail=\n\(terminalTail())")
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("11")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("2")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 6):", timeout: 10.0)
+                sendChoice("6")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 2):", timeout: 10.0)
+
+                sendChoice("1")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 4):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 2):", timeout: 10.0)
+
+                sendChoice("2")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 3):", timeout: 10.0)
+                let statusLineTitles: [Int: String] = [
+                    1: "This is a simple test of the status-line",
+                    2: "This test writes SGR controls to the status-line",
+                    3: "This test demonstrates cursor-movement in the status-line",
+                ]
+                for item in 1...3 {
+                    sendChoice(String(item))
+                    try Self.waitForTerminalText(controller, toContain: statusLineTitles[item]!, timeout: 10.0)
+                    _ = try waitForAnyTail(["Push <RETURN>", "Enter choice number (0 - 3):"], 10.0)
+                    try advancePastHoldToMenu(["Enter choice number (0 - 3):"], 10.0)
+                }
+
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 2):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 6):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("VT320 Screen-Display Tests"))
+                XCTAssertTrue(replayLog.contains("Test Status line (DECSASD/DECSSDT)"))
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    @MainActor
+    func testTerminalControllerRealPTYVttestVT420PresentationReportsReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-vt420-presentation.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+                let terminalTail = { String(controller.allText().suffix(1400)) }
+                let advancePastHoldToMenu: ([String], TimeInterval) throws -> Void = { menuNeedles, timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if menuNeedles.contains(where: { tail.contains($0) }) {
+                            return
+                        }
+                        if tail.contains("Push <RETURN>") {
+                            pressReturn()
+                        }
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out advancing past hold to menu \(menuNeedles). Tail=\n\(terminalTail())")
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("11")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("3")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("7")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 3):", timeout: 10.0)
+                sendChoice("2")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 3):", timeout: 10.0)
+                sendChoice("2")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 2):", timeout: 10.0)
+
+                sendChoice("1")
+                try Self.waitForTerminalText(controller, toContain: "Push <RETURN>", timeout: 10.0)
+                try advancePastHoldToMenu(["Enter choice number (0 - 2):"], 10.0)
+
+                sendChoice("2")
+                try Self.waitForTerminalText(controller, toContain: "Push <RETURN>", timeout: 10.0)
+                try advancePastHoldToMenu(["Enter choice number (0 - 2):"], 10.0)
+
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 3):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 3):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("VT420 Presentation State Reports"))
+                XCTAssertTrue(replayLog.contains("Request Mode (DECRQM)/Report Mode (DECRPM)"))
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    @MainActor
+    func testTerminalControllerRealPTYVttestVT520ScreenDisplayCursorStyleReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-vt520-cursor-style.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+                let terminalTail = { String(controller.allText().suffix(1600)) }
+                let advancePastVT520CursorStyleScenario: (TimeInterval) throws -> Void = { timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if tail.contains("Enter choice number (0 - 3):") {
+                            return
+                        }
+                        pressReturn()
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out advancing VT520 cursor style replay. Tail=\n\(terminalTail())")
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("11")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("4")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 6):", timeout: 10.0)
+                sendChoice("6")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 3):", timeout: 10.0)
+
+                sendChoice("2")
+                try Self.waitForTerminalText(controller, toContain: "The cursor should be a blinking rectangle", timeout: 10.0)
+                try advancePastVT520CursorStyleScenario(40.0)
+
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 6):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("VT520 Screen-Display Tests"))
+                XCTAssertTrue(replayLog.contains("Test Set Cursor Style (DECSCUSR)"))
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    @MainActor
+    func testTerminalControllerRealPTYVttestVT520CursorMovementReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-vt520-cursor-movement.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+                let terminalTail = { String(controller.allText().suffix(1600)) }
+                let advancePastScenario: ([String], TimeInterval) throws -> Void = { menuNeedles, timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if menuNeedles.contains(where: { tail.contains($0) }) {
+                            return
+                        }
+                        pressReturn()
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out advancing VT520 cursor-movement replay. Tail=\n\(terminalTail())")
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("11")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("4")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 6):", timeout: 10.0)
+                sendChoice("2")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 15):", timeout: 10.0)
+
+                sendChoice("7")
+                try Self.waitForTerminalText(controller, toContain: "Push <RETURN>", timeout: 10.0)
+                try advancePastScenario(["Enter choice number (0 - 15):"], 10.0)
+
+                sendChoice("8")
+                try Self.waitForTerminalText(controller, toContain: "Push <RETURN>", timeout: 10.0)
+                try advancePastScenario(["Enter choice number (0 - 15):"], 10.0)
+
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 6):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("VT520 Cursor-Movement"))
+                XCTAssertTrue(replayLog.contains("Test Character-Position-Absolute (HPA)"))
+                XCTAssertTrue(replayLog.contains("Test Cursor-Back-Tab (CBT)"))
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    func testTerminalControllerRealPTYVttestVT420DeviceStatusBasicReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-vt420-device-status-basic.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+                let terminalTail = { String(controller.allText().suffix(1400)) }
+                let advancePastHoldToMenu: ([String], TimeInterval) throws -> Void = { menuNeedles, timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if menuNeedles.contains(where: { tail.contains($0) }) {
+                            return
+                        }
+                        if tail.contains("Push <RETURN>") {
+                            pressReturn()
+                        }
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out advancing past hold to menu \(menuNeedles). Tail=\n\(terminalTail())")
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("11")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("3")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("7")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 3):", timeout: 10.0)
+                sendChoice("3")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 11):", timeout: 10.0)
+
+                for item in ["2", "3", "4"] {
+                    sendChoice(item)
+                    try Self.waitForTerminalText(controller, toContain: "Push <RETURN>", timeout: 10.0)
+                    try advancePastHoldToMenu(["Enter choice number (0 - 11):"], 10.0)
+                }
+
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 3):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("VT420 Device Status Reports (DSR)"))
+                XCTAssertTrue(replayLog.contains("Test Printer Status"))
+                XCTAssertTrue(replayLog.contains("Test UDK Status"))
+                XCTAssertTrue(replayLog.contains("Test Keyboard Status"))
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
+                XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
+            }
+        }
+    }
+
+    @MainActor
+    func testTerminalControllerRealPTYVttestVT420DeviceStatusExtendedReplayCompletes() throws {
+        guard let vttestPath = Self.findExecutable(named: "vttest") else {
+            throw XCTSkip("vttest is not installed in this environment")
+        }
+
+        try withTemporaryDirectory { directory in
+            try MainActor.assumeIsolated {
+                let logPath = directory.appendingPathComponent("vttest-vt420-device-status-extended.log").path
+
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-256color",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                try controller.start()
+                controller.sendInput("'\(Self.shellSingleQuoted(vttestPath))' -l '\(Self.shellSingleQuoted(logPath))'\n")
+
+                let pressReturn = { controller.sendInput("\n") }
+                let sendChoice: (String) -> Void = { choice in
+                    controller.sendInput(choice)
+                    pressReturn()
+                }
+                let terminalTail = { String(controller.allText().suffix(1400)) }
+                let advancePastHoldToMenu: ([String], TimeInterval) throws -> Void = { menuNeedles, timeout in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        let tail = terminalTail()
+                        if menuNeedles.contains(where: { tail.contains($0) }) {
+                            return
+                        }
+                        if tail.contains("Push <RETURN>") {
+                            pressReturn()
+                        }
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    }
+                    XCTFail("Timed out advancing past hold to menu \(menuNeedles). Tail=\n\(terminalTail())")
+                }
+
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("11")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("3")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("7")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 3):", timeout: 10.0)
+                sendChoice("3")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 11):", timeout: 10.0)
+
+                for item in ["5", "7", "8", "11"] {
+                    sendChoice(item)
+                    try Self.waitForTerminalText(controller, toContain: "Push <RETURN>", timeout: 10.0)
+                    try advancePastHoldToMenu(["Enter choice number (0 - 11):"], 10.0)
+                }
+
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 3):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 8):", timeout: 10.0)
+                sendChoice("0")
+                try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
+                sendChoice("0")
+                controller.sendInput("exit\n")
+
+                let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
+                XCTAssertTrue(replayLog.contains("VT420 Device Status Reports (DSR)"))
+                XCTAssertTrue(replayLog.contains("Test Macro Space"))
+                XCTAssertTrue(replayLog.contains("Test Data Integrity"))
+                XCTAssertTrue(replayLog.contains("Test Multiple Session Status"))
+                XCTAssertTrue(replayLog.contains("Test Extended Cursor-Position (DECXCPR)"))
                 XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
                 XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
             }

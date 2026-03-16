@@ -163,6 +163,30 @@ final class TextModelTests: XCTestCase {
         XCTAssertEqual(decoder.debugBOMProbeCapacity, 0)
     }
 
+    func testTerminalTextDecoderPreservesRawC1ControlsInUTF8Stream() {
+        let decoder = TerminalTextDecoder(encoding: .utf8)
+        var output = [UInt32](repeating: 0, count: 8)
+        let bytes = Data([0x9B, 0x35, 0x6E, 0x90, 0x71, 0x9C])
+
+        let count = bytes.withUnsafeBytes { rawBuffer in
+            decoder.decode(rawBuffer.bindMemory(to: UInt8.self), into: &output)
+        }
+
+        XCTAssertEqual(Array(output.prefix(count)), [0x9B, 0x35, 0x6E, 0x90, 0x71, 0x9C])
+    }
+
+    func testTerminalTextDecoderStillDecodesValidUTF8AroundRawC1Controls() {
+        let decoder = TerminalTextDecoder(encoding: .utf8)
+        var output = [UInt32](repeating: 0, count: 8)
+        let bytes = Data([0x41, 0x9B] + Array("あ".utf8) + [0x9C, 0x42])
+
+        let count = bytes.withUnsafeBytes { rawBuffer in
+            decoder.decode(rawBuffer.bindMemory(to: UInt8.self), into: &output)
+        }
+
+        XCTAssertEqual(Array(output.prefix(count)), [0x41, 0x9B, 0x3042, 0x9C, 0x42])
+    }
+
     func testTerminalGridResizeRowsOnlyReturnsTrimmedRows() {
         let grid = TerminalGrid(rows: 3, cols: 4)
         grid.setCell(Cell(codepoint: 0x41, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 0)

@@ -338,17 +338,12 @@ final class TerminalController {
         model.onResponse = { [weak self] response in
             guard let self = self else { return }
             guard let data = self.textEncoding.encode(response) else { return }
-            // Queue write to avoid blocking model lock on I/O
-            DispatchQueue.global(qos: .userInteractive).async {
-                self.pty.write(data)
-            }
+            self.pty.writeResponse(data)
         }
 
         model.onResponseData = { [weak self] data in
             guard let self = self else { return }
-            DispatchQueue.global(qos: .userInteractive).async {
-                self.pty.write(data)
-            }
+            self.pty.writeResponse(data)
         }
 
         model.encodeText = { [textEncoding] string in

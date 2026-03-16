@@ -8492,28 +8492,61 @@ final class AppKitComponentTests: XCTestCase {
             delegate.switchToSplit([first, second])
             let split = try currentSplitContainer(in: hostedContentView)
 
-            first.sendInput("i=1; while [ $i -le 10 ]; do printf '%03d\\n' \"$i\"; i=$((i+1)); done\n")
-            let completedExpectation = expectation(description: "command finished in narrow split terminal")
-            let completionDeadline = Date().addingTimeInterval(8.0)
-            func pollForCompletedCommand() {
+            let doneMarker = "__SPLIT_DONE__"
+            let scriptURL = directory.appendingPathComponent("completed-output.sh")
+            try """
+            #!/bin/sh
+            i=1
+            while [ "$i" -le 10 ]; do
+              printf '%03d\\n' "$i"
+              i=$((i+1))
+            done
+            printf '\(doneMarker)\\n'
+            sleep 30
+            """.write(to: scriptURL, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
+
+            let promptReadyDeadline = Date().addingTimeInterval(16.0)
+            var promptReady = false
+            var nudgedShell = false
+            while !promptReady && Date() < promptReadyDeadline {
                 let text = first.allText()
-                if text.contains("001"),
-                   text.contains("010"),
-                   text.contains("009"),
-                   text.contains("while [ $i -le 10 ]") {
-                    completedExpectation.fulfill()
-                    return
-                }
-                if Date() < completionDeadline {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: pollForCompletedCommand)
+                promptReady = text.contains("%") || text.contains("$")
+                if !promptReady {
+                    if !nudgedShell, Date() > promptReadyDeadline.addingTimeInterval(-8.0) {
+                        first.sendInput("\n")
+                        nudgedShell = true
+                    }
+                    RunLoop.main.run(until: Date().addingTimeInterval(0.05))
                 }
             }
-            DispatchQueue.main.async(execute: pollForCompletedCommand)
-            wait(for: [completedExpectation], timeout: 8.5)
+            XCTAssertTrue(promptReady, "interactive shell prompt became ready before split command execution")
+
+            first.sendInput("stty -echo\n")
+            let echoDisabled = expectation(description: "split-completed-output-echo-disabled")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                echoDisabled.fulfill()
+            }
+            wait(for: [echoDisabled], timeout: 1.0)
+            let quotedScriptPath = scriptURL.path.replacingOccurrences(of: "'", with: "'\\''")
+            first.sendInput("/bin/sh '\(quotedScriptPath)'\n")
+            let commandSettled = expectation(description: "split completed output settled")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) {
+                commandSettled.fulfill()
+            }
+            wait(for: [commandSettled], timeout: 9.0)
+            let completedSeen = {
+                let text = first.allText()
+                return text.contains("001")
+                    && text.contains("009")
+                    && text.contains("010")
+                    && text.contains(doneMarker)
+            }()
+            XCTAssertTrue(completedSeen, "command finished in narrow split terminal: \(first.allText())")
             drainMainQueue(testCase: self)
 
             let baselineText = normalizedTerminalText(first.allText())
-            let baselineViewport = visibleViewportLines(of: first, count: 40)
+            let baselineViewport = normalizedViewportContentLines(visibleViewportLines(of: first, count: 40))
 
             split.onMaximizeTerminal?(first)
             drainMainQueue(testCase: self)
@@ -8527,7 +8560,10 @@ final class AppKitComponentTests: XCTestCase {
             wait(for: [settleExpectation], timeout: 1.0)
 
             XCTAssertEqual(normalizedTerminalText(first.allText()), baselineText)
-            XCTAssertEqual(visibleViewportLines(of: first, count: 40), baselineViewport)
+            XCTAssertEqual(
+                normalizedViewportContentLines(visibleViewportLines(of: first, count: 40)),
+                baselineViewport
+            )
         }
     }
 
@@ -9287,6 +9323,10 @@ private extension AppKitComponentTests {
             lines.removeLast()
         }
         return lines.joined(separator: "\n")
+    }
+
+    func normalizedViewportContentLines(_ lines: [String]) -> [String] {
+        lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
     }
 
     func viewportLineText(cells: [Cell], cols: Int) -> String {

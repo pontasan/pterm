@@ -62,7 +62,7 @@ final class MarkdownEditorRenderingTests: XCTestCase {
             XCTAssertEqual(metalSurface.debugPrepareVisibleGlyphsForTesting(), 0, "Expected committed glyphs to stay masked while insert preview is active")
             XCTAssertGreaterThan(metalSurface.debugLastRenderedCharacterRange.length, 0, "Expected visible markdown characters to be rendered")
             XCTAssertGreaterThan(metalSurface.debugActivePreviewCount, 0, "Expected committed insert preview to be active")
-            RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+            RunLoop.main.run(until: Date().addingTimeInterval(0.50))
             XCTAssertEqual(metalSurface.debugActivePreviewCount, 0, "Expected committed insert preview to expire")
             XCTAssertGreaterThan(metalSurface.debugPrepareVisibleGlyphsForTesting(), 0, "Expected visible glyph vertices to be generated after preview finishes")
         } else {

@@ -261,6 +261,14 @@ final class PTY {
         enqueueWrite(data, highPriority: false)
     }
 
+    /// Write terminal protocol responses back to the child process.
+    /// Responses must preserve ordering and should not be delayed behind
+    /// regular user-input writes, since queries such as DSR/DA can be
+    /// latency-sensitive.
+    func writeResponse(_ data: Data) {
+        enqueueWrite(data, highPriority: true)
+    }
+
     /// Write a string to the PTY.
     func write(_ string: String) {
         guard let data = string.data(using: .utf8) else { return }

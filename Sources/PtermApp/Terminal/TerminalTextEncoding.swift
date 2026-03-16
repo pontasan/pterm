@@ -79,7 +79,12 @@ final class TerminalTextDecoder {
     }
 
     func reset() {
-        utf8_decoder_init(&utf8Decoder, true)
+        // Terminals must preserve 8-bit C1 controls such as CSI (0x9B),
+        // DCS (0x90), OSC (0x9D), and ST (0x9C). kitty's benchmark and
+        // vttest both exercise these paths. The core decoder still supports
+        // a strict "reject C1" mode for non-terminal use, but terminal input
+        // decoding must pass them through so the VT parser can interpret them.
+        utf8_decoder_init(&utf8Decoder, false)
         pendingByte = nil
         pendingHighSurrogate = nil
         bomProbe.removeAll(keepingCapacity: false)
@@ -157,13 +162,7 @@ final class TerminalTextDecoder {
                let asciiCount = decodeASCIIIfPossible(input, into: &output) {
                 return asciiCount
             }
-            return utf8_decoder_decode(
-                &utf8Decoder,
-                input.baseAddress,
-                input.count,
-                &output,
-                output.count
-            )
+            return decodeUTF8(input, into: &output)
         case .utf16, .utf16LittleEndian, .utf16BigEndian:
             return decodeUTF16(input, into: &output)
         }
@@ -178,6 +177,34 @@ final class TerminalTextDecoder {
             output[index] = UInt32(byte)
         }
         return input.count
+    }
+
+    private func decodeUTF8(_ input: UnsafeBufferPointer<UInt8>, into output: inout [UInt32]) -> Int {
+        var outCount = 0
+
+        for byte in input {
+            guard outCount < output.count else { break }
+
+            // Preserve raw 8-bit C1 controls when they occur at codepoint
+            // boundaries. Terminals must recognize these as control functions,
+            // not replacement glyphs.
+            if utf8Decoder.state == UTF8_ACCEPT, byte >= 0x80, byte <= 0x9F {
+                output[outCount] = UInt32(byte)
+                outCount += 1
+                continue
+            }
+
+            let result = utf8_decoder_feed(&utf8Decoder, byte)
+            if result == UTF8_ACCEPT {
+                output[outCount] = utf8Decoder.codepoint
+                outCount += 1
+            } else if result == UTF8_REJECT {
+                output[outCount] = UInt32(UTF8_REPLACEMENT_CHAR)
+                outCount += 1
+            }
+        }
+
+        return outCount
     }
 
     private func decodeUTF16(_ input: UnsafeBufferPointer<UInt8>, into output: inout [UInt32]) -> Int {

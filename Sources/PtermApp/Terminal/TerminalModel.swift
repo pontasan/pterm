@@ -102,6 +102,7 @@ final class TerminalModel {
     private var dcsFinalByte: UInt32 = 0
     private var dcsIntermediates: [UInt8] = []
     private var operatingLevel: Int = 4
+    private var reportedLinesPerScreen: Int
 
     private var titleUpdateWindowStart: TimeInterval = ProcessInfo.processInfo.systemUptime
     private var titleUpdateCount = 0
@@ -130,6 +131,7 @@ final class TerminalModel {
     init(rows: Int, cols: Int) {
         self.rows = rows
         self.cols = cols
+        self.reportedLinesPerScreen = rows
         self.grid = TerminalGrid(rows: rows, cols: cols)
         initTabStops()
     }
@@ -763,6 +765,7 @@ final class TerminalModel {
         let hasSpaceIntermediate = effectiveIntermediates == [UInt8(ascii: " ")]
         let hasQuoteIntermediate = effectiveIntermediates == [UInt8(ascii: "\"")]
         let hasBangIntermediate = effectiveIntermediates == [UInt8(ascii: "!")]
+        let hasStarIntermediate = effectiveIntermediates == [UInt8(ascii: "*")]
 
         if hasSpaceIntermediate {
             switch finalByte {
@@ -815,6 +818,18 @@ final class TerminalModel {
             switch finalByte {
             case 0x70: // DECSTR - Soft terminal reset
                 softReset()
+                return
+            default:
+                break
+            }
+        }
+
+        if hasStarIntermediate {
+            switch finalByte {
+            case 0x7C: // DECSNLS - Select Number of Lines Per Screen
+                let targetRows = max(1, Int(vt_parser_param(parser, 0, Int32(reportedLinesPerScreen))))
+                reportedLinesPerScreen = targetRows
+                onWindowResizeRequest?(targetRows, cols)
                 return
             default:
                 break
@@ -1031,6 +1046,11 @@ final class TerminalModel {
 
         case 0x78: // DECREQTPARM - Request Terminal Parameters
             handleRequestTerminalParameters(parser: parser, privateMarker: privateMarker)
+
+        case 0x79: // DECTST - Invoke Confidence Test
+            // vttest expects the terminal to accept this without a reply.
+            // We currently model this as a no-op self-test success.
+            break
 
         case 0x72: // DECSTBM - Set Top and Bottom Margins
             let top = Int(vt_parser_param(parser, 0, 1)) - 1
@@ -1379,12 +1399,24 @@ final class TerminalModel {
         let privateMarker = parser.pointee.intermediate_count > 0 ? parser.pointee.intermediates.0 : 0
         if privateMarker == UInt8(ascii: "?") {
             switch param {
+            case 6: // DECXCPR - Extended cursor position report
+                sendResponse("\u{1B}[?\(cursor.row + 1);\(cursor.col + 1);1R")
             case 15: // Printer status
                 sendResponse("\u{1B}[?13n")
             case 25: // UDK status
                 sendResponse("\u{1B}[?20n")
             case 26: // Keyboard status
                 sendResponse("\u{1B}[?27;1;0;0n")
+            case 55: // Locator status
+                sendResponse("\u{1B}[?53n")
+            case 56: // Identify locator
+                sendResponse("\u{1B}[?57;0n")
+            case 62: // Macro space status
+                sendResponse("\u{1B}[0*{")
+            case 75: // Data integrity
+                sendResponse("\u{1B}[?70n")
+            case 85: // Multi-session status
+                sendResponse("\u{1B}[?83n")
             default:
                 break
             }
@@ -1540,6 +1572,10 @@ final class TerminalModel {
         case "\"p":
             let controlMode = responseControlsUse8Bit ? 0 : 1
             sendDCSResponse("1$r6\(operatingLevel);\(controlMode)\"p")
+        case " q":
+            sendDCSResponse("1$r\(deccusrStatusParameter()) q")
+        case "*|":
+            sendDCSResponse("1$r\(reportedLinesPerScreen)*|")
         default:
             sendDCSResponse("1$r\(request)")
         }
@@ -1560,6 +1596,17 @@ final class TerminalModel {
         let sdesig = deccirCharsetDesignations()
 
         return "1$u\(cursor.row + 1);\(cursor.col + 1);1;\(srend);\(satt);\(sflag);\(pgl);\(pgr);\(scss);\(sdesig)"
+    }
+
+    private func deccusrStatusParameter() -> Int {
+        switch (cursor.shape, cursor.blinking) {
+        case (.block, true): return 1
+        case (.block, false): return 2
+        case (.underline, true): return 3
+        case (.underline, false): return 4
+        case (.bar, true): return 5
+        case (.bar, false): return 6
+        }
     }
 
     private func makeDECTABSRResponseBody() -> String {
@@ -1633,10 +1680,9 @@ final class TerminalModel {
             // response that vttest accepts as a valid firmware report.
             sendResponse("\u{1B}[>41;0;0c")
         case UInt8(ascii: "="):
-            // Tertiary DA is only expected for VT420+ class terminals. We do
-            // not advertise that capability from primary DA, so leaving this
-            // unanswered keeps vttest in the "not supported" path.
-            break
+            // Tertiary DA (unit ID) for VT420+ class terminals. vttest accepts
+            // any eight-digit hexadecimal identifier wrapped in DCS !| ... ST.
+            sendDCSResponse("!|00000000")
         default:
             // Primary DA: advertise a VT420-class terminal so vttest enables
             // VT320/VT420 feature menus and validates DECSCL/DECRQSS paths.
@@ -1916,6 +1962,7 @@ final class TerminalModel {
         insertModeEnabled = false
         isAlternateScreen = false
         alternateGrid = nil
+        reportedLinesPerScreen = rows
         g0Charset = .ascii
         g1Charset = .ascii
         g2Charset = .ascii
@@ -1941,6 +1988,7 @@ final class TerminalModel {
         focusTrackingEnabled = false
         pendingUpdateModeEnabled = false
         insertModeEnabled = false
+        reportedLinesPerScreen = rows
         g0Charset = .ascii
         g1Charset = .ascii
         g2Charset = .ascii
@@ -2139,6 +2187,7 @@ final class TerminalModel {
                                    cursorRow: 0, cursorCol: 0)
         rows = newRows
         cols = newCols
+        reportedLinesPerScreen = newRows
         cursor.row = result.cursorRow
         cursor.col = result.cursorCol
         cursor.pendingWrap = false
