@@ -54,7 +54,7 @@ final class TerminalModel {
     private var activeCharsetIsG1 = false
 
     /// Callback when a line scrolls off the top of the screen (for scrollback)
-    var onScrollOut: ((_ cells: ArraySlice<Cell>, _ isWrapped: Bool, _ encodingHint: ScrollbackBuffer.RowEncodingHint) -> Void)?
+    var onScrollOut: ((_ cells: ArraySlice<Cell>, _ cellCount: Int, _ isWrapped: Bool, _ encodingHint: ScrollbackBuffer.RowEncodingHint) -> Void)?
 
     /// Callback when title changes
     var onTitleChange: ((String) -> Void)?
@@ -256,12 +256,20 @@ final class TerminalModel {
             if byte >= 0x20 && byte < 0x7F {
                 let runStart = index
                 var runCount = 1
+                var containsSpace = byte == 0x20
                 while runStart + runCount < bytes.count {
                     let next = bytes[runStart + runCount]
                     guard next >= 0x20 && next < 0x7F else { break }
+                    if next == 0x20 {
+                        containsSpace = true
+                    }
                     runCount += 1
                 }
-                handleASCIIByteRun(bytes.baseAddress!.advanced(by: runStart), count: runCount)
+                handleASCIIByteRun(
+                    bytes.baseAddress!.advanced(by: runStart),
+                    count: runCount,
+                    containsSpace: containsSpace
+                )
                 index += runCount
                 continue
             }
@@ -363,10 +371,10 @@ final class TerminalModel {
 
     private func handleASCIIByteRun(_ bytes: UnsafeBufferPointer<UInt8>) {
         guard let base = bytes.baseAddress else { return }
-        handleASCIIByteRun(base, count: bytes.count)
+        handleASCIIByteRun(base, count: bytes.count, containsSpace: true)
     }
 
-    private func handleASCIIByteRun(_ bytes: UnsafePointer<UInt8>, count: Int) {
+    private func handleASCIIByteRun(_ bytes: UnsafePointer<UInt8>, count: Int, containsSpace: Bool) {
         guard count > 0 else { return }
 
         var remainingBase = bytes
@@ -385,13 +393,22 @@ final class TerminalModel {
             guard available > 0 else { break }
 
             let chunkCount = min(remainingCount, available)
-            grid.writeSingleWidthASCIIBytes(
-                remainingBase,
-                count: chunkCount,
-                attributes: attributes,
-                atRow: cursor.row,
-                startCol: cursor.col
-            )
+            if attributes == .default && !containsSpace {
+                grid.writeSingleWidthDefaultASCIIBytesWithoutSpaces(
+                    remainingBase,
+                    count: chunkCount,
+                    atRow: cursor.row,
+                    startCol: cursor.col
+                )
+            } else {
+                grid.writeSingleWidthASCIIBytes(
+                    remainingBase,
+                    count: chunkCount,
+                    attributes: attributes,
+                    atRow: cursor.row,
+                    startCol: cursor.col
+                )
+            }
 
             cursor.col += chunkCount
             remainingBase = remainingBase.advanced(by: chunkCount)
@@ -536,8 +553,17 @@ final class TerminalModel {
             // Save the line being scrolled out
             let encodingHint = grid.rowEncodingHint(grid.scrollTop)
             let scrolledRow = grid.rowCells(grid.scrollTop)
+            let scrollbackCellCount: Int
+            switch encodingHint.kind {
+            case .compactDefault(let serializedCount):
+                scrollbackCellCount = serializedCount
+            case .compactUniformAttributes(_, let serializedCount):
+                scrollbackCellCount = serializedCount
+            case .full, .unknown:
+                scrollbackCellCount = grid.cols
+            }
             let isWrapped = grid.isWrapped(grid.scrollTop)
-            onScrollOut?(scrolledRow, isWrapped, encodingHint)
+            onScrollOut?(scrolledRow, scrollbackCellCount, isWrapped, encodingHint)
             grid.scrollUp(count: 1)
         } else if cursor.row < rows - 1 {
             cursor.row += 1
@@ -1243,7 +1269,7 @@ final class TerminalModel {
 
         // Save trimmed rows to scrollback before they are lost
         for trimmed in result.trimmedRows {
-            onScrollOut?(ArraySlice(trimmed.cells), trimmed.isWrapped, .unknown)
+            onScrollOut?(ArraySlice(trimmed.cells), trimmed.cells.count, trimmed.isWrapped, .unknown)
         }
 
         // Alternate grid doesn't need cursor-aware re-wrap

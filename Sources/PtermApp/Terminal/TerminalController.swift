@@ -164,7 +164,7 @@ final class TerminalController {
     private var renderContentVersion: UInt64 = 0
     private var outputActivitySuppressedUntilUptime: TimeInterval = 0
     private let scrollbackCompactionLock = NSLock()
-    private var pendingScrollbackCompaction: DispatchWorkItem?
+    private var pendingScrollbackCompaction: DispatchSourceTimer?
     private let ptyResizeLock = NSLock()
     private var pendingPTYResizeWorkItem: DispatchWorkItem?
     private var appliedPTYSize: (rows: Int, cols: Int)?
@@ -176,10 +176,6 @@ final class TerminalController {
     private var textExtractionGridRowBuffer: [Cell] = []
     private var textExtractionScrollbackRowBuffer: [Cell] = []
     private var searchColumnBuffer: [Int] = []
-    private var pendingScrollbackRows: [ScrollbackBuffer.BufferedRow] = []
-    private var pendingScrollbackRowBufferPool: [[Cell]] = []
-    private var isBatchingScrollbackDuringPTYParse = false
-
     private let termEnv: String
     private let textEncoding: TerminalTextEncoding
     private let shellLaunchOrder: [String]
@@ -199,6 +195,11 @@ final class TerminalController {
     private static let inputEchoSuppressionInterval: TimeInterval = 0.35
     private static let interruptDrainQuietPeriod: TimeInterval = 0.10
     private static let ptyResizeCoalescingDelay: TimeInterval = 0.05
+    private static let scrollbackCompactionDelay: TimeInterval = 1.0
+    private static let scrollbackCompactionQueue = DispatchQueue(
+        label: "com.pterm.scrollback.compaction",
+        qos: .utility
+    )
 
     var persistedSettings: PersistedTerminalSettings {
         PersistedTerminalSettings(
@@ -293,7 +294,7 @@ final class TerminalController {
 
     deinit {
         cancelPendingPTYResize()
-        cancelPendingScrollbackCompaction()
+        invalidateScrollbackCompactionTimer()
         pty.stop()
         vt_parser_destroy(&parser)
     }
@@ -351,29 +352,16 @@ final class TerminalController {
         }
 
         // Wire scrollback: when a line scrolls off the top, store it
-        model.onScrollOut = { [weak self] cells, isWrapped, encodingHint in
+        model.onScrollOut = { [weak self] cells, cellCount, isWrapped, encodingHint in
             guard let self = self else { return }
-            if self.isBatchingScrollbackDuringPTYParse {
-                var reusableCells = self.pendingScrollbackRowBufferPool.popLast() ?? []
-                reusableCells.removeAll(keepingCapacity: true)
-                if reusableCells.capacity < cells.count {
-                    reusableCells.reserveCapacity(cells.count)
-                }
-                reusableCells.append(contentsOf: cells)
-                self.pendingScrollbackRows.append(
-                    ScrollbackBuffer.BufferedRow(
-                        cells: reusableCells,
-                        isWrapped: isWrapped,
-                        encodingHint: encodingHint
-                    )
-                )
-            } else {
-                self.scrollback.appendRow(cells, isWrapped: isWrapped, encodingHint: encodingHint)
+            self.scrollback.appendRow(cells,
+                                      cellCount: cellCount,
+                                      isWrapped: isWrapped,
+                                      encodingHint: encodingHint)
 
-                // If user is scrolled back, increment offset to keep viewport stable
-                if self.scrollOffset > 0 {
-                    self.scrollOffset += 1
-                }
+            // If user is scrolled back, increment offset to keep viewport stable
+            if self.scrollOffset > 0 {
+                self.scrollOffset += 1
             }
         }
     }
@@ -381,8 +369,8 @@ final class TerminalController {
     // MARK: - Start / Stop
 
     func start() throws {
-        pty.onOutput = { [weak self] data in
-            self?.handlePTYOutput(data)
+        pty.onOutputBytes = { [weak self] bytes in
+            self?.handlePTYOutput(bytes)
         }
 
         pty.onExit = { [weak self] in
@@ -407,6 +395,7 @@ final class TerminalController {
 
     func stop(waitForExit: Bool = false) {
         cancelPendingPTYResize()
+        cancelPendingScrollbackCompaction()
         lock.withWriteLock {
             isShuttingDown = true
             releaseScratchStorageNow()
@@ -589,6 +578,15 @@ final class TerminalController {
     /// The entire decode + parse pipeline runs under lock to ensure
     /// decoder and parser state are never accessed concurrently.
     private func handlePTYOutput(_ data: Data) {
+        data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return
+            }
+            handlePTYOutput(UnsafeBufferPointer(start: baseAddress, count: rawBuffer.count))
+        }
+    }
+
+    private func handlePTYOutput(_ data: UnsafeBufferPointer<UInt8>) {
         let shouldDiscardInterruptOutput = callbackLock.withLock {
             interruptDiscardingOutput
         }
@@ -601,83 +599,75 @@ final class TerminalController {
     }
 
     private func processPTYOutput(_ data: Data, recordAudit: Bool) {
+        data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return
+            }
+            processPTYOutput(
+                UnsafeBufferPointer(start: baseAddress, count: rawBuffer.count),
+                recordAudit: recordAudit
+            )
+        }
+    }
+
+    private func processPTYOutput(_ data: UnsafeBufferPointer<UInt8>, recordAudit: Bool) {
         guard !data.isEmpty else { return }
         cancelPendingScrollbackCompaction()
         if recordAudit {
-            auditLogger?.recordOutput(data)
+            auditLogger?.recordOutput(Data(bytes: data.baseAddress!, count: data.count))
         }
         var clearedScrollback = false
         var didMutateDisplay = false
-        data.withUnsafeBytes { rawPtr in
-            guard let ptr = rawPtr.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                return
+        let ptr = data.baseAddress!
+        let count = data.count
+
+        lock.withWriteLock {
+            let input = UnsafeBufferPointer(start: ptr, count: count)
+            let remainingInput: UnsafeBufferPointer<UInt8>
+            if canUseDirectASCIIGroundFastPath(input) {
+                let consumed = model.consumeGroundASCIIBytesFastPathPrefix(input)
+                if consumed > 0 {
+                    didMutateDisplay = true
+                }
+                remainingInput = UnsafeBufferPointer(
+                    start: ptr.advanced(by: consumed),
+                    count: count - consumed
+                )
+            } else {
+                remainingInput = input
             }
-            let count = rawPtr.count
 
-            lock.withWriteLock {
-                isBatchingScrollbackDuringPTYParse = true
-                defer {
-                    if !pendingScrollbackRows.isEmpty {
-                        recyclePendingScrollbackRows()
-                    }
-                    isBatchingScrollbackDuringPTYParse = false
-                }
-                let input = UnsafeBufferPointer(start: ptr, count: count)
-                let remainingInput: UnsafeBufferPointer<UInt8>
-                if canUseDirectASCIIGroundFastPath(input) {
-                    let consumed = model.consumeGroundASCIIBytesFastPathPrefix(input)
-                    if consumed > 0 {
-                        didMutateDisplay = true
-                    }
-                    remainingInput = UnsafeBufferPointer(
-                        start: ptr.advanced(by: consumed),
-                        count: count - consumed
-                    )
-                } else {
-                    remainingInput = input
-                }
+            if !remainingInput.isEmpty {
+                ensureCodepointBufferCapacity(requiredCount: remainingInput.count)
+                let cpCount = textDecoder.decode(remainingInput, into: &codepointBuffer)
 
-                if !remainingInput.isEmpty {
-                    ensureCodepointBufferCapacity(requiredCount: remainingInput.count)
-                    let cpCount = textDecoder.decode(remainingInput, into: &codepointBuffer)
-
-                    // Feed codepoints to VT parser (which updates the model)
-                    if cpCount > 0 {
-                        codepointBuffer.withUnsafeBufferPointer { buffer in
-                            let decoded = UnsafeBufferPointer(start: buffer.baseAddress, count: cpCount)
-                            if parser.state == VT_STATE_GROUND {
-                                let consumed = model.consumeGroundFastPathPrefix(decoded)
-                                if consumed < cpCount {
-                                    vt_parser_feed(&parser, buffer.baseAddress!.advanced(by: consumed), cpCount - consumed)
-                                }
-                            } else {
-                                vt_parser_feed(&parser, codepointBuffer, cpCount)
+                // Feed codepoints to VT parser (which updates the model)
+                if cpCount > 0 {
+                    codepointBuffer.withUnsafeBufferPointer { buffer in
+                        let decoded = UnsafeBufferPointer(start: buffer.baseAddress, count: cpCount)
+                        if parser.state == VT_STATE_GROUND {
+                            let consumed = model.consumeGroundFastPathPrefix(decoded)
+                            if consumed < cpCount {
+                                vt_parser_feed(&parser, buffer.baseAddress!.advanced(by: consumed), cpCount - consumed)
                             }
+                        } else {
+                            vt_parser_feed(&parser, codepointBuffer, cpCount)
                         }
-                        didMutateDisplay = true
                     }
+                    didMutateDisplay = true
                 }
+            }
 
-                if parserRequestedScrollbackClear {
-                    if suppressScrollbackClear ||
-                       (scrollbackPersistenceEnabled && isShuttingDown) {
-                        parserRequestedScrollbackClear = false
-                    } else {
-                        recyclePendingScrollbackRows()
-                        scrollback.clear()
-                        scrollOffset = 0
-                        parserRequestedScrollbackClear = false
-                        clearedScrollback = true
-                        didMutateDisplay = true
-                    }
-                }
-
-                if !pendingScrollbackRows.isEmpty {
-                    scrollback.appendRows(pendingScrollbackRows)
-                    if scrollOffset > 0 {
-                        scrollOffset += pendingScrollbackRows.count
-                    }
-                    recyclePendingScrollbackRows()
+            if parserRequestedScrollbackClear {
+                if suppressScrollbackClear ||
+                   (scrollbackPersistenceEnabled && isShuttingDown) {
+                    parserRequestedScrollbackClear = false
+                } else {
+                    scrollback.clear()
+                    scrollOffset = 0
+                    parserRequestedScrollbackClear = false
+                    clearedScrollback = true
+                    didMutateDisplay = true
                 }
             }
         }
@@ -707,16 +697,6 @@ final class TerminalController {
         }
 
         return true
-    }
-
-    private func recyclePendingScrollbackRows() {
-        guard !pendingScrollbackRows.isEmpty else { return }
-        pendingScrollbackRowBufferPool.reserveCapacity(
-            pendingScrollbackRowBufferPool.count + pendingScrollbackRows.count
-        )
-        while let row = pendingScrollbackRows.popLast() {
-            pendingScrollbackRowBufferPool.append(row.cells)
-        }
     }
 
     // MARK: - Resize
@@ -1214,30 +1194,41 @@ final class TerminalController {
     }
 
     private func scheduleScrollbackCompaction() {
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.performIdleScrollbackCompaction()
+        let timer = scrollbackCompactionLock.withLock { () -> DispatchSourceTimer in
+            if let pendingScrollbackCompaction {
+                return pendingScrollbackCompaction
+            }
+            let timer = DispatchSource.makeTimerSource(queue: Self.scrollbackCompactionQueue)
+            timer.setEventHandler { [weak self] in
+                _ = self?.performIdleScrollbackCompaction()
+            }
+            pendingScrollbackCompaction = timer
+            timer.resume()
+            return timer
         }
-
-        scrollbackCompactionLock.withLock {
-            pendingScrollbackCompaction?.cancel()
-            pendingScrollbackCompaction = workItem
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
+        timer.schedule(
+            deadline: .now() + Self.scrollbackCompactionDelay,
+            leeway: .milliseconds(50)
+        )
     }
 
     private func cancelPendingScrollbackCompaction() {
-        scrollbackCompactionLock.withLock {
-            pendingScrollbackCompaction?.cancel()
+        let timer = scrollbackCompactionLock.withLock { pendingScrollbackCompaction }
+        timer?.schedule(deadline: .distantFuture)
+    }
+
+    private func invalidateScrollbackCompactionTimer() {
+        let timer = scrollbackCompactionLock.withLock { () -> DispatchSourceTimer? in
+            let timer = pendingScrollbackCompaction
             pendingScrollbackCompaction = nil
+            return timer
         }
+        timer?.setEventHandler {}
+        timer?.cancel()
     }
 
     @discardableResult
     private func performIdleScrollbackCompaction() -> Bool {
-        scrollbackCompactionLock.withLock {
-            pendingScrollbackCompaction = nil
-        }
         return lock.withWriteLock {
             let didCompact = scrollback.compactIfUnderutilized()
             shrinkIdleCodepointBufferIfNeeded()

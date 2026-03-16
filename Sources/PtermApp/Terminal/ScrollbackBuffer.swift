@@ -27,11 +27,13 @@ final class ScrollbackBuffer {
 
     struct BufferedRow {
         let cells: [Cell]
+        let cellCount: Int
         let isWrapped: Bool
         let encodingHint: RowEncodingHint
 
-        init(cells: [Cell], isWrapped: Bool, encodingHint: RowEncodingHint = .unknown) {
+        init(cells: [Cell], cellCount: Int? = nil, isWrapped: Bool, encodingHint: RowEncodingHint = .unknown) {
             self.cells = cells
+            self.cellCount = cellCount ?? cells.count
             self.isWrapped = isWrapped
             self.encodingHint = encodingHint
         }
@@ -168,9 +170,16 @@ final class ScrollbackBuffer {
 
     /// Append a row of cells to the scrollback buffer.
     func appendRow(_ cells: ArraySlice<Cell>, isWrapped: Bool, encodingHint: RowEncodingHint = .unknown) {
+        appendRow(cells, cellCount: cells.count, isWrapped: isWrapped, encodingHint: encodingHint)
+    }
+
+    /// Append a row slice without forcing callers to materialize or trim into a new Array.
+    func appendRow(_ cells: ArraySlice<Cell>,
+                   cellCount: Int,
+                   isWrapped: Bool,
+                   encodingHint: RowEncodingHint = .unknown) {
         guard let rb = ringBuffer else { return }
 
-        let cellCount = cells.count
         let encodingPlan = Self.encodingPlan(for: cells, cellCount: cellCount, hint: encodingHint)
         let byteCount = Self.serializedByteCount(for: encodingPlan, cellCount: cellCount)
 
@@ -192,9 +201,8 @@ final class ScrollbackBuffer {
         serializedRowsScratch.removeAll(keepingCapacity: true)
         var totalByteCount = 0
         for row in rows {
-            let slice = ArraySlice(row.cells)
-            let cellCount = row.cells.count
-            let plan = Self.encodingPlan(for: slice, cellCount: cellCount, hint: row.encodingHint)
+            let cellCount = row.cellCount
+            let plan = Self.encodingPlan(for: row.cells, cellCount: cellCount, hint: row.encodingHint)
             let byteCount = Self.serializedByteCount(for: plan, cellCount: cellCount)
             serializedRowsScratch.append(
                 SerializedRowScratch(
@@ -220,7 +228,7 @@ final class ScrollbackBuffer {
             rowOffsetsScratch[index] = UInt32(runningOffset)
             rowLengthsScratch[index] = UInt32(serialized.byteCount)
             rowContinuationsScratch[index] = serialized.isWrapped
-            Self.serializeRow(ArraySlice(row.cells),
+            Self.serializeRow(row.cells,
                               cellCount: serialized.cellCount,
                               using: serialized.plan,
                               into: buf + runningOffset)
@@ -450,7 +458,30 @@ final class ScrollbackBuffer {
         }
     }
 
+    private static func encodingPlan(for cells: [Cell],
+                                     cellCount: Int,
+                                     hint: RowEncodingHint = .unknown) -> RowEncodingPlan {
+        cells.withUnsafeBufferPointer { buffer in
+            encodingPlan(for: buffer, cellCount: cellCount, hint: hint)
+        }
+    }
+
     private static func encodingPlan(for cells: ArraySlice<Cell>,
+                                     cellCount: Int,
+                                     hint: RowEncodingHint = .unknown) -> RowEncodingPlan {
+        if let result = cells.withContiguousStorageIfAvailable({ storage in
+            encodingPlan(
+                for: UnsafeBufferPointer(start: storage.baseAddress, count: min(cellCount, storage.count)),
+                cellCount: cellCount,
+                hint: hint
+            )
+        }) {
+            return result
+        }
+        return encodingPlan(for: Array(cells), cellCount: cellCount, hint: hint)
+    }
+
+    private static func encodingPlan(for cells: UnsafeBufferPointer<Cell>,
                                      cellCount: Int,
                                      hint: RowEncodingHint = .unknown) -> RowEncodingPlan {
         switch hint.kind {
@@ -467,7 +498,7 @@ final class ScrollbackBuffer {
             break
         }
 
-        guard let first = cells.first else { return .full }
+        guard let first = cells.first else { return .compactDefault(serializedCount: 0) }
 
         let sharedAttributes = first.attributes
         var canUseCompactDefault = true
@@ -487,13 +518,14 @@ final class ScrollbackBuffer {
             }
         }
 
-        var compactDefaultSerializedCount = cells.count
-        var compactUniformSerializedCount = cells.count
+        var compactDefaultSerializedCount = cellCount
+        var compactUniformSerializedCount = cellCount
         if canUseCompactDefault || canUseCompactUniform {
             var sawCompactDefaultContent = false
             var sawCompactUniformContent = false
-            var index = cells.count - 1
-            for cell in cells.reversed() {
+            var index = cellCount - 1
+            for storageIndex in stride(from: cellCount - 1, through: 0, by: -1) {
+                let cell = cells[storageIndex]
                 if canUseCompactDefault {
                     if !sawCompactDefaultContent {
                         if isDefaultBlankCell(cell) {
@@ -554,7 +586,33 @@ final class ScrollbackBuffer {
         }
     }
 
+    private static func serializeRow(_ cells: [Cell],
+                                     cellCount: Int,
+                                     using encodingPlan: RowEncodingPlan,
+                                     into buf: UnsafeMutablePointer<UInt8>) {
+        cells.withUnsafeBufferPointer { buffer in
+            serializeRow(buffer, cellCount: cellCount, using: encodingPlan, into: buf)
+        }
+    }
+
     private static func serializeRow(_ cells: ArraySlice<Cell>,
+                                     cellCount: Int,
+                                     using encodingPlan: RowEncodingPlan,
+                                     into buf: UnsafeMutablePointer<UInt8>) {
+        if let _ = cells.withContiguousStorageIfAvailable({ storage in
+            serializeRow(
+                UnsafeBufferPointer(start: storage.baseAddress, count: min(cellCount, storage.count)),
+                cellCount: cellCount,
+                using: encodingPlan,
+                into: buf
+            )
+        }) {
+            return
+        }
+        serializeRow(Array(cells), cellCount: cellCount, using: encodingPlan, into: buf)
+    }
+
+    private static func serializeRow(_ cells: UnsafeBufferPointer<Cell>,
                                      cellCount: Int,
                                      using encodingPlan: RowEncodingPlan,
                                      into buf: UnsafeMutablePointer<UInt8>) {
@@ -566,8 +624,9 @@ final class ScrollbackBuffer {
             if trimmed {
                 serializeUInt16(UInt16(cellCount), to: buf + 1)
             }
-            for cell in cells.prefix(serializedCount) {
-                serializeCompactDefaultCell(cell, to: buf + offset)
+            precondition(cells.count >= serializedCount, "Compact default row missing serialized cells")
+            for index in 0..<serializedCount {
+                serializeCompactDefaultCell(cells[index], to: buf + offset)
                 offset += MemoryLayout<UInt32>.size
             }
         case .compactUniformAttributes(let sharedAttributes, let serializedCount):
@@ -580,14 +639,16 @@ final class ScrollbackBuffer {
             if trimmed {
                 serializeUInt16(UInt16(cellCount), to: buf + 10)
             }
-            for cell in cells.prefix(serializedCount) {
-                serializeCompactUniformAttributeCell(cell, to: buf + offset)
+            precondition(cells.count >= serializedCount, "Uniform row missing serialized cells")
+            for index in 0..<serializedCount {
+                serializeCompactUniformAttributeCell(cells[index], to: buf + offset)
                 offset += uniformAttributesBytesPerCell
             }
         case .full:
+            precondition(cells.count == cellCount, "Full row serialization requires all cells")
             var offset = 0
-            for cell in cells {
-                serializeCell(cell, to: buf + offset)
+            for index in 0..<cellCount {
+                serializeCell(cells[index], to: buf + offset)
                 offset += bytesPerCell
             }
         }

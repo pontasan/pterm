@@ -65,16 +65,17 @@ final class PTY {
     /// Signals that the child process has fully exited and been reaped.
     private let exitSemaphore = DispatchSemaphore(value: 0)
 
-    /// Reusable read buffer to avoid allocating and value-copying an Array on every PTY event.
+    /// Reusable read buffer to avoid allocating on every PTY event.
+    /// The same storage also backs aggregated output batches, so the hot read
+    /// path can stay on raw bytes until a caller explicitly needs `Data`.
     private var readBuffer: UnsafeMutablePointer<UInt8>?
     private var readBufferCapacity = 0
     private let readBufferLock = NSLock()
-    /// Reuse the aggregation buffer across read callbacks so high-volume PTY output
-    /// does not repeatedly allocate and free Data storage for each dispatch event.
     private var aggregatedReadData = Data()
 
     /// Callback invoked when data is available from the PTY
     var onOutput: ((Data) -> Void)?
+    var onOutputBytes: ((UnsafeBufferPointer<UInt8>) -> Void)?
 
     /// Callback invoked when the child process exits
     var onExit: (() -> Void)?
@@ -385,14 +386,21 @@ final class PTY {
 
         guard fd >= 0 else { return }
 
-        let (buffer, bufferCapacity) = preparedReadBuffer()
-        aggregatedReadData.removeAll(keepingCapacity: true)
-        aggregatedReadData.reserveCapacity(ReadBufferPolicy.preferredCapacity)
+        let bufferCapacity = preparedReadBufferCapacity()
+        guard let aggregatedReadBuffer = preparedReadBufferPointer() else {
+            fatalError("Failed to allocate PTY read buffer")
+        }
+        var aggregatedCount = 0
 
-        while aggregatedReadData.count < ReadBufferPolicy.maximumBatchBytes {
-            let bytesRead = read(fd, buffer, bufferCapacity)
+        while aggregatedCount < ReadBufferPolicy.maximumBatchBytes {
+            let remainingCapacity = min(
+                bufferCapacity,
+                ReadBufferPolicy.maximumBatchBytes - aggregatedCount
+            )
+            let destination = aggregatedReadBuffer.advanced(by: aggregatedCount)
+            let bytesRead = read(fd, destination, remainingCapacity)
             if bytesRead > 0 {
-                aggregatedReadData.append(buffer, count: bytesRead)
+                aggregatedCount += bytesRead
                 continue
             }
 
@@ -401,9 +409,8 @@ final class PTY {
                 _isRunning = false
                 fdLock.unlock()
                 releaseReadBuffer()
-                if !aggregatedReadData.isEmpty {
-                    onOutput?(aggregatedReadData)
-                    shrinkIdleReadBufferIfNeeded()
+                if aggregatedCount > 0 {
+                    emitOutput(buffer: aggregatedReadBuffer, count: aggregatedCount)
                 }
                 markReadChannelClosedAndNotifyIfReady()
                 return
@@ -415,20 +422,23 @@ final class PTY {
             break
         }
 
-        if !aggregatedReadData.isEmpty {
-            onOutput?(aggregatedReadData)
-            shrinkIdleReadBufferIfNeeded()
+        if aggregatedCount > 0 {
+            emitOutput(buffer: aggregatedReadBuffer, count: aggregatedCount)
         }
     }
 
-    private func preparedReadBuffer() -> (UnsafeMutablePointer<UInt8>, Int) {
+    private func preparedReadBufferPointer() -> UnsafeMutablePointer<UInt8>? {
         readBufferLock.lock()
         defer { readBufferLock.unlock() }
-        ensureReadBufferCapacityLocked(ReadBufferPolicy.preferredCapacity)
-        guard let readBuffer else {
-            fatalError("Failed to allocate PTY read buffer")
-        }
-        return (readBuffer, readBufferCapacity)
+        ensureReadBufferCapacityLocked(ReadBufferPolicy.maximumBatchBytes)
+        return readBuffer
+    }
+
+    private func preparedReadBufferCapacity() -> Int {
+        readBufferLock.lock()
+        defer { readBufferLock.unlock() }
+        ensureReadBufferCapacityLocked(ReadBufferPolicy.maximumBatchBytes)
+        return readBufferCapacity
     }
 
     private func shrinkIdleReadBufferIfNeeded() {
@@ -460,6 +470,17 @@ final class PTY {
         readBuffer.deallocate()
         self.readBuffer = nil
         readBufferCapacity = 0
+    }
+
+    private func emitOutput(buffer: UnsafeMutablePointer<UInt8>, count: Int) {
+        let bytes = UnsafeBufferPointer(start: buffer, count: count)
+        if let onOutputBytes {
+            onOutputBytes(bytes)
+            return
+        }
+        aggregatedReadData.removeAll(keepingCapacity: true)
+        aggregatedReadData.append(buffer, count: count)
+        onOutput?(aggregatedReadData)
     }
 
     private func monitorChildExit() {

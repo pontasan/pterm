@@ -334,6 +334,89 @@ final class TextModelTests: XCTestCase {
         }
     }
 
+    func testTerminalGridScrollbackCellsOnlyCopySerializedPrefixForCompactDefaultRows() {
+        let grid = TerminalGrid(rows: 1, cols: 6)
+        let digits = Array("123".utf8)
+        digits.withUnsafeBufferPointer { bytes in
+            grid.writeSingleWidthASCIIBytes(
+                bytes.baseAddress!,
+                count: bytes.count,
+                attributes: .default,
+                atRow: 0,
+                startCol: 0
+            )
+        }
+
+        let hint = grid.rowEncodingHint(0)
+        let scrollbackCells = grid.scrollbackCells(0, encodingHint: hint)
+
+        XCTAssertEqual(scrollbackCells.map(\.codepoint), digits.map(UInt32.init))
+        switch hint.kind {
+        case .compactDefault(let serializedCount):
+            XCTAssertEqual(serializedCount, 3)
+        default:
+            XCTFail("expected compact default hint")
+        }
+    }
+
+    func testTerminalGridSparseDefaultASCIIRowBehavesLikeBlankTailUntilMaterialized() {
+        let grid = TerminalGrid(rows: 1, cols: 8)
+        let digits = Array("123".utf8)
+        digits.withUnsafeBufferPointer { bytes in
+            grid.writeSingleWidthDefaultASCIIBytesWithoutSpaces(
+                bytes.baseAddress!,
+                count: bytes.count,
+                atRow: 0,
+                startCol: 0
+            )
+        }
+
+        XCTAssertEqual(grid.rowCells(0).map(\.codepoint), digits.map(UInt32.init))
+        XCTAssertEqual(grid.cell(at: 0, col: 0).codepoint, UInt32(Character("1").asciiValue!))
+        XCTAssertEqual(grid.cell(at: 0, col: 3).codepoint, Cell.empty.codepoint)
+        XCTAssertEqual(grid.cell(at: 0, col: 7).codepoint, Cell.empty.codepoint)
+
+        grid.setCell(
+            Cell(codepoint: UInt32(Character("Z").asciiValue!), attributes: .default, width: 1, isWideContinuation: false),
+            at: 0,
+            col: 5
+        )
+
+        XCTAssertEqual(grid.cell(at: 0, col: 0).codepoint, UInt32(Character("1").asciiValue!))
+        XCTAssertEqual(grid.cell(at: 0, col: 3).codepoint, Cell.empty.codepoint)
+        XCTAssertEqual(grid.cell(at: 0, col: 5).codepoint, UInt32(Character("Z").asciiValue!))
+        XCTAssertEqual(grid.rowCells(0).count, 8)
+    }
+
+    func testTerminalGridSparseDefaultASCIIRowCanExtendWithoutMaterializingBlankTail() {
+        let grid = TerminalGrid(rows: 1, cols: 8)
+        Array("123".utf8).withUnsafeBufferPointer { bytes in
+            grid.writeSingleWidthDefaultASCIIBytesWithoutSpaces(
+                bytes.baseAddress!,
+                count: bytes.count,
+                atRow: 0,
+                startCol: 0
+            )
+        }
+        Array("45".utf8).withUnsafeBufferPointer { bytes in
+            grid.writeSingleWidthDefaultASCIIBytesWithoutSpaces(
+                bytes.baseAddress!,
+                count: bytes.count,
+                atRow: 0,
+                startCol: 3
+            )
+        }
+
+        switch grid.rowEncodingHint(0).kind {
+        case .compactDefault(let serializedCount):
+            XCTAssertEqual(serializedCount, 5)
+        default:
+            XCTFail("expected compact default hint after sparse append")
+        }
+        XCTAssertEqual(grid.rowCells(0).map(\.codepoint), Array("12345".utf8).map(UInt32.init))
+        XCTAssertEqual(grid.cell(at: 0, col: 6).codepoint, Cell.empty.codepoint)
+    }
+
     func testTerminalGridOutOfBoundsAccessIsSafe() {
         let grid = TerminalGrid(rows: 2, cols: 2)
         XCTAssertEqual(grid.cell(at: -1, col: 0).codepoint, 0x20)
