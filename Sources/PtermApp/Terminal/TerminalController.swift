@@ -165,9 +165,14 @@ final class TerminalController {
     private var outputActivitySuppressedUntilUptime: TimeInterval = 0
     private let scrollbackCompactionLock = NSLock()
     private var pendingScrollbackCompaction: DispatchSourceTimer?
+    private var scrollbackCompactionArmed = false
+    private var lastScrollbackActivityUptime: TimeInterval = 0
     private let ptyResizeLock = NSLock()
     private var pendingPTYResizeWorkItem: DispatchWorkItem?
     private var appliedPTYSize: (rows: Int, cols: Int)?
+    private var isBatchingParserScrollOut = false
+    private var pendingParserScrollOutRows: [ScrollbackBuffer.BufferedRow] = []
+    private var pendingParserScrollOffsetDelta = 0
 
     /// Decode buffer for UTF-8 -> codepoints.
     /// Starts empty and grows on demand so idle terminals do not pay a
@@ -352,16 +357,20 @@ final class TerminalController {
         }
 
         // Wire scrollback: when a line scrolls off the top, store it
-        model.onScrollOut = { [weak self] cells, cellCount, isWrapped, encodingHint in
+        model.onScrollOut = { [weak self] row in
             guard let self = self else { return }
-            self.scrollback.appendRow(cells,
-                                      cellCount: cellCount,
-                                      isWrapped: isWrapped,
-                                      encodingHint: encodingHint)
+            if self.isBatchingParserScrollOut {
+                self.pendingParserScrollOutRows.append(row)
+                if self.scrollOffset > 0 {
+                    self.pendingParserScrollOffsetDelta += 1
+                }
+            } else {
+                self.scrollback.appendRow(row)
 
-            // If user is scrolled back, increment offset to keep viewport stable
-            if self.scrollOffset > 0 {
-                self.scrollOffset += 1
+                // If user is scrolled back, increment offset to keep viewport stable
+                if self.scrollOffset > 0 {
+                    self.scrollOffset += 1
+                }
             }
         }
     }
@@ -398,6 +407,7 @@ final class TerminalController {
         cancelPendingScrollbackCompaction()
         lock.withWriteLock {
             isShuttingDown = true
+            scrollback.flushPendingRows()
             releaseScratchStorageNow()
         }
         pty.stop(waitForExit: waitForExit)
@@ -407,6 +417,7 @@ final class TerminalController {
     func initiateShutdown() {
         lock.withWriteLock {
             isShuttingDown = true
+            scrollback.flushPendingRows()
             releaseScratchStorageNow()
         }
         pty.initiateShutdown()
@@ -612,7 +623,6 @@ final class TerminalController {
 
     private func processPTYOutput(_ data: UnsafeBufferPointer<UInt8>, recordAudit: Bool) {
         guard !data.isEmpty else { return }
-        cancelPendingScrollbackCompaction()
         if recordAudit {
             auditLogger?.recordOutput(Data(bytes: data.baseAddress!, count: data.count))
         }
@@ -622,6 +632,8 @@ final class TerminalController {
         let count = data.count
 
         lock.withWriteLock {
+            beginParserScrollOutBatch()
+            defer { endParserScrollOutBatch() }
             let input = UnsafeBufferPointer(start: ptr, count: count)
             let remainingInput: UnsafeBufferPointer<UInt8>
             if canUseDirectASCIIGroundFastPath(input) {
@@ -663,6 +675,7 @@ final class TerminalController {
                    (scrollbackPersistenceEnabled && isShuttingDown) {
                     parserRequestedScrollbackClear = false
                 } else {
+                    discardPendingParserScrollOutBatch()
                     scrollback.clear()
                     scrollOffset = 0
                     parserRequestedScrollbackClear = false
@@ -670,6 +683,8 @@ final class TerminalController {
                     didMutateDisplay = true
                 }
             }
+
+            flushPendingParserScrollOutBatch()
         }
 
         guard didMutateDisplay || clearedScrollback else { return }
@@ -697,6 +712,34 @@ final class TerminalController {
         }
 
         return true
+    }
+
+    private func beginParserScrollOutBatch() {
+        precondition(!isBatchingParserScrollOut, "Parser scroll-out batching must not be nested")
+        isBatchingParserScrollOut = true
+        pendingParserScrollOutRows.removeAll(keepingCapacity: true)
+        pendingParserScrollOffsetDelta = 0
+    }
+
+    private func endParserScrollOutBatch() {
+        isBatchingParserScrollOut = false
+        pendingParserScrollOutRows.removeAll(keepingCapacity: true)
+        pendingParserScrollOffsetDelta = 0
+    }
+
+    private func discardPendingParserScrollOutBatch() {
+        pendingParserScrollOutRows.removeAll(keepingCapacity: true)
+        pendingParserScrollOffsetDelta = 0
+    }
+
+    private func flushPendingParserScrollOutBatch() {
+        guard !pendingParserScrollOutRows.isEmpty else { return }
+        scrollback.appendRows(pendingParserScrollOutRows)
+        if scrollOffset > 0 {
+            scrollOffset += pendingParserScrollOffsetDelta
+        }
+        pendingParserScrollOutRows.removeAll(keepingCapacity: true)
+        pendingParserScrollOffsetDelta = 0
     }
 
     // MARK: - Resize
@@ -923,10 +966,8 @@ final class TerminalController {
                         cells = textExtractionGridRowBuffer
                     }
 
-                    Self.appendCells(in: cells, from: 0, through: max(model.cols - 1, 0), to: &result)
-
+                    let maxColumn = max(model.cols - 1, 0)
                     if absoluteRow < totalRows - 1 {
-                        Self.trimTrailingSpaces(from: &result)
                         let nextIsWrapped: Bool
                         if absoluteRow + 1 < scrollback.rowCount {
                             nextIsWrapped = scrollback.isRowWrapped(at: absoluteRow + 1)
@@ -936,9 +977,14 @@ final class TerminalController {
                         } else {
                             nextIsWrapped = false
                         }
+                        if let textEndColumn = Self.lastNonSpaceColumn(in: cells, through: maxColumn) {
+                            Self.appendCells(in: cells, from: 0, through: textEndColumn, to: &result)
+                        }
                         if !nextIsWrapped {
                             result.append("\n")
                         }
+                    } else {
+                        Self.appendCells(in: cells, from: 0, through: maxColumn, to: &result)
                     }
                 }
 
@@ -1120,12 +1166,18 @@ final class TerminalController {
         stateChange: Bool = false
     ) {
         let shouldSchedule = callbackLock.withLock {
+            let wantsNeedsDisplay = needsDisplay && onNeedsDisplay != nil
+            let wantsOutputActivity = outputActivity && onOutputActivity != nil
+            let wantsStateChange = stateChange && onStateChange != nil
             if needsDisplay {
                 renderContentVersion &+= 1
-                pendingNeedsDisplay = true
             }
-            pendingOutputActivity = pendingOutputActivity || outputActivity
-            pendingStateChange = pendingStateChange || stateChange
+            guard wantsNeedsDisplay || wantsOutputActivity || wantsStateChange else {
+                return false
+            }
+            pendingNeedsDisplay = pendingNeedsDisplay || wantsNeedsDisplay
+            pendingOutputActivity = pendingOutputActivity || wantsOutputActivity
+            pendingStateChange = pendingStateChange || wantsStateChange
             if mainCallbacksScheduled {
                 return false
             }
@@ -1194,26 +1246,38 @@ final class TerminalController {
     }
 
     private func scheduleScrollbackCompaction() {
-        let timer = scrollbackCompactionLock.withLock { () -> DispatchSourceTimer in
+        let now = ProcessInfo.processInfo.systemUptime
+        let timerToSchedule = scrollbackCompactionLock.withLock { () -> DispatchSourceTimer? in
+            lastScrollbackActivityUptime = now
+            let timer: DispatchSourceTimer
             if let pendingScrollbackCompaction {
-                return pendingScrollbackCompaction
+                timer = pendingScrollbackCompaction
+            } else {
+                let created = DispatchSource.makeTimerSource(queue: Self.scrollbackCompactionQueue)
+                created.setEventHandler { [weak self] in
+                    self?.handleScrollbackCompactionTimerFired()
+                }
+                pendingScrollbackCompaction = created
+                created.resume()
+                timer = created
             }
-            let timer = DispatchSource.makeTimerSource(queue: Self.scrollbackCompactionQueue)
-            timer.setEventHandler { [weak self] in
-                _ = self?.performIdleScrollbackCompaction()
+            guard !scrollbackCompactionArmed else {
+                return nil
             }
-            pendingScrollbackCompaction = timer
-            timer.resume()
+            scrollbackCompactionArmed = true
             return timer
         }
-        timer.schedule(
+        timerToSchedule?.schedule(
             deadline: .now() + Self.scrollbackCompactionDelay,
             leeway: .milliseconds(50)
         )
     }
 
     private func cancelPendingScrollbackCompaction() {
-        let timer = scrollbackCompactionLock.withLock { pendingScrollbackCompaction }
+        let timer = scrollbackCompactionLock.withLock { () -> DispatchSourceTimer? in
+            scrollbackCompactionArmed = false
+            return pendingScrollbackCompaction
+        }
         timer?.schedule(deadline: .distantFuture)
     }
 
@@ -1234,6 +1298,36 @@ final class TerminalController {
             shrinkIdleCodepointBufferIfNeeded()
             shrinkIdleExtractionScratchIfNeeded()
             return didCompact
+        }
+    }
+
+    private func handleScrollbackCompactionTimerFired() {
+        enum TimerAction {
+            case reschedule(TimeInterval, DispatchSourceTimer)
+            case compact
+            case none
+        }
+
+        let action = scrollbackCompactionLock.withLock { () -> TimerAction in
+            guard let timer = pendingScrollbackCompaction, scrollbackCompactionArmed else {
+                return .none
+            }
+            let elapsed = ProcessInfo.processInfo.systemUptime - lastScrollbackActivityUptime
+            let remaining = Self.scrollbackCompactionDelay - elapsed
+            if remaining > 0 {
+                return .reschedule(remaining, timer)
+            }
+            scrollbackCompactionArmed = false
+            return .compact
+        }
+
+        switch action {
+        case .reschedule(let delay, let timer):
+            timer.schedule(deadline: .now() + delay, leeway: .milliseconds(50))
+        case .compact:
+            _ = performIdleScrollbackCompaction()
+        case .none:
+            break
         }
     }
 
@@ -1396,6 +1490,20 @@ final class TerminalController {
             }
         }
         return result
+    }
+
+    private static func lastNonSpaceColumn(in row: [Cell], through end: Int) -> Int? {
+        guard !row.isEmpty, end >= 0 else { return nil }
+        var column = min(end, row.count - 1)
+        while column >= 0 {
+            let cell = row[column]
+            if cell.isWideContinuation || cell.codepoint == 0x20 {
+                column -= 1
+                continue
+            }
+            return column
+        }
+        return nil
     }
 
     private static func appendCells(in row: [Cell], from start: Int, through end: Int, to output: inout String) {

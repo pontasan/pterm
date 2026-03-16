@@ -54,7 +54,7 @@ final class TerminalModel {
     private var activeCharsetIsG1 = false
 
     /// Callback when a line scrolls off the top of the screen (for scrollback)
-    var onScrollOut: ((_ cells: ArraySlice<Cell>, _ cellCount: Int, _ isWrapped: Bool, _ encodingHint: ScrollbackBuffer.RowEncodingHint) -> Void)?
+    var onScrollOut: ((ScrollbackBuffer.BufferedRow) -> Void)?
 
     /// Callback when title changes
     var onTitleChange: ((String) -> Void)?
@@ -552,7 +552,6 @@ final class TerminalModel {
             // At bottom of scroll region: scroll up
             // Save the line being scrolled out
             let encodingHint = grid.rowEncodingHint(grid.scrollTop)
-            let scrolledRow = grid.rowCells(grid.scrollTop)
             let scrollbackCellCount: Int
             switch encodingHint.kind {
             case .compactDefault(let serializedCount):
@@ -563,7 +562,14 @@ final class TerminalModel {
                 scrollbackCellCount = grid.cols
             }
             let isWrapped = grid.isWrapped(grid.scrollTop)
-            onScrollOut?(scrolledRow, scrollbackCellCount, isWrapped, encodingHint)
+            onScrollOut?(
+                ScrollbackBuffer.BufferedRow(
+                    cells: grid.rowCells(grid.scrollTop),
+                    cellCount: scrollbackCellCount,
+                    isWrapped: isWrapped,
+                    encodingHint: encodingHint
+                )
+            )
             grid.scrollUp(count: 1)
         } else if cursor.row < rows - 1 {
             cursor.row += 1
@@ -1269,7 +1275,14 @@ final class TerminalModel {
 
         // Save trimmed rows to scrollback before they are lost
         for trimmed in result.trimmedRows {
-            onScrollOut?(ArraySlice(trimmed.cells), trimmed.cells.count, trimmed.isWrapped, .unknown)
+            onScrollOut?(
+                ScrollbackBuffer.BufferedRow(
+                    cells: trimmed.cells,
+                    cellCount: trimmed.cells.count,
+                    isWrapped: trimmed.isWrapped,
+                    encodingHint: .unknown
+                )
+            )
         }
 
         // Alternate grid doesn't need cursor-aware re-wrap

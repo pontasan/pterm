@@ -459,14 +459,12 @@ final class PTY {
         }
         releaseReadBufferLocked()
         let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
-        buffer.initialize(repeating: 0, count: capacity)
         readBuffer = buffer
         readBufferCapacity = capacity
     }
 
     private func releaseReadBufferLocked() {
         guard let readBuffer else { return }
-        readBuffer.deinitialize(count: readBufferCapacity)
         readBuffer.deallocate()
         self.readBuffer = nil
         readBufferCapacity = 0

@@ -877,6 +877,58 @@ final class TextModelTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(destination.capacity, 8)
     }
 
+    func testScrollbackBufferRecentRowsAreVisibleBeforeArchivedFlush() throws {
+        let buffer = ScrollbackBuffer(initialCapacity: 256, maxCapacity: 256)
+        let rowA: ArraySlice<Cell> = [
+            Cell(codepoint: 0x41, attributes: .default, width: 1, isWideContinuation: false)
+        ][0...0]
+        let rowB: ArraySlice<Cell> = [
+            Cell(codepoint: 0x42, attributes: .default, width: 1, isWideContinuation: false)
+        ][0...0]
+
+        buffer.appendRow(rowA, isWrapped: false)
+        buffer.appendRow(rowB, isWrapped: true)
+
+        XCTAssertEqual(buffer.rowCount, 2)
+        XCTAssertEqual(try XCTUnwrap(buffer.getRow(at: 0)).map(\.codepoint), [0x41])
+        XCTAssertEqual(try XCTUnwrap(buffer.getRow(at: 1)).map(\.codepoint), [0x42])
+        XCTAssertFalse(buffer.isRowWrapped(at: 0))
+        XCTAssertTrue(buffer.isRowWrapped(at: 1))
+
+        buffer.flushPendingRows()
+
+        XCTAssertEqual(buffer.rowCount, 2)
+        XCTAssertEqual(try XCTUnwrap(buffer.getRow(at: 0)).map(\.codepoint), [0x41])
+        XCTAssertEqual(try XCTUnwrap(buffer.getRow(at: 1)).map(\.codepoint), [0x42])
+        XCTAssertFalse(buffer.isRowWrapped(at: 0))
+        XCTAssertTrue(buffer.isRowWrapped(at: 1))
+    }
+
+    func testScrollbackBufferRecentCompactRowsDecodeBeforeArchivedFlush() throws {
+        let buffer = ScrollbackBuffer(initialCapacity: 256, maxCapacity: 256)
+        let row: ArraySlice<Cell> = [
+            Cell(codepoint: 0x31, attributes: .default, width: 1, isWideContinuation: false),
+            Cell(codepoint: 0x32, attributes: .default, width: 1, isWideContinuation: false),
+            .empty,
+            .empty
+        ][0...3]
+
+        buffer.appendRow(row, isWrapped: false)
+
+        XCTAssertEqual(buffer.rowCount, 1)
+        let restoredBeforeFlush = try XCTUnwrap(buffer.getRow(at: 0))
+        XCTAssertEqual(restoredBeforeFlush.count, 4)
+        XCTAssertEqual(restoredBeforeFlush[0].codepoint, 0x31)
+        XCTAssertEqual(restoredBeforeFlush[1].codepoint, 0x32)
+        XCTAssertEqual(restoredBeforeFlush[2].codepoint, Cell.empty.codepoint)
+        XCTAssertEqual(restoredBeforeFlush[3].codepoint, Cell.empty.codepoint)
+
+        buffer.flushPendingRows()
+
+        let restoredAfterFlush = try XCTUnwrap(buffer.getRow(at: 0))
+        XCTAssertEqual(restoredAfterFlush.map(\.codepoint), restoredBeforeFlush.map(\.codepoint))
+    }
+
     func testScrollbackBufferTrimmedCompactRowsFitMoreHistoryWithinSameCapacity() throws {
         let buffer = ScrollbackBuffer(initialCapacity: 64, maxCapacity: 64)
         let row: ArraySlice<Cell> = [
