@@ -10,9 +10,30 @@ import PtermCore
 /// Thread safety: Callers must manage external synchronization.
 /// In practice, the TerminalController lock covers all access.
 final class ScrollbackBuffer {
+    struct RowEncodingHint {
+        enum Kind {
+            case unknown
+            case compactDefault(serializedCount: Int)
+            case compactUniformAttributes(sharedAttributes: CellAttributes, serializedCount: Int)
+            case full
+        }
+
+        let kind: Kind
+
+        static let unknown = RowEncodingHint(kind: .unknown)
+        static let full = RowEncodingHint(kind: .full)
+    }
+
     struct BufferedRow {
         let cells: [Cell]
         let isWrapped: Bool
+        let encodingHint: RowEncodingHint
+
+        init(cells: [Cell], isWrapped: Bool, encodingHint: RowEncodingHint = .unknown) {
+            self.cells = cells
+            self.isWrapped = isWrapped
+            self.encodingHint = encodingHint
+        }
     }
 
     private enum RowEncodingPlan {
@@ -50,6 +71,11 @@ final class ScrollbackBuffer {
         return Int(ring_buffer_row_index_capacity(rb))
     }
 
+    var bytesUsed: Int {
+        guard let rb = ringBuffer else { return 0 }
+        return Int(ring_buffer_bytes_used(rb))
+    }
+
     var serializationBufferCapacity: Int {
         serializeBufCapacity
     }
@@ -77,11 +103,16 @@ final class ScrollbackBuffer {
     private static let uniformAttributesHeaderBytes = 10
     private static let uniformAttributesTrimmedHeaderBytes = 12
     private static let uniformAttributesBytesPerCell = 5
-    private static let targetBytesPerRowIndexEntry = 128
-    private static let rowIndexReserveSoftLimit = 4096
+    // Treat large heap-backed startup budgets as permission to pre-size row metadata so
+    // short-row workloads (like line-oriented logs or `seq`) do not immediately grow the
+    // row index. Small budgets keep the ring buffer's default row floor so metadata cannot
+    // starve data capacity, and mmap-backed buffers keep their persisted layout stable.
+    private static let eagerRowIndexReserveMinimumInitialCapacity = 1 * 1024 * 1024
+    private static let targetInitialBytesPerStoredRow = 64
+    private static let rowIndexReserveSoftLimit = 131_072
 
-    init(initialCapacity: Int = 64 * 1024 * 1024,
-         maxCapacity: Int = 64 * 1024 * 1024,
+    init(initialCapacity: Int,
+         maxCapacity: Int,
          persistentPath: String? = nil) {
         self.persistentPath = persistentPath
         self.unlinkOnDeinit = false
@@ -102,11 +133,13 @@ final class ScrollbackBuffer {
             self.ringBuffer = ringBuffer
         }
 
-        if let ringBuffer {
+        if let ringBuffer,
+           persistentPath == nil,
+           initialCapacity >= Self.eagerRowIndexReserveMinimumInitialCapacity {
             let estimatedRows = max(
                 Int(RING_BUFFER_MIN_ROWS),
                 min(
-                    maxCapacity / Self.targetBytesPerRowIndexEntry,
+                    initialCapacity / Self.targetInitialBytesPerStoredRow,
                     Self.rowIndexReserveSoftLimit
                 )
             )
@@ -133,11 +166,11 @@ final class ScrollbackBuffer {
     // MARK: - Row Operations
 
     /// Append a row of cells to the scrollback buffer.
-    func appendRow(_ cells: ArraySlice<Cell>, isWrapped: Bool) {
+    func appendRow(_ cells: ArraySlice<Cell>, isWrapped: Bool, encodingHint: RowEncodingHint = .unknown) {
         guard let rb = ringBuffer else { return }
 
         let cellCount = cells.count
-        let encodingPlan = Self.encodingPlan(for: cells)
+        let encodingPlan = Self.encodingPlan(for: cells, hint: encodingHint)
         let byteCount = Self.serializedByteCount(for: encodingPlan, cellCount: cellCount)
 
         // Ensure serialization buffer is large enough while bounding retained slack.
@@ -160,7 +193,7 @@ final class ScrollbackBuffer {
         for row in rows {
             let slice = ArraySlice(row.cells)
             let cellCount = row.cells.count
-            let plan = Self.encodingPlan(for: slice)
+            let plan = Self.encodingPlan(for: slice, hint: row.encodingHint)
             let byteCount = Self.serializedByteCount(for: plan, cellCount: cellCount)
             serializedRowsScratch.append(
                 SerializedRowScratch(
@@ -416,7 +449,21 @@ final class ScrollbackBuffer {
         }
     }
 
-    private static func encodingPlan(for cells: ArraySlice<Cell>) -> RowEncodingPlan {
+    private static func encodingPlan(for cells: ArraySlice<Cell>, hint: RowEncodingHint = .unknown) -> RowEncodingPlan {
+        switch hint.kind {
+        case .compactDefault(let serializedCount):
+            return .compactDefault(serializedCount: min(serializedCount, cells.count))
+        case .compactUniformAttributes(let sharedAttributes, let serializedCount):
+            return .compactUniformAttributes(
+                sharedAttributes: sharedAttributes,
+                serializedCount: min(serializedCount, cells.count)
+            )
+        case .full:
+            return .full
+        case .unknown:
+            break
+        }
+
         guard let first = cells.first else { return .full }
 
         let sharedAttributes = first.attributes

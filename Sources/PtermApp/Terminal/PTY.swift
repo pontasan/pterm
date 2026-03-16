@@ -65,8 +65,9 @@ final class PTY {
     /// Signals that the child process has fully exited and been reaped.
     private let exitSemaphore = DispatchSemaphore(value: 0)
 
-    /// Reusable read buffer to avoid allocating a fresh 16KB array on every PTY event.
-    private var readBuffer: [UInt8] = []
+    /// Reusable read buffer to avoid allocating and value-copying an Array on every PTY event.
+    private var readBuffer: UnsafeMutablePointer<UInt8>?
+    private var readBufferCapacity = 0
     private let readBufferLock = NSLock()
 
     /// Callback invoked when data is available from the PTY
@@ -74,6 +75,11 @@ final class PTY {
 
     /// Callback invoked when the child process exits
     var onExit: (() -> Void)?
+
+    private let exitStateLock = NSLock()
+    private var childExitObserved = false
+    private var readChannelClosed = false
+    private var exitNotified = false
 
     private var pendingHighPriorityWrites: [PendingWrite] = []
     private var pendingRegularWrites: [PendingWrite] = []
@@ -91,14 +97,14 @@ final class PTY {
     var debugReadBufferCapacity: Int {
         readBufferLock.lock()
         defer { readBufferLock.unlock() }
-        return readBuffer.count
+        return readBufferCapacity
     }
 
     func debugPrimeReadBufferCapacity(_ capacity: Int) {
         readBufferLock.lock()
         defer { readBufferLock.unlock() }
         let normalized = max(ReadBufferPolicy.minimumCapacity, capacity)
-        readBuffer = [UInt8](repeating: 0, count: normalized)
+        ensureReadBufferCapacityLocked(normalized)
     }
 
     func debugShrinkIdleReadBufferNow() {
@@ -163,6 +169,7 @@ final class PTY {
         fdLock.unlock()
 
         self.childPID = pid
+        resetExitState()
 
         // Set non-blocking mode
         let flags = fcntl(amaster, F_GETFL)
@@ -375,18 +382,16 @@ final class PTY {
 
         guard fd >= 0 else { return }
 
-        var buffer = preparedReadBuffer()
+        let (buffer, bufferCapacity) = preparedReadBuffer()
         var aggregatedData = Data()
         aggregatedData.reserveCapacity(ReadBufferPolicy.preferredCapacity)
 
         while aggregatedData.count < ReadBufferPolicy.maximumBatchBytes {
-            let bytesRead = read(fd, &buffer, buffer.count)
+            let bytesRead = read(fd, buffer, bufferCapacity)
             if bytesRead > 0 {
                 aggregatedData.append(buffer, count: bytesRead)
                 continue
             }
-
-            storeReadBuffer(buffer)
 
             if bytesRead == 0 || (bytesRead < 0 && errno != EAGAIN && errno != EINTR) {
                 fdLock.lock()
@@ -397,9 +402,7 @@ final class PTY {
                     onOutput?(aggregatedData)
                     shrinkIdleReadBufferIfNeeded()
                 }
-                DispatchQueue.main.async { [weak self] in
-                    self?.onExit?()
-                }
+                markReadChannelClosedAndNotifyIfReady()
                 return
             }
 
@@ -409,40 +412,51 @@ final class PTY {
             break
         }
 
-        storeReadBuffer(buffer)
-
         if !aggregatedData.isEmpty {
             onOutput?(aggregatedData)
             shrinkIdleReadBufferIfNeeded()
         }
     }
 
-    private func preparedReadBuffer() -> [UInt8] {
+    private func preparedReadBuffer() -> (UnsafeMutablePointer<UInt8>, Int) {
         readBufferLock.lock()
         defer { readBufferLock.unlock() }
-        if readBuffer.isEmpty {
-            readBuffer = [UInt8](repeating: 0, count: ReadBufferPolicy.preferredCapacity)
+        ensureReadBufferCapacityLocked(ReadBufferPolicy.preferredCapacity)
+        guard let readBuffer else {
+            fatalError("Failed to allocate PTY read buffer")
         }
-        return readBuffer
-    }
-
-    private func storeReadBuffer(_ buffer: [UInt8]) {
-        readBufferLock.lock()
-        readBuffer = buffer
-        readBufferLock.unlock()
+        return (readBuffer, readBufferCapacity)
     }
 
     private func shrinkIdleReadBufferIfNeeded() {
         readBufferLock.lock()
         defer { readBufferLock.unlock() }
-        guard !readBuffer.isEmpty else { return }
-        readBuffer.removeAll(keepingCapacity: false)
+        releaseReadBufferLocked()
     }
 
     private func releaseReadBuffer() {
         readBufferLock.lock()
-        readBuffer.removeAll(keepingCapacity: false)
+        releaseReadBufferLocked()
         readBufferLock.unlock()
+    }
+
+    private func ensureReadBufferCapacityLocked(_ capacity: Int) {
+        if readBufferCapacity == capacity, readBuffer != nil {
+            return
+        }
+        releaseReadBufferLocked()
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
+        buffer.initialize(repeating: 0, count: capacity)
+        readBuffer = buffer
+        readBufferCapacity = capacity
+    }
+
+    private func releaseReadBufferLocked() {
+        guard let readBuffer else { return }
+        readBuffer.deinitialize(count: readBufferCapacity)
+        readBuffer.deallocate()
+        self.readBuffer = nil
+        readBufferCapacity = 0
     }
 
     private func monitorChildExit() {
@@ -457,8 +471,50 @@ final class PTY {
             self.childPID = 0
             self.fdLock.unlock()
             self.exitSemaphore.signal()
-            DispatchQueue.main.async {
-                self.onExit?()
+            self.markChildExitObservedAndNotifyIfReady()
+        }
+    }
+
+    private func resetExitState() {
+        exitStateLock.lock()
+        childExitObserved = false
+        readChannelClosed = false
+        exitNotified = false
+        exitStateLock.unlock()
+    }
+
+    private func markReadChannelClosedAndNotifyIfReady() {
+        exitStateLock.lock()
+        readChannelClosed = true
+        let shouldNotify = childExitObserved && !exitNotified
+        if shouldNotify {
+            exitNotified = true
+        }
+        exitStateLock.unlock()
+
+        if shouldNotify {
+            DispatchQueue.main.async { [weak self] in
+                self?.onExit?()
+            }
+        }
+    }
+
+    private func markChildExitObservedAndNotifyIfReady() {
+        exitStateLock.lock()
+        childExitObserved = true
+        fdLock.lock()
+        let fdClosed = masterFD < 0
+        let readSourceGone = readSource == nil
+        fdLock.unlock()
+        let shouldNotify = (readChannelClosed || fdClosed || readSourceGone) && !exitNotified
+        if shouldNotify {
+            exitNotified = true
+        }
+        exitStateLock.unlock()
+
+        if shouldNotify {
+            DispatchQueue.main.async { [weak self] in
+                self?.onExit?()
             }
         }
     }

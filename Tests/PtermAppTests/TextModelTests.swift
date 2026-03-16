@@ -251,6 +251,89 @@ final class TextModelTests: XCTestCase {
         XCTAssertFalse(grid.isWrapped(0))
     }
 
+    func testTerminalGridRowEncodingHintTracksCompactDefaultRowsAndRecomputesAfterMutation() {
+        let grid = TerminalGrid(rows: 2, cols: 6)
+        let digits = Array("123".utf8)
+
+        digits.withUnsafeBufferPointer { bytes in
+            grid.writeSingleWidthASCIIBytes(
+                bytes.baseAddress!,
+                count: bytes.count,
+                attributes: .default,
+                atRow: 0,
+                startCol: 0
+            )
+        }
+
+        switch grid.rowEncodingHint(0).kind {
+        case .compactDefault(let serializedCount):
+            XCTAssertEqual(serializedCount, 3)
+        default:
+            XCTFail("expected compact default hint")
+        }
+
+        grid.setCell(
+            Cell(codepoint: 0x41, attributes: CellAttributes(
+                foreground: .indexed(2),
+                background: .default,
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+                inverse: false,
+                hidden: false,
+                dim: false,
+                blink: false
+            ), width: 1, isWideContinuation: false),
+            at: 0,
+            col: 5
+        )
+
+        switch grid.rowEncodingHint(0).kind {
+        case .unknown:
+            break
+        default:
+            XCTFail("expected unknown hint after non-default mutation")
+        }
+
+        grid.clearRow(0)
+        switch grid.rowEncodingHint(0).kind {
+        case .compactDefault(let serializedCount):
+            XCTAssertEqual(serializedCount, 0)
+        default:
+            XCTFail("expected blank compact default hint")
+        }
+    }
+
+    func testTerminalGridRowEncodingHintIsInvalidatedByResizeAndRecomputedFromContent() {
+        let grid = TerminalGrid(rows: 2, cols: 4)
+        let letters = Array("ABCD".utf8)
+        letters.withUnsafeBufferPointer { bytes in
+            grid.writeSingleWidthASCIIBytes(
+                bytes.baseAddress!,
+                count: bytes.count,
+                attributes: .default,
+                atRow: 0,
+                startCol: 0
+            )
+        }
+
+        _ = grid.resize(newRows: 3, newCols: 2, cursorRow: 0, cursorCol: 0)
+
+        switch grid.rowEncodingHint(0).kind {
+        case .compactDefault(let serializedCount):
+            XCTAssertEqual(serializedCount, 2)
+        default:
+            XCTFail("expected compact default hint after resize recomputation")
+        }
+        switch grid.rowEncodingHint(1).kind {
+        case .compactDefault(let serializedCount):
+            XCTAssertEqual(serializedCount, 2)
+        default:
+            XCTFail("expected compact default hint for wrapped continuation row")
+        }
+    }
+
     func testTerminalGridOutOfBoundsAccessIsSafe() {
         let grid = TerminalGrid(rows: 2, cols: 2)
         XCTAssertEqual(grid.cell(at: -1, col: 0).codepoint, 0x20)

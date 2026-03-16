@@ -194,12 +194,16 @@ final class PTYIntegrationTests: XCTestCase {
         wait(for: [exitExpectation], timeout: 8.0)
         drainMainQueue(testCase: self)
 
+        let text = controller.allText()
+        let lateMatches = controller.findMatches(for: "__ROW__79")
+        let earlyMatches = controller.findMatches(for: "__ROW__0")
+
         XCTAssertGreaterThan(outputActivityCount, 0)
         XCTAssertLessThan(controller.scrollback.rowCount, 80)
-        XCTAssertTrue(controller.findMatches(for: "__ROW__79").contains { $0.absoluteRow >= 0 })
-        XCTAssertTrue(controller.findMatches(for: "__ROW__0").isEmpty)
-        XCTAssertTrue(controller.allText().contains("__ROW__79"))
-        XCTAssertFalse(controller.allText().contains("__ROW__0"))
+        XCTAssertTrue(lateMatches.contains { $0.absoluteRow >= 0 })
+        XCTAssertTrue(earlyMatches.isEmpty)
+        XCTAssertTrue(text.contains("__ROW__79"))
+        XCTAssertFalse(text.contains("__ROW__0"))
     }
 
     @MainActor
@@ -233,6 +237,59 @@ final class PTYIntegrationTests: XCTestCase {
         let text = controller.allText()
         XCTAssertTrue(text.contains("100000"), "seq output tail should remain visible")
         XCTAssertTrue(text.contains("__PTERM_TIME__"), "shell timing output should be captured")
+    }
+
+    @MainActor
+    func testTerminalControllerRealPTYTimeSeq100000ScrollbackSizingProbe() throws {
+        let initialCapacity = 16 * 1024 * 1024
+        let controller = TerminalController(
+            rows: 24,
+            cols: 80,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: initialCapacity,
+            scrollbackMaxCapacity: initialCapacity,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        defer { controller.stop(waitForExit: true) }
+
+        let exitExpectation = expectation(description: "controller-exit-time-seq-100000-sizing-probe")
+        var exited = false
+        controller.onExit = {
+            guard !exited else { return }
+            exited = true
+            exitExpectation.fulfill()
+        }
+
+        try controller.start()
+        let initialRowIndexCapacity = controller.scrollback.rowIndexCapacity
+        let initialDataCapacity = controller.scrollback.capacity
+        controller.sendInput("TIMEFMT=$'__PTERM_TIME__ %U %S %P %E'; time seq 1 100000; exit\n")
+
+        wait(for: [exitExpectation], timeout: 30.0)
+        drainMainQueue(testCase: self)
+
+        let scrollback = controller.scrollback
+        let rowIndexBytes = scrollback.rowIndexCapacity * 12
+        print(
+            "SEQ100000_SCROLLBACK "
+                + "initial_capacity=\(initialCapacity) "
+                + "initial_data_capacity=\(initialDataCapacity) "
+                + "initial_row_index_capacity=\(initialRowIndexCapacity) "
+                + "data_capacity=\(scrollback.capacity) "
+                + "data_bytes_used=\(scrollback.bytesUsed) "
+                + "row_count=\(scrollback.rowCount) "
+                + "row_index_capacity=\(scrollback.rowIndexCapacity) "
+                + "row_index_bytes=\(rowIndexBytes) "
+                + "serialization_buffer_capacity=\(scrollback.serializationBufferCapacity)"
+        )
+
+        let text = controller.allText()
+        XCTAssertTrue(text.contains("100000"), "seq output tail should remain visible")
+        XCTAssertTrue(text.contains("__PTERM_TIME__"), "shell timing output should be captured")
+        XCTAssertEqual(scrollback.capacity, initialDataCapacity, "seq workload should not require data buffer growth")
+        XCTAssertEqual(scrollback.rowIndexCapacity, initialRowIndexCapacity, "seq workload should not require row-index growth")
     }
 
     @MainActor

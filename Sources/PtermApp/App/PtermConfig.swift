@@ -133,7 +133,7 @@ struct PtermConfig {
         fontSize: nil,
         terminalAppearance: .default,
         memoryMax: 64 * 1024 * 1024,
-        memoryInitial: 2 * 1024 * 1024,
+        memoryInitial: 4 * 1024 * 1024,
         sessionScrollBufferPersistence: false,
         audit: .disabled,
         security: .default,

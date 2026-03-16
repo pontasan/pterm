@@ -351,7 +351,7 @@ final class TerminalController {
         }
 
         // Wire scrollback: when a line scrolls off the top, store it
-        model.onScrollOut = { [weak self] cells, isWrapped in
+        model.onScrollOut = { [weak self] cells, isWrapped, encodingHint in
             guard let self = self else { return }
             if self.isBatchingScrollbackDuringPTYParse {
                 var reusableCells = self.pendingScrollbackRowBufferPool.popLast() ?? []
@@ -361,10 +361,14 @@ final class TerminalController {
                 }
                 reusableCells.append(contentsOf: cells)
                 self.pendingScrollbackRows.append(
-                    ScrollbackBuffer.BufferedRow(cells: reusableCells, isWrapped: isWrapped)
+                    ScrollbackBuffer.BufferedRow(
+                        cells: reusableCells,
+                        isWrapped: isWrapped,
+                        encodingHint: encodingHint
+                    )
                 )
             } else {
-                self.scrollback.appendRow(cells, isWrapped: isWrapped)
+                self.scrollback.appendRow(cells, isWrapped: isWrapped, encodingHint: encodingHint)
 
                 // If user is scrolled back, increment offset to keep viewport stable
                 if self.scrollOffset > 0 {

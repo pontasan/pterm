@@ -158,6 +158,40 @@ final class RingBufferTests: XCTestCase {
         XCTAssertEqual(ring_buffer_bytes_used(rb), size_t(ring_buffer_row_count(rb)))
     }
 
+    func testBatchAppendRowsGrowsRowIndexWithoutPerRowEviction() {
+        let rb = ring_buffer_create_sized(512, 512)
+        XCTAssertNotNil(rb)
+        defer { ring_buffer_destroy(rb) }
+
+        let rowCount = 96
+        let payload = Array(repeating: UInt8(ascii: "x"), count: rowCount)
+        let offsets = (0..<rowCount).map(UInt32.init)
+        let lengths = Array(repeating: UInt32(1), count: rowCount)
+        let continuations = Array(repeating: false, count: rowCount)
+
+        let result = payload.withUnsafeBufferPointer { payloadPointer in
+            offsets.withUnsafeBufferPointer { offsetsPointer in
+                lengths.withUnsafeBufferPointer { lengthsPointer in
+                    continuations.withUnsafeBufferPointer { continuationPointer in
+                        ring_buffer_append_rows(
+                            rb,
+                            payloadPointer.baseAddress,
+                            offsetsPointer.baseAddress,
+                            lengthsPointer.baseAddress,
+                            continuationPointer.baseAddress,
+                            UInt32(rowCount)
+                        )
+                    }
+                }
+            }
+        }
+
+        XCTAssertGreaterThanOrEqual(result, 0)
+        XCTAssertEqual(ring_buffer_row_count(rb), UInt32(rowCount))
+        XCTAssertGreaterThanOrEqual(ring_buffer_row_index_capacity(rb), UInt32(rowCount))
+        XCTAssertEqual(ring_buffer_bytes_used(rb), size_t(rowCount))
+    }
+
     func testInitialRowIndexCapacityStartsAtSoftLimitInsteadOfScalingWithInitialBytes() {
         let rb = ring_buffer_create_sized(2 * 1024 * 1024, 2 * 1024 * 1024)
         XCTAssertNotNil(rb)

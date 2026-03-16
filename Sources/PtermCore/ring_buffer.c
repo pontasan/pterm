@@ -253,6 +253,59 @@ static bool ring_buffer_append_row_internal(RingBuffer *rb,
                                             uint32_t length,
                                             bool continuation,
                                             bool *did_evict_out);
+static bool ring_buffer_resize_mmap(RingBuffer *rb,
+                                    size_t target_data_capacity,
+                                    uint32_t target_row_capacity);
+static bool ring_buffer_grow_if_needed(RingBuffer *rb, size_t needed_capacity);
+static bool ring_buffer_grow_rows_if_needed(RingBuffer *rb, uint32_t needed_rows);
+static bool ring_buffer_resize_heap_rows_only(RingBuffer *rb, uint32_t target_row_capacity);
+
+static bool ring_buffer_prepare_append_batch(RingBuffer *rb,
+                                             size_t total_length,
+                                             uint32_t additional_rows) {
+    if (!rb || additional_rows == 0) return false;
+
+    if (!(rb->flags & RING_FLAG_MMAP) && !rb->data) {
+        rb->data = calloc(1, rb->data_capacity);
+        if (!rb->data) {
+            return false;
+        }
+    }
+    if (!(rb->flags & RING_FLAG_MMAP) && !rb->rows) {
+        rb->rows = calloc(rb->row_capacity, sizeof(RingRowEntry));
+        if (!rb->rows) {
+            return false;
+        }
+    }
+
+    if ((rb->flags & RING_FLAG_MMAP) && (rb->data_capacity == 0 || rb->row_capacity == 0)) {
+        if (!ring_buffer_resize_mmap(rb, rb->initial_data_capacity, rb->initial_row_capacity)) {
+            return false;
+        }
+    }
+
+    if (total_length > rb->max_data_capacity) {
+        return false;
+    }
+
+    size_t required_capacity = rb->bytes_used + total_length;
+    if (required_capacity <= rb->max_data_capacity &&
+        required_capacity > rb->data_capacity &&
+        !ring_buffer_grow_if_needed(rb, required_capacity)) {
+        return false;
+    }
+
+    uint64_t needed_rows_u64 = (uint64_t)rb->row_count + (uint64_t)additional_rows;
+    uint32_t needed_rows = needed_rows_u64 > RING_BUFFER_MAX_ROWS
+        ? RING_BUFFER_MAX_ROWS
+        : (uint32_t)needed_rows_u64;
+    if (needed_rows > rb->row_capacity &&
+        !ring_buffer_grow_rows_if_needed(rb, needed_rows)) {
+        return false;
+    }
+
+    return true;
+}
 
 static void ring_buffer_release_copy_buf(RingBuffer *rb) {
     if (!rb) return;
@@ -348,6 +401,30 @@ static bool ring_buffer_resize_heap(RingBuffer *rb,
     rb->row_head = 0;
     rb->row_tail = row_count;
     ring_buffer_release_copy_buf(rb);
+    return true;
+}
+
+static bool ring_buffer_resize_heap_rows_only(RingBuffer *rb, uint32_t target_row_capacity) {
+    if (!rb || (rb->flags & RING_FLAG_MMAP)) return false;
+    if (target_row_capacity == 0 || target_row_capacity > RING_BUFFER_MAX_ROWS) return false;
+    if (target_row_capacity == rb->row_capacity) return false;
+    if (rb->row_count > target_row_capacity) return false;
+
+    RingRowEntry *new_rows = calloc(target_row_capacity, sizeof(RingRowEntry));
+    if (!new_rows) {
+        return false;
+    }
+
+    for (uint32_t row = 0; row < rb->row_count; row++) {
+        uint32_t actual_idx = (uint32_t)((rb->row_head + row) % rb->row_capacity);
+        new_rows[row] = rb->rows[actual_idx];
+    }
+
+    free(rb->rows);
+    rb->rows = new_rows;
+    rb->row_capacity = target_row_capacity;
+    rb->row_head = 0;
+    rb->row_tail = rb->row_count;
     return true;
 }
 
@@ -493,7 +570,7 @@ static bool ring_buffer_grow_rows_if_needed(RingBuffer *rb, uint32_t needed_rows
     if (rb->flags & RING_FLAG_MMAP) {
         return ring_buffer_resize_mmap(rb, rb->data_capacity, new_row_capacity);
     }
-    return ring_buffer_resize_heap(rb, rb->data_capacity, new_row_capacity);
+    return ring_buffer_resize_heap_rows_only(rb, new_row_capacity);
 }
 
 static bool ring_buffer_shrink_heap(RingBuffer *rb, size_t target_capacity) {
@@ -849,6 +926,14 @@ int64_t ring_buffer_append_rows(RingBuffer *rb,
                                 const bool *continuations,
                                 uint32_t row_count) {
     if (!rb || !data_blob || !row_offsets || !row_lengths || !continuations || row_count == 0) {
+        return -1;
+    }
+
+    size_t total_length = 0;
+    for (uint32_t i = 0; i < row_count; i++) {
+        total_length += (size_t)row_lengths[i];
+    }
+    if (!ring_buffer_prepare_append_batch(rb, total_length, row_count)) {
         return -1;
     }
 

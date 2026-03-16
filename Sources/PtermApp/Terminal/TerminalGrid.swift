@@ -5,6 +5,17 @@ import Foundation
 /// Each row has a `isWrapped` flag indicating whether it is a soft-wrapped
 /// continuation of the previous row (as opposed to a hard line break).
 final class TerminalGrid {
+    /// Row content hints are intentionally layout-independent.
+    /// Resize/reflow invalidates wrap/visible layout state, but "can this row be
+    /// serialized as compact default/uniform/full?" depends only on the row's cells.
+    /// We therefore track per-physical-row content hints here and either keep them
+    /// exact across simple mutations or mark them dirty for on-demand recomputation.
+    private enum RowEncodingHintState {
+        case blankDefault
+        case compactDefault(serializedCount: Int)
+        case dirty
+    }
+
     /// Number of rows
     private(set) var rows: Int
 
@@ -14,12 +25,16 @@ final class TerminalGrid {
     /// Cell storage: row-major order
     private var cells: [Cell]
     private var emptyRowTemplate: [Cell]
+    private var rowEncodingHintStates: [RowEncodingHintState]
 
     /// Logical row -> physical storage row mapping.
     /// Scroll operations rotate this indirection instead of physically
     /// copying every row's cells on each line feed.
     private var rowOrder: [Int]
     private var hasRowPermutation = false
+    /// Fast path for full-screen scroll: logical row 0 maps to rowOrder[rowOrderHead].
+    /// Partial region transforms first normalize this head back into rowOrder itself.
+    private var rowOrderHead = 0
 
     /// Per-row wrap flags packed into 64-bit words.
     private var lineWrappedWords: [UInt64]
@@ -41,6 +56,7 @@ final class TerminalGrid {
         self.scrollBottom = rows - 1
         self.cells = Array(repeating: Cell.empty, count: rows * cols)
         self.emptyRowTemplate = Array(repeating: Cell.empty, count: cols)
+        self.rowEncodingHintStates = Array(repeating: .blankDefault, count: rows)
         self.rowOrder = []
         self.lineWrappedWords = Array(repeating: 0, count: Self.wrapWordCount(for: rows))
     }
@@ -59,6 +75,7 @@ final class TerminalGrid {
     func setCell(_ cell: Cell, at row: Int, col: Int) {
         guard row >= 0, row < rows, col >= 0, col < cols else { return }
         cells[cellIndex(row: row, col: col)] = cell
+        markRowEncodingHintDirty(row)
     }
 
     /// Write a contiguous run of single-width cells into one row.
@@ -95,6 +112,13 @@ final class TerminalGrid {
                 width: 1,
                 isWideContinuation: false
             )
+            updateCompactDefaultHintIfPossible(
+                row: row,
+                startCol: startCol,
+                scalarProvider: { codepoints[$0] },
+                count: 1,
+                attributes: attributes
+            )
             return
         }
         for index in 0..<count {
@@ -105,6 +129,13 @@ final class TerminalGrid {
                 isWideContinuation: false
             )
         }
+        updateCompactDefaultHintIfPossible(
+            row: row,
+            startCol: startCol,
+            scalarProvider: { codepoints[$0] },
+            count: count,
+            attributes: attributes
+        )
     }
 
     func writeSingleWidthASCIIBytes(
@@ -123,6 +154,13 @@ final class TerminalGrid {
                 width: 1,
                 isWideContinuation: false
             )
+            updateCompactDefaultHintIfPossible(
+                row: row,
+                startCol: startCol,
+                scalarProvider: { UInt32(bytes[$0]) },
+                count: 1,
+                attributes: attributes
+            )
             return
         }
         for index in 0..<count {
@@ -133,6 +171,13 @@ final class TerminalGrid {
                 isWideContinuation: false
             )
         }
+        updateCompactDefaultHintIfPossible(
+            row: row,
+            startCol: startCol,
+            scalarProvider: { UInt32(bytes[$0]) },
+            count: count,
+            attributes: attributes
+        )
     }
 
 
@@ -167,6 +212,7 @@ final class TerminalGrid {
         for col in start..<end {
             cells[offset + col] = Cell.empty
         }
+        markRowEncodingHintDirty(row)
     }
 
     /// Clear entire row.
@@ -179,13 +225,16 @@ final class TerminalGrid {
             }
         }
         setWrapped(row, false)
+        setRowEncodingHintBlank(row)
     }
 
     /// Clear entire grid.
     func clearAll() {
         cells = Array(repeating: Cell.empty, count: rows * cols)
+        rowEncodingHintStates = Array(repeating: .blankDefault, count: rows)
         rowOrder.removeAll(keepingCapacity: true)
         hasRowPermutation = false
+        rowOrderHead = 0
         resetWrapStorage(for: rows)
     }
 
@@ -209,7 +258,10 @@ final class TerminalGrid {
         if count == 1 {
             ensureRowOrderMaterialized()
             if top == 0 && bottom == rows - 1 {
-                rowOrder.rotateLeftByOneInPlace()
+                rowOrderHead += 1
+                if rowOrderHead == rows {
+                    rowOrderHead = 0
+                }
             } else {
                 rotateRowOrder(in: top...bottom, leftBy: 1)
             }
@@ -389,6 +441,7 @@ final class TerminalGrid {
         self.cols = newCols
         self.cells = newCells
         self.emptyRowTemplate = Array(repeating: Cell.empty, count: newCols)
+        self.rowEncodingHintStates = Array(repeating: .dirty, count: newRows)
         self.rowOrder.removeAll(keepingCapacity: true)
         self.hasRowPermutation = false
         self.setWrappedFlags(newWrapped)
@@ -437,6 +490,7 @@ final class TerminalGrid {
 
         cells = logicalRows.flatMap { $0 }
         emptyRowTemplate = Array(repeating: Cell.empty, count: cols)
+        rowEncodingHintStates = Array(repeating: .dirty, count: newRows)
         rowOrder.removeAll(keepingCapacity: true)
         hasRowPermutation = false
         setWrappedFlags(wrappedFlags)
@@ -543,6 +597,21 @@ final class TerminalGrid {
         return cells[start..<(start + cols)]
     }
 
+    func rowEncodingHint(_ row: Int) -> ScrollbackBuffer.RowEncodingHint {
+        guard row >= 0, row < rows else { return .unknown }
+        let physicalRow = physicalRow(for: row)
+        switch rowEncodingHintStates[physicalRow] {
+        case .blankDefault:
+            return ScrollbackBuffer.RowEncodingHint(kind: .compactDefault(serializedCount: 0))
+        case .compactDefault(let serializedCount):
+            return ScrollbackBuffer.RowEncodingHint(kind: .compactDefault(serializedCount: serializedCount))
+        case .dirty:
+            let hint = recomputeRowEncodingHint(forPhysicalRow: physicalRow)
+            rowEncodingHintStates[physicalRow] = rowEncodingHintState(from: hint)
+            return hint
+        }
+    }
+
 
     /// Insert blank cells at column, shifting existing cells right.
     func insertBlanks(row: Int, col: Int, count: Int) {
@@ -559,6 +628,7 @@ final class TerminalGrid {
         for c in col..<min(col + shift, cols) {
             cells[offset + c] = Cell.empty
         }
+        markRowEncodingHintDirty(row)
     }
 
     /// Delete cells at column, shifting remaining cells left.
@@ -576,6 +646,7 @@ final class TerminalGrid {
         for c in (cols - shift)..<cols {
             cells[offset + c] = Cell.empty
         }
+        markRowEncodingHintDirty(row)
     }
 
     // MARK: - Wrap Storage
@@ -632,12 +703,17 @@ final class TerminalGrid {
     /// Return an immutable copy of the grid contents for diagnostics and benchmarks.
     func snapshot() -> TerminalGrid {
         let copy = TerminalGrid(rows: rows, cols: cols)
-        copy.cells = cells
+        // Force independent storage for snapshots so hot-path mutations on the live
+        // grid do not trigger whole-grid COW copies while a snapshot is still alive.
+        copy.cells = Array(cells)
+        copy.emptyRowTemplate = Array(emptyRowTemplate)
+        copy.rowEncodingHintStates = Array(rowEncodingHintStates)
         copy.hasRowPermutation = hasRowPermutation
         if hasRowPermutation {
-            copy.rowOrder = rowOrder
+            copy.rowOrder = Array(rowOrder)
+            copy.rowOrderHead = rowOrderHead
         }
-        copy.lineWrappedWords = lineWrappedWords
+        copy.lineWrappedWords = Array(lineWrappedWords)
         copy.scrollTop = scrollTop
         copy.scrollBottom = scrollBottom
         return copy
@@ -645,12 +721,94 @@ final class TerminalGrid {
 
     private func physicalRow(for logicalRow: Int) -> Int {
         guard hasRowPermutation else { return logicalRow }
-        return rowOrder[logicalRow]
+        return rowOrder[(rowOrderHead + logicalRow) % rows]
+    }
+
+    private func markRowEncodingHintDirty(_ logicalRow: Int) {
+        let physicalRow = physicalRow(for: logicalRow)
+        rowEncodingHintStates[physicalRow] = .dirty
+    }
+
+    private func setRowEncodingHintBlank(_ logicalRow: Int) {
+        let physicalRow = physicalRow(for: logicalRow)
+        rowEncodingHintStates[physicalRow] = .blankDefault
+    }
+
+    private func updateCompactDefaultHintIfPossible(
+        row: Int,
+        startCol: Int,
+        scalarProvider: (Int) -> UInt32,
+        count: Int,
+        attributes: CellAttributes
+    ) {
+        guard attributes == .default else {
+            markRowEncodingHintDirty(row)
+            return
+        }
+
+        let physicalRow = physicalRow(for: row)
+        let priorSerializedCount: Int
+        switch rowEncodingHintStates[physicalRow] {
+        case .blankDefault:
+            priorSerializedCount = 0
+        case .compactDefault(let serializedCount):
+            priorSerializedCount = serializedCount
+        case .dirty:
+            return
+        }
+
+        var lastNonBlankColumn = priorSerializedCount
+        for index in 0..<count {
+            let codepoint = scalarProvider(index)
+            if codepoint != Cell.empty.codepoint {
+                lastNonBlankColumn = max(lastNonBlankColumn, startCol + index + 1)
+            } else if startCol + index < priorSerializedCount {
+                rowEncodingHintStates[physicalRow] = .dirty
+                return
+            }
+        }
+        rowEncodingHintStates[physicalRow] = lastNonBlankColumn == 0
+            ? .blankDefault
+            : .compactDefault(serializedCount: lastNonBlankColumn)
+    }
+
+    private func recomputeRowEncodingHint(forPhysicalRow physicalRow: Int) -> ScrollbackBuffer.RowEncodingHint {
+        let start = physicalRow * cols
+        let end = start + cols
+        let rowSlice = cells[start..<end]
+        var serializedCount = rowSlice.count
+        for cell in rowSlice {
+            if cell.attributes != .default || cell.width != 1 || cell.isWideContinuation {
+                return .unknown
+            }
+        }
+        while serializedCount > 0 {
+            let cell = rowSlice[rowSlice.index(rowSlice.startIndex, offsetBy: serializedCount - 1)]
+            guard cell.codepoint == Cell.empty.codepoint else { break }
+            serializedCount -= 1
+        }
+        return ScrollbackBuffer.RowEncodingHint(kind: .compactDefault(serializedCount: serializedCount))
+    }
+
+    private func rowEncodingHintState(from hint: ScrollbackBuffer.RowEncodingHint) -> RowEncodingHintState {
+        switch hint.kind {
+        case .compactDefault(let serializedCount):
+            return serializedCount == 0 ? .blankDefault : .compactDefault(serializedCount: serializedCount)
+        case .compactUniformAttributes, .full, .unknown:
+            return .dirty
+        }
     }
 
     private func ensureRowOrderMaterialized() {
         guard !hasRowPermutation, rowOrder.isEmpty else { return }
         rowOrder = Array(0..<rows)
+        rowOrderHead = 0
+    }
+
+    private func normalizeRowOrderIfNeeded() {
+        guard hasRowPermutation, rowOrderHead != 0, !rowOrder.isEmpty else { return }
+        rowOrder.rotateLeft(by: rowOrderHead)
+        rowOrderHead = 0
     }
 
     private func rowBaseOffset(for row: Int) -> Int {
@@ -662,12 +820,14 @@ final class TerminalGrid {
     }
 
     private func rotateRowOrder(in range: ClosedRange<Int>, leftBy amount: Int) {
+        normalizeRowOrderIfNeeded()
         var segment = Array(rowOrder[range])
         segment.rotateLeft(by: amount)
         rowOrder.replaceSubrange(range, with: segment)
     }
 
     private func rotateRowOrder(in range: ClosedRange<Int>, rightBy amount: Int) {
+        normalizeRowOrderIfNeeded()
         var segment = Array(rowOrder[range])
         segment.rotateRight(by: amount)
         rowOrder.replaceSubrange(range, with: segment)

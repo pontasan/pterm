@@ -551,7 +551,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         addSpacing(12)
 
         let currentMax = intVal(configData["memory_max"]) ?? (64 * 1024 * 1024)
-        let currentInitial = intVal(configData["memory_initial"]) ?? (2 * 1024 * 1024)
+        let currentInitial = intVal(configData["memory_initial"]) ?? (4 * 1024 * 1024)
 
         let (maxRow, maxField) = makeTextFieldRow(label: "Max Scrollback (MB):",
                                                    value: "\(currentMax / (1024 * 1024))", width: width)
