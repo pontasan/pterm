@@ -1312,6 +1312,16 @@ final class MetalRenderer {
 
         for row in 0..<viewRows {
             let rowSnapshot = snapshot.visibleRows[row]
+            let lineAttribute = rowSnapshot.lineAttribute
+            let lineColumnWidth = lineAttribute.isDoubleWidth ? cellW * 2.0 : cellW
+            let lineHeightScale: Float = {
+                switch lineAttribute {
+                case .doubleHeightTop, .doubleHeightBottom:
+                    return 2.0
+                case .singleWidth, .doubleWidth:
+                    return 1.0
+                }
+            }()
             let rowMatches = bufferSet.terminalSearchMatchesScratch[row]
             var currentMatchIndex = 0
             let selectedColumnRange: ClosedRange<Int>? = {
@@ -1349,9 +1359,9 @@ final class MetalRenderer {
 
                 if cell.isWideContinuation { continue }
 
-                let x = padX + Float(col) * cellW
+                let x = padX + Float(col) * lineColumnWidth
                 let y = padY + Float(row) * cellH
-                let w = cellW * Float(max(1, cell.width))
+                let w = lineColumnWidth * Float(max(1, cell.width))
                 let h = cellH
 
                 var fgColor: (r: Float, g: Float, b: Float)
@@ -1371,7 +1381,8 @@ final class MetalRenderer {
                     }
                 }
 
-                if cell.attributes.inverse != isSelected {
+                let effectiveInverse = (cell.attributes.inverse != isSelected) != snapshot.reverseVideo
+                if effectiveInverse {
                     fgColor = resolveBackgroundColorAsForeground(cell.attributes.background)
                     bgColor = resolveForegroundColorAsBackground(cell.attributes.foreground)
                 } else {
@@ -1434,12 +1445,22 @@ final class MetalRenderer {
                     let glyphX = shouldSnapGlyphPosition ? Self.snapToPixel(rawGlyphX) : rawGlyphX
                     let glyphY = shouldSnapGlyphPosition ? Self.snapToPixel(rawGlyphY) : rawGlyphY
                     let glyphW = Float(glyph.pixelWidth)
-                    let glyphH = Float(glyph.pixelHeight)
+                    let glyphH = Float(glyph.pixelHeight) * lineHeightScale
+                    let (textureY, textureH): (Float, Float) = {
+                        switch lineAttribute {
+                        case .doubleHeightTop:
+                            return (glyph.textureY, glyph.textureH * 0.5)
+                        case .doubleHeightBottom:
+                            return (glyph.textureY + glyph.textureH * 0.5, glyph.textureH * 0.5)
+                        case .singleWidth, .doubleWidth:
+                            return (glyph.textureY, glyph.textureH)
+                        }
+                    }()
 
                     addQuad(to: &vd.glyphVertices,
                             x: glyphX, y: glyphY, w: glyphW, h: glyphH,
-                            tx: glyph.textureX, ty: glyph.textureY,
-                            tw: glyph.textureW, th: glyph.textureH,
+                            tx: glyph.textureX, ty: textureY,
+                            tw: glyph.textureW, th: textureH,
                             fg: (fgColor.r, fgColor.g, fgColor.b, 1),
                             bg: (0, 0, 0, 0))
 
@@ -1447,8 +1468,8 @@ final class MetalRenderer {
                         let boldOffset = max(1.0, ceil(scaleFactor * 0.5))
                         addQuad(to: &vd.glyphVertices,
                                 x: glyphX + boldOffset, y: glyphY, w: glyphW, h: glyphH,
-                                tx: glyph.textureX, ty: glyph.textureY,
-                                tw: glyph.textureW, th: glyph.textureH,
+                                tx: glyph.textureX, ty: textureY,
+                                tw: glyph.textureW, th: textureH,
                                 fg: (fgColor.r, fgColor.g, fgColor.b, 1),
                                 bg: (0, 0, 0, 0))
                     }
@@ -1485,18 +1506,20 @@ final class MetalRenderer {
             let cursorOverlay = transientTextOverlays.last { $0.cursorRow != nil && $0.cursorCol != nil }
             let cursorCol = cursorOverlay?.cursorCol.map { min(max($0, 0), max(viewCols - 1, 0)) } ?? snapshot.cursor.col
             let cursorRow = cursorOverlay?.cursorRow.map { min(max($0, 0), max(viewRows - 1, 0)) } ?? snapshot.cursor.row
-            let cx = padX + Float(cursorCol) * cellW
+            let cursorLineAttribute = snapshot.visibleRows[cursorRow].lineAttribute
+            let cursorColumnWidth = cursorLineAttribute.isDoubleWidth ? cellW * 2.0 : cellW
+            let cx = padX + Float(cursorCol) * cursorColumnWidth
             let cy = padY + Float(cursorRow) * cellH
             let cursorColor: (Float, Float, Float, Float) = (0.8, 0.8, 0.8, 1)
 
             switch snapshot.cursor.shape {
             case .block:
-                addQuad(to: &vd.cursorVertices, x: cx, y: cy, w: cellW, h: cellH,
+                addQuad(to: &vd.cursorVertices, x: cx, y: cy, w: cursorColumnWidth, h: cellH,
                         tx: 0, ty: 0, tw: 0, th: 0,
                         fg: cursorColor, bg: cursorColor)
             case .underline:
                 addQuad(to: &vd.cursorVertices, x: cx, y: cy + cellH - cursorThickness,
-                        w: cellW, h: cursorThickness,
+                        w: cursorColumnWidth, h: cursorThickness,
                         tx: 0, ty: 0, tw: 0, th: 0,
                         fg: cursorColor, bg: cursorColor)
             case .bar:

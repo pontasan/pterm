@@ -626,6 +626,16 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertFalse(harness.model.applicationCursorKeys)
     }
 
+    func testTerminalModelApplicationKeypadModeToggles() {
+        let harness = TerminalModelHarness()
+
+        harness.feed("\u{1B}=")
+        XCTAssertTrue(harness.model.applicationKeypadMode)
+
+        harness.feed("\u{1B}>")
+        XCTAssertFalse(harness.model.applicationKeypadMode)
+    }
+
     func testTerminalModelBracketedPasteModeToggles() {
         let harness = TerminalModelHarness()
 
@@ -1717,5 +1727,76 @@ final class TerminalModelRegressionTests: XCTestCase {
 
         XCTAssertNil(characterResize)
         XCTAssertNil(pixelResize)
+    }
+
+    func testTerminalModelDECLineAttributesTrackCurrentRow() {
+        let harness = TerminalModelHarness(rows: 3, cols: 8)
+
+        harness.feed("\u{1B}#6")
+        XCTAssertEqual(harness.model.grid.lineAttribute(at: 0), .doubleWidth)
+
+        harness.feed("\u{1B}E")
+        harness.feed("\u{1B}#3")
+        XCTAssertEqual(harness.model.grid.lineAttribute(at: 1), .doubleHeightTop)
+
+        harness.feed("\u{1B}E")
+        harness.feed("\u{1B}#4")
+        XCTAssertEqual(harness.model.grid.lineAttribute(at: 2), .doubleHeightBottom)
+
+        harness.feed("\u{1B}[1;1H")
+        harness.feed("\u{1B}#5")
+        XCTAssertEqual(harness.model.grid.lineAttribute(at: 0), .singleWidth)
+    }
+
+    func testTerminalModelDoubleWidthLinesClampHorizontalAddressingToHalfWidth() {
+        let harness = TerminalModelHarness(rows: 2, cols: 8)
+
+        harness.feed("\u{1B}#6")
+        harness.feed("\u{1B}[99G")
+        XCTAssertEqual(harness.model.cursor.col, 3)
+
+        harness.feed("A")
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 3).codepoint, 0x41)
+        XCTAssertTrue(harness.model.cursor.pendingWrap)
+    }
+
+    func testTerminalModelDECALNFillsScreenWithEsAndResetsLineAttributes() {
+        let harness = TerminalModelHarness(rows: 2, cols: 4)
+
+        harness.feed("\u{1B}#6")
+        harness.feed("ABCD")
+        harness.feed("\u{1B}#8")
+
+        for row in 0..<2 {
+            XCTAssertEqual(harness.model.grid.lineAttribute(at: row), .singleWidth)
+            for col in 0..<4 {
+                XCTAssertEqual(harness.model.grid.cell(at: row, col: col).codepoint, 0x45)
+            }
+        }
+        XCTAssertEqual(harness.model.cursor.row, 0)
+        XCTAssertEqual(harness.model.cursor.col, 0)
+    }
+
+    func testTerminalModelDECCOLMAndDECSCNMUpdateResizeAndReverseVideoState() {
+        let harness = TerminalModelHarness(rows: 24, cols: 80)
+        var resizeRequests: [(Int, Int)] = []
+        harness.model.onWindowResizeRequest = { resizeRequests.append(($0, $1)) }
+
+        harness.feed("\u{1B}=")
+        harness.feed("\u{1B}[?5h")
+        XCTAssertTrue(harness.model.reverseVideoEnabled)
+        XCTAssertTrue(harness.model.applicationKeypadMode)
+
+        harness.feed("\u{1B}[?3h")
+        harness.feed("\u{1B}[?3l")
+        harness.feed("\u{1B}[?5l")
+        harness.feed("\u{1B}c")
+
+        XCTAssertEqual(resizeRequests.map(\.0), [24, 24])
+        XCTAssertEqual(resizeRequests.map(\.1), [132, 80])
+        XCTAssertFalse(harness.model.reverseVideoEnabled)
+        XCTAssertFalse(harness.model.applicationKeypadMode)
+        XCTAssertEqual(harness.model.cursor.row, 0)
+        XCTAssertEqual(harness.model.cursor.col, 0)
     }
 }

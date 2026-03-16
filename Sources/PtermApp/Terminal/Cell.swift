@@ -1,5 +1,21 @@
 import Foundation
 
+enum TerminalLineAttribute: Equatable {
+    case singleWidth
+    case doubleWidth
+    case doubleHeightTop
+    case doubleHeightBottom
+
+    var isDoubleWidth: Bool {
+        switch self {
+        case .singleWidth:
+            return false
+        case .doubleWidth, .doubleHeightTop, .doubleHeightBottom:
+            return true
+        }
+    }
+}
+
 /// A single cell in the terminal grid.
 /// Each cell holds one character (codepoint), its visual attributes, and display width.
 struct Cell {

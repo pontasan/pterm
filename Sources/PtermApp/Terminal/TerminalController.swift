@@ -17,6 +17,7 @@ final class TerminalController {
     private struct ViewportRow {
         let cells: [Cell]
         let isWrapped: Bool
+        let lineAttribute: TerminalLineAttribute
     }
 
     struct DetectedLink {
@@ -56,6 +57,7 @@ final class TerminalController {
 
     struct RenderRowSnapshot {
         let cells: [Cell]
+        let lineAttribute: TerminalLineAttribute
     }
 
     /// The minimum self-contained state required to render one frame safely.
@@ -80,6 +82,7 @@ final class TerminalController {
         let rows: Int
         let cols: Int
         let cursor: CursorState
+        let reverseVideo: Bool
         let scrollOffset: Int
         let firstVisibleAbsoluteRow: Int
         let visibleRows: [RenderRowSnapshot]
@@ -1089,6 +1092,7 @@ final class TerminalController {
             let rows = model.rows
             let cols = model.cols
             let cursor = model.cursor
+            let reverseVideo = model.reverseVideoEnabled
             let offset = scrollOffset
             let visibleRows = visibleRowsLocked()
             let firstVisibleAbsoluteRow = offset > 0
@@ -1096,13 +1100,14 @@ final class TerminalController {
                 : scrollback.rowCount
 
             let renderRows = visibleRows.map { row in
-                RenderRowSnapshot(cells: row.cells)
+                RenderRowSnapshot(cells: row.cells, lineAttribute: row.lineAttribute)
             }
 
             return RenderSnapshot(
                 rows: rows,
                 cols: cols,
                 cursor: cursor,
+                reverseVideo: reverseVideo,
                 scrollOffset: offset,
                 firstVisibleAbsoluteRow: firstVisibleAbsoluteRow,
                 visibleRows: renderRows
@@ -1320,7 +1325,8 @@ final class TerminalController {
             if absoluteRow < scrollbackCount {
                 rows.append(ViewportRow(
                     cells: scrollback.getRow(at: absoluteRow) ?? [],
-                    isWrapped: scrollback.isRowWrapped(at: absoluteRow)
+                    isWrapped: scrollback.isRowWrapped(at: absoluteRow),
+                    lineAttribute: .singleWidth
                 ))
                 continue
             }
@@ -1330,7 +1336,13 @@ final class TerminalController {
             for col in 0..<model.cols {
                 cells.append(model.grid.cell(at: gridRow, col: col))
             }
-            rows.append(ViewportRow(cells: cells, isWrapped: model.grid.isWrapped(gridRow)))
+            rows.append(
+                ViewportRow(
+                    cells: cells,
+                    isWrapped: model.grid.isWrapped(gridRow),
+                    lineAttribute: model.grid.lineAttribute(at: gridRow)
+                )
+            )
         }
         return rows
     }

@@ -47,6 +47,9 @@ final class TerminalModel {
     /// Application cursor keys mode (DECCKM)
     var applicationCursorKeys: Bool = false
 
+    /// Application keypad mode (DECPAM/DECPNM)
+    var applicationKeypadMode: Bool = false
+
     /// ANSI Line Feed / New Line mode (LNM).
     /// When enabled, the Return key should send CRLF rather than CR.
     var newLineMode: Bool = false
@@ -124,6 +127,7 @@ final class TerminalModel {
     var mouseProtocol: MouseProtocol = .x10
     var focusTrackingEnabled: Bool = false
     private(set) var pendingUpdateModeEnabled: Bool = false
+    private(set) var reverseVideoEnabled = false
     private var insertModeEnabled = false
     private var protectedAreaModeEnabled = false
     private static let answerbackMessage = "pterm"
@@ -212,6 +216,36 @@ final class TerminalModel {
         let location = Self.tabStopBitLocation(for: column)
         guard location.word < tabStopWords.count else { return false }
         return (tabStopWords[location.word] & location.bit) != 0
+    }
+
+    private func lineAttribute(at row: Int) -> TerminalLineAttribute {
+        grid.lineAttribute(at: row)
+    }
+
+    private func visibleColumnCount(for row: Int) -> Int {
+        max(1, lineAttribute(at: row).isDoubleWidth ? max(cols / 2, 1) : cols)
+    }
+
+    private func clampColumn(_ column: Int, for row: Int) -> Int {
+        min(max(column, 0), visibleColumnCount(for: row) - 1)
+    }
+
+    private func clampCursorToVisibleLineWidth() {
+        guard rows > 0, cols > 0 else { return }
+        cursor.row = min(max(cursor.row, 0), rows - 1)
+        let maxVisibleColumn = visibleColumnCount(for: cursor.row) - 1
+        if cursor.col > maxVisibleColumn {
+            cursor.col = maxVisibleColumn
+            cursor.pendingWrap = false
+        } else if cursor.col < 0 {
+            cursor.col = 0
+            cursor.pendingWrap = false
+        }
+    }
+
+    private func setCurrentLineAttribute(_ attribute: TerminalLineAttribute) {
+        grid.setLineAttribute(attribute, at: cursor.row)
+        clampCursorToVisibleLineWidth()
     }
 
     // MARK: - VT Parser Action Handling
@@ -440,7 +474,7 @@ final class TerminalModel {
                 cursor.pendingWrap = false
             }
 
-            let available = cols - cursor.col
+            let available = visibleColumnCount(for: cursor.row) - cursor.col
             guard available > 0 else { break }
 
             let chunkCount = min(remainingCount, available)
@@ -456,8 +490,9 @@ final class TerminalModel {
             remainingBase = remainingBase.advanced(by: chunkCount)
             remainingCount -= chunkCount
 
-            if cursor.col >= cols {
-                cursor.col = cols - 1
+            let visibleCols = visibleColumnCount(for: cursor.row)
+            if cursor.col >= visibleCols {
+                cursor.col = visibleCols - 1
                 if cursor.autoWrapMode {
                     cursor.pendingWrap = true
                 }
@@ -535,7 +570,7 @@ final class TerminalModel {
                 cursor.pendingWrap = false
             }
 
-            let available = cols - cursor.col
+            let available = visibleColumnCount(for: cursor.row) - cursor.col
             guard available > 0 else { break }
 
             let chunkCount = min(remainingCount, available)
@@ -560,8 +595,9 @@ final class TerminalModel {
             remainingBase = remainingBase.advanced(by: chunkCount)
             remainingCount -= chunkCount
 
-            if cursor.col >= cols {
-                cursor.col = cols - 1
+            let visibleCols = visibleColumnCount(for: cursor.row)
+            if cursor.col >= visibleCols {
+                cursor.col = visibleCols - 1
                 if cursor.autoWrapMode {
                     cursor.pendingWrap = true
                 }
@@ -598,13 +634,14 @@ final class TerminalModel {
         let charWidth = max(1, width)
 
         // Check if we need to wrap before printing
-        if cursor.col + charWidth > cols {
+        let visibleCols = visibleColumnCount(for: cursor.row)
+        if cursor.col + charWidth > visibleCols {
             if cursor.autoWrapMode {
                 cursor.col = 0
                 lineFeed()
                 grid.setWrapped(cursor.row, true)
             } else {
-                cursor.col = cols - charWidth
+                cursor.col = max(0, visibleCols - charWidth)
             }
         }
 
@@ -621,12 +658,13 @@ final class TerminalModel {
             grid.setCell(cell, at: cursor.row, col: cursor.col)
 
             cursor.col += 1
-            if cursor.col >= cols {
+            let visibleCols = visibleColumnCount(for: cursor.row)
+            if cursor.col >= visibleCols {
                 if cursor.autoWrapMode {
                     cursor.pendingWrap = true
-                    cursor.col = cols - 1
+                    cursor.col = visibleCols - 1
                 } else {
-                    cursor.col = cols - 1
+                    cursor.col = visibleCols - 1
                 }
             }
             return
@@ -646,7 +684,7 @@ final class TerminalModel {
         grid.setCell(cell, at: cursor.row, col: cursor.col)
 
         // For double-width characters, mark the continuation cell
-        if charWidth == 2 && cursor.col + 1 < cols {
+        if charWidth == 2 && cursor.col + 1 < visibleCols {
             let contCell = Cell(
                 codepoint: 0,
                 attributes: currentPrintAttributes(),
@@ -658,12 +696,12 @@ final class TerminalModel {
 
         // Advance cursor
         cursor.col += charWidth
-        if cursor.col >= cols {
+        if cursor.col >= visibleCols {
             if cursor.autoWrapMode {
                 cursor.pendingWrap = true
-                cursor.col = cols - 1
+                cursor.col = visibleCols - 1
             } else {
-                cursor.col = cols - 1
+                cursor.col = visibleCols - 1
             }
         }
     }
@@ -685,8 +723,9 @@ final class TerminalModel {
             }
 
         case 0x09: // HT (Horizontal Tab)
-            let nextTab = nextTabStop(after: cursor.col) ?? (cols - 1)
-            cursor.col = min(nextTab, cols - 1)
+            let visibleCols = visibleColumnCount(for: cursor.row)
+            let nextTab = nextTabStop(after: cursor.col) ?? (visibleCols - 1)
+            cursor.col = min(nextTab, visibleCols - 1)
             cursor.pendingWrap = false
 
         case 0x0A, 0x0B, 0x0C: // LF, VT, FF
@@ -737,6 +776,7 @@ final class TerminalModel {
             cursor.row += 1
         }
         cursor.pendingWrap = false
+        clampCursorToVisibleLineWidth()
     }
 
     private func currentPrintAttributes() -> CellAttributes {
@@ -750,6 +790,7 @@ final class TerminalModel {
     // MARK: - CSI Sequences
 
     private func handleCSI(finalByte: UInt32, parser: UnsafePointer<VtParser>) {
+        defer { clampCursorToVisibleLineWidth() }
         let intermediatePrefix = [
             parser.pointee.intermediates.0,
             parser.pointee.intermediates.1,
@@ -876,12 +917,12 @@ final class TerminalModel {
 
         case 0x43: // CUF - Cursor Forward
             let n = vt_parser_param(parser, 0, 1)
-            cursor.col = min(cols - 1, cursor.col + Int(n))
+            cursor.col = clampColumn(cursor.col + Int(n), for: cursor.row)
             cursor.pendingWrap = false
 
         case 0x44: // CUB - Cursor Backward
             let n = vt_parser_param(parser, 0, 1)
-            cursor.col = max(0, cursor.col - Int(n))
+            cursor.col = clampColumn(cursor.col - Int(n), for: cursor.row)
             cursor.pendingWrap = false
 
         case 0x45: // CNL - Cursor Next Line
@@ -898,7 +939,7 @@ final class TerminalModel {
 
         case 0x47: // CHA - Cursor Character Absolute
             let n = vt_parser_param(parser, 0, 1)
-            cursor.col = min(cols - 1, max(0, Int(n) - 1))
+            cursor.col = clampColumn(Int(n) - 1, for: cursor.row)
             cursor.pendingWrap = false
 
         case 0x49: // CHT - Cursor Horizontal Forward Tabulation
@@ -914,7 +955,7 @@ final class TerminalModel {
             let row = vt_parser_param(parser, 0, 1)
             let col = vt_parser_param(parser, 1, 1)
             cursor.row = min(rows - 1, max(0, Int(row) - 1))
-            cursor.col = min(cols - 1, max(0, Int(col) - 1))
+            cursor.col = clampColumn(Int(col) - 1, for: cursor.row)
             cursor.pendingWrap = false
 
         case 0x4A: // ED - Erase in Display
@@ -977,7 +1018,7 @@ final class TerminalModel {
 
         case 0x60: // HPA - Character Position Absolute
             let n = vt_parser_param(parser, 0, 1)
-            cursor.col = min(cols - 1, max(0, Int(n) - 1))
+            cursor.col = clampColumn(Int(n) - 1, for: cursor.row)
             cursor.pendingWrap = false
 
         case 0x61: // HPR - Character Position Relative
@@ -1196,6 +1237,15 @@ final class TerminalModel {
                 switch mode {
                 case 1: // DECCKM - Application Cursor Keys
                     applicationCursorKeys = set
+                case 3: // DECCOLM - 80/132 column mode
+                    let targetCols = set ? 132 : 80
+                    cursor = CursorState()
+                    grid.scrollTop = 0
+                    grid.scrollBottom = rows - 1
+                    initTabStops()
+                    onWindowResizeRequest?(rows, targetCols)
+                case 5: // DECSCNM - Reverse video
+                    reverseVideoEnabled = set
                 case 6: // DECOM - Origin Mode
                     cursor.originMode = set
                     cursor.row = set ? grid.scrollTop : 0
@@ -1735,6 +1785,7 @@ final class TerminalModel {
     // MARK: - ESC Sequences
 
     private func handleESC(finalByte: UInt32, parser: UnsafePointer<VtParser>) {
+        defer { clampCursorToVisibleLineWidth() }
         let p = parser.pointee
 
         // Check for intermediate characters
@@ -1751,7 +1802,20 @@ final class TerminalModel {
             }
 
             if intermediate == UInt8(ascii: "#") {
-                // DEC screen alignment test etc.
+                switch finalByte {
+                case 0x33: // DECDHL top half
+                    setCurrentLineAttribute(.doubleHeightTop)
+                case 0x34: // DECDHL bottom half
+                    setCurrentLineAttribute(.doubleHeightBottom)
+                case 0x35: // DECSWL
+                    setCurrentLineAttribute(.singleWidth)
+                case 0x36: // DECDWL
+                    setCurrentLineAttribute(.doubleWidth)
+                case 0x38: // DECALN
+                    performScreenAlignmentDisplay()
+                default:
+                    break
+                }
                 return
             }
 
@@ -1797,6 +1861,12 @@ final class TerminalModel {
 
         case 0x4F: // SS3 - Single Shift G3 into GL for next graphic character
             singleShiftInvocation = .g3
+
+        case 0x3D: // DECPAM - Application Keypad
+            applicationKeypadMode = true
+
+        case 0x3E: // DECPNM - Numeric Keypad
+            applicationKeypadMode = false
 
         case 0x6E: // LS2 - Locking Shift G2 into GL
             glInvocation = .g2
@@ -1891,6 +1961,29 @@ final class TerminalModel {
         }
     }
 
+    private func performScreenAlignmentDisplay() {
+        cursor.originMode = false
+        cursor.row = 0
+        cursor.col = 0
+        cursor.pendingWrap = false
+        grid.scrollTop = 0
+        grid.scrollBottom = rows - 1
+
+        let fill = Cell(
+            codepoint: 0x45,
+            attributes: currentPrintAttributes(),
+            width: 1,
+            isWideContinuation: false
+        )
+
+        for row in 0..<rows {
+            grid.setLineAttribute(.singleWidth, at: row)
+            for col in 0..<cols {
+                grid.setCell(fill, at: row, col: col)
+            }
+        }
+    }
+
     private func applyTitleUpdate(_ rawTitle: String) {
         guard consumeTitleUpdateBudget() else { return }
         let safe = Self.sanitizeTitle(rawTitle)
@@ -1954,11 +2047,13 @@ final class TerminalModel {
         grid.scrollBottom = rows - 1
         bracketedPasteMode = false
         applicationCursorKeys = false
+        applicationKeypadMode = false
         newLineMode = false
         mouseReporting = .none
         mouseProtocol = .x10
         focusTrackingEnabled = false
         pendingUpdateModeEnabled = false
+        reverseVideoEnabled = false
         insertModeEnabled = false
         isAlternateScreen = false
         alternateGrid = nil
@@ -1982,11 +2077,13 @@ final class TerminalModel {
         grid.scrollBottom = rows - 1
         bracketedPasteMode = false
         applicationCursorKeys = false
+        applicationKeypadMode = false
         newLineMode = false
         mouseReporting = .none
         mouseProtocol = .x10
         focusTrackingEnabled = false
         pendingUpdateModeEnabled = false
+        reverseVideoEnabled = false
         insertModeEnabled = false
         reportedLinesPerScreen = rows
         g0Charset = .ascii
@@ -2192,6 +2289,7 @@ final class TerminalModel {
         cursor.col = result.cursorCol
         cursor.pendingWrap = false
         initTabStops()
+        clampCursorToVisibleLineWidth()
     }
 
 

@@ -39,6 +39,7 @@ final class TerminalGrid {
     /// Wrap flags are stored per physical row so row rotation automatically
     /// carries wrap state with the row content.
     private var physicalWrappedFlags: [Bool]
+    private var physicalLineAttributes: [TerminalLineAttribute]
     /// Blank rows are tracked as metadata so scroll-heavy workloads can expose
     /// fresh empty rows without touching `cols` cells on every line feed.
     /// Writers materialize the row lazily before mutating individual cells.
@@ -69,6 +70,7 @@ final class TerminalGrid {
         self.rowEncodingHintStates = Array(repeating: .blankDefault, count: rows)
         self.rowOrder = []
         self.physicalWrappedFlags = Array(repeating: false, count: rows)
+        self.physicalLineAttributes = Array(repeating: .singleWidth, count: rows)
         self.physicalBlankRows = Array(repeating: true, count: rows)
         self.physicalSparseCompactDefaultPrefixCounts = Array(repeating: 0, count: rows)
     }
@@ -289,6 +291,16 @@ final class TerminalGrid {
         return physicalWrappedFlags[physicalRow(for: row)]
     }
 
+    func lineAttribute(at row: Int) -> TerminalLineAttribute {
+        guard row >= 0, row < rows else { return .singleWidth }
+        return physicalLineAttributes[physicalRow(for: row)]
+    }
+
+    func setLineAttribute(_ attribute: TerminalLineAttribute, at row: Int) {
+        guard row >= 0, row < rows else { return }
+        physicalLineAttributes[physicalRow(for: row)] = attribute
+    }
+
     // MARK: - Line Operations
 
     /// Clear a range of cells in a row to empty.
@@ -309,6 +321,7 @@ final class TerminalGrid {
         guard row >= 0, row < rows else { return }
         setPhysicalRowBlank(physicalRow(for: row))
         setWrapped(row, false)
+        setLineAttribute(.singleWidth, at: row)
         setRowEncodingHintBlank(row)
     }
 
@@ -320,6 +333,7 @@ final class TerminalGrid {
         hasRowPermutation = false
         rowOrderHead = 0
         physicalWrappedFlags = Array(repeating: false, count: rows)
+        physicalLineAttributes = Array(repeating: .singleWidth, count: rows)
         physicalBlankRows = Array(repeating: true, count: rows)
     }
 
@@ -449,6 +463,7 @@ final class TerminalGrid {
         // 3. Re-wrap logical lines at new column width
         var newCells = [Cell]()
         var newWrapped = [Bool]()
+        var newLineAttributes = [TerminalLineAttribute]()
         var newCursorRow = 0
         var newCursorCol = cursorLogicalCol
 
@@ -475,6 +490,7 @@ final class TerminalGrid {
 
                 // First row of a logical line: not wrapped. Subsequent: wrapped.
                 newWrapped.append(rowInLine > 0)
+                newLineAttributes.append(.singleWidth)
             }
         }
 
@@ -513,6 +529,7 @@ final class TerminalGrid {
             }
             newCells.removeFirst(excessRows * newCols)
             newWrapped.removeFirst(excessRows)
+            newLineAttributes.removeFirst(excessRows)
             newCursorRow -= excessRows
         } else if totalRows < newRows {
             let padRows = newRows - totalRows
@@ -520,6 +537,8 @@ final class TerminalGrid {
                 Array(repeating: Cell.empty, count: padRows * newCols))
             newWrapped.append(contentsOf:
                 Array(repeating: false, count: padRows))
+            newLineAttributes.append(contentsOf:
+                Array(repeating: .singleWidth, count: padRows))
         }
 
         self.rows = newRows
@@ -530,6 +549,7 @@ final class TerminalGrid {
         self.rowOrder.removeAll(keepingCapacity: true)
         self.hasRowPermutation = false
         self.setWrappedFlags(newWrapped)
+        self.physicalLineAttributes = newLineAttributes
         self.physicalBlankRows = stride(from: 0, to: newCells.count, by: newCols).map { start in
             newCells[start..<(start + newCols)].allSatisfy { cell in
                 cell.codepoint == Cell.empty.codepoint &&
@@ -553,6 +573,7 @@ final class TerminalGrid {
         var trimmedRows: [TrimmedRow] = []
         var logicalRows = (0..<rows).map { Array(rowCells($0)) }
         var wrappedFlags = wrappedFlagsArray(startingAt: 0, count: rows)
+        var lineAttributes = (0..<rows).map(lineAttribute(at:))
 
         if newRows < rows {
             // Shrinking: if cursor is below new bottom, scroll content up
@@ -569,17 +590,20 @@ final class TerminalGrid {
                 )
                 logicalRows = existingRows + paddingRows
                 wrappedFlags = Array(wrappedFlags[scrollAmount..<rows]) + Array(repeating: false, count: scrollAmount)
+                lineAttributes = Array(lineAttributes[scrollAmount..<rows]) + Array(repeating: .singleWidth, count: scrollAmount)
                 newCursorRow -= scrollAmount
             }
             // Trim to newRows
             logicalRows = Array(logicalRows.prefix(newRows))
             wrappedFlags = Array(wrappedFlags.prefix(newRows))
+            lineAttributes = Array(lineAttributes.prefix(newRows))
         } else if newRows > rows {
             // Growing: add empty rows at bottom
             let padRows = newRows - rows
             logicalRows.append(contentsOf:
                 Array(repeating: Array(repeating: Cell.empty, count: cols), count: padRows))
             wrappedFlags.append(contentsOf: Array(repeating: false, count: padRows))
+            lineAttributes.append(contentsOf: Array(repeating: .singleWidth, count: padRows))
         }
 
         cells = logicalRows.flatMap { $0 }
@@ -589,6 +613,7 @@ final class TerminalGrid {
         hasRowPermutation = false
         self.rows = newRows
         setWrappedFlags(wrappedFlags)
+        physicalLineAttributes = lineAttributes
         physicalBlankRows = logicalRows.map { row in
             row.allSatisfy { cell in
                 cell.codepoint == Cell.empty.codepoint &&
@@ -830,6 +855,7 @@ final class TerminalGrid {
             copy.rowOrderHead = rowOrderHead
         }
         copy.physicalWrappedFlags = Array(physicalWrappedFlags)
+        copy.physicalLineAttributes = Array(physicalLineAttributes)
         copy.physicalBlankRows = Array(physicalBlankRows)
         copy.physicalSparseCompactDefaultPrefixCounts = Array(physicalSparseCompactDefaultPrefixCounts)
         copy.scrollTop = scrollTop

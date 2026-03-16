@@ -2514,6 +2514,134 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(spy.playCount, 1)
     }
 
+    func testKeyboardHandlerMapsFunctionKeysToVttestCompatibleXtermSequences() throws {
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let handler = KeyboardHandler(controller: controller)
+        let expectations: [(UInt16, String)] = [
+            (122, "\u{1B}[11~"),
+            (120, "\u{1B}[12~"),
+            (99, "\u{1B}[13~"),
+            (118, "\u{1B}[14~"),
+            (96, "\u{1B}[15~"),
+            (97, "\u{1B}[17~"),
+            (98, "\u{1B}[18~"),
+            (100, "\u{1B}[19~"),
+            (101, "\u{1B}[20~"),
+            (109, "\u{1B}[21~"),
+            (103, "\u{1B}[23~"),
+            (111, "\u{1B}[24~"),
+            (105, "\u{1B}[25~"),
+            (107, "\u{1B}[26~"),
+            (113, "\u{1B}[28~"),
+            (106, "\u{1B}[29~"),
+            (64, "\u{1B}[31~"),
+            (79, "\u{1B}[32~"),
+            (80, "\u{1B}[33~"),
+            (90, "\u{1B}[34~"),
+        ]
+
+        for (keyCode, expected) in expectations {
+            let event = try XCTUnwrap(NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [],
+                timestamp: 0,
+                windowNumber: 0,
+                context: nil,
+                characters: "",
+                charactersIgnoringModifiers: "",
+                isARepeat: false,
+                keyCode: keyCode
+            ))
+            XCTAssertEqual(handler.debugInputSequence(for: event), expected, "Unexpected sequence for keyCode \(keyCode)")
+        }
+    }
+
+    func testKeyboardHandlerUsesApplicationCursorAndKeypadModesFromTerminalModel() throws {
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let handler = KeyboardHandler(controller: controller)
+
+        let upArrow = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: String(UnicodeScalar(NSUpArrowFunctionKey)!),
+            charactersIgnoringModifiers: String(UnicodeScalar(NSUpArrowFunctionKey)!),
+            isARepeat: false,
+            keyCode: 126
+        ))
+        XCTAssertEqual(handler.debugInputSequence(for: upArrow), "\u{1B}[A")
+
+        controller.withModel { $0.applicationCursorKeys = true }
+        XCTAssertEqual(handler.debugInputSequence(for: upArrow), "\u{1B}OA")
+
+        let homeKey = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "",
+            charactersIgnoringModifiers: "",
+            isARepeat: false,
+            keyCode: 115
+        ))
+        XCTAssertEqual(handler.debugInputSequence(for: homeKey), "\u{1B}OH")
+
+        let keypadOne = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.numericPad],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "1",
+            charactersIgnoringModifiers: "1",
+            isARepeat: false,
+            keyCode: 83
+        ))
+        XCTAssertNil(handler.debugInputSequence(for: keypadOne))
+
+        controller.withModel { $0.applicationKeypadMode = true }
+        XCTAssertEqual(handler.debugInputSequence(for: keypadOne), "\u{1B}Oq")
+
+        let keypadPlus = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.numericPad],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "+",
+            charactersIgnoringModifiers: "+",
+            isARepeat: false,
+            keyCode: 69
+        ))
+        XCTAssertEqual(handler.debugInputSequence(for: keypadPlus), "\u{1B}Ok")
+    }
+
     func testTerminalViewIdlePurgeReleasesKeyboardHandlerAndRecreatesItOnNextInput() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(

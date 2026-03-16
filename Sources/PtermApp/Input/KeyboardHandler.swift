@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 
 /// Converts NSEvent keyboard events to terminal input byte sequences.
 ///
@@ -70,7 +71,7 @@ final class KeyboardHandler {
         }
 
         // Special keys
-        if let specialInput = handleSpecialKey(event: event) {
+        if let specialInput = debugInputSequence(for: event) {
             controller.sendInput(specialInput)
             playInputFeedbackIfEnabled()
             return true
@@ -91,10 +92,22 @@ final class KeyboardHandler {
         if modifiers.contains(.control) {
             return false
         }
-        if handleSpecialKey(event: event) != nil {
+        if debugInputSequence(for: event) != nil {
             return false
         }
         return event.characters != nil
+    }
+
+    func debugInputSequence(for event: NSEvent) -> String? {
+        guard let controller = controller else { return nil }
+        let modes = controller.withModel { model in
+            (appCursor: model.applicationCursorKeys, appKeypad: model.applicationKeypadMode)
+        }
+        return translatedSpecialKeyInput(
+            for: event,
+            applicationCursorKeys: modes.appCursor,
+            applicationKeypadMode: modes.appKeypad
+        )
     }
 
     func debugSpecialKeySelector(for event: NSEvent) -> Selector? {
@@ -161,11 +174,16 @@ final class KeyboardHandler {
         }
     }
 
-    private func handleSpecialKey(event: NSEvent) -> String? {
-        guard let controller = controller else { return nil }
-
-        let appCursor = controller.withModel { $0.applicationCursorKeys }
+    private func translatedSpecialKeyInput(
+        for event: NSEvent,
+        applicationCursorKeys appCursor: Bool,
+        applicationKeypadMode appKeypad: Bool
+    ) -> String? {
         let prefix: String = appCursor ? "\u{1B}O" : "\u{1B}["
+
+        if appKeypad, let keypadSequence = applicationKeypadSequence(for: event) {
+            return keypadSequence
+        }
 
         switch event.keyCode {
         case 126: // Up
@@ -177,9 +195,9 @@ final class KeyboardHandler {
         case 123: // Left
             return "\(prefix)D"
         case 115: // Home
-            return "\u{1B}[H"
+            return appCursor ? "\u{1B}OH" : "\u{1B}[H"
         case 119: // End
-            return "\u{1B}[F"
+            return appCursor ? "\u{1B}OF" : "\u{1B}[F"
         case 116: // PageUp
             return "\u{1B}[5~"
         case 121: // PageDown
@@ -200,20 +218,51 @@ final class KeyboardHandler {
             }
             return "\t"
         // Function keys
-        case 122: return "\u{1B}OP"  // F1
-        case 120: return "\u{1B}OQ"  // F2
-        case 99:  return "\u{1B}OR"  // F3
-        case 118: return "\u{1B}OS"  // F4
+        case UInt16(kVK_F1): return "\u{1B}[11~" // F1
+        case UInt16(kVK_F2): return "\u{1B}[12~" // F2
+        case UInt16(kVK_F3): return "\u{1B}[13~" // F3
+        case UInt16(kVK_F4): return "\u{1B}[14~" // F4
         case 96:  return "\u{1B}[15~" // F5
         case 97:  return "\u{1B}[17~" // F6
         case 98:  return "\u{1B}[18~" // F7
         case 100: return "\u{1B}[19~" // F8
         case 101: return "\u{1B}[20~" // F9
-        case 109: return "\u{1B}[21~" // F10
-        case 103: return "\u{1B}[23~" // F11
-        case 111: return "\u{1B}[24~" // F12
+        case UInt16(kVK_F10): return "\u{1B}[21~" // F10
+        case UInt16(kVK_F11): return "\u{1B}[23~" // F11
+        case UInt16(kVK_F12): return "\u{1B}[24~" // F12
+        case UInt16(kVK_F13): return "\u{1B}[25~" // F13
+        case UInt16(kVK_F14): return "\u{1B}[26~" // F14
+        case UInt16(kVK_F15), UInt16(kVK_Help): return "\u{1B}[28~" // Help (F15)
+        case UInt16(kVK_F16): return "\u{1B}[29~" // Do (F16)
+        case UInt16(kVK_F17): return "\u{1B}[31~" // F17
+        case UInt16(kVK_F18): return "\u{1B}[32~" // F18
+        case UInt16(kVK_F19): return "\u{1B}[33~" // F19
+        case UInt16(kVK_F20): return "\u{1B}[34~" // F20
         default:
             return nil
+        }
+    }
+
+    private func applicationKeypadSequence(for event: NSEvent) -> String? {
+        switch event.keyCode {
+        case UInt16(kVK_ANSI_Keypad0): return "\u{1B}Op"
+        case UInt16(kVK_ANSI_Keypad1): return "\u{1B}Oq"
+        case UInt16(kVK_ANSI_Keypad2): return "\u{1B}Or"
+        case UInt16(kVK_ANSI_Keypad3): return "\u{1B}Os"
+        case UInt16(kVK_ANSI_Keypad4): return "\u{1B}Ot"
+        case UInt16(kVK_ANSI_Keypad5): return "\u{1B}Ou"
+        case UInt16(kVK_ANSI_Keypad6): return "\u{1B}Ov"
+        case UInt16(kVK_ANSI_Keypad7): return "\u{1B}Ow"
+        case UInt16(kVK_ANSI_Keypad8): return "\u{1B}Ox"
+        case UInt16(kVK_ANSI_Keypad9): return "\u{1B}Oy"
+        case UInt16(kVK_ANSI_KeypadPlus): return "\u{1B}Ok"
+        case UInt16(kVK_ANSI_KeypadMultiply): return "\u{1B}Oj"
+        case UInt16(kVK_ANSI_KeypadDivide): return "\u{1B}Oo"
+        case UInt16(kVK_ANSI_KeypadMinus): return "\u{1B}Om"
+        case UInt16(kVK_ANSI_KeypadDecimal): return "\u{1B}On"
+        case UInt16(kVK_ANSI_KeypadEquals): return "\u{1B}OX"
+        case UInt16(kVK_ANSI_KeypadEnter): return "\u{1B}OM"
+        default: return nil
         }
     }
 }
