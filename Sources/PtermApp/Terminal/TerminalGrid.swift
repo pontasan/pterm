@@ -268,7 +268,7 @@ final class TerminalGrid {
             hasRowPermutation = true
 
             if top == 0 && bottom == rows - 1 {
-                shiftWrappedFlagsDownOneRow()
+                shiftWrappedFlagsDown(by: 1)
             } else if top < bottom {
                 var nextWrapped = isWrapped(top + 1)
                 for row in top..<bottom {
@@ -280,6 +280,17 @@ final class TerminalGrid {
                 }
             }
             clearRow(bottom)
+            return
+        }
+
+        if top == 0 && bottom == rows - 1 {
+            ensureRowOrderMaterialized()
+            rowOrderHead = (rowOrderHead + count) % rows
+            hasRowPermutation = true
+            shiftWrappedFlagsDown(by: count)
+            for row in (bottom - count + 1)...bottom {
+                clearRow(row)
+            }
             return
         }
 
@@ -308,6 +319,20 @@ final class TerminalGrid {
 
         if count >= regionHeight {
             for row in top...bottom {
+                clearRow(row)
+            }
+            return
+        }
+
+        if top == 0 && bottom == rows - 1 {
+            ensureRowOrderMaterialized()
+            rowOrderHead -= count
+            if rowOrderHead < 0 {
+                rowOrderHead += rows
+            }
+            hasRowPermutation = true
+            shiftWrappedFlagsUp(by: count)
+            for row in top..<(top + count) {
                 clearRow(row)
             }
             return
@@ -597,6 +622,7 @@ final class TerminalGrid {
         return cells[start..<(start + cols)]
     }
 
+
     func rowEncodingHint(_ row: Int) -> ScrollbackBuffer.RowEncodingHint {
         guard row >= 0, row < rows else { return .unknown }
         let physicalRow = physicalRow(for: row)
@@ -671,15 +697,48 @@ final class TerminalGrid {
         }
     }
 
-    private func shiftWrappedFlagsDownOneRow() {
+    private func shiftWrappedFlagsDown(by amount: Int) {
         guard !lineWrappedWords.isEmpty else { return }
-        var carry: UInt64 = 0
-        for wordIndex in stride(from: lineWrappedWords.count - 1, through: 0, by: -1) {
-            let word = lineWrappedWords[wordIndex]
-            let nextCarry = (word & 1) << 63
-            lineWrappedWords[wordIndex] = (word >> 1) | carry
-            carry = nextCarry
+        let normalizedAmount = amount % rows
+        guard normalizedAmount > 0 else { return }
+        let wholeWords = normalizedAmount / 64
+        let bitShift = normalizedAmount % 64
+        var shifted = Array(repeating: UInt64(0), count: lineWrappedWords.count)
+        for destinationWord in 0..<lineWrappedWords.count {
+            let sourceWord = destinationWord + wholeWords
+            guard sourceWord < lineWrappedWords.count else { continue }
+            var word = lineWrappedWords[sourceWord] >> UInt64(bitShift)
+            if bitShift > 0, sourceWord + 1 < lineWrappedWords.count {
+                word |= lineWrappedWords[sourceWord + 1] << UInt64(64 - bitShift)
+            }
+            shifted[destinationWord] = word
         }
+        lineWrappedWords = shifted
+        trimExtraWrappedBits()
+    }
+
+    private func shiftWrappedFlagsUp(by amount: Int) {
+        guard !lineWrappedWords.isEmpty else { return }
+        let normalizedAmount = amount % rows
+        guard normalizedAmount > 0 else { return }
+        let wholeWords = normalizedAmount / 64
+        let bitShift = normalizedAmount % 64
+        var shifted = Array(repeating: UInt64(0), count: lineWrappedWords.count)
+        for destinationWord in stride(from: lineWrappedWords.count - 1, through: 0, by: -1) {
+            let sourceWord = destinationWord >= wholeWords ? destinationWord - wholeWords : -1
+            guard sourceWord >= 0 else { continue }
+            var word = lineWrappedWords[sourceWord] << UInt64(bitShift)
+            if bitShift > 0, sourceWord > 0 {
+                word |= lineWrappedWords[sourceWord - 1] >> UInt64(64 - bitShift)
+            }
+            shifted[destinationWord] = word
+        }
+        lineWrappedWords = shifted
+        trimExtraWrappedBits()
+    }
+
+    private func trimExtraWrappedBits() {
+        guard !lineWrappedWords.isEmpty else { return }
         let extraBits = lineWrappedWords.count * 64 - rows
         if extraBits > 0 {
             let validBits = 64 - extraBits

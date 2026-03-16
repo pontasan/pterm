@@ -372,6 +372,62 @@ final class TextModelTests: XCTestCase {
         XCTAssertEqual(grid.cell(at: 2, col: 0).codepoint, 67)
     }
 
+    func testTerminalGridFullScreenScrollUpByMultipleRowsPreservesContentAndWrapFlags() {
+        let grid = TerminalGrid(rows: 5, cols: 2)
+        for row in 0..<5 {
+            for col in 0..<2 {
+                grid.setCell(
+                    Cell(codepoint: UInt32(65 + row), attributes: .default, width: 1, isWideContinuation: false),
+                    at: row,
+                    col: col
+                )
+            }
+        }
+        grid.setWrapped(1, true)
+        grid.setWrapped(3, true)
+
+        grid.scrollUp(count: 2)
+
+        XCTAssertEqual(grid.rowCells(0).map(\.codepoint), [67, 67])
+        XCTAssertEqual(grid.rowCells(1).map(\.codepoint), [68, 68])
+        XCTAssertEqual(grid.rowCells(2).map(\.codepoint), [69, 69])
+        XCTAssertEqual(grid.rowCells(3).map(\.codepoint), [0x20, 0x20])
+        XCTAssertEqual(grid.rowCells(4).map(\.codepoint), [0x20, 0x20])
+        XCTAssertFalse(grid.isWrapped(0))
+        XCTAssertTrue(grid.isWrapped(1))
+        XCTAssertFalse(grid.isWrapped(2))
+        XCTAssertFalse(grid.isWrapped(3))
+        XCTAssertFalse(grid.isWrapped(4))
+    }
+
+    func testTerminalGridFullScreenScrollDownByMultipleRowsPreservesContentAndWrapFlags() {
+        let grid = TerminalGrid(rows: 5, cols: 2)
+        for row in 0..<5 {
+            for col in 0..<2 {
+                grid.setCell(
+                    Cell(codepoint: UInt32(65 + row), attributes: .default, width: 1, isWideContinuation: false),
+                    at: row,
+                    col: col
+                )
+            }
+        }
+        grid.setWrapped(2, true)
+        grid.setWrapped(4, true)
+
+        grid.scrollDown(count: 2)
+
+        XCTAssertEqual(grid.rowCells(0).map(\.codepoint), [0x20, 0x20])
+        XCTAssertEqual(grid.rowCells(1).map(\.codepoint), [0x20, 0x20])
+        XCTAssertEqual(grid.rowCells(2).map(\.codepoint), [65, 65])
+        XCTAssertEqual(grid.rowCells(3).map(\.codepoint), [66, 66])
+        XCTAssertEqual(grid.rowCells(4).map(\.codepoint), [67, 67])
+        XCTAssertFalse(grid.isWrapped(0))
+        XCTAssertFalse(grid.isWrapped(1))
+        XCTAssertFalse(grid.isWrapped(2))
+        XCTAssertFalse(grid.isWrapped(3))
+        XCTAssertTrue(grid.isWrapped(4))
+    }
+
     func testTerminalGridResizeRewrapsLogicalLinesAndPreservesCursor() {
         let grid = TerminalGrid(rows: 2, cols: 4)
         let characters: [UInt32] = [0x41, 0x42, 0x43, 0x44, 0x45, 0x46]

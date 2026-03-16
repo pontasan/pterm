@@ -69,6 +69,9 @@ final class PTY {
     private var readBuffer: UnsafeMutablePointer<UInt8>?
     private var readBufferCapacity = 0
     private let readBufferLock = NSLock()
+    /// Reuse the aggregation buffer across read callbacks so high-volume PTY output
+    /// does not repeatedly allocate and free Data storage for each dispatch event.
+    private var aggregatedReadData = Data()
 
     /// Callback invoked when data is available from the PTY
     var onOutput: ((Data) -> Void)?
@@ -383,13 +386,13 @@ final class PTY {
         guard fd >= 0 else { return }
 
         let (buffer, bufferCapacity) = preparedReadBuffer()
-        var aggregatedData = Data()
-        aggregatedData.reserveCapacity(ReadBufferPolicy.preferredCapacity)
+        aggregatedReadData.removeAll(keepingCapacity: true)
+        aggregatedReadData.reserveCapacity(ReadBufferPolicy.preferredCapacity)
 
-        while aggregatedData.count < ReadBufferPolicy.maximumBatchBytes {
+        while aggregatedReadData.count < ReadBufferPolicy.maximumBatchBytes {
             let bytesRead = read(fd, buffer, bufferCapacity)
             if bytesRead > 0 {
-                aggregatedData.append(buffer, count: bytesRead)
+                aggregatedReadData.append(buffer, count: bytesRead)
                 continue
             }
 
@@ -398,8 +401,8 @@ final class PTY {
                 _isRunning = false
                 fdLock.unlock()
                 releaseReadBuffer()
-                if !aggregatedData.isEmpty {
-                    onOutput?(aggregatedData)
+                if !aggregatedReadData.isEmpty {
+                    onOutput?(aggregatedReadData)
                     shrinkIdleReadBufferIfNeeded()
                 }
                 markReadChannelClosedAndNotifyIfReady()
@@ -412,8 +415,8 @@ final class PTY {
             break
         }
 
-        if !aggregatedData.isEmpty {
-            onOutput?(aggregatedData)
+        if !aggregatedReadData.isEmpty {
+            onOutput?(aggregatedReadData)
             shrinkIdleReadBufferIfNeeded()
         }
     }

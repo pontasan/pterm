@@ -534,9 +534,9 @@ final class TerminalModel {
         if cursor.row == grid.scrollBottom {
             // At bottom of scroll region: scroll up
             // Save the line being scrolled out
+            let encodingHint = grid.rowEncodingHint(grid.scrollTop)
             let scrolledRow = grid.rowCells(grid.scrollTop)
             let isWrapped = grid.isWrapped(grid.scrollTop)
-            let encodingHint = grid.rowEncodingHint(grid.scrollTop)
             onScrollOut?(scrolledRow, isWrapped, encodingHint)
             grid.scrollUp(count: 1)
         } else if cursor.row < rows - 1 {

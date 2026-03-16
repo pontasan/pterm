@@ -939,9 +939,7 @@ final class TerminalController {
                     } else {
                         let gridRow = absoluteRow - scrollback.rowCount
                         textExtractionGridRowBuffer.removeAll(keepingCapacity: true)
-                        for col in 0..<model.cols {
-                            textExtractionGridRowBuffer.append(model.grid.cell(at: gridRow, col: col))
-                        }
+                        textExtractionGridRowBuffer.append(contentsOf: model.grid.rowCells(gridRow))
                         cells = textExtractionGridRowBuffer
                     }
 

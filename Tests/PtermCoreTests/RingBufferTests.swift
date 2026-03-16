@@ -192,6 +192,44 @@ final class RingBufferTests: XCTestCase {
         XCTAssertEqual(ring_buffer_bytes_used(rb), size_t(rowCount))
     }
 
+    func testBatchAppendRowsOverSmallBudgetStillRetainsNewestRowsByEvictingOldest() {
+        let rb = ring_buffer_create_sized(8, 8)
+        XCTAssertNotNil(rb)
+        defer { ring_buffer_destroy(rb) }
+
+        let payload: [UInt8] = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]
+        let offsets: [UInt32] = [0, 4, 8, 12]
+        let lengths: [UInt32] = [4, 4, 4, 4]
+        let continuations = Array(repeating: false, count: 4)
+
+        let result = payload.withUnsafeBufferPointer { payloadPointer in
+            offsets.withUnsafeBufferPointer { offsetsPointer in
+                lengths.withUnsafeBufferPointer { lengthsPointer in
+                    continuations.withUnsafeBufferPointer { continuationPointer in
+                        ring_buffer_append_rows(
+                            rb,
+                            payloadPointer.baseAddress,
+                            offsetsPointer.baseAddress,
+                            lengthsPointer.baseAddress,
+                            continuationPointer.baseAddress,
+                            4
+                        )
+                    }
+                }
+            }
+        }
+
+        XCTAssertGreaterThanOrEqual(result, 0)
+        XCTAssertEqual(ring_buffer_row_count(rb), 2)
+
+        var dataPtr: UnsafePointer<UInt8>?
+        var length: UInt32 = 0
+        XCTAssertTrue(ring_buffer_get_row(rb, 0, &dataPtr, &length, nil))
+        XCTAssertEqual(Array(UnsafeBufferPointer(start: dataPtr, count: Int(length))), [2, 2, 2, 2])
+        XCTAssertTrue(ring_buffer_get_row(rb, 1, &dataPtr, &length, nil))
+        XCTAssertEqual(Array(UnsafeBufferPointer(start: dataPtr, count: Int(length))), [3, 3, 3, 3])
+    }
+
     func testInitialRowIndexCapacityStartsAtSoftLimitInsteadOfScalingWithInitialBytes() {
         let rb = ring_buffer_create_sized(2 * 1024 * 1024, 2 * 1024 * 1024)
         XCTAssertNotNil(rb)

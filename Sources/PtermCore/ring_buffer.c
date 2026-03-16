@@ -284,23 +284,12 @@ static bool ring_buffer_prepare_append_batch(RingBuffer *rb,
         }
     }
 
-    if (total_length > rb->max_data_capacity) {
-        return false;
-    }
-
     size_t required_capacity = rb->bytes_used + total_length;
-    if (required_capacity <= rb->max_data_capacity &&
-        required_capacity > rb->data_capacity &&
-        !ring_buffer_grow_if_needed(rb, required_capacity)) {
-        return false;
+    if (required_capacity > rb->max_data_capacity) {
+        required_capacity = rb->max_data_capacity;
     }
-
-    uint64_t needed_rows_u64 = (uint64_t)rb->row_count + (uint64_t)additional_rows;
-    uint32_t needed_rows = needed_rows_u64 > RING_BUFFER_MAX_ROWS
-        ? RING_BUFFER_MAX_ROWS
-        : (uint32_t)needed_rows_u64;
-    if (needed_rows > rb->row_capacity &&
-        !ring_buffer_grow_rows_if_needed(rb, needed_rows)) {
+    if (required_capacity > rb->data_capacity &&
+        !ring_buffer_grow_if_needed(rb, required_capacity)) {
         return false;
     }
 

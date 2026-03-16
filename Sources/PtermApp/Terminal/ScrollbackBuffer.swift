@@ -22,6 +22,7 @@ final class ScrollbackBuffer {
 
         static let unknown = RowEncodingHint(kind: .unknown)
         static let full = RowEncodingHint(kind: .full)
+
     }
 
     struct BufferedRow {
@@ -170,7 +171,7 @@ final class ScrollbackBuffer {
         guard let rb = ringBuffer else { return }
 
         let cellCount = cells.count
-        let encodingPlan = Self.encodingPlan(for: cells, hint: encodingHint)
+        let encodingPlan = Self.encodingPlan(for: cells, cellCount: cellCount, hint: encodingHint)
         let byteCount = Self.serializedByteCount(for: encodingPlan, cellCount: cellCount)
 
         // Ensure serialization buffer is large enough while bounding retained slack.
@@ -193,7 +194,7 @@ final class ScrollbackBuffer {
         for row in rows {
             let slice = ArraySlice(row.cells)
             let cellCount = row.cells.count
-            let plan = Self.encodingPlan(for: slice, hint: row.encodingHint)
+            let plan = Self.encodingPlan(for: slice, cellCount: cellCount, hint: row.encodingHint)
             let byteCount = Self.serializedByteCount(for: plan, cellCount: cellCount)
             serializedRowsScratch.append(
                 SerializedRowScratch(
@@ -449,14 +450,16 @@ final class ScrollbackBuffer {
         }
     }
 
-    private static func encodingPlan(for cells: ArraySlice<Cell>, hint: RowEncodingHint = .unknown) -> RowEncodingPlan {
+    private static func encodingPlan(for cells: ArraySlice<Cell>,
+                                     cellCount: Int,
+                                     hint: RowEncodingHint = .unknown) -> RowEncodingPlan {
         switch hint.kind {
         case .compactDefault(let serializedCount):
-            return .compactDefault(serializedCount: min(serializedCount, cells.count))
+            return .compactDefault(serializedCount: min(serializedCount, cellCount))
         case .compactUniformAttributes(let sharedAttributes, let serializedCount):
             return .compactUniformAttributes(
                 sharedAttributes: sharedAttributes,
-                serializedCount: min(serializedCount, cells.count)
+                serializedCount: min(serializedCount, cellCount)
             )
         case .full:
             return .full
