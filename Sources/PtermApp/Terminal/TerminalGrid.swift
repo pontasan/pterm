@@ -789,6 +789,14 @@ final class TerminalGrid {
         markRowEncodingHintDirty(row)
     }
 
+    func scrollLineLeft(row: Int, count: Int) {
+        deleteCells(row: row, col: 0, count: count)
+    }
+
+    func scrollLineRight(row: Int, count: Int) {
+        insertBlanks(row: row, col: 0, count: count)
+    }
+
     private func setWrappedFlags(_ wrappedFlags: [Bool]) {
         physicalWrappedFlags = Array(wrappedFlags.prefix(rows))
         if physicalWrappedFlags.count < rows {

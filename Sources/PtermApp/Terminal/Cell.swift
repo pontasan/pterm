@@ -35,6 +35,7 @@ struct CellAttributes: Equatable {
     var hidden: Bool
     var dim: Bool
     var blink: Bool
+    var decProtected: Bool = false
 
     static let `default` = CellAttributes(
         foreground: .default,
@@ -46,7 +47,8 @@ struct CellAttributes: Equatable {
         inverse: false,
         hidden: false,
         dim: false,
-        blink: false
+        blink: false,
+        decProtected: false
     )
 }
 

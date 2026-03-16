@@ -134,7 +134,7 @@ final class KeyboardHandler {
             controller.sendInput("\u{1B}[6~")
         case #selector(NSResponder.insertNewline(_:)),
              #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
-            controller.sendInput("\r")
+            controller.sendInput(controller.newlineKeyInput())
         case #selector(NSResponder.insertTab(_:)):
             controller.sendInput("\t")
         case #selector(NSResponder.insertBacktab(_:)):

@@ -183,13 +183,15 @@ final class SplitTerminalContainerView: NSView {
             scrollView.terminalView.shortcutConfiguration = shortcutConfiguration
             scrollView.terminalView.outputConfirmedInputAnimationsEnabled = outputConfirmedInputAnimationsEnabled
             scrollView.terminalView.typewriterSoundEnabled = typewriterSoundEnabled
-            // Suppress individual rendering — SplitRenderView handles it.
-            // Also make the CAMetalLayer invisible so it doesn't interfere
-            // with Window Server compositing of the overlay SplitRenderView.
-            scrollView.terminalView.renderingSuppressed = true
-            scrollView.terminalView.alphaValue = 0
             scrollView.terminalView.imagePreviewURLProvider = imagePreviewURLProvider
             scrollView.terminalView.terminalController = controller
+            // Suppress individual rendering after the controller is attached.
+            // TerminalView.setupController() restores the controller-owned
+            // suppression state, so split mode must reassert its own policy here.
+            scrollView.terminalView.renderingSuppressed = true
+            // Also make the CAMetalLayer invisible so it doesn't interfere
+            // with Window Server compositing of the overlay SplitRenderView.
+            scrollView.terminalView.alphaValue = 0
             scrollView.terminalView.onBecameFirstResponder = { [weak self, weak controller] in
                 guard let self, let controller else { return }
                 self.onActiveControllerChange?(controller)

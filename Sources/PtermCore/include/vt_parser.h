@@ -86,6 +86,10 @@ struct VtParser {
     size_t   string_len;
     size_t   string_capacity;
     bool     string_overflow;  /* Set when string buffer allocation fails or limit exceeded */
+    uint32_t osc_command;
+    bool     osc_command_has_digits;
+    bool     osc_saw_separator;
+    bool     osc_ignore_payload;
 
     /* Callback */
     VtParserCallback callback;

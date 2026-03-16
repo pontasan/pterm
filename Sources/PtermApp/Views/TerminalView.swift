@@ -532,6 +532,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     private func teardownController() {
         cancelDeferredResizeNotifications()
         terminalController?.onNeedsDisplay = nil
+        terminalController?.onRenderingSuppressedChange = nil
         keyboardHandler = nil
     }
 
@@ -545,11 +546,15 @@ final class TerminalView: MTKView, NSTextInputClient {
             self?.updateMarkedTextOverlay()
             self?.scrollerSyncPending = true
         }
+        controller.onRenderingSuppressedChange = { [weak self] suppressed in
+            self?.renderingSuppressed = suppressed
+        }
         controller.notifyFocusChanged(window?.isKeyWindow == true)
         scrollerSyncPending = true
         updateTerminalSize(notificationMode: .immediateOnly)
         updateCursorBlinkTimer()
         updateOutputPulseTimer()
+        renderingSuppressed = controller.isRenderingSuppressed
         // When a controller is assigned to a new view (e.g., returning to split view),
         // ensure we show the latest output, not stale scrollback position.
         controller.scrollToBottom()

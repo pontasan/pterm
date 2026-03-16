@@ -29,6 +29,23 @@ static void parser_clear(VtParser *parser) {
 static void parser_string_clear(VtParser *parser) {
     parser->string_len = 0;
     parser->string_overflow = false;
+    parser->osc_command = 0;
+    parser->osc_command_has_digits = false;
+    parser->osc_saw_separator = false;
+    parser->osc_ignore_payload = false;
+}
+
+static inline bool osc_command_should_capture(uint32_t command, bool has_digits) {
+    if (!has_digits) return false;
+    switch (command) {
+        case 0:
+        case 2:
+        case 7:
+        case 52:
+            return true;
+        default:
+            return false;
+    }
 }
 
 static void parser_string_put(VtParser *parser, uint8_t byte) {
@@ -137,6 +154,7 @@ static inline bool is_private_marker(uint32_t cp) {
 static void handle_execute(VtParser *parser, uint32_t cp) {
     /* C0 controls that are always processed regardless of state */
     switch (cp) {
+        case 0x05: /* ENQ */
         case 0x07: /* BEL */
         case 0x08: /* BS */
         case 0x09: /* HT */
@@ -414,8 +432,26 @@ void vt_parser_feed_one(VtParser *parser, uint32_t cp) {
             emit(parser, VT_ACTION_OSC_END, 0);
             parser->state = VT_STATE_GROUND;
         } else if (cp >= 0x20 && cp <= 0x7E) {
-            parser_string_put(parser, (uint8_t)cp);
-            emit(parser, VT_ACTION_OSC_PUT, cp);
+            if (!parser->osc_saw_separator) {
+                if (cp >= '0' && cp <= '9') {
+                    parser->osc_command_has_digits = true;
+                    parser->osc_command = parser->osc_command * 10 + (uint32_t)(cp - '0');
+                } else if (cp == ';') {
+                    parser->osc_saw_separator = true;
+                    parser->osc_ignore_payload = !osc_command_should_capture(
+                        parser->osc_command,
+                        parser->osc_command_has_digits
+                    );
+                } else {
+                    parser->osc_saw_separator = true;
+                    parser->osc_ignore_payload = true;
+                }
+                parser_string_put(parser, (uint8_t)cp);
+                emit(parser, VT_ACTION_OSC_PUT, cp);
+            } else if (!parser->osc_ignore_payload) {
+                parser_string_put(parser, (uint8_t)cp);
+                emit(parser, VT_ACTION_OSC_PUT, cp);
+            }
         } else if (is_c0(cp) && cp != 0x07) {
             /* C0 controls other than BEL: ignore in OSC string */
         }
@@ -440,6 +476,30 @@ void vt_parser_feed_one(VtParser *parser, uint32_t cp) {
 
 void vt_parser_feed(VtParser *parser, const uint32_t *codepoints, size_t count) {
     for (size_t i = 0; i < count; i++) {
+        if (parser->state == VT_STATE_OSC_STRING &&
+            parser->osc_saw_separator &&
+            parser->osc_ignore_payload) {
+            for (; i < count; i++) {
+                uint32_t cp = codepoints[i];
+                if (cp == 0x07) {
+                    emit(parser, VT_ACTION_OSC_END, 0);
+                    parser->state = VT_STATE_GROUND;
+                    break;
+                }
+                if (cp == 0x9C) {
+                    emit(parser, VT_ACTION_OSC_END, 0);
+                    parser->state = VT_STATE_GROUND;
+                    break;
+                }
+                if (cp == 0x1B) {
+                    emit(parser, VT_ACTION_OSC_END, 0);
+                    parser_clear(parser);
+                    parser->state = VT_STATE_ESCAPE;
+                    break;
+                }
+            }
+            continue;
+        }
         vt_parser_feed_one(parser, codepoints[i]);
     }
 }

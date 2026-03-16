@@ -9,7 +9,15 @@ import PtermCore
 final class TerminalModel {
     private enum DesignatedCharacterSet {
         case ascii
+        case british
         case decSpecialGraphics
+    }
+
+    private enum InvokedCharacterSet {
+        case g0
+        case g1
+        case g2
+        case g3
     }
 
     private enum TitleUpdateRateLimit {
@@ -39,6 +47,10 @@ final class TerminalModel {
     /// Application cursor keys mode (DECCKM)
     var applicationCursorKeys: Bool = false
 
+    /// ANSI Line Feed / New Line mode (LNM).
+    /// When enabled, the Return key should send CRLF rather than CR.
+    var newLineMode: Bool = false
+
     /// Mouse reporting mode
     var mouseReporting: MouseReportingMode = .none
 
@@ -48,10 +60,14 @@ final class TerminalModel {
     /// Tab stops stored as a compact bitset to keep per-terminal overhead low.
     private var tabStopWords: [UInt64] = []
 
-    /// G0/G1 character set designations and the currently invoked set.
+    /// Designated character sets and the currently invoked GL/GR sets.
     private var g0Charset: DesignatedCharacterSet = .ascii
     private var g1Charset: DesignatedCharacterSet = .ascii
-    private var activeCharsetIsG1 = false
+    private var g2Charset: DesignatedCharacterSet = .ascii
+    private var g3Charset: DesignatedCharacterSet = .ascii
+    private var glInvocation: InvokedCharacterSet = .g0
+    private var grInvocation: InvokedCharacterSet = .g1
+    private var singleShiftInvocation: InvokedCharacterSet?
 
     /// Callback when a line scrolls off the top of the screen (for scrollback)
     var onScrollOut: ((ScrollbackBuffer.BufferedRow) -> Void)?
@@ -70,13 +86,22 @@ final class TerminalModel {
     var onWindowResizeRequest: ((_ rows: Int, _ cols: Int) -> Void)?
     var onWindowPixelResizeRequest: ((_ width: Int, _ height: Int) -> Void)?
     var onClearScrollback: (() -> Void)?
+    var onPendingUpdateModeChange: ((Bool) -> Void)?
 
     /// OSC string accumulator
     private var oscString: String = ""
+    private var oscCommandPrefix: String = ""
+    private var oscSawSeparator = false
+    private var oscShouldAccumulatePayload = true
 
     /// Maximum length for OSC strings in Swift layer (4KB is sufficient for all
     /// legitimate OSC commands: titles, color definitions, etc.)
     private static let maxOSCStringLength = 4096
+
+    /// Active DCS request metadata. Payload bytes are accumulated in the C parser.
+    private var dcsFinalByte: UInt32 = 0
+    private var dcsIntermediates: [UInt8] = []
+    private var operatingLevel: Int = 4
 
     private var titleUpdateWindowStart: TimeInterval = ProcessInfo.processInfo.systemUptime
     private var titleUpdateCount = 0
@@ -97,6 +122,10 @@ final class TerminalModel {
 
     var mouseProtocol: MouseProtocol = .x10
     var focusTrackingEnabled: Bool = false
+    private(set) var pendingUpdateModeEnabled: Bool = false
+    private var insertModeEnabled = false
+    private var protectedAreaModeEnabled = false
+    private static let answerbackMessage = "pterm"
 
     init(rows: Int, cols: Int) {
         self.rows = rows
@@ -120,9 +149,28 @@ final class TerminalModel {
         setTabStopBit(at: column, enabled: true)
     }
 
+    private func clearTabStop(at column: Int) {
+        guard column >= 0 else { return }
+        setTabStopBit(at: column, enabled: false)
+    }
+
+    private func clearAllTabStops() {
+        for index in tabStopWords.indices {
+            tabStopWords[index] = 0
+        }
+    }
+
     private func nextTabStop(after column: Int) -> Int? {
         guard column + 1 < cols else { return nil }
         for idx in (column + 1)..<cols where isTabStopSet(at: idx) {
+            return idx
+        }
+        return nil
+    }
+
+    private func previousTabStop(before column: Int) -> Int? {
+        guard column > 0 else { return nil }
+        for idx in stride(from: column - 1, through: 0, by: -1) where isTabStopSet(at: idx) {
             return idx
         }
         return nil
@@ -184,15 +232,50 @@ final class TerminalModel {
 
         case VT_ACTION_OSC_START:
             oscString = ""
+            oscCommandPrefix = ""
+            oscSawSeparator = false
+            oscShouldAccumulatePayload = true
 
         case VT_ACTION_OSC_PUT:
-            if oscString.count < Self.maxOSCStringLength,
-               let scalar = Unicode.Scalar(codepoint) {
-                oscString.append(Character(scalar))
+            guard let scalar = Unicode.Scalar(codepoint) else { break }
+            let character = Character(scalar)
+            if !oscSawSeparator {
+                if character == ";" {
+                    oscSawSeparator = true
+                    if let command = Int(oscCommandPrefix) {
+                        oscShouldAccumulatePayload = Self.shouldAccumulateOSCPayload(for: command)
+                        if oscShouldAccumulatePayload {
+                            oscString = oscCommandPrefix + ";"
+                        }
+                    } else {
+                        oscShouldAccumulatePayload = false
+                    }
+                } else if oscCommandPrefix.count < 16 {
+                    oscCommandPrefix.append(character)
+                }
+            } else if oscShouldAccumulatePayload && oscString.count < Self.maxOSCStringLength {
+                oscString.append(character)
             }
 
         case VT_ACTION_OSC_END:
-            handleOSC(oscString)
+            if oscSawSeparator && oscShouldAccumulatePayload {
+                handleOSC(oscString)
+            }
+            oscString = ""
+            oscCommandPrefix = ""
+            oscSawSeparator = false
+            oscShouldAccumulatePayload = true
+
+        case VT_ACTION_DCS_START:
+            dcsFinalByte = codepoint
+            let intermediates = parser.pointee.intermediates
+            let allIntermediates = [intermediates.0, intermediates.1, intermediates.2, intermediates.3]
+            dcsIntermediates = Array(allIntermediates.prefix(Int(parser.pointee.intermediate_count)))
+
+        case VT_ACTION_DCS_END:
+            handleDCS(parser: parser)
+            dcsFinalByte = 0
+            dcsIntermediates.removeAll(keepingCapacity: true)
 
         default:
             break
@@ -207,7 +290,12 @@ final class TerminalModel {
     }
 
     var canUseASCIIGroundFastPath: Bool {
-        g0Charset == .ascii && g1Charset == .ascii && cursor.autoWrapMode
+        g0Charset == .ascii &&
+        g1Charset == .ascii &&
+        g2Charset == .ascii &&
+        g3Charset == .ascii &&
+        singleShiftInvocation == nil &&
+        cursor.autoWrapMode
     }
 
     /// Fast path for the common "ground-state text stream" case.
@@ -278,6 +366,12 @@ final class TerminalModel {
             case 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F:
                 handleExecute(UInt32(byte))
                 index += 1
+            case 0x1B:
+                if let skippedCount = consumeIgnoredOSCBytes(in: bytes, from: index) {
+                    index += skippedCount
+                } else {
+                    return index
+                }
             default:
                 return index
             }
@@ -334,7 +428,7 @@ final class TerminalModel {
 
         var remainingBase = codepoints
         var remainingCount = count
-        let attributes = cursor.attributes
+        let attributes = currentPrintAttributes()
 
         while remainingCount > 0 {
             if cursor.pendingWrap {
@@ -369,6 +463,56 @@ final class TerminalModel {
         }
     }
 
+    private func consumeIgnoredOSCBytes(
+        in bytes: UnsafeBufferPointer<UInt8>,
+        from startIndex: Int
+    ) -> Int? {
+        guard startIndex + 2 < bytes.count,
+              bytes[startIndex] == 0x1B,
+              bytes[startIndex + 1] == 0x5D
+        else {
+            return nil
+        }
+
+        var index = startIndex + 2
+        var command = 0
+        var sawDigit = false
+        while index < bytes.count {
+            let byte = bytes[index]
+            if byte >= 0x30 && byte <= 0x39 {
+                sawDigit = true
+                command = command * 10 + Int(byte - 0x30)
+                index += 1
+                continue
+            }
+            break
+        }
+
+        guard sawDigit,
+              index < bytes.count,
+              bytes[index] == 0x3B,
+              !Self.shouldAccumulateOSCPayload(for: command)
+        else {
+            return nil
+        }
+
+        index += 1
+        while index < bytes.count {
+            let byte = bytes[index]
+            if byte == 0x07 {
+                return index - startIndex + 1
+            }
+            if byte == 0x1B,
+               index + 1 < bytes.count,
+               bytes[index + 1] == 0x5C {
+                return index - startIndex + 2
+            }
+            index += 1
+        }
+
+        return nil
+    }
+
     private func handleASCIIByteRun(_ bytes: UnsafeBufferPointer<UInt8>) {
         guard let base = bytes.baseAddress else { return }
         handleASCIIByteRun(base, count: bytes.count, containsSpace: true)
@@ -379,7 +523,7 @@ final class TerminalModel {
 
         var remainingBase = bytes
         var remainingCount = count
-        let attributes = cursor.attributes
+        let attributes = currentPrintAttributes()
 
         while remainingCount > 0 {
             if cursor.pendingWrap {
@@ -426,7 +570,13 @@ final class TerminalModel {
     private func handlePrint(_ codepoint: UInt32) {
         let translatedCodepoint: UInt32
         let width: Int
-        if g0Charset == .ascii && g1Charset == .ascii && codepoint >= 0x20 && codepoint < 0x7F {
+        if g0Charset == .ascii &&
+            g1Charset == .ascii &&
+            g2Charset == .ascii &&
+            g3Charset == .ascii &&
+            singleShiftInvocation == nil &&
+            codepoint >= 0x20 &&
+            codepoint < 0x7F {
             translatedCodepoint = codepoint
             width = 1
         } else {
@@ -457,9 +607,12 @@ final class TerminalModel {
         }
 
         if charWidth == 1 {
+            if insertModeEnabled {
+                insertBlankCharacters(count: 1)
+            }
             let cell = Cell(
                 codepoint: translatedCodepoint,
-                attributes: cursor.attributes,
+                attributes: currentPrintAttributes(),
                 width: 1,
                 isWideContinuation: false
             )
@@ -477,10 +630,14 @@ final class TerminalModel {
             return
         }
 
+        if insertModeEnabled {
+            insertBlankCharacters(count: charWidth)
+        }
+
         // Write the cell
         let cell = Cell(
             codepoint: translatedCodepoint,
-            attributes: cursor.attributes,
+            attributes: currentPrintAttributes(),
             width: UInt8(charWidth),
             isWideContinuation: false
         )
@@ -490,7 +647,7 @@ final class TerminalModel {
         if charWidth == 2 && cursor.col + 1 < cols {
             let contCell = Cell(
                 codepoint: 0,
-                attributes: cursor.attributes,
+                attributes: currentPrintAttributes(),
                 width: 0,
                 isWideContinuation: true
             )
@@ -516,6 +673,9 @@ final class TerminalModel {
         case 0x07: // BEL
             onBell?()
 
+        case 0x05: // ENQ
+            sendResponse(Self.answerbackMessage)
+
         case 0x08: // BS (Backspace)
             if cursor.col > 0 {
                 cursor.col -= 1
@@ -535,10 +695,10 @@ final class TerminalModel {
             cursor.pendingWrap = false
 
         case 0x0E: // SO (Shift Out) - G1 character set
-            activeCharsetIsG1 = true
+            glInvocation = .g1
 
         case 0x0F: // SI (Shift In) - G0 character set
-            activeCharsetIsG1 = false
+            glInvocation = .g0
 
         default:
             break
@@ -577,14 +737,116 @@ final class TerminalModel {
         cursor.pendingWrap = false
     }
 
+    private func currentPrintAttributes() -> CellAttributes {
+        var attributes = cursor.attributes
+        if protectedAreaModeEnabled {
+            attributes.decProtected = true
+        }
+        return attributes
+    }
+
     // MARK: - CSI Sequences
 
     private func handleCSI(finalByte: UInt32, parser: UnsafePointer<VtParser>) {
-        let hasPrivateMarker = parser.pointee.intermediate_count > 0 &&
-            (parser.pointee.intermediates.0 == UInt8(ascii: "?") ||
-             parser.pointee.intermediates.0 == UInt8(ascii: ">") ||
-             parser.pointee.intermediates.0 == UInt8(ascii: "="))
-        let privateMarker = hasPrivateMarker ? parser.pointee.intermediates.0 : 0
+        let intermediatePrefix = [
+            parser.pointee.intermediates.0,
+            parser.pointee.intermediates.1,
+            parser.pointee.intermediates.2,
+            parser.pointee.intermediates.3,
+        ]
+        let allIntermediates = Array(intermediatePrefix.prefix(Int(parser.pointee.intermediate_count)))
+        let hasPrivateMarker = allIntermediates.first == UInt8(ascii: "?") ||
+            allIntermediates.first == UInt8(ascii: ">") ||
+            allIntermediates.first == UInt8(ascii: "=")
+        let privateMarker = hasPrivateMarker ? (allIntermediates.first ?? 0) : 0
+        let effectiveIntermediates = hasPrivateMarker ? Array(allIntermediates.dropFirst()) : allIntermediates
+        let hasSpaceIntermediate = effectiveIntermediates == [UInt8(ascii: " ")]
+        let hasQuoteIntermediate = effectiveIntermediates == [UInt8(ascii: "\"")]
+        let hasBangIntermediate = effectiveIntermediates == [UInt8(ascii: "!")]
+
+        if hasSpaceIntermediate {
+            switch finalByte {
+            case 0x40: // SL - Scroll Left
+                let n = Int(vt_parser_param(parser, 0, 1))
+                grid.scrollLineLeft(row: cursor.row, count: n)
+                return
+            case 0x41: // SR - Scroll Right
+                let n = Int(vt_parser_param(parser, 0, 1))
+                grid.scrollLineRight(row: cursor.row, count: n)
+                return
+            case 0x71: // DECSCUSR - Set Cursor Style
+                let ps = Int(vt_parser_param(parser, 0, 0))
+                switch ps {
+                case 0, 1: cursor.shape = .block;     cursor.blinking = true
+                case 2:    cursor.shape = .block;     cursor.blinking = false
+                case 3:    cursor.shape = .underline;  cursor.blinking = true
+                case 4:    cursor.shape = .underline;  cursor.blinking = false
+                case 5:    cursor.shape = .bar;        cursor.blinking = true
+                case 6:    cursor.shape = .bar;        cursor.blinking = false
+                default:   break
+                }
+                return
+            default:
+                break
+            }
+        }
+
+        if hasQuoteIntermediate {
+            switch finalByte {
+            case 0x70: // DECSCL - Set Conformance Level
+                handleDECSCL(parser: parser)
+                return
+            case 0x71: // DECSCA - Select Character Protection Attribute
+                switch Int(vt_parser_param(parser, 0, 0)) {
+                case 1:
+                    cursor.attributes.decProtected = true
+                case 0, 2:
+                    cursor.attributes.decProtected = false
+                default:
+                    break
+                }
+                return
+            default:
+                break
+            }
+        }
+
+        if hasBangIntermediate {
+            switch finalByte {
+            case 0x70: // DECSTR - Soft terminal reset
+                softReset()
+                return
+            default:
+                break
+            }
+        }
+
+        let hasDollarIntermediate = effectiveIntermediates == [UInt8(ascii: "$")]
+
+        if hasDollarIntermediate {
+            switch finalByte {
+            case 0x70: // DECRQM - Request Mode
+                sendResponse(makeDECRPMResponseBody(mode: Int(vt_parser_param(parser, 0, 0)), privateMarker: privateMarker))
+                return
+            case 0x75: // DECRQTSR - Request terminal state report
+                if vt_parser_param(parser, 0, 0) == 1 {
+                    sendDCSResponse("1$s")
+                }
+                return
+            case 0x77: // DECRQPSR - Request presentation state report
+                switch vt_parser_param(parser, 0, 0) {
+                case 1:
+                    sendDCSResponse(makeDECCIRResponseBody())
+                case 2:
+                    sendDCSResponse(makeDECTABSRResponseBody())
+                default:
+                    break
+                }
+                return
+            default:
+                break
+            }
+        }
 
         switch finalByte {
         case 0x41: // CUU - Cursor Up
@@ -624,6 +886,15 @@ final class TerminalModel {
             cursor.col = min(cols - 1, max(0, Int(n) - 1))
             cursor.pendingWrap = false
 
+        case 0x49: // CHT - Cursor Horizontal Forward Tabulation
+            let count = max(1, Int(vt_parser_param(parser, 0, 1)))
+            var target = cursor.col
+            for _ in 0..<count {
+                target = nextTabStop(after: target) ?? (cols - 1)
+            }
+            cursor.col = min(cols - 1, max(0, target))
+            cursor.pendingWrap = false
+
         case 0x48: // CUP - Cursor Position
             let row = vt_parser_param(parser, 0, 1)
             let col = vt_parser_param(parser, 1, 1)
@@ -632,10 +903,18 @@ final class TerminalModel {
             cursor.pendingWrap = false
 
         case 0x4A: // ED - Erase in Display
-            handleEraseDisplay(param: vt_parser_param(parser, 0, 0))
+            if privateMarker == UInt8(ascii: "?") {
+                handleSelectiveEraseDisplay(param: vt_parser_param(parser, 0, 0))
+            } else {
+                handleEraseDisplay(param: vt_parser_param(parser, 0, 0))
+            }
 
         case 0x4B: // EL - Erase in Line
-            handleEraseLine(param: vt_parser_param(parser, 0, 0))
+            if privateMarker == UInt8(ascii: "?") {
+                handleSelectiveEraseLine(param: vt_parser_param(parser, 0, 0))
+            } else {
+                handleEraseLine(param: vt_parser_param(parser, 0, 0))
+            }
 
         case 0x4C: // IL - Insert Lines
             let n = Int(vt_parser_param(parser, 0, 1))
@@ -657,7 +936,7 @@ final class TerminalModel {
 
         case 0x50: // DCH - Delete Characters
             let n = Int(vt_parser_param(parser, 0, 1))
-            grid.deleteCells(row: cursor.row, col: cursor.col, count: n)
+            deleteCharactersPreservingProtected(count: n)
 
         case 0x53: // SU - Scroll Up
             let n = Int(vt_parser_param(parser, 0, 1))
@@ -669,12 +948,31 @@ final class TerminalModel {
 
         case 0x58: // ECH - Erase Characters
             let n = Int(vt_parser_param(parser, 0, 1))
-            grid.clearCells(row: cursor.row, fromCol: cursor.col,
-                           toCol: cursor.col + n - 1)
+            eraseCells(row: cursor.row, fromCol: cursor.col,
+                       toCol: cursor.col + n - 1, selective: false)
+
+        case 0x5A: // CBT - Cursor Backward Tabulation
+            let count = max(1, Int(vt_parser_param(parser, 0, 1)))
+            var target = cursor.col
+            for _ in 0..<count {
+                target = previousTabStop(before: target) ?? 0
+            }
+            cursor.col = max(0, min(cols - 1, target))
+            cursor.pendingWrap = false
+
+        case 0x60: // HPA - Character Position Absolute
+            let n = vt_parser_param(parser, 0, 1)
+            cursor.col = min(cols - 1, max(0, Int(n) - 1))
+            cursor.pendingWrap = false
+
+        case 0x61: // HPR - Character Position Relative
+            let n = vt_parser_param(parser, 0, 1)
+            cursor.col = min(cols - 1, max(0, cursor.col + Int(n)))
+            cursor.pendingWrap = false
 
         case 0x40: // ICH - Insert Characters
             let n = Int(vt_parser_param(parser, 0, 1))
-            grid.insertBlanks(row: cursor.row, col: cursor.col, count: n)
+            insertBlankCharacters(count: n)
 
         case 0x62: // REP - Repeat preceding character
             // Security: cap at screen area to prevent CPU DoS
@@ -694,6 +992,11 @@ final class TerminalModel {
             cursor.row = min(rows - 1, max(0, Int(n) - 1))
             cursor.pendingWrap = false
 
+        case 0x65: // VPR - Line Position Relative
+            let n = vt_parser_param(parser, 0, 1)
+            cursor.row = min(rows - 1, max(0, cursor.row + Int(n)))
+            cursor.pendingWrap = false
+
         case 0x66: // HVP - Horizontal and Vertical Position (same as CUP)
             let row = vt_parser_param(parser, 0, 1)
             let col = vt_parser_param(parser, 1, 1)
@@ -704,6 +1007,16 @@ final class TerminalModel {
         case 0x68: // SM - Set Mode
             handleSetMode(parser: parser, privateMarker: privateMarker, set: true)
 
+        case 0x67: // TBC - Tab Clear
+            switch vt_parser_param(parser, 0, 0) {
+            case 0:
+                clearTabStop(at: cursor.col)
+            case 3:
+                clearAllTabStops()
+            default:
+                break
+            }
+
         case 0x6C: // RM - Reset Mode
             handleSetMode(parser: parser, privateMarker: privateMarker, set: false)
 
@@ -713,6 +1026,12 @@ final class TerminalModel {
         case 0x6E: // DSR - Device Status Report
             handleDSR(parser: parser)
 
+        case 0x63: // DA - Device Attributes
+            handleDeviceAttributes(privateMarker: privateMarker)
+
+        case 0x78: // DECREQTPARM - Request Terminal Parameters
+            handleRequestTerminalParameters(parser: parser, privateMarker: privateMarker)
+
         case 0x72: // DECSTBM - Set Top and Bottom Margins
             let top = Int(vt_parser_param(parser, 0, 1)) - 1
             let bottom = Int(vt_parser_param(parser, 1, Int32(rows))) - 1
@@ -721,21 +1040,6 @@ final class TerminalModel {
             cursor.row = cursor.originMode ? grid.scrollTop : 0
             cursor.col = 0
             cursor.pendingWrap = false
-
-        case 0x71: // DECSCUSR (Set Cursor Style) — CSI Ps SP q
-            if parser.pointee.intermediate_count == 1 &&
-               parser.pointee.intermediates.0 == 0x20 {
-                let ps = Int(vt_parser_param(parser, 0, 0))
-                switch ps {
-                case 0, 1: cursor.shape = .block;     cursor.blinking = true
-                case 2:    cursor.shape = .block;     cursor.blinking = false
-                case 3:    cursor.shape = .underline;  cursor.blinking = true
-                case 4:    cursor.shape = .underline;  cursor.blinking = false
-                case 5:    cursor.shape = .bar;        cursor.blinking = true
-                case 6:    cursor.shape = .bar;        cursor.blinking = false
-                default:   break
-                }
-            }
 
         case 0x74: // Window manipulation
             handleWindowManipulation(parser: parser)
@@ -767,20 +1071,24 @@ final class TerminalModel {
     private func handleEraseDisplay(param: Int32) {
         switch param {
         case 0: // Erase from cursor to end of display
-            grid.clearCells(row: cursor.row, fromCol: cursor.col, toCol: cols - 1)
+            eraseCells(row: cursor.row, fromCol: cursor.col, toCol: cols - 1, selective: false)
             for row in (cursor.row + 1)..<rows {
-                grid.clearRow(row)
+                eraseRow(row, selective: false)
             }
         case 1: // Erase from start to cursor
             for row in 0..<cursor.row {
-                grid.clearRow(row)
+                eraseRow(row, selective: false)
             }
-            grid.clearCells(row: cursor.row, fromCol: 0, toCol: cursor.col)
+            eraseCells(row: cursor.row, fromCol: 0, toCol: cursor.col, selective: false)
         case 2: // Erase entire display
-            grid.clearAll()
+            for row in 0..<rows {
+                eraseRow(row, selective: false)
+            }
         case 3: // Erase scrollback (xterm extension)
             onClearScrollback?()
-            grid.clearAll()
+            for row in 0..<rows {
+                eraseRow(row, selective: false)
+            }
         default:
             break
         }
@@ -789,13 +1097,68 @@ final class TerminalModel {
     private func handleEraseLine(param: Int32) {
         switch param {
         case 0: // Erase from cursor to end of line
-            grid.clearCells(row: cursor.row, fromCol: cursor.col, toCol: cols - 1)
+            eraseCells(row: cursor.row, fromCol: cursor.col, toCol: cols - 1, selective: false)
         case 1: // Erase from start to cursor
-            grid.clearCells(row: cursor.row, fromCol: 0, toCol: cursor.col)
+            eraseCells(row: cursor.row, fromCol: 0, toCol: cursor.col, selective: false)
         case 2: // Erase entire line
-            grid.clearRow(cursor.row)
+            eraseRow(cursor.row, selective: false)
         default:
             break
+        }
+    }
+
+    private func handleSelectiveEraseDisplay(param: Int32) {
+        switch param {
+        case 0:
+            eraseCells(row: cursor.row, fromCol: cursor.col, toCol: cols - 1, selective: true)
+            if cursor.row + 1 < rows {
+                for row in (cursor.row + 1)..<rows {
+                    eraseRow(row, selective: true)
+                }
+            }
+        case 1:
+            for row in 0..<cursor.row {
+                eraseRow(row, selective: true)
+            }
+            eraseCells(row: cursor.row, fromCol: 0, toCol: cursor.col, selective: true)
+        case 2:
+            for row in 0..<rows {
+                eraseRow(row, selective: true)
+            }
+        default:
+            break
+        }
+    }
+
+    private func handleSelectiveEraseLine(param: Int32) {
+        switch param {
+        case 0:
+            eraseCells(row: cursor.row, fromCol: cursor.col, toCol: cols - 1, selective: true)
+        case 1:
+            eraseCells(row: cursor.row, fromCol: 0, toCol: cursor.col, selective: true)
+        case 2:
+            eraseRow(cursor.row, selective: true)
+        default:
+            break
+        }
+    }
+
+    private func eraseRow(_ row: Int, selective: Bool) {
+        eraseCells(row: row, fromCol: 0, toCol: cols - 1, selective: selective)
+    }
+
+    private func eraseCells(row: Int, fromCol: Int, toCol: Int, selective: Bool) {
+        guard row >= 0, row < rows else { return }
+        let lower = max(0, fromCol)
+        let upper = min(cols - 1, toCol)
+        guard lower <= upper else { return }
+
+        for col in lower...upper {
+            let cell = grid.cell(at: row, col: col)
+            let shouldErase = selective ? !cell.attributes.decProtected : !cell.attributes.decProtected
+            if shouldErase {
+                grid.setCell(.empty, at: row, col: col)
+            }
         }
     }
 
@@ -846,11 +1209,24 @@ final class TerminalModel {
                     }
                 case 2004: // Bracketed paste mode
                     bracketedPasteMode = set
+                case 2026: // PENDING_UPDATE - pause rendering while terminal state continues to advance
+                    guard pendingUpdateModeEnabled != set else { break }
+                    pendingUpdateModeEnabled = set
+                    onPendingUpdateModeChange?(set)
                 default:
                     break
                 }
             }
-            // Standard ANSI modes are rarely used; ignore for now
+            else {
+                switch mode {
+                case 4: // IRM - Insert/Replace Mode
+                    insertModeEnabled = set
+                case 20: // LNM - Line Feed / New Line Mode
+                    newLineMode = set
+                default:
+                    break
+                }
+            }
         }
     }
 
@@ -995,12 +1371,28 @@ final class TerminalModel {
 
     /// Response callback: writes response bytes to PTY
     var onResponse: ((String) -> Void)?
+    var onResponseData: ((Data) -> Void)?
+    private var responseControlsUse8Bit = false
 
     private func handleDSR(parser: UnsafePointer<VtParser>) {
         let param = vt_parser_param(parser, 0, 0)
+        let privateMarker = parser.pointee.intermediate_count > 0 ? parser.pointee.intermediates.0 : 0
+        if privateMarker == UInt8(ascii: "?") {
+            switch param {
+            case 15: // Printer status
+                sendResponse("\u{1B}[?13n")
+            case 25: // UDK status
+                sendResponse("\u{1B}[?20n")
+            case 26: // Keyboard status
+                sendResponse("\u{1B}[?27;1;0;0n")
+            default:
+                break
+            }
+            return
+        }
+
         switch param {
-        case 5: // Status report
-            // Response: OK
+        case 5: // Operating status report
             sendResponse("\u{1B}[0n")
         case 6: // Cursor position report
             sendResponse("\u{1B}[\(cursor.row + 1);\(cursor.col + 1)R")
@@ -1012,7 +1404,286 @@ final class TerminalModel {
     private func sendResponse(_ response: String) {
         // Security: sanitize response - strip any control characters from
         // dynamic content. For DSR, the row/col are integers so this is safe.
+        let bytes = encodedResponseBytes(for: response)
+        if let onResponseData {
+            onResponseData(bytes)
+            return
+        }
+        if responseControlsUse8Bit, let latin1 = String(data: bytes, encoding: .isoLatin1) {
+            onResponse?(latin1)
+            return
+        }
         onResponse?(response)
+    }
+
+    private func sendDCSResponse(_ body: String) {
+        let response = "\u{1B}P\(body)\u{1B}\\"
+        let bytes = encodedResponseBytes(for: response)
+        if let onResponseData {
+            onResponseData(bytes)
+            return
+        }
+        if responseControlsUse8Bit, let latin1 = String(data: bytes, encoding: .isoLatin1) {
+            onResponse?(latin1)
+            return
+        }
+        onResponse?(response)
+    }
+
+    private func makeDECRPMResponseBody(mode: Int, privateMarker: UInt8) -> String {
+        let status: Int
+        if privateMarker == UInt8(ascii: "?") {
+            status = decModeReportStatus(mode: mode)
+            return "\u{1B}[?\(mode);\(status)$y"
+        }
+
+        status = ansiModeReportStatus(mode: mode)
+        return "\u{1B}[\(mode);\(status)$y"
+    }
+
+    private func ansiModeReportStatus(mode: Int) -> Int {
+        switch mode {
+        case 4:
+            return insertModeEnabled ? 1 : 2
+        case 20:
+            return newLineMode ? 1 : 2
+        default:
+            return 0
+        }
+    }
+
+    private func decModeReportStatus(mode: Int) -> Int {
+        switch mode {
+        case 1:
+            return applicationCursorKeys ? 1 : 2
+        case 2:
+            return 1
+        case 6:
+            return cursor.originMode ? 1 : 2
+        case 7:
+            return cursor.autoWrapMode ? 1 : 2
+        case 25:
+            return cursor.visible ? 1 : 2
+        case 1004:
+            return focusTrackingEnabled ? 1 : 2
+        default:
+            return 0
+        }
+    }
+
+    private func encodedResponseBytes(for response: String) -> Data {
+        guard responseControlsUse8Bit else {
+            return Data(response.utf8)
+        }
+
+        let source = Array(response.utf8)
+        var encoded: [UInt8] = []
+        encoded.reserveCapacity(source.count)
+        var index = 0
+        while index < source.count {
+            let byte = source[index]
+            if byte == 0x1B, index + 1 < source.count {
+                switch source[index + 1] {
+                case UInt8(ascii: "["):
+                    encoded.append(0x9B)
+                    index += 2
+                    continue
+                case UInt8(ascii: "]"):
+                    encoded.append(0x9D)
+                    index += 2
+                    continue
+                case UInt8(ascii: "P"):
+                    encoded.append(0x90)
+                    index += 2
+                    continue
+                case UInt8(ascii: "\\"):
+                    encoded.append(0x9C)
+                    index += 2
+                    continue
+                case UInt8(ascii: "N"):
+                    encoded.append(0x8E)
+                    index += 2
+                    continue
+                case UInt8(ascii: "O"):
+                    encoded.append(0x8F)
+                    index += 2
+                    continue
+                default:
+                    break
+                }
+            }
+            encoded.append(byte)
+            index += 1
+        }
+        return Data(encoded)
+    }
+
+    private func handleDCS(parser: UnsafePointer<VtParser>) {
+        guard dcsFinalByte != 0 else { return }
+        let payloadData: Data
+        if parser.pointee.string_len == 0 || parser.pointee.string_buf == nil {
+            payloadData = Data()
+        } else {
+            payloadData = Data(bytes: parser.pointee.string_buf, count: parser.pointee.string_len)
+        }
+        guard let payload = String(data: payloadData, encoding: .isoLatin1) else { return }
+
+        if dcsFinalByte == UInt32(UInt8(ascii: "q")),
+           dcsIntermediates == [UInt8(ascii: "$")] {
+            handleDECRQSS(payload)
+        }
+    }
+
+    private func handleDECRQSS(_ request: String) {
+        guard !request.isEmpty else { return }
+        switch request {
+        case "\"p":
+            let controlMode = responseControlsUse8Bit ? 0 : 1
+            sendDCSResponse("1$r6\(operatingLevel);\(controlMode)\"p")
+        default:
+            sendDCSResponse("1$r\(request)")
+        }
+    }
+
+    private func makeDECCIRResponseBody() -> String {
+        let srend = deccirFlagByte(
+            reverse: cursor.attributes.inverse,
+            blinking: cursor.attributes.blink,
+            underline: cursor.attributes.underline,
+            bold: cursor.attributes.bold
+        )
+        let satt = deccirSelectiveEraseByte()
+        let sflag = deccirStateFlagByte()
+        let pgl = deccirInvocationIndex(glInvocation)
+        let pgr = deccirInvocationIndex(grInvocation)
+        let scss = deccirCharsetSizeByte()
+        let sdesig = deccirCharsetDesignations()
+
+        return "1$u\(cursor.row + 1);\(cursor.col + 1);1;\(srend);\(satt);\(sflag);\(pgl);\(pgr);\(scss);\(sdesig)"
+    }
+
+    private func makeDECTABSRResponseBody() -> String {
+        var stops: [String] = []
+        stops.reserveCapacity(cols / 4)
+        for column in 0..<cols where isTabStopSet(at: column) {
+            stops.append(String(column + 1))
+        }
+        return "2$u" + stops.joined(separator: "/")
+    }
+
+    private func deccirFlagByte(reverse: Bool, blinking: Bool, underline: Bool, bold: Bool) -> String {
+        let value = 0x40 |
+            (reverse ? 0x08 : 0) |
+            (blinking ? 0x04 : 0) |
+            (underline ? 0x02 : 0) |
+            (bold ? 0x01 : 0)
+        return String(UnicodeScalar(value)!)
+    }
+
+    private func deccirSelectiveEraseByte() -> String {
+        let value = 0x40 | (cursor.attributes.decProtected ? 0x01 : 0)
+        return String(UnicodeScalar(value)!)
+    }
+
+    private func deccirStateFlagByte() -> String {
+        let value = 0x40 |
+            (cursor.pendingWrap ? 0x08 : 0) |
+            (singleShiftInvocation == .g3 ? 0x04 : 0) |
+            (singleShiftInvocation == .g2 ? 0x02 : 0) |
+            (cursor.originMode ? 0x01 : 0)
+        return String(UnicodeScalar(value)!)
+    }
+
+    private func deccirInvocationIndex(_ invocation: InvokedCharacterSet) -> Int {
+        switch invocation {
+        case .g0: return 0
+        case .g1: return 1
+        case .g2: return 2
+        case .g3: return 3
+        }
+    }
+
+    private func deccirCharsetSizeByte() -> String {
+        // Current supported sets are all 94-character designations.
+        return String(UnicodeScalar(0x40)!)
+    }
+
+    private func deccirCharsetDesignations() -> String {
+        deccirDesignationSuffix(for: g0Charset) +
+        deccirDesignationSuffix(for: g1Charset) +
+        deccirDesignationSuffix(for: g2Charset) +
+        deccirDesignationSuffix(for: g3Charset)
+    }
+
+    private func deccirDesignationSuffix(for charset: DesignatedCharacterSet) -> String {
+        switch charset {
+        case .ascii:
+            return "B"
+        case .british:
+            return "A"
+        case .decSpecialGraphics:
+            return "0"
+        }
+    }
+
+    private func handleDeviceAttributes(privateMarker: UInt8) {
+        switch privateMarker {
+        case UInt8(ascii: ">"):
+            // Secondary DA: emulate a broadly compatible VT420/xterm-style
+            // response that vttest accepts as a valid firmware report.
+            sendResponse("\u{1B}[>41;0;0c")
+        case UInt8(ascii: "="):
+            // Tertiary DA is only expected for VT420+ class terminals. We do
+            // not advertise that capability from primary DA, so leaving this
+            // unanswered keeps vttest in the "not supported" path.
+            break
+        default:
+            // Primary DA: advertise a VT420-class terminal so vttest enables
+            // VT320/VT420 feature menus and validates DECSCL/DECRQSS paths.
+            sendResponse("\u{1B}[?64;1;2;6;8;9;15c")
+        }
+    }
+
+    private func handleDECSCL(parser: UnsafePointer<VtParser>) {
+        let requestedLevelCode = Int(vt_parser_param(parser, 0, 61))
+        let requestedLevel: Int
+        switch requestedLevelCode {
+        case 61...64:
+            requestedLevel = requestedLevelCode - 60
+        default:
+            requestedLevel = 1
+        }
+
+        operatingLevel = requestedLevel
+
+        let controlModeParam: Int
+        if parser.pointee.param_count > 1 {
+            controlModeParam = Int(withUnsafeBytes(of: parser.pointee.params) { rawBytes in
+                rawBytes.bindMemory(to: Int32.self)[1]
+            })
+        } else {
+            controlModeParam = 1
+        }
+
+        switch controlModeParam {
+        case 0:
+            responseControlsUse8Bit = true
+        default:
+            responseControlsUse8Bit = false
+        }
+    }
+
+    private func handleRequestTerminalParameters(parser: UnsafePointer<VtParser>, privateMarker: UInt8) {
+        guard privateMarker == 0 else { return }
+
+        switch vt_parser_param(parser, 0, 0) {
+        case 0:
+            sendResponse("\u{1B}[2;1;1;120;120;1;0x")
+        case 1:
+            sendResponse("\u{1B}[3;1;1;120;120;1;0x")
+        default:
+            break
+        }
     }
 
     // MARK: - ESC Sequences
@@ -1037,6 +1708,19 @@ final class TerminalModel {
                 // DEC screen alignment test etc.
                 return
             }
+
+            if intermediate == UInt8(ascii: " ") {
+                switch finalByte {
+                case 0x46: // S7C1T
+                    responseControlsUse8Bit = false
+                    return
+                case 0x47: // S8C1T
+                    responseControlsUse8Bit = true
+                    return
+                default:
+                    break
+                }
+            }
         }
 
         switch finalByte {
@@ -1055,6 +1739,33 @@ final class TerminalModel {
 
         case 0x48: // HTS - Horizontal Tab Set
             setTabStop(at: cursor.col)
+
+        case 0x56: // SPA - Start of Protected Area
+            protectedAreaModeEnabled = true
+
+        case 0x57: // EPA - End of Protected Area
+            protectedAreaModeEnabled = false
+
+        case 0x4E: // SS2 - Single Shift G2 into GL for next graphic character
+            singleShiftInvocation = .g2
+
+        case 0x4F: // SS3 - Single Shift G3 into GL for next graphic character
+            singleShiftInvocation = .g3
+
+        case 0x6E: // LS2 - Locking Shift G2 into GL
+            glInvocation = .g2
+
+        case 0x6F: // LS3 - Locking Shift G3 into GL
+            glInvocation = .g3
+
+        case 0x7C: // LS3R - Locking Shift G3 into GR
+            grInvocation = .g3
+
+        case 0x7D: // LS2R - Locking Shift G2 into GR
+            grInvocation = .g2
+
+        case 0x7E: // LS1R - Locking Shift G1 into GR
+            grInvocation = .g1
 
         case 0x4D: // RI - Reverse Index (move cursor up, scroll if at top)
             if cursor.row == grid.scrollTop {
@@ -1093,6 +1804,15 @@ final class TerminalModel {
             if result.count >= maxTitleLength { break }
         }
         return result
+    }
+
+    private static func shouldAccumulateOSCPayload(for command: Int) -> Bool {
+        switch command {
+        case 0, 2, 7, 52:
+            return true
+        default:
+            return false
+        }
     }
 
     private func handleOSC(_ str: String) {
@@ -1188,15 +1908,113 @@ final class TerminalModel {
         grid.scrollBottom = rows - 1
         bracketedPasteMode = false
         applicationCursorKeys = false
+        newLineMode = false
         mouseReporting = .none
         mouseProtocol = .x10
         focusTrackingEnabled = false
+        pendingUpdateModeEnabled = false
+        insertModeEnabled = false
         isAlternateScreen = false
         alternateGrid = nil
         g0Charset = .ascii
         g1Charset = .ascii
-        activeCharsetIsG1 = false
+        g2Charset = .ascii
+        g3Charset = .ascii
+        glInvocation = .g0
+        grInvocation = .g1
+        singleShiftInvocation = nil
+        protectedAreaModeEnabled = false
+        responseControlsUse8Bit = false
         initTabStops()
+        onPendingUpdateModeChange?(false)
+    }
+
+    private func softReset() {
+        cursor = CursorState()
+        grid.scrollTop = 0
+        grid.scrollBottom = rows - 1
+        bracketedPasteMode = false
+        applicationCursorKeys = false
+        newLineMode = false
+        mouseReporting = .none
+        mouseProtocol = .x10
+        focusTrackingEnabled = false
+        pendingUpdateModeEnabled = false
+        insertModeEnabled = false
+        g0Charset = .ascii
+        g1Charset = .ascii
+        g2Charset = .ascii
+        g3Charset = .ascii
+        glInvocation = .g0
+        grInvocation = .g1
+        singleShiftInvocation = nil
+        protectedAreaModeEnabled = false
+        responseControlsUse8Bit = false
+        initTabStops()
+        onPendingUpdateModeChange?(false)
+    }
+
+    private func insertBlankCharacters(count: Int) {
+        transformUnprotectedCells(row: cursor.row, startCol: cursor.col, count: count, mode: .insert)
+    }
+
+    private func deleteCharactersPreservingProtected(count: Int) {
+        transformUnprotectedCells(row: cursor.row, startCol: cursor.col, count: count, mode: .delete)
+    }
+
+    private enum ProtectedTransformMode {
+        case insert
+        case delete
+    }
+
+    private func transformUnprotectedCells(
+        row: Int,
+        startCol: Int,
+        count: Int,
+        mode: ProtectedTransformMode
+    ) {
+        guard row >= 0, row < rows, startCol >= 0, startCol < cols, count > 0 else { return }
+
+        let snapshot = (0..<cols).map { grid.cell(at: row, col: $0) }
+        let editableColumns = Array((startCol..<cols).filter { !snapshot[$0].attributes.decProtected })
+        guard !editableColumns.isEmpty else { return }
+
+        let shift = min(count, editableColumns.count)
+        var updated = snapshot
+
+        switch mode {
+        case .insert:
+            for destinationPosition in stride(from: editableColumns.count - 1, through: 0, by: -1) {
+                let destinationColumn = editableColumns[destinationPosition]
+                let sourcePosition = destinationPosition - shift
+                if sourcePosition >= 0 {
+                    updated[destinationColumn] = snapshot[editableColumns[sourcePosition]]
+                } else {
+                    updated[destinationColumn] = .empty
+                }
+            }
+        case .delete:
+            for destinationPosition in 0..<editableColumns.count {
+                let destinationColumn = editableColumns[destinationPosition]
+                let sourcePosition = destinationPosition + shift
+                if sourcePosition < editableColumns.count {
+                    updated[destinationColumn] = snapshot[editableColumns[sourcePosition]]
+                } else {
+                    updated[destinationColumn] = .empty
+                }
+            }
+        }
+
+        for column in 0..<cols where !cellsEqual(updated[column], snapshot[column]) {
+            grid.setCell(updated[column], at: row, col: column)
+        }
+    }
+
+    private func cellsEqual(_ lhs: Cell, _ rhs: Cell) -> Bool {
+        lhs.codepoint == rhs.codepoint &&
+        lhs.attributes == rhs.attributes &&
+        lhs.width == rhs.width &&
+        lhs.isWideContinuation == rhs.isWideContinuation
     }
 
     func notifyFocusChanged(_ isFocused: Bool) {
@@ -1209,6 +2027,8 @@ final class TerminalModel {
         switch finalByte {
         case 0x30: // "0" = DEC Special Graphics
             charset = .decSpecialGraphics
+        case 0x41: // "A" = British
+            charset = .british
         case 0x42: // "B" = US ASCII
             charset = .ascii
         default:
@@ -1218,16 +2038,32 @@ final class TerminalModel {
         switch intermediate {
         case UInt8(ascii: "("):
             g0Charset = charset
-        case UInt8(ascii: ")"):
+        case UInt8(ascii: ")"), UInt8(ascii: "-"):
             g1Charset = charset
+        case UInt8(ascii: "*"), UInt8(ascii: "."):
+            g2Charset = charset
+        case UInt8(ascii: "+"), UInt8(ascii: "/"):
+            g3Charset = charset
         default:
             return
         }
     }
 
     private func translateCharacterSet(_ codepoint: UInt32) -> UInt32 {
-        let charset = activeCharsetIsG1 ? g1Charset : g0Charset
-        guard charset == .decSpecialGraphics else { return codepoint }
+        let invocation = singleShiftInvocation ?? ((codepoint < 0x80) ? glInvocation : grInvocation)
+        let charset = designatedCharacterSet(for: invocation)
+        if singleShiftInvocation != nil {
+            singleShiftInvocation = nil
+        }
+
+        switch charset {
+        case .ascii:
+            return codepoint
+        case .british:
+            return codepoint == 0x23 ? 0x00A3 : codepoint
+        case .decSpecialGraphics:
+            break
+        }
 
         switch codepoint {
         case 0x5F: return 0x00A0 // no-break space
@@ -1264,6 +2100,19 @@ final class TerminalModel {
         case 0x7E: return 0x00B7 // middle dot
         default:
             return codepoint
+        }
+    }
+
+    private func designatedCharacterSet(for invocation: InvokedCharacterSet) -> DesignatedCharacterSet {
+        switch invocation {
+        case .g0:
+            return g0Charset
+        case .g1:
+            return g1Charset
+        case .g2:
+            return g2Charset
+        case .g3:
+            return g3Charset
         }
     }
 

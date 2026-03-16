@@ -679,6 +679,76 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertEqual(controller.scrollback.rowCount, 0)
     }
 
+    func testPendingUpdateModeSuppressesDisplayCallbacksUntilResume() {
+        let controller = makeController(rows: 2, cols: 8)
+        var displayCount = 0
+        var suppressionChanges: [Bool] = []
+        controller.onNeedsDisplay = { displayCount += 1 }
+        controller.onRenderingSuppressedChange = { suppressionChanges.append($0) }
+
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?2026hAB".utf8))
+        drainMainQueue(testCase: self)
+        XCTAssertEqual(displayCount, 0)
+        XCTAssertEqual(suppressionChanges, [true])
+        XCTAssertTrue(controller.isRenderingSuppressed)
+
+        controller.debugProcessPTYOutputForTesting(Data("CD\u{1B}[?2026l".utf8))
+        drainMainQueue(testCase: self)
+        XCTAssertEqual(displayCount, 1)
+        XCTAssertEqual(suppressionChanges, [true, false])
+        XCTAssertFalse(controller.isRenderingSuppressed)
+        XCTAssertEqual(controller.withViewport { model, _, _ in
+            [
+                model.grid.cell(at: 0, col: 0).codepoint,
+                model.grid.cell(at: 0, col: 1).codepoint,
+                model.grid.cell(at: 0, col: 2).codepoint,
+                model.grid.cell(at: 0, col: 3).codepoint
+            ]
+        }, [0x41, 0x42, 0x43, 0x44])
+    }
+
+    func testPendingUpdateModeStillDisplaysProgressLineBeforeSuppressingRendering() {
+        let controller = makeController(rows: 2, cols: 32)
+        var displayCount = 0
+        var suppressionChanges: [Bool] = []
+        controller.onNeedsDisplay = { displayCount += 1 }
+        controller.onRenderingSuppressedChange = { suppressionChanges.append($0) }
+
+        controller.debugProcessPTYOutputForTesting(Data("Running: Only ASCII chars\r\n\u{1B}[?2026h".utf8))
+        drainMainQueue(testCase: self)
+
+        XCTAssertEqual(displayCount, 1)
+        XCTAssertEqual(suppressionChanges, [true])
+        XCTAssertTrue(controller.isRenderingSuppressed)
+        XCTAssertEqual(controller.withViewport { model, _, _ in
+            String(model.grid.rowCells(0).map { Character(UnicodeScalar($0.codepoint) ?? " ") })
+        }.trimmingCharacters(in: .whitespaces), "Running: Only ASCII chars")
+    }
+
+    func testPendingUpdateModeDisplaysProgressLineWhenResumeAndPauseShareChunk() {
+        let controller = makeController(rows: 2, cols: 40)
+        var displayCount = 0
+        var suppressionChanges: [Bool] = []
+        controller.onNeedsDisplay = { displayCount += 1 }
+        controller.onRenderingSuppressedChange = { suppressionChanges.append($0) }
+
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?2026h".utf8))
+        drainMainQueue(testCase: self)
+        XCTAssertTrue(controller.isRenderingSuppressed)
+
+        controller.debugProcessPTYOutputForTesting(
+            Data("Running: Long escape codes\r\n\u{1B}[?2026l\u{1B}[?2026h".utf8)
+        )
+        drainMainQueue(testCase: self)
+
+        XCTAssertEqual(displayCount, 1)
+        XCTAssertEqual(suppressionChanges, [true, false, true])
+        XCTAssertTrue(controller.isRenderingSuppressed)
+        XCTAssertEqual(controller.withViewport { model, _, _ in
+            String(model.grid.rowCells(0).map { Character(UnicodeScalar($0.codepoint) ?? " ") })
+        }.trimmingCharacters(in: .whitespaces), "Running: Long escape codes")
+    }
+
     func testFindMatchesIsCaseInsensitiveAndEmptyQueryReturnsNoMatches() {
         let controller = makeController(rows: 1, cols: 8)
         controller.withModel { model in

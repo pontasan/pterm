@@ -143,6 +143,7 @@ final class TerminalController {
     /// Callback when terminal needs redraw
     var onNeedsDisplay: (() -> Void)?
     var onOutputActivity: (() -> Void)?
+    var onRenderingSuppressedChange: ((Bool) -> Void)?
 
     /// Callback when terminal exits
     var onExit: (() -> Void)?
@@ -159,6 +160,8 @@ final class TerminalController {
     private var pendingNeedsDisplay = false
     private var pendingOutputActivity = false
     private var pendingStateChange = false
+    private var terminalRenderingSuppressed = false
+    private var pendingRenderingSuppressedChanges: [Bool] = []
     private var interruptDiscardingOutput = false
     private var pendingInterruptDrainCompletion: DispatchWorkItem?
     private var renderContentVersion: UInt64 = 0
@@ -230,6 +233,10 @@ final class TerminalController {
         callbackLock.withLock {
             renderContentVersion
         }
+    }
+
+    var isRenderingSuppressed: Bool {
+        lock.withReadLock { terminalRenderingSuppressed }
     }
 
     var isInInterruptCatchUpMode: Bool {
@@ -337,6 +344,13 @@ final class TerminalController {
             }
         }
 
+        model.onResponseData = { [weak self] data in
+            guard let self = self else { return }
+            DispatchQueue.global(qos: .userInteractive).async {
+                self.pty.write(data)
+            }
+        }
+
         model.encodeText = { [textEncoding] string in
             textEncoding.encode(string)
         }
@@ -354,6 +368,14 @@ final class TerminalController {
             // This callback is invoked while the controller write lock is held
             // during VT parsing, so only record intent here and clear after parsing.
             self?.parserRequestedScrollbackClear = true
+        }
+
+        model.onPendingUpdateModeChange = { [weak self] suppressed in
+            guard let self = self else { return }
+            if self.terminalRenderingSuppressed != suppressed {
+                self.terminalRenderingSuppressed = suppressed
+                self.pendingRenderingSuppressedChanges.append(suppressed)
+            }
         }
 
         // Wire scrollback: when a line scrolls off the top, store it
@@ -558,6 +580,11 @@ final class TerminalController {
         sendInput(data)
     }
 
+    /// Sequence emitted for an Enter/Return keypress, honoring ANSI newline mode.
+    func newlineKeyInput() -> String {
+        withModel { $0.newLineMode ? "\r\n" : "\r" }
+    }
+
     /// Send an interrupt equivalent to Ctrl+C by injecting the PTY's VINTR byte.
     /// This preserves normal terminal semantics across local shells, SSH, and
     /// other intermediate clients that expect to receive the control character
@@ -628,10 +655,15 @@ final class TerminalController {
         }
         var clearedScrollback = false
         var didMutateDisplay = false
+        var renderingSuppressed = false
+        var renderingSuppressedChanges: [Bool] = []
+        var startedRenderingSuppressed = false
+        let pendingUpdateAnalysis = Self.analyzePendingUpdateSequences(in: data)
         let ptr = data.baseAddress!
         let count = data.count
 
         lock.withWriteLock {
+            startedRenderingSuppressed = terminalRenderingSuppressed
             beginParserScrollOutBatch()
             defer { endParserScrollOutBatch() }
             let input = UnsafeBufferPointer(start: ptr, count: count)
@@ -685,21 +717,163 @@ final class TerminalController {
             }
 
             flushPendingParserScrollOutBatch()
+            renderingSuppressed = terminalRenderingSuppressed
+            renderingSuppressedChanges = pendingRenderingSuppressedChanges
+            pendingRenderingSuppressedChanges.removeAll(keepingCapacity: true)
         }
 
-        guard didMutateDisplay || clearedScrollback else { return }
+        if !renderingSuppressedChanges.isEmpty {
+            let now = ProcessInfo.processInfo.systemUptime
+            let shouldReportOutputActivity = callbackLock.withLock {
+                now >= outputActivitySuppressedUntilUptime
+            }
+
+            if renderingSuppressedChanges == [false, true],
+               startedRenderingSuppressed,
+               (didMutateDisplay || clearedScrollback),
+               pendingUpdateAnalysis.hasRenderableContentBeforeDisable {
+                scheduleInterleavedRenderingSuppressionDisplay(
+                    outputActivity: shouldReportOutputActivity,
+                    stateChange: clearedScrollback,
+                    endingSuppressed: true
+                )
+                scheduleScrollbackCompaction()
+                return
+            }
+
+            if renderingSuppressedChanges == [true],
+               (didMutateDisplay || clearedScrollback),
+               pendingUpdateAnalysis.hasRenderableContentBeforeEnable {
+                scheduleMainCallbacks(
+                    needsDisplay: true,
+                    outputActivity: shouldReportOutputActivity,
+                    stateChange: clearedScrollback
+                )
+                dispatchRenderingSuppressionChanges(renderingSuppressedChanges)
+                scheduleScrollbackCompaction()
+                return
+            }
+
+            dispatchRenderingSuppressionChanges(renderingSuppressedChanges)
+        }
+
+        guard didMutateDisplay || clearedScrollback else {
+            scheduleScrollbackCompaction()
+            return
+        }
 
         let now = ProcessInfo.processInfo.systemUptime
         let shouldReportOutputActivity = callbackLock.withLock {
             now >= outputActivitySuppressedUntilUptime
         }
+        let shouldRequestDisplay = !renderingSuppressed
+        let shouldReportOutputActivityNow = shouldRequestDisplay && shouldReportOutputActivity
 
         scheduleMainCallbacks(
-            needsDisplay: true,
-            outputActivity: shouldReportOutputActivity,
+            needsDisplay: shouldRequestDisplay,
+            outputActivity: shouldReportOutputActivityNow,
             stateChange: clearedScrollback
         )
         scheduleScrollbackCompaction()
+    }
+
+    private struct PendingUpdateSequenceAnalysis {
+        var hasRenderableContentBeforeEnable = false
+        var hasRenderableContentBeforeDisable = false
+    }
+
+    private static func analyzePendingUpdateSequences(
+        in data: UnsafeBufferPointer<UInt8>
+    ) -> PendingUpdateSequenceAnalysis {
+        guard let bytes = data.baseAddress, data.count >= 8 else {
+            return PendingUpdateSequenceAnalysis()
+        }
+        var result = PendingUpdateSequenceAnalysis()
+        var segmentHasRenderableContent = false
+        var index = 0
+
+        while index < data.count {
+            if bytes[index] == 0x1B, index <= data.count - 8,
+               bytes[index + 1] == 0x5B,
+               bytes[index + 2] == 0x3F,
+               bytes[index + 3] == 0x32,
+               bytes[index + 4] == 0x30,
+               bytes[index + 5] == 0x32,
+               bytes[index + 6] == 0x36 {
+                if bytes[index + 7] == 0x68 {
+                    if segmentHasRenderableContent {
+                        result.hasRenderableContentBeforeEnable = true
+                    }
+                    segmentHasRenderableContent = false
+                    index += 8
+                    continue
+                }
+                if bytes[index + 7] == 0x6C {
+                    if segmentHasRenderableContent {
+                        result.hasRenderableContentBeforeDisable = true
+                    }
+                    segmentHasRenderableContent = false
+                    index += 8
+                    continue
+                }
+            }
+
+            if !segmentHasRenderableContent, Self.isRenderableByte(bytes[index]) {
+                segmentHasRenderableContent = true
+                if result.hasRenderableContentBeforeEnable && result.hasRenderableContentBeforeDisable {
+                    return result
+                }
+            }
+            index += 1
+        }
+
+        return result
+    }
+
+    private static func isRenderableByte(_ byte: UInt8) -> Bool {
+        switch byte {
+        case 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D:
+            return true
+        case 0x20...0x7E, 0x80...0xFF:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func dispatchRenderingSuppressionChanges(_ changes: [Bool]) {
+        guard !changes.isEmpty else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            for change in changes {
+                self.onRenderingSuppressedChange?(change)
+            }
+        }
+    }
+
+    private func scheduleInterleavedRenderingSuppressionDisplay(
+        outputActivity: Bool,
+        stateChange: Bool,
+        endingSuppressed: Bool
+    ) {
+        callbackLock.withLock {
+            renderContentVersion &+= 1
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.onRenderingSuppressedChange?(false)
+            if outputActivity {
+                self.onOutputActivity?()
+            }
+            self.onNeedsDisplay?()
+            if stateChange {
+                self.onStateChange?()
+            }
+            if endingSuppressed {
+                self.onRenderingSuppressedChange?(true)
+            }
+        }
     }
 
     private func canUseDirectASCIIGroundFastPath(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
@@ -749,6 +923,12 @@ final class TerminalController {
             let oldRows = model.rows
             let oldCols = model.cols
             if rows != oldRows || cols != oldCols {
+                // Presentation transitions can trigger multiple resizes while the
+                // same completed output is being reflowed across views. Commit any
+                // pending recent scrollback rows before mutating the grid so the
+                // resize operates on a stable history boundary instead of mixing
+                // transient recent rows with newly trimmed rows from the resize.
+                scrollback.flushPendingRows()
                 model.resize(newRows: rows, newCols: cols)
                 // After resize, snap to the latest content so the user sees
                 // the current terminal output, not stale scrollback.
