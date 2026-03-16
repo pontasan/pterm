@@ -13,6 +13,7 @@ final class TerminalGrid {
 
     /// Cell storage: row-major order
     private var cells: [Cell]
+    private var emptyRowTemplate: [Cell]
 
     /// Logical row -> physical storage row mapping.
     /// Scroll operations rotate this indirection instead of physically
@@ -39,6 +40,7 @@ final class TerminalGrid {
         self.cols = cols
         self.scrollBottom = rows - 1
         self.cells = Array(repeating: Cell.empty, count: rows * cols)
+        self.emptyRowTemplate = Array(repeating: Cell.empty, count: cols)
         self.rowOrder = []
         self.lineWrappedWords = Array(repeating: 0, count: Self.wrapWordCount(for: rows))
     }
@@ -58,6 +60,81 @@ final class TerminalGrid {
         guard row >= 0, row < rows, col >= 0, col < cols else { return }
         cells[cellIndex(row: row, col: col)] = cell
     }
+
+    /// Write a contiguous run of single-width cells into one row.
+    /// The caller guarantees bounds and width semantics.
+    func writeSingleWidthCells(
+        _ codepoints: UnsafeBufferPointer<UInt32>,
+        attributes: CellAttributes,
+        atRow row: Int,
+        startCol: Int
+    ) {
+        guard !codepoints.isEmpty else { return }
+        writeSingleWidthCells(
+            codepoints.baseAddress!,
+            count: codepoints.count,
+            attributes: attributes,
+            atRow: row,
+            startCol: startCol
+        )
+    }
+
+    func writeSingleWidthCells(
+        _ codepoints: UnsafePointer<UInt32>,
+        count: Int,
+        attributes: CellAttributes,
+        atRow row: Int,
+        startCol: Int
+    ) {
+        guard count > 0 else { return }
+        let offset = rowBaseOffset(for: row) + startCol
+        if count == 1 {
+            cells[offset] = Cell(
+                codepoint: codepoints[0],
+                attributes: attributes,
+                width: 1,
+                isWideContinuation: false
+            )
+            return
+        }
+        for index in 0..<count {
+            cells[offset + index] = Cell(
+                codepoint: codepoints[index],
+                attributes: attributes,
+                width: 1,
+                isWideContinuation: false
+            )
+        }
+    }
+
+    func writeSingleWidthASCIIBytes(
+        _ bytes: UnsafePointer<UInt8>,
+        count: Int,
+        attributes: CellAttributes,
+        atRow row: Int,
+        startCol: Int
+    ) {
+        guard count > 0 else { return }
+        let offset = rowBaseOffset(for: row) + startCol
+        if count == 1 {
+            cells[offset] = Cell(
+                codepoint: UInt32(bytes[0]),
+                attributes: attributes,
+                width: 1,
+                isWideContinuation: false
+            )
+            return
+        }
+        for index in 0..<count {
+            cells[offset + index] = Cell(
+                codepoint: UInt32(bytes[index]),
+                attributes: attributes,
+                width: 1,
+                isWideContinuation: false
+            )
+        }
+    }
+
 
     // MARK: - Wrap Flag
 
@@ -94,10 +171,14 @@ final class TerminalGrid {
 
     /// Clear entire row.
     func clearRow(_ row: Int) {
-        clearCells(row: row, fromCol: 0, toCol: cols - 1)
-        if row >= 0 && row < rows {
-            setWrapped(row, false)
+        guard row >= 0, row < rows else { return }
+        let offset = rowBaseOffset(for: row)
+        cells.withUnsafeMutableBufferPointer { destination in
+            emptyRowTemplate.withUnsafeBufferPointer { source in
+                destination.baseAddress!.advanced(by: offset).update(from: source.baseAddress!, count: cols)
+            }
         }
+        setWrapped(row, false)
     }
 
     /// Clear entire grid.
@@ -127,10 +208,16 @@ final class TerminalGrid {
 
         if count == 1 {
             ensureRowOrderMaterialized()
-            rotateRowOrder(in: top...bottom, leftBy: 1)
+            if top == 0 && bottom == rows - 1 {
+                rowOrder.rotateLeftByOneInPlace()
+            } else {
+                rotateRowOrder(in: top...bottom, leftBy: 1)
+            }
             hasRowPermutation = true
 
-            if top < bottom {
+            if top == 0 && bottom == rows - 1 {
+                shiftWrappedFlagsDownOneRow()
+            } else if top < bottom {
                 var nextWrapped = isWrapped(top + 1)
                 for row in top..<bottom {
                     let wrapped = nextWrapped
@@ -140,7 +227,6 @@ final class TerminalGrid {
                     setWrapped(row, wrapped)
                 }
             }
-
             clearRow(bottom)
             return
         }
@@ -302,6 +388,7 @@ final class TerminalGrid {
         self.rows = newRows
         self.cols = newCols
         self.cells = newCells
+        self.emptyRowTemplate = Array(repeating: Cell.empty, count: newCols)
         self.rowOrder.removeAll(keepingCapacity: true)
         self.hasRowPermutation = false
         self.setWrappedFlags(newWrapped)
@@ -349,6 +436,7 @@ final class TerminalGrid {
         }
 
         cells = logicalRows.flatMap { $0 }
+        emptyRowTemplate = Array(repeating: Cell.empty, count: cols)
         rowOrder.removeAll(keepingCapacity: true)
         hasRowPermutation = false
         setWrappedFlags(wrappedFlags)
@@ -455,6 +543,7 @@ final class TerminalGrid {
         return cells[start..<(start + cols)]
     }
 
+
     /// Insert blank cells at column, shifting existing cells right.
     func insertBlanks(row: Int, col: Int, count: Int) {
         guard row >= 0, row < rows, col >= 0, col < cols else { return }
@@ -508,6 +597,23 @@ final class TerminalGrid {
         for (row, wrapped) in wrappedFlags.enumerated() where wrapped {
             let (wordIndex, bitMask) = Self.wrapBitLocation(for: row)
             lineWrappedWords[wordIndex] |= bitMask
+        }
+    }
+
+    private func shiftWrappedFlagsDownOneRow() {
+        guard !lineWrappedWords.isEmpty else { return }
+        var carry: UInt64 = 0
+        for wordIndex in stride(from: lineWrappedWords.count - 1, through: 0, by: -1) {
+            let word = lineWrappedWords[wordIndex]
+            let nextCarry = (word & 1) << 63
+            lineWrappedWords[wordIndex] = (word >> 1) | carry
+            carry = nextCarry
+        }
+        let extraBits = lineWrappedWords.count * 64 - rows
+        if extraBits > 0 {
+            let validBits = 64 - extraBits
+            let mask = validBits == 64 ? UInt64.max : ((UInt64(1) << UInt64(validBits)) - 1)
+            lineWrappedWords[lineWrappedWords.count - 1] &= mask
         }
     }
 
@@ -574,6 +680,19 @@ private extension Array where Element == Int {
         let amount = rawAmount % count
         guard amount > 0 else { return }
         self = Array(self[amount...]) + self[..<amount]
+    }
+
+    mutating func rotateLeftByOneInPlace() {
+        guard count > 1 else { return }
+        let elementCount = count
+        let first = self[0]
+        self.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            for index in 0..<(elementCount - 1) {
+                base[index] = base[index + 1]
+            }
+            base[elementCount - 1] = first
+        }
     }
 
     mutating func rotateRight(by rawAmount: Int) {

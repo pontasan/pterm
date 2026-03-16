@@ -206,6 +206,10 @@ final class TerminalModel {
         lineFeed()
     }
 
+    var canUseASCIIGroundFastPath: Bool {
+        g0Charset == .ascii && g1Charset == .ascii && cursor.autoWrapMode
+    }
+
     /// Fast path for the common "ground-state text stream" case.
     ///
     /// When the VT parser is already in ground state and the incoming chunk
@@ -213,12 +217,191 @@ final class TerminalModel {
     /// through the full C state machine and per-codepoint callback bridge is
     /// unnecessary overhead. This path preserves the same semantics by
     /// dispatching directly to the existing print/execute handlers.
-    func handleGroundFastPath(_ codepoints: UnsafeBufferPointer<UInt32>) {
-        for codepoint in codepoints {
-            if codepoint <= 0x1F || codepoint == 0x7F {
+    @discardableResult
+    func consumeGroundFastPathPrefix(_ codepoints: UnsafeBufferPointer<UInt32>) -> Int {
+        guard !codepoints.isEmpty else { return 0 }
+        if canUseASCIIGroundFastPath {
+            return consumeGroundASCIICodepointsFastPathPrefix(codepoints)
+        }
+
+        var index = 0
+        while index < codepoints.count {
+            let codepoint = codepoints[index]
+            switch codepoint {
+            case 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F:
                 handleExecute(codepoint)
-            } else {
+                index += 1
+            case 0x1B, 0x18, 0x1A, 0x7F, 0x00...0x1F:
+                return index
+            default:
                 handlePrint(codepoint)
+                index += 1
+            }
+        }
+
+        return index
+    }
+
+    func handleGroundFastPath(_ codepoints: UnsafeBufferPointer<UInt32>) {
+        _ = consumeGroundFastPathPrefix(codepoints)
+    }
+
+    @discardableResult
+    func consumeGroundASCIIBytesFastPathPrefix(_ bytes: UnsafeBufferPointer<UInt8>) -> Int {
+        guard !bytes.isEmpty else { return 0 }
+
+        var index = 0
+        while index < bytes.count {
+            let byte = bytes[index]
+            if byte >= 0x20 && byte < 0x7F {
+                let runStart = index
+                var runCount = 1
+                while runStart + runCount < bytes.count {
+                    let next = bytes[runStart + runCount]
+                    guard next >= 0x20 && next < 0x7F else { break }
+                    runCount += 1
+                }
+                handleASCIIByteRun(bytes.baseAddress!.advanced(by: runStart), count: runCount)
+                index += runCount
+                continue
+            }
+
+            switch byte {
+            case 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F:
+                handleExecute(UInt32(byte))
+                index += 1
+            default:
+                return index
+            }
+        }
+
+        return index
+    }
+
+    func handleGroundASCIIBytesFastPath(_ bytes: UnsafeBufferPointer<UInt8>) {
+        _ = consumeGroundASCIIBytesFastPathPrefix(bytes)
+    }
+
+    @discardableResult
+    private func consumeGroundASCIICodepointsFastPathPrefix(_ codepoints: UnsafeBufferPointer<UInt32>) -> Int {
+        guard !codepoints.isEmpty else { return 0 }
+        var index = 0
+        while index < codepoints.count {
+            let codepoint = codepoints[index]
+            if codepoint >= 0x20 && codepoint < 0x7F {
+                let runStart = index
+                var runCount = 1
+                while runStart + runCount < codepoints.count {
+                    let next = codepoints[runStart + runCount]
+                    guard next >= 0x20 && next < 0x7F else { break }
+                    runCount += 1
+                }
+                handleASCIIRun(codepoints.baseAddress!.advanced(by: runStart), count: runCount)
+                index += runCount
+                continue
+            }
+
+            switch codepoint {
+            case 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F:
+                handleExecute(codepoint)
+                index += 1
+            case 0x1B, 0x18, 0x1A, 0x7F, 0x00...0x1F:
+                return index
+            default:
+                handlePrint(codepoint)
+                index += 1
+            }
+        }
+
+        return index
+    }
+
+    private func handleASCIIRun(_ codepoints: UnsafeBufferPointer<UInt32>) {
+        guard let base = codepoints.baseAddress else { return }
+        handleASCIIRun(base, count: codepoints.count)
+    }
+
+    private func handleASCIIRun(_ codepoints: UnsafePointer<UInt32>, count: Int) {
+        guard count > 0 else { return }
+
+        var remainingBase = codepoints
+        var remainingCount = count
+        let attributes = cursor.attributes
+
+        while remainingCount > 0 {
+            if cursor.pendingWrap {
+                cursor.col = 0
+                lineFeed()
+                grid.setWrapped(cursor.row, true)
+                cursor.pendingWrap = false
+            }
+
+            let available = cols - cursor.col
+            guard available > 0 else { break }
+
+            let chunkCount = min(remainingCount, available)
+            grid.writeSingleWidthCells(
+                remainingBase,
+                count: chunkCount,
+                attributes: attributes,
+                atRow: cursor.row,
+                startCol: cursor.col
+            )
+
+            cursor.col += chunkCount
+            remainingBase = remainingBase.advanced(by: chunkCount)
+            remainingCount -= chunkCount
+
+            if cursor.col >= cols {
+                cursor.col = cols - 1
+                if cursor.autoWrapMode {
+                    cursor.pendingWrap = true
+                }
+            }
+        }
+    }
+
+    private func handleASCIIByteRun(_ bytes: UnsafeBufferPointer<UInt8>) {
+        guard let base = bytes.baseAddress else { return }
+        handleASCIIByteRun(base, count: bytes.count)
+    }
+
+    private func handleASCIIByteRun(_ bytes: UnsafePointer<UInt8>, count: Int) {
+        guard count > 0 else { return }
+
+        var remainingBase = bytes
+        var remainingCount = count
+        let attributes = cursor.attributes
+
+        while remainingCount > 0 {
+            if cursor.pendingWrap {
+                cursor.col = 0
+                lineFeed()
+                grid.setWrapped(cursor.row, true)
+                cursor.pendingWrap = false
+            }
+
+            let available = cols - cursor.col
+            guard available > 0 else { break }
+
+            let chunkCount = min(remainingCount, available)
+            grid.writeSingleWidthASCIIBytes(
+                remainingBase,
+                count: chunkCount,
+                attributes: attributes,
+                atRow: cursor.row,
+                startCol: cursor.col
+            )
+
+            cursor.col += chunkCount
+            remainingBase = remainingBase.advanced(by: chunkCount)
+            remainingCount -= chunkCount
+
+            if cursor.col >= cols {
+                cursor.col = cols - 1
+                if cursor.autoWrapMode {
+                    cursor.pendingWrap = true
+                }
             }
         }
     }

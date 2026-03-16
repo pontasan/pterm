@@ -14,6 +14,7 @@ private func durationNanoseconds(_ duration: Duration) -> UInt64 {
 @MainActor
 final class PerformanceRegressionTests: XCTestCase {
     private static let allowedRegressionMultiplier = 2.0
+    private static var baselineResetPerformedForCurrentRun = false
 
     private struct HistoricalReference {
         let beforeNanoseconds: UInt64
@@ -342,8 +343,9 @@ final class PerformanceRegressionTests: XCTestCase {
     }
 
     private func loadBaselineFile(from url: URL, reset: Bool) throws -> BaselineFile {
-        if reset {
-            return BaselineFile(machine: ProcessInfo.processInfo.hostName, records: [:])
+        if reset, !Self.baselineResetPerformedForCurrentRun {
+            try? FileManager.default.removeItem(at: url)
+            Self.baselineResetPerformedForCurrentRun = true
         }
         guard FileManager.default.fileExists(atPath: url.path) else {
             return BaselineFile(machine: ProcessInfo.processInfo.hostName, records: [:])

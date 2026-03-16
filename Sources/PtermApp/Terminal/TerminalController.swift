@@ -177,6 +177,7 @@ final class TerminalController {
     private var textExtractionScrollbackRowBuffer: [Cell] = []
     private var searchColumnBuffer: [Int] = []
     private var pendingScrollbackRows: [ScrollbackBuffer.BufferedRow] = []
+    private var pendingScrollbackRowBufferPool: [[Cell]] = []
     private var isBatchingScrollbackDuringPTYParse = false
 
     private let termEnv: String
@@ -353,8 +354,14 @@ final class TerminalController {
         model.onScrollOut = { [weak self] cells, isWrapped in
             guard let self = self else { return }
             if self.isBatchingScrollbackDuringPTYParse {
+                var reusableCells = self.pendingScrollbackRowBufferPool.popLast() ?? []
+                reusableCells.removeAll(keepingCapacity: true)
+                if reusableCells.capacity < cells.count {
+                    reusableCells.reserveCapacity(cells.count)
+                }
+                reusableCells.append(contentsOf: cells)
                 self.pendingScrollbackRows.append(
-                    ScrollbackBuffer.BufferedRow(cells: Array(cells), isWrapped: isWrapped)
+                    ScrollbackBuffer.BufferedRow(cells: reusableCells, isWrapped: isWrapped)
                 )
             } else {
                 self.scrollback.appendRow(cells, isWrapped: isWrapped)
@@ -605,28 +612,46 @@ final class TerminalController {
 
             lock.withWriteLock {
                 isBatchingScrollbackDuringPTYParse = true
-                pendingScrollbackRows.removeAll(keepingCapacity: true)
                 defer {
-                    pendingScrollbackRows.removeAll(keepingCapacity: true)
+                    if !pendingScrollbackRows.isEmpty {
+                        recyclePendingScrollbackRows()
+                    }
                     isBatchingScrollbackDuringPTYParse = false
                 }
-                ensureCodepointBufferCapacity(requiredCount: count)
-                let cpCount = textDecoder.decode(
-                    UnsafeBufferPointer(start: ptr, count: count),
-                    into: &codepointBuffer
-                )
-
-                // Feed codepoints to VT parser (which updates the model)
-                if cpCount > 0 {
-                    codepointBuffer.withUnsafeBufferPointer { buffer in
-                        let decoded = UnsafeBufferPointer(start: buffer.baseAddress, count: cpCount)
-                        if canUseGroundFastPath(decoded) {
-                            model.handleGroundFastPath(decoded)
-                        } else {
-                            vt_parser_feed(&parser, codepointBuffer, cpCount)
-                        }
+                let input = UnsafeBufferPointer(start: ptr, count: count)
+                let remainingInput: UnsafeBufferPointer<UInt8>
+                if canUseDirectASCIIGroundFastPath(input) {
+                    let consumed = model.consumeGroundASCIIBytesFastPathPrefix(input)
+                    if consumed > 0 {
+                        didMutateDisplay = true
                     }
-                    didMutateDisplay = true
+                    remainingInput = UnsafeBufferPointer(
+                        start: ptr.advanced(by: consumed),
+                        count: count - consumed
+                    )
+                } else {
+                    remainingInput = input
+                }
+
+                if !remainingInput.isEmpty {
+                    ensureCodepointBufferCapacity(requiredCount: remainingInput.count)
+                    let cpCount = textDecoder.decode(remainingInput, into: &codepointBuffer)
+
+                    // Feed codepoints to VT parser (which updates the model)
+                    if cpCount > 0 {
+                        codepointBuffer.withUnsafeBufferPointer { buffer in
+                            let decoded = UnsafeBufferPointer(start: buffer.baseAddress, count: cpCount)
+                            if parser.state == VT_STATE_GROUND {
+                                let consumed = model.consumeGroundFastPathPrefix(decoded)
+                                if consumed < cpCount {
+                                    vt_parser_feed(&parser, buffer.baseAddress!.advanced(by: consumed), cpCount - consumed)
+                                }
+                            } else {
+                                vt_parser_feed(&parser, codepointBuffer, cpCount)
+                            }
+                        }
+                        didMutateDisplay = true
+                    }
                 }
 
                 if parserRequestedScrollbackClear {
@@ -634,7 +659,7 @@ final class TerminalController {
                        (scrollbackPersistenceEnabled && isShuttingDown) {
                         parserRequestedScrollbackClear = false
                     } else {
-                        pendingScrollbackRows.removeAll(keepingCapacity: true)
+                        recyclePendingScrollbackRows()
                         scrollback.clear()
                         scrollOffset = 0
                         parserRequestedScrollbackClear = false
@@ -648,6 +673,7 @@ final class TerminalController {
                     if scrollOffset > 0 {
                         scrollOffset += pendingScrollbackRows.count
                     }
+                    recyclePendingScrollbackRows()
                 }
             }
         }
@@ -667,21 +693,26 @@ final class TerminalController {
         scheduleScrollbackCompaction()
     }
 
-    private func canUseGroundFastPath(_ codepoints: UnsafeBufferPointer<UInt32>) -> Bool {
-        guard parser.state == VT_STATE_GROUND else { return false }
-        for codepoint in codepoints {
-            switch codepoint {
-            case 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F:
-                continue
-            case 0x1B, 0x18, 0x1A, 0x7F:
-                return false
-            case 0x00...0x1F:
-                return false
-            default:
-                continue
-            }
+    private func canUseDirectASCIIGroundFastPath(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard textEncoding == .utf8,
+              textDecoder.canDecodeDirectASCII,
+              parser.state == VT_STATE_GROUND,
+              model.canUseASCIIGroundFastPath
+        else {
+            return false
         }
+
         return true
+    }
+
+    private func recyclePendingScrollbackRows() {
+        guard !pendingScrollbackRows.isEmpty else { return }
+        pendingScrollbackRowBufferPool.reserveCapacity(
+            pendingScrollbackRowBufferPool.count + pendingScrollbackRows.count
+        )
+        while let row = pendingScrollbackRows.popLast() {
+            pendingScrollbackRowBufferPool.append(row.cells)
+        }
     }
 
     // MARK: - Resize

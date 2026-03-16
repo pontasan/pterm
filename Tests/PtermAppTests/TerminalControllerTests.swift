@@ -1207,4 +1207,25 @@ final class TerminalControllerTests: XCTestCase {
             4 * 1024
         )
     }
+
+    func testDebugProcessPTYOutputMatchesByteWiseProcessingForConsecutiveLineFeeds() {
+        let bulk = makeController(rows: 3, cols: 4)
+        let byteWise = makeController(rows: 3, cols: 4)
+        let payload = Data("A\n\n\n\nB\n\nC\nD\n\n\n\nE".utf8)
+
+        bulk.debugProcessPTYOutputForTesting(payload)
+        for byte in payload {
+            byteWise.debugProcessPTYOutputForTesting(Data([byte]))
+        }
+
+        let bulkRowCount = bulk.withViewport { _, scrollback, _ in scrollback.rowCount }
+        let byteWiseRowCount = byteWise.withViewport { _, scrollback, _ in scrollback.rowCount }
+        XCTAssertEqual(bulkRowCount, byteWiseRowCount)
+
+        for offset in 0...bulkRowCount {
+            bulk.setScrollOffset(offset)
+            byteWise.setScrollOffset(offset)
+            XCTAssertEqual(bulk.allText(), byteWise.allText(), "mismatch at scroll offset \(offset)")
+        }
+    }
 }

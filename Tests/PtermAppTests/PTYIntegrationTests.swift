@@ -203,6 +203,39 @@ final class PTYIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminalControllerRealPTYTimeSeq100000ProfileFixture() throws {
+        let controller = TerminalController(
+            rows: 24,
+            cols: 80,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 16 * 1024 * 1024,
+            scrollbackMaxCapacity: 16 * 1024 * 1024,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        defer { controller.stop(waitForExit: true) }
+
+        let exitExpectation = expectation(description: "controller-exit-time-seq-100000")
+        var exited = false
+        controller.onExit = {
+            guard !exited else { return }
+            exited = true
+            exitExpectation.fulfill()
+        }
+
+        try controller.start()
+        controller.sendInput("TIMEFMT=$'__PTERM_TIME__ %U %S %P %E'; time seq 1 100000; exit\n")
+
+        wait(for: [exitExpectation], timeout: 30.0)
+        drainMainQueue(testCase: self)
+
+        let text = controller.allText()
+        XCTAssertTrue(text.contains("100000"), "seq output tail should remain visible")
+        XCTAssertTrue(text.contains("__PTERM_TIME__"), "shell timing output should be captured")
+    }
+
+    @MainActor
     func testTerminalControllerRealPTYRemainsResponsiveDuringConcurrentResizeAndQueries() throws {
         let controller = TerminalController(
             rows: 6,

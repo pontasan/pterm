@@ -103,6 +103,10 @@ final class TerminalTextDecoder {
         bomProbe.count
     }
 
+    var canDecodeDirectASCII: Bool {
+        encoding == .utf8 && utf8Decoder.state == UTF8_ACCEPT
+    }
+
     func decode(_ data: Data) -> String? {
         ensureDecodeBufferCapacity(requiredCount: max(data.count, 1))
         let count = data.withUnsafeBytes { rawBuffer in
