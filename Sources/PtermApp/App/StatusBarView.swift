@@ -144,68 +144,61 @@ final class StatusBarView: NSView {
         let vertInset: CGFloat = 4
         let height = bounds.height - vertInset * 2
         let spacing: CGFloat = 6
+        let metricsGap: CGFloat = 12
+
+        // Right side: metrics
+        let metricsX = bounds.width - inset - metricsLabelWidth
+        metricsLabel.frame = NSRect(x: metricsX, y: vertInset, width: metricsLabelWidth, height: height)
+        let contentMaxX = metricsLabel.frame.minX - metricsGap
 
         // Left side: [backButton] [separator] [noteButton] [separator] [Cmd hint]
         //            [separator] [Shift+Cmd+Click hint] [separator] [Cmd+Click hint]
         var x = inset
+
+        func placeSeparator(_ label: NSTextField, at originX: CGFloat) -> CGFloat {
+            label.sizeToFit()
+            label.frame = NSRect(x: originX, y: vertInset, width: label.frame.width, height: height)
+            return label.frame.maxX + spacing
+        }
+
+        func placeTruncatingLabel(_ label: NSTextField, at originX: CGFloat) -> CGFloat {
+            let fittingSize = label.sizeThatFits(NSSize(width: CGFloat.greatestFiniteMagnitude, height: height))
+            let width = max(0, min(ceil(fittingSize.width), contentMaxX - originX))
+            label.frame = NSRect(x: originX, y: vertInset, width: width, height: height)
+            return label.frame.maxX + spacing
+        }
 
         if !backButton.isHidden {
             backButton.sizeToFit()
             backButton.frame = NSRect(x: x, y: vertInset, width: backButton.frame.width, height: height)
             x = backButton.frame.maxX + spacing
 
-            separatorLabel.sizeToFit()
-            separatorLabel.frame = NSRect(x: x, y: vertInset, width: separatorLabel.frame.width, height: height)
-            x = separatorLabel.frame.maxX + spacing
+            x = placeSeparator(separatorLabel, at: x)
         }
 
         noteButton.sizeToFit()
         noteButton.frame = NSRect(x: x, y: vertInset, width: noteButton.frame.width, height: height)
         x = noteButton.frame.maxX + spacing
 
-        commandHintSeparatorLabel.sizeToFit()
-        commandHintSeparatorLabel.frame = NSRect(x: x, y: vertInset, width: commandHintSeparatorLabel.frame.width, height: height)
-        x = commandHintSeparatorLabel.frame.maxX + spacing
+        x = placeSeparator(commandHintSeparatorLabel, at: x)
 
-        commandHintLabel.sizeToFit()
-        commandHintLabel.frame = NSRect(x: x, y: vertInset, width: commandHintLabel.frame.width, height: height)
-        x = commandHintLabel.frame.maxX + spacing
+        x = placeTruncatingLabel(commandHintLabel, at: x)
 
         if !multiSelectHintLabel.isHidden {
-            multiSelectHintSeparatorLabel.sizeToFit()
-            multiSelectHintSeparatorLabel.frame = NSRect(x: x, y: vertInset, width: multiSelectHintSeparatorLabel.frame.width, height: height)
-            x = multiSelectHintSeparatorLabel.frame.maxX + spacing
+            x = placeSeparator(multiSelectHintSeparatorLabel, at: x)
 
-            multiSelectHintLabel.sizeToFit()
-            multiSelectHintLabel.frame = NSRect(x: x, y: vertInset, width: multiSelectHintLabel.frame.width, height: height)
-            x = multiSelectHintLabel.frame.maxX + spacing
+            x = placeTruncatingLabel(multiSelectHintLabel, at: x)
         }
 
         if !commandClickHintLabel.isHidden {
-            commandClickHintSeparatorLabel.sizeToFit()
-            commandClickHintSeparatorLabel.frame = NSRect(x: x, y: vertInset, width: commandClickHintSeparatorLabel.frame.width, height: height)
-            x = commandClickHintSeparatorLabel.frame.maxX + spacing
+            x = placeSeparator(commandClickHintSeparatorLabel, at: x)
 
-            commandClickHintLabel.sizeToFit()
-            commandClickHintLabel.frame = NSRect(x: x, y: vertInset, width: commandClickHintLabel.frame.width, height: height)
+            x = placeTruncatingLabel(commandClickHintLabel, at: x)
         }
 
-        // Right side: metrics
-        let metricsX = bounds.width - inset - metricsLabelWidth
-        metricsLabel.frame = NSRect(x: metricsX, y: vertInset, width: metricsLabelWidth, height: height)
-
         if !overviewHintLabel.isHidden {
-            overviewHintSeparatorLabel.sizeToFit()
-            overviewHintSeparatorLabel.frame = NSRect(
-                x: noteButton.frame.maxX + spacing,
-                y: vertInset,
-                width: overviewHintSeparatorLabel.frame.width,
-                height: height
-            )
-            let hintMinX = overviewHintSeparatorLabel.frame.maxX + spacing
-            let hintMaxX = metricsLabel.frame.minX - 12
-            let availableWidth = max(0, hintMaxX - hintMinX)
-            overviewHintLabel.frame = NSRect(x: hintMinX, y: vertInset, width: availableWidth, height: height)
+            x = placeSeparator(overviewHintSeparatorLabel, at: x)
+            _ = placeTruncatingLabel(overviewHintLabel, at: x)
         }
     }
 

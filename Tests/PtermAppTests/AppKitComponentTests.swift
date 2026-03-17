@@ -98,6 +98,24 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(labels.first(where: { $0.stringValue == "|" && !$0.isHidden })?.isHidden, false)
     }
 
+    func testStatusBarOverviewHintDoesNotOverlapCommandHint() {
+        let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
+
+        view.setOverviewSelectAllHintVisible(true)
+        view.layoutSubtreeIfNeeded()
+
+        let labels = allSubviews(in: view).compactMap { $0 as? NSTextField }
+        let commandHint = try? XCTUnwrap(labels.first(where: { $0.identifier?.rawValue == "statusbar.commandHint" }))
+        let overviewHint = try? XCTUnwrap(labels.first(where: { $0.identifier?.rawValue == "statusbar.overviewHint" }))
+
+        XCTAssertNotNil(commandHint)
+        XCTAssertNotNil(overviewHint)
+        if let commandHint, let overviewHint {
+            XCTAssertLessThanOrEqual(commandHint.frame.maxX, overviewHint.frame.minX)
+            XCTAssertLessThanOrEqual(overviewHint.frame.maxX, view.bounds.maxX)
+        }
+    }
+
     func testStatusBarOverviewHintStartsHidden() {
         let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
 
