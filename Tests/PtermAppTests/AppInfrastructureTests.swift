@@ -79,6 +79,96 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertEqual(options.immediateAction, .version)
     }
 
+    func testLaunchOptionsParsesDirectCommandEqualsForm() throws {
+        let options = try LaunchOptions.parse(arguments: ["--command=/opt/homebrew/bin/vttest"])
+
+        XCTAssertEqual(
+            options.directLaunch,
+            DirectLaunchOptions(
+                executablePath: "/opt/homebrew/bin/vttest",
+                arguments: []
+            )
+        )
+    }
+
+    func testLaunchOptionsParsesDirectCommandAndPassthroughArguments() throws {
+        let options = try LaunchOptions.parse(
+            arguments: ["--command", "/usr/bin/env", "--", "printenv", "TERM"]
+        )
+
+        XCTAssertEqual(
+            options.directLaunch,
+            DirectLaunchOptions(
+                executablePath: "/usr/bin/env",
+                arguments: ["printenv", "TERM"]
+            )
+        )
+    }
+
+    func testLaunchOptionsRejectsDuplicateDirectCommandOptions() {
+        XCTAssertThrowsError(
+            try LaunchOptions.parse(arguments: ["--command=/bin/echo", "--command=/bin/date"])
+        ) { error in
+            XCTAssertEqual(error as? LaunchOptionsError, .duplicateCommandOption)
+        }
+    }
+
+    func testLaunchOptionsRejectsEmptyDirectCommandPath() {
+        XCTAssertThrowsError(try LaunchOptions.parse(arguments: ["--command="])) { error in
+            XCTAssertEqual(error as? LaunchOptionsError, .emptyCommandPath)
+        }
+    }
+
+    func testTransientWorkspaceNameUsesCommandBasenameAndUniqueSuffix() {
+        let id = UUID(uuidString: "12345678-1234-1234-1234-123456789ABC")!
+
+        let name = AppDelegate.transientWorkspaceName(
+            commandPath: "/opt/homebrew/bin/vttest",
+            id: id
+        )
+
+        XCTAssertTrue(name.contains("Temporary"))
+        XCTAssertTrue(name.contains("vttest"))
+        XCTAssertTrue(name.contains("12345678"))
+    }
+
+    func testPersistedPresentationPlanDropsTransientFocusedTerminal() {
+        let transientID = UUID()
+
+        let plan = AppDelegate.persistedPresentationPlan(
+            currentPresentation: .focused(transientID),
+            persistedTerminalIDs: []
+        )
+
+        XCTAssertEqual(
+            plan,
+            AppDelegate.PersistedPresentationPlan(
+                mode: .integrated,
+                focusedTerminalID: nil,
+                splitTerminalIDs: []
+            )
+        )
+    }
+
+    func testPersistedPresentationPlanCollapsesSplitWhenOnlyOnePersistentTerminalRemains() {
+        let persistedID = UUID()
+        let transientID = UUID()
+
+        let plan = AppDelegate.persistedPresentationPlan(
+            currentPresentation: .split([persistedID, transientID]),
+            persistedTerminalIDs: [persistedID]
+        )
+
+        XCTAssertEqual(
+            plan,
+            AppDelegate.PersistedPresentationPlan(
+                mode: .focused,
+                focusedTerminalID: persistedID,
+                splitTerminalIDs: []
+            )
+        )
+    }
+
     func testPtermCommandLineHelpTextMentionsSupportedOptions() {
         let help = PtermCommandLine.helpText()
 
@@ -86,6 +176,7 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertTrue(help.contains("--version"))
         XCTAssertTrue(help.contains("--user-data-dir"))
         XCTAssertTrue(help.contains("--restore-session"))
+        XCTAssertTrue(help.contains("--command"))
         XCTAssertTrue(help.contains("attempt"))
         XCTAssertTrue(help.contains("force"))
         XCTAssertTrue(help.contains("never"))
@@ -1954,6 +2045,28 @@ final class AppInfrastructureTests: XCTestCase {
 
         XCTAssertNotNil(controller.lastOutputAt)
         XCTAssertGreaterThan(controller.screenRevision, initialRevision)
+    }
+
+    func testMCPVisibleTextRawPreservesLeadingAndTrailingWhitespace() {
+        let controller = TerminalController(
+            rows: 2,
+            cols: 6,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 32,
+            scrollbackMaxCapacity: 32,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+
+        controller.debugProcessPTYOutputForTesting(Data("  hi  \n".utf8))
+
+        let snapshot = controller.captureRenderSnapshot()
+        let raw = AppDelegate.mcpVisibleText(from: snapshot, trimWhitespace: false)
+        let trimmed = AppDelegate.mcpVisibleText(from: snapshot, trimWhitespace: true)
+
+        XCTAssertTrue(raw.hasPrefix("  hi  "))
+        XCTAssertEqual(trimmed.components(separatedBy: "\n").first, "hi")
     }
 
     func testMCPTerminalWaitConditionMatchesForegroundRevisionAndIdleState() throws {

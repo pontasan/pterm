@@ -50,6 +50,9 @@ final class TerminalManager {
     /// Create and add a new terminal session. Returns the new controller.
     @discardableResult
     func addTerminal(initialDirectory: String? = nil,
+                     executablePath: String? = nil,
+                     executableArguments: [String] = [],
+                     isTransient: Bool = false,
                      customTitle: String? = nil,
                      workspaceName: String = "Uncategorized",
                      textEncoding: TerminalTextEncoding? = nil,
@@ -59,7 +62,7 @@ final class TerminalManager {
                      startAsynchronously: Bool = false,
                      onStartFailure: ((Error) -> Void)? = nil,
                      configure: ((TerminalController) -> Void)? = nil) throws -> TerminalController {
-        let scrollbackPath = config.sessionScrollBufferPersistence
+        let scrollbackPath = config.sessionScrollBufferPersistence && !isTransient
             ? Self.scrollbackPath(for: id).path
             : nil
         let controller = TerminalController(
@@ -73,6 +76,9 @@ final class TerminalManager {
             fontName: fontName,
             fontSize: fontSize,
             initialDirectory: initialDirectory,
+            executablePath: executablePath,
+            executableArguments: executableArguments,
+            isTransient: isTransient,
             customTitle: customTitle,
             workspaceName: workspaceName,
             id: id,

@@ -37,6 +37,19 @@ final class PTYIntegrationTests: XCTestCase {
         )
     }
 
+    func testResolveExecutablePathRequiresAbsoluteExecutableFile() {
+        XCTAssertEqual(
+            PTY.resolveExecutablePath("/bin/echo", isExecutable: { $0 == "/bin/echo" }),
+            "/bin/echo"
+        )
+        XCTAssertNil(
+            PTY.resolveExecutablePath("echo", isExecutable: { _ in true })
+        )
+        XCTAssertNil(
+            PTY.resolveExecutablePath("/missing/echo", isExecutable: { _ in false })
+        )
+    }
+
     func testPTYExecutesResolvedShellAndExportsMatchingShellEnvironment() throws {
         let pty = PTY()
         defer { pty.stop(waitForExit: true) }
@@ -121,6 +134,48 @@ final class PTYIntegrationTests: XCTestCase {
 
         wait(for: [outputExpectation, exitExpectation], timeout: 8.0)
         XCTAssertTrue(collectedOutput.contains("\(marker)xterm-256color__"))
+    }
+
+    func testPTYCanLaunchDirectExecutableWithoutShell() throws {
+        let pty = PTY()
+        defer { pty.stop(waitForExit: true) }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pterm-direct-exec-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let outputExpectation = expectation(description: "pty-direct-exec-output")
+        let exitExpectation = expectation(description: "pty-direct-exec-exit")
+        let lock = NSLock()
+        var collectedOutput = ""
+        var exited = false
+
+        pty.onOutput = { data in
+            let chunk = String(decoding: data, as: UTF8.self)
+            lock.lock()
+            collectedOutput += chunk
+            if collectedOutput.contains(directory.path) {
+                outputExpectation.fulfill()
+            }
+            lock.unlock()
+        }
+        pty.onExit = {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !exited else { return }
+            exited = true
+            exitExpectation.fulfill()
+        }
+
+        try pty.start(
+            rows: 24,
+            cols: 80,
+            initialDirectory: directory.path,
+            executablePath: "/bin/pwd"
+        )
+
+        wait(for: [outputExpectation, exitExpectation], timeout: 8.0)
+        XCTAssertTrue(collectedOutput.contains(directory.path))
     }
 
     @MainActor

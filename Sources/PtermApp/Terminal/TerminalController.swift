@@ -125,6 +125,9 @@ final class TerminalController {
     /// Workspace grouping name for persistence/audit.
     private(set) var workspaceName: String
 
+    /// Whether this terminal is transient and must never be restored from session persistence.
+    let isTransient: Bool
+
     /// Current working directory
     private(set) var currentDirectory: String = "~"
     private var currentDirectoryPath: String
@@ -194,6 +197,8 @@ final class TerminalController {
     private var persistedFontName: String
     private var persistedFontSize: Double
     private let initialDirectory: String
+    private let executablePath: String?
+    private let executableArguments: [String]
     private let scrollbackPersistenceEnabled: Bool
     private let currentDirectoryProvider: (pid_t) -> String?
     private var parserRequestedScrollbackClear = false
@@ -287,7 +292,11 @@ final class TerminalController {
          scrollbackMaxCapacity: Int,
          fontName: String,
          fontSize: Double,
-         initialDirectory: String? = nil, customTitle: String? = nil,
+         initialDirectory: String? = nil,
+         executablePath: String? = nil,
+         executableArguments: [String] = [],
+         isTransient: Bool = false,
+         customTitle: String? = nil,
          workspaceName: String = "Uncategorized", id: UUID = UUID(),
          scrollbackPersistencePath: String? = nil,
          currentDirectoryProvider: @escaping (pid_t) -> String? = { ProcessInspection.currentDirectory(pid: $0) }) {
@@ -306,6 +315,9 @@ final class TerminalController {
         self.persistedFontSize = fontSize
         self.initialDirectory = (initialDirectory as NSString?)?.expandingTildeInPath
             ?? FileManager.default.homeDirectoryForCurrentUser.path
+        self.executablePath = executablePath
+        self.executableArguments = executableArguments
+        self.isTransient = isTransient
         self.scrollbackPersistenceEnabled = scrollbackPersistencePath != nil
         self.currentDirectoryProvider = currentDirectoryProvider
         self.customTitle = customTitle
@@ -434,7 +446,9 @@ final class TerminalController {
             cols: UInt16(c),
             termEnv: termEnv,
             initialDirectory: initialDirectory,
-            shellLaunchOrder: shellLaunchOrder
+            shellLaunchOrder: shellLaunchOrder,
+            executablePath: executablePath,
+            arguments: executableArguments
         )
         ptyResizeLock.withLock {
             appliedPTYSize = (r, c)

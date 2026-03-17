@@ -6,6 +6,7 @@ import Darwin
 enum PTYError: Error {
     case forkptyFailed(String)
     case shellNotFound(String)
+    case executableNotFound(String)
 }
 
 /// Manages a pseudo-terminal (PTY) for communicating with a child shell process.
@@ -118,9 +119,13 @@ final class PTY {
     /// Start the PTY with the specified terminal size.
     /// Spawns the user's preferred shell as the child process.
     /// Throws PTYError.forkptyFailed if forkpty() fails.
-    func start(rows: UInt16, cols: UInt16, termEnv: String = "xterm-256color",
+    func start(rows: UInt16,
+               cols: UInt16,
+               termEnv: String = "xterm-256color",
                initialDirectory: String? = nil,
-               shellLaunchOrder: [String] = ShellLaunchConfiguration.default.launchOrder) throws {
+               shellLaunchOrder: [String] = ShellLaunchConfiguration.default.launchOrder,
+               executablePath: String? = nil,
+               arguments: [String] = []) throws {
         // Validate TERM value: only allow alphanumeric and hyphens
         let validTerm = termEnv.allSatisfy {
             $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_")
@@ -146,6 +151,19 @@ final class PTY {
             throw PTYError.shellNotFound("No executable shell found in launch order: \(shellLaunchOrder.joined(separator: ", "))")
         }
 
+        let resolvedExecutablePath: String?
+        if let executablePath {
+            guard let directPath = Self.resolveExecutablePath(
+                executablePath,
+                isExecutable: FileManager.default.isExecutableFile(atPath:)
+            ) else {
+                throw PTYError.executableNotFound("No executable found at path: \(executablePath)")
+            }
+            resolvedExecutablePath = directPath
+        } else {
+            resolvedExecutablePath = nil
+        }
+
         var amaster: Int32 = -1
         let pid = forkpty(&amaster, nil, nil, &winSize)
 
@@ -154,14 +172,22 @@ final class PTY {
         }
 
         if pid == 0 {
-            // Child process: exec user's preferred shell
+            // Child process: exec user's preferred shell or a requested program
             setupChildEnvironment(shellPath: resolvedShellPath, termEnv: safeTerm, initialDirectory: initialDirectory)
-            let argv: [UnsafeMutablePointer<CChar>?] = [
-                strdup(resolvedShellPath),
-                strdup("--login"),
-                nil
-            ]
-            execv(resolvedShellPath, argv)
+            if let resolvedExecutablePath {
+                let argv = Self.makeExecArguments(
+                    executablePath: resolvedExecutablePath,
+                    arguments: arguments
+                )
+                execv(resolvedExecutablePath, argv)
+            } else {
+                let argv: [UnsafeMutablePointer<CChar>?] = [
+                    strdup(resolvedShellPath),
+                    strdup("--login"),
+                    nil
+                ]
+                execv(resolvedShellPath, argv)
+            }
             // If execv returns, it failed
             _exit(1)
         }
@@ -343,9 +369,38 @@ final class PTY {
         return nil
     }
 
+    static func resolveExecutablePath(
+        _ executablePath: String,
+        isExecutable: (String) -> Bool
+    ) -> String? {
+        let trimmed = executablePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.hasPrefix("/") else {
+            return nil
+        }
+
+        let normalized = URL(fileURLWithPath: trimmed).standardizedFileURL.path
+        guard isExecutable(normalized) else {
+            return nil
+        }
+        return normalized
+    }
+
     private func resolvedUserShellPath() -> String? {
         let userInfo = getpwuid(getuid())
         return userInfo.flatMap { String(validatingUTF8: $0.pointee.pw_shell) }
+    }
+
+    private static func makeExecArguments(
+        executablePath: String,
+        arguments: [String]
+    ) -> [UnsafeMutablePointer<CChar>?] {
+        var argv: [UnsafeMutablePointer<CChar>?] = [strdup(executablePath)]
+        argv.reserveCapacity(arguments.count + 2)
+        for argument in arguments {
+            argv.append(strdup(argument))
+        }
+        argv.append(nil)
+        return argv
     }
 
     private func setupChildEnvironment(shellPath: String, termEnv: String, initialDirectory: String?) {

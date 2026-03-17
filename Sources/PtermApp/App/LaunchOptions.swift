@@ -5,6 +5,8 @@ enum LaunchOptionsError: Error, LocalizedError, Equatable {
     case duplicateProfileRootOption
     case emptyProfileRootPath
     case invalidRestoreSessionMode(String)
+    case duplicateCommandOption
+    case emptyCommandPath
 
     var errorDescription: String? {
         switch self {
@@ -16,6 +18,10 @@ enum LaunchOptionsError: Error, LocalizedError, Equatable {
             return "Profile root path must not be empty."
         case .invalidRestoreSessionMode(let value):
             return "Invalid value for --restore-session: \(value). Expected one of: attempt, force, never."
+        case .duplicateCommandOption:
+            return "Command was specified more than once."
+        case .emptyCommandPath:
+            return "Command path must not be empty."
         }
     }
 }
@@ -31,10 +37,16 @@ enum LaunchImmediateAction: Equatable {
     case version
 }
 
+struct DirectLaunchOptions: Equatable {
+    let executablePath: String
+    let arguments: [String]
+}
+
 struct LaunchOptions: Equatable {
     let profileRoot: URL?
     let restoreSessionMode: RestoreSessionMode
     let immediateAction: LaunchImmediateAction?
+    let directLaunch: DirectLaunchOptions?
 
     static func parse(arguments: [String],
                       currentDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath,
@@ -43,6 +55,7 @@ struct LaunchOptions: Equatable {
         var profileRoot: URL?
         var restoreSessionMode: RestoreSessionMode = .attempt
         var immediateAction: LaunchImmediateAction?
+        var directLaunch: DirectLaunchOptions?
 
         while index < arguments.count {
             let argument = arguments[index]
@@ -68,12 +81,36 @@ struct LaunchOptions: Equatable {
                     throw LaunchOptionsError.invalidRestoreSessionMode(value)
                 }
                 restoreSessionMode = parsedMode
+            } else if let value = commandValue(for: argument, nextArgument: arguments[safe: index + 1]) {
+                if directLaunch != nil {
+                    throw LaunchOptionsError.duplicateCommandOption
+                }
+                if requiresSeparateValue(argument), arguments[safe: index + 1] == nil {
+                    throw LaunchOptionsError.missingValue(argument)
+                }
+                if requiresSeparateValue(argument) {
+                    index += 1
+                }
+                let executablePath = try resolveCommandPath(value)
+                var directLaunchArguments: [String] = []
+                if arguments[safe: index + 1] == "--" {
+                    directLaunchArguments = Array(arguments.dropFirst(index + 2))
+                    index = arguments.count
+                }
+                directLaunch = DirectLaunchOptions(
+                    executablePath: executablePath,
+                    arguments: directLaunchArguments
+                )
             } else if argument == "--help" || argument == "-h" {
                 immediateAction = .help
             } else if argument == "--version" || argument == "-v" {
                 immediateAction = .version
             } else if argument == "--user-data-dir" {
                 throw LaunchOptionsError.missingValue(argument)
+            } else if argument == "--command" {
+                throw LaunchOptionsError.missingValue(argument)
+            } else if argument == "--" {
+                break
             }
             index += 1
         }
@@ -81,7 +118,8 @@ struct LaunchOptions: Equatable {
         return LaunchOptions(
             profileRoot: profileRoot,
             restoreSessionMode: restoreSessionMode,
-            immediateAction: immediateAction
+            immediateAction: immediateAction,
+            directLaunch: directLaunch
         )
     }
 
@@ -105,8 +143,18 @@ struct LaunchOptions: Equatable {
         return nil
     }
 
+    private static func commandValue(for argument: String, nextArgument: String?) -> String? {
+        if argument == "--command" {
+            return nextArgument
+        }
+        if argument.hasPrefix("--command=") {
+            return String(argument.dropFirst("--command=".count))
+        }
+        return nil
+    }
+
     private static func requiresSeparateValue(_ argument: String) -> Bool {
-        argument == "--user-data-dir" || argument == "--restore-session"
+        argument == "--user-data-dir" || argument == "--restore-session" || argument == "--command"
     }
 
     private static func resolveProfileRoot(_ rawValue: String,
@@ -124,6 +172,14 @@ struct LaunchOptions: Equatable {
             resolved = currentDirectory.appendingPathComponent(expanded, isDirectory: true)
         }
         return resolved.standardizedFileURL
+    }
+
+    private static func resolveCommandPath(_ rawValue: String) throws -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw LaunchOptionsError.emptyCommandPath
+        }
+        return NSString(string: trimmed).expandingTildeInPath
     }
 }
 
@@ -173,6 +229,15 @@ enum PtermCommandLine {
                 attempt  Try restoring. If the previous exit was unclean, ask for confirmation.
                 force    Restore without confirmation, even after an unclean exit.
                 never    Do not restore any previous session.
+
+          --command <path>
+          --command=<path>
+              Launch the given executable directly in a transient focused terminal.
+              To pass arguments to the launched program, place `--` after the command
+              option and put all remaining values after it.
+              Example:
+                \(executable) --command /opt/homebrew/bin/vttest
+                \(executable) --command /usr/bin/env -- printenv TERM
         """
     }
 }

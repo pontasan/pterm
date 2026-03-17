@@ -235,6 +235,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private enum WorkspaceNaming {
         static let uncategorized = "Uncategorized"
         static let initialWorkspaceBaseName = "Workspace"
+        static let transientBaseName = "Temporary"
+    }
+
+    struct PersistedPresentationPlan: Equatable {
+        let mode: PersistedSessionState.PresentedMode
+        let focusedTerminalID: UUID?
+        let splitTerminalIDs: [UUID]
     }
 
     enum TerminalListPresentation: Equatable {
@@ -256,7 +263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isIntegratedViewVisible || terminalBackgroundOpacity < 0.999
     }
 
-    init(launchOptions: LaunchOptions = LaunchOptions(profileRoot: nil, restoreSessionMode: .attempt, immediateAction: nil)) {
+    init(launchOptions: LaunchOptions = LaunchOptions(profileRoot: nil, restoreSessionMode: .attempt, immediateAction: nil, directLaunch: nil)) {
         self.launchOptions = launchOptions
         super.init()
     }
@@ -477,6 +484,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    static func transientWorkspaceName(commandPath: String, id: UUID) -> String {
+        let commandName = URL(fileURLWithPath: commandPath).lastPathComponent
+        let trimmedCommand = commandName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let suffix = String(id.uuidString.prefix(8))
+        let baseName = trimmedCommand.isEmpty
+            ? WorkspaceNaming.transientBaseName
+            : "\(WorkspaceNaming.transientBaseName) \(trimmedCommand)"
+        return FileNameSanitizer.sanitize("\(baseName) \(suffix)", fallback: WorkspaceNaming.transientBaseName)
+    }
+
+    static func persistedPresentationPlan(
+        currentPresentation: TerminalListPresentation,
+        persistedTerminalIDs: Set<UUID>
+    ) -> PersistedPresentationPlan {
+        switch currentPresentation {
+        case .integrated:
+            return PersistedPresentationPlan(mode: .integrated, focusedTerminalID: nil, splitTerminalIDs: [])
+        case .focused(let id):
+            guard persistedTerminalIDs.contains(id) else {
+                return PersistedPresentationPlan(mode: .integrated, focusedTerminalID: nil, splitTerminalIDs: [])
+            }
+            return PersistedPresentationPlan(mode: .focused, focusedTerminalID: id, splitTerminalIDs: [])
+        case .split(let ids):
+            let remaining = ids.filter { persistedTerminalIDs.contains($0) }
+            if remaining.count >= 2 {
+                return PersistedPresentationPlan(mode: .split, focusedTerminalID: nil, splitTerminalIDs: remaining)
+            }
+            if let first = remaining.first {
+                return PersistedPresentationPlan(mode: .focused, focusedTerminalID: first, splitTerminalIDs: [])
+            }
+            return PersistedPresentationPlan(mode: .integrated, focusedTerminalID: nil, splitTerminalIDs: [])
+        }
+    }
+
     private var viewMode: ViewMode = .integrated
     private var isTerminating = false
     private var isRestoringSession = false
@@ -640,6 +681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             _ = addInitialWorkspaceTerminal()
             switchToIntegrated()
         }
+        performDirectLaunchIfRequested()
 
         // Show window
         NSApp.setActivationPolicy(.regular)
@@ -659,6 +701,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Setup menu
         setupMenu()
         configureMCPServer()
+    }
+
+    private func performDirectLaunchIfRequested() {
+        guard let directLaunch = launchOptions.directLaunch else { return }
+        let terminalID = UUID()
+        let workspaceName = Self.transientWorkspaceName(
+            commandPath: directLaunch.executablePath,
+            id: terminalID
+        )
+        guard let controller = addNewTerminal(
+            executablePath: directLaunch.executablePath,
+            executableArguments: directLaunch.arguments,
+            isTransient: true,
+            workspaceName: workspaceName,
+            id: terminalID,
+            startAsynchronously: true
+        ) else {
+            return
+        }
+        switchToFocused(controller)
     }
 
     private func runNoteEditorSelfTestIfRequested() {
@@ -724,6 +786,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @discardableResult
     private func addNewTerminal(initialDirectory: String? = nil,
+                                executablePath: String? = nil,
+                                executableArguments: [String] = [],
+                                isTransient: Bool = false,
                                 customTitle: String? = nil,
                                 workspaceName: String = "Uncategorized",
                                 textEncoding: TerminalTextEncoding? = nil,
@@ -731,10 +796,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 fontSize: Double? = nil,
                                 id: UUID = UUID(),
                                 startAsynchronously: Bool = false) -> TerminalController? {
-        ensureWorkspaceExists(named: workspaceName)
+        if !isTransient {
+            ensureWorkspaceExists(named: workspaceName)
+        }
         do {
             let controller = try manager.addTerminal(
                 initialDirectory: initialDirectory,
+                executablePath: executablePath,
+                executableArguments: executableArguments,
+                isTransient: isTransient,
                 customTitle: customTitle,
                 workspaceName: normalizedWorkspaceName(workspaceName),
                 textEncoding: textEncoding,
@@ -1985,26 +2055,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sessionScrollBufferPersistenceEnabled: Bool
     )? {
         guard let window, let manager else { return nil }
-        let presentedMode: PersistedSessionState.PresentedMode
-        let splitIDs: [UUID]
+        let persistedControllers = manager.terminals.filter { !$0.isTransient }
+        let persistedTerminalIDs = Set(persistedControllers.map(\.id))
+        let currentPresentation: TerminalListPresentation
         switch viewMode {
         case .integrated:
-            presentedMode = .integrated
-            splitIDs = []
-        case .focused:
-            presentedMode = .focused
-            splitIDs = []
+            currentPresentation = .integrated
+        case .focused(let controller):
+            currentPresentation = .focused(controller.id)
         case .split(let controllers):
-            presentedMode = .split
-            splitIDs = controllers.map(\.id)
+            currentPresentation = .split(controllers.map(\.id))
         }
+        let presentationPlan = Self.persistedPresentationPlan(
+            currentPresentation: currentPresentation,
+            persistedTerminalIDs: persistedTerminalIDs
+        )
         let state = PersistedSessionState(
             windowFrame: PersistedWindowFrame(frame: window.frame),
-            focusedTerminalID: focusedController?.id,
-            presentedMode: presentedMode,
-            splitTerminalIDs: splitIDs,
+            focusedTerminalID: presentationPlan.focusedTerminalID,
+            presentedMode: presentationPlan.mode,
+            splitTerminalIDs: presentationPlan.splitTerminalIDs,
             workspaceNames: workspaceNames,
-            terminals: manager.terminals.map(\.sessionSnapshot)
+            terminals: persistedControllers.map(\.sessionSnapshot)
         )
         return (state, !isRestoringSession, config.sessionScrollBufferPersistence)
     }
@@ -3243,13 +3315,18 @@ extension AppDelegate: MCPToolProvider {
             ),
             MCPToolDefinition(
                 name: "create_terminal",
-                description: "Create a terminal in a workspace. The returned terminal_id is the primary identifier for later terminal operations.",
+                description: "Create a terminal in a workspace. The returned terminal_id is the primary identifier for later terminal operations. By default this launches the configured shell. If command is provided, launch that executable directly as a transient terminal foreground process in a temporary workspace, focus it immediately, and exclude it from session restore.",
                 inputSchema: [
                     "type": "object",
                     "properties": [
                         "workspace_name": ["type": "string"],
                         "initial_directory": ["type": "string"],
-                        "title": ["type": "string"]
+                        "title": ["type": "string"],
+                        "command": ["type": "string"],
+                        "arguments": [
+                            "type": "array",
+                            "items": ["type": "string"]
+                        ]
                     ]
                 ]
             ),
@@ -3438,16 +3515,31 @@ extension AppDelegate: MCPToolProvider {
             removeWorkspace(named: workspaceName)
             payload = mcpStatePayload()
         case "create_terminal":
-            let workspaceName = (arguments["workspace_name"] as? String) ?? WorkspaceNaming.uncategorized
             let initialDirectory = arguments["initial_directory"] as? String
             let title = arguments["title"] as? String
+            let command = arguments["command"] as? String
+            let executableArguments = arguments["arguments"] as? [String] ?? []
+            let terminalID = UUID()
+            let isDirectLaunch = command != nil
+            let workspaceName = if let command {
+                Self.transientWorkspaceName(commandPath: command, id: terminalID)
+            } else {
+                (arguments["workspace_name"] as? String) ?? WorkspaceNaming.uncategorized
+            }
             guard let controller = addNewTerminal(
                 initialDirectory: initialDirectory,
+                executablePath: command,
+                executableArguments: executableArguments,
+                isTransient: isDirectLaunch,
                 customTitle: title,
                 workspaceName: workspaceName,
+                id: terminalID,
                 startAsynchronously: true
             ) else {
                 throw MCPServerError.invalidRequest
+            }
+            if isDirectLaunch {
+                switchToFocused(controller)
             }
             payload = [
                 "terminal": mcpTerminalPayload(for: controller),
@@ -3673,6 +3765,7 @@ extension AppDelegate: MCPToolProvider {
             "title": controller.title,
             "custom_title": controller.customTitle ?? NSNull(),
             "workspace_name": snapshot.workspaceName,
+            "is_transient": controller.isTransient,
             "current_directory": snapshot.currentDirectory,
             "is_alive": controller.isAlive,
             "foreground_process_id": controller.foregroundProcessID.map { Int($0) } ?? NSNull(),
@@ -3686,21 +3779,32 @@ extension AppDelegate: MCPToolProvider {
         [
             "terminal": mcpTerminalPayload(for: controller),
             "all_text": controller.allText(),
-            "visible_text": mcpVisibleText(for: controller)
+            "visible_text": mcpVisibleText(for: controller),
+            "visible_text_raw": mcpVisibleText(for: controller, trimWhitespace: false)
         ]
     }
 
-    private func mcpVisibleText(for controller: TerminalController) -> String {
-        controller.captureRenderSnapshot().visibleRows
+    private func mcpVisibleText(for controller: TerminalController, trimWhitespace: Bool = true) -> String {
+        Self.mcpVisibleText(from: controller.captureRenderSnapshot(), trimWhitespace: trimWhitespace)
+    }
+
+    static func mcpVisibleText(
+        from snapshot: TerminalController.RenderSnapshot,
+        trimWhitespace: Bool
+    ) -> String {
+        snapshot.visibleRows
             .map { row in
-                String(row.cells.compactMap { cell in
+                let text = String(row.cells.compactMap { cell in
                     guard cell.codepoint != 0,
                           let scalar = UnicodeScalar(cell.codepoint) else {
                         return Character(" ")
                     }
                     return Character(scalar)
                 })
-                .trimmingCharacters(in: .whitespaces)
+                if trimWhitespace {
+                    return text.trimmingCharacters(in: .whitespaces)
+                }
+                return text
             }
             .joined(separator: "\n")
     }
