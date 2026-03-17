@@ -438,6 +438,7 @@ final class TerminalController {
         }
 
         pty.onExit = { [weak self] in
+            self?.auditLogger?.flush()
             self?.onExit?()
         }
 
@@ -1661,6 +1662,16 @@ final class TerminalController {
     func debugPrimeCodepointBufferCapacity(_ requiredCount: Int) {
         lock.withWriteLock {
             ensureCodepointBufferCapacity(requiredCount: requiredCount)
+        }
+    }
+
+    func debugAppendScrollbackRowForTesting(
+        _ cells: ArraySlice<Cell>,
+        isWrapped: Bool,
+        encodingHint: ScrollbackBuffer.RowEncodingHint = .unknown
+    ) {
+        lock.withWriteLock {
+            scrollback.appendRow(cells, isWrapped: isWrapped, encodingHint: encodingHint)
         }
     }
 

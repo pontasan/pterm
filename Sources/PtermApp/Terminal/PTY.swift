@@ -512,10 +512,10 @@ final class PTY {
                 fdLock.lock()
                 _isRunning = false
                 fdLock.unlock()
-                releaseReadBuffer()
                 if aggregatedCount > 0 {
                     emitOutput(buffer: aggregatedReadBuffer, count: aggregatedCount)
                 }
+                releaseReadBuffer()
                 markReadChannelClosedAndNotifyIfReady()
                 return
             }
@@ -524,10 +524,10 @@ final class PTY {
                 fdLock.lock()
                 _isRunning = false
                 fdLock.unlock()
-                releaseReadBuffer()
                 if aggregatedCount > 0 {
                     emitOutput(buffer: aggregatedReadBuffer, count: aggregatedCount)
                 }
+                releaseReadBuffer()
                 markReadChannelClosedAndNotifyIfReady()
                 return
             }

@@ -1280,7 +1280,7 @@ final class TerminalControllerTests: XCTestCase {
         for index in 0..<50 {
             group.enter()
             queue.async {
-                controller.scrollback.appendRow(ArraySlice("row\(index)".unicodeScalars.map {
+                controller.debugAppendScrollbackRowForTesting(ArraySlice("row\(index)".unicodeScalars.map {
                     Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
                 }), isWrapped: false)
                 _ = controller.findMatches(for: "row")

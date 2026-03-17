@@ -8746,7 +8746,6 @@ final class AppKitComponentTests: XCTestCase {
               i=$((i+1))
             done
             printf '\(doneMarker)\\n'
-            sleep 30
             """.write(to: scriptURL, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
 
@@ -8774,18 +8773,27 @@ final class AppKitComponentTests: XCTestCase {
             wait(for: [echoDisabled], timeout: 1.0)
             let quotedScriptPath = scriptURL.path.replacingOccurrences(of: "'", with: "'\\''")
             first.sendInput("/bin/sh '\(quotedScriptPath)'\n")
-            let commandSettled = expectation(description: "split completed output settled")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) {
-                commandSettled.fulfill()
-            }
-            wait(for: [commandSettled], timeout: 9.0)
-            let completedSeen = {
+            let commandCompleted = expectation(description: "split completed output observed")
+            let completionDeadline = Date().addingTimeInterval(5.0)
+            func completedOutputVisible() -> Bool {
                 let text = first.allText()
                 return text.contains("001")
                     && text.contains("009")
                     && text.contains("010")
                     && text.contains(doneMarker)
-            }()
+            }
+            func pollForCompletedOutput() {
+                if completedOutputVisible() || Date() >= completionDeadline {
+                    commandCompleted.fulfill()
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    pollForCompletedOutput()
+                }
+            }
+            pollForCompletedOutput()
+            wait(for: [commandCompleted], timeout: 5.5)
+            let completedSeen = completedOutputVisible()
             XCTAssertTrue(completedSeen, "command finished in narrow split terminal: \(first.allText())")
             drainMainQueue(testCase: self)
 

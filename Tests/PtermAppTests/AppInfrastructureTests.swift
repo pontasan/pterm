@@ -343,6 +343,16 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertFalse(PtermDirectories.isUsingOverriddenBaseDirectory)
     }
 
+    func testTestProcessDefaultsPtermDirectoriesToTemporaryProfileRoot() {
+        let defaultProfileRoot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".pterm", isDirectory: true)
+            .standardizedFileURL
+        XCTAssertFalse(PtermDirectories.isUsingOverriddenBaseDirectory)
+        XCTAssertNotEqual(PtermDirectories.base.standardizedFileURL, defaultProfileRoot)
+        XCTAssertEqual(PtermDirectories.config, PtermDirectories.base.appendingPathComponent("config.json"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: PtermDirectories.config.path))
+    }
+
     func testWithTemporaryPtermConfigOverridesProfileRootForEntirePtermTree() throws {
         try withTemporaryPtermConfig { configURL in
             XCTAssertEqual(configURL, PtermDirectories.config)

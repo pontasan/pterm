@@ -99,6 +99,13 @@ final class TerminalAuditLogger {
         }
     }
 
+    func flush() {
+        queue.sync {
+            try? flushPendingBuffer()
+            try? fileHandle?.synchronize()
+        }
+    }
+
     func cleanupExpiredLogs(retentionDays: Int?) throws {
         guard let retentionDays else { return }
         try FileManager.default.createDirectory(at: rootDirectory, withIntermediateDirectories: true,

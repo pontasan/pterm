@@ -8,6 +8,7 @@ import Foundation
 enum PtermDirectories {
     private static let overrideLock = NSLock()
     private static var overriddenBaseDirectory: URL?
+    private static var cachedTestBaseDirectory: URL?
 
     /// Base directory: ~/.pterm/ unless explicitly overridden.
     static var base: URL {
@@ -93,6 +94,40 @@ enum PtermDirectories {
     }
 
     private static func defaultBaseDirectory() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".pterm", isDirectory: true)
+        if let testBaseDirectory = ProcessInfo.processInfo.environment["PTERM_TEST_BASE_DIR"],
+           !testBaseDirectory.isEmpty {
+            return URL(fileURLWithPath: testBaseDirectory, isDirectory: true)
+        }
+        if NSClassFromString("XCTestCase") != nil {
+            return prepareTestProcessBaseDirectory()
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".pterm", isDirectory: true)
+    }
+
+    private static func prepareTestProcessBaseDirectory() -> URL {
+        overrideLock.lock()
+        defer { overrideLock.unlock() }
+
+        if let cachedTestBaseDirectory {
+            return cachedTestBaseDirectory
+        }
+
+        let fm = FileManager.default
+        let rootDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent(".pterm-tests-\(UUID().uuidString)", isDirectory: true)
+        try? fm.createDirectory(
+            at: rootDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        let configURL = rootDirectory.appendingPathComponent("config.json")
+        if !fm.fileExists(atPath: configURL.path) {
+            try? "{}".write(to: configURL, atomically: true, encoding: .utf8)
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
+        }
+
+        cachedTestBaseDirectory = rootDirectory.standardizedFileURL
+        return cachedTestBaseDirectory!
     }
 }
