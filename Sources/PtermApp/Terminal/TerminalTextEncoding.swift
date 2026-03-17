@@ -216,6 +216,23 @@ final class TerminalTextDecoder {
                         continue
                     }
 
+                    if byte >= 0xE0, byte <= 0xEF {
+                        let remainingOutput = outputBuffer.count - outCount
+                        var bytesConsumed = 0
+                        let decodedCount = utf8_decoder_decode_three_byte_prefix(
+                            input.baseAddress!.advanced(by: index),
+                            input.count - index,
+                            outputBase.advanced(by: outCount),
+                            remainingOutput,
+                            &bytesConsumed
+                        )
+                        if decodedCount > 0 {
+                            outCount += Int(decodedCount)
+                            index += bytesConsumed
+                            continue
+                        }
+                    }
+
                     if byte >= 0xC2, byte <= 0xDF, index + 1 < input.count {
                         let b1 = input[index + 1]
                         if b1 & 0xC0 == 0x80 {

@@ -1419,6 +1419,28 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertEqual(bulkState.2, byteWiseState.2)
     }
 
+    func testDebugProcessPTYOutputMatchesByteWiseProcessingForMixedWideUnicodeAndASCII() {
+        let bulk = makeController(rows: 24, cols: 80)
+        let byteWise = makeController(rows: 24, cols: 80)
+        let payloadString =
+            "日本語かな mixed ASCII 123\tline\n"
+            + "中文，カナ、한글 fullwidth：ＡＢＣ € accents ÀÁÂ\n"
+            + "終わり"
+        let payload = Data(payloadString.utf8)
+
+        bulk.debugProcessPTYOutputForTesting(payload)
+        for byte in payload {
+            byteWise.debugProcessPTYOutputForTesting(Data([byte]))
+        }
+
+        XCTAssertEqual(bulk.allText(), byteWise.allText())
+        let bulkCursor = bulk.withModel { ($0.cursor.row, $0.cursor.col, $0.cursor.pendingWrap) }
+        let byteWiseCursor = byteWise.withModel { ($0.cursor.row, $0.cursor.col, $0.cursor.pendingWrap) }
+        XCTAssertEqual(bulkCursor.0, byteWiseCursor.0)
+        XCTAssertEqual(bulkCursor.1, byteWiseCursor.1)
+        XCTAssertEqual(bulkCursor.2, byteWiseCursor.2)
+    }
+
     func testAlternateScreenScrollDoesNotAppendScrollback() {
         let controller = makeController(rows: 3, cols: 6)
         let payload = Data(("\u{1B}[?1049h" + "1\n2\n3\n4\n5\n").utf8)

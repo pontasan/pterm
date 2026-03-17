@@ -1,6 +1,10 @@
 #include "utf8_decoder.h"
 #include <string.h>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 /*
  * DFA-based UTF-8 decoder.
  *
@@ -157,6 +161,21 @@ size_t utf8_decoder_decode_ascii_prefix(const uint8_t *input,
     size_t count = input_len < output_capacity ? input_len : output_capacity;
     size_t index = 0;
 
+#if defined(__aarch64__)
+    while (index + 16 <= count) {
+        uint8x16_t chunk = vld1q_u8(input + index);
+        if (vmaxvq_u8(chunk) & 0x80) break;
+
+        uint16x8_t low16 = vmovl_u8(vget_low_u8(chunk));
+        uint16x8_t high16 = vmovl_u8(vget_high_u8(chunk));
+
+        vst1q_u32(output + index, vmovl_u16(vget_low_u16(low16)));
+        vst1q_u32(output + index + 4, vmovl_u16(vget_high_u16(low16)));
+        vst1q_u32(output + index + 8, vmovl_u16(vget_low_u16(high16)));
+        vst1q_u32(output + index + 12, vmovl_u16(vget_high_u16(high16)));
+        index += 16;
+    }
+#else
     const size_t word_mask = ~(size_t)0 / 0xFF;
     const size_t high_bit_mask = word_mask << 7;
 
@@ -176,6 +195,7 @@ size_t utf8_decoder_decode_ascii_prefix(const uint8_t *input,
         }
         index += sizeof(size_t);
     }
+#endif
 
     while (index < count) {
         uint8_t byte = input[index];
@@ -185,4 +205,100 @@ size_t utf8_decoder_decode_ascii_prefix(const uint8_t *input,
     }
 
     return index;
+}
+
+size_t utf8_decoder_decode_three_byte_prefix(const uint8_t *input,
+                                             size_t input_len,
+                                             uint32_t *output,
+                                             size_t output_capacity,
+                                             size_t *bytes_consumed) {
+    if (bytes_consumed) *bytes_consumed = 0;
+    if (!input || !output || output_capacity == 0) return 0;
+
+    size_t in_index = 0;
+    size_t out_index = 0;
+
+    while (in_index + 2 < input_len && out_index < output_capacity) {
+        const uint8_t b0 = input[in_index];
+        const uint8_t b1 = input[in_index + 1];
+        const uint8_t b2 = input[in_index + 2];
+
+        if (b2 < 0x80 || b2 > 0xBF) break;
+
+        if (b0 >= 0xE1 && b0 <= 0xEC) {
+            if ((b1 & 0xC0) != 0x80) break;
+        } else if (b0 >= 0xEE && b0 <= 0xEF) {
+            if ((b1 & 0xC0) != 0x80) break;
+        } else if (b0 == 0xE0) {
+            if (b1 < 0xA0 || b1 > 0xBF) break;
+        } else if (b0 == 0xED) {
+            if (b1 < 0x80 || b1 > 0x9F) break;
+        } else {
+            break;
+        }
+
+        output[out_index++] =
+            ((uint32_t)(b0 & 0x0F) << 12) |
+            ((uint32_t)(b1 & 0x3F) << 6) |
+            (uint32_t)(b2 & 0x3F);
+        in_index += 3;
+    }
+
+    if (bytes_consumed) *bytes_consumed = in_index;
+    return out_index;
+}
+
+static inline bool utf8_decoder_is_common_wide_three_byte_codepoint(uint32_t codepoint) {
+    return
+        (codepoint >= 0x3000 && codepoint <= 0x303F) ||
+        (codepoint >= 0x3400 && codepoint <= 0x4DBF) ||
+        (codepoint >= 0x3040 && codepoint <= 0x30FF) ||
+        (codepoint >= 0x4E00 && codepoint <= 0x9FFF) ||
+        (codepoint >= 0xAC00 && codepoint <= 0xD7AF) ||
+        (codepoint >= 0xFF01 && codepoint <= 0xFF60) ||
+        (codepoint >= 0xFFE0 && codepoint <= 0xFFE6);
+}
+
+size_t utf8_decoder_decode_common_wide_three_byte_prefix(const uint8_t *input,
+                                                         size_t input_len,
+                                                         uint32_t *output,
+                                                         size_t output_capacity,
+                                                         size_t *bytes_consumed) {
+    if (bytes_consumed) *bytes_consumed = 0;
+    if (!input || !output || output_capacity == 0) return 0;
+
+    size_t in_index = 0;
+    size_t out_index = 0;
+
+    while (in_index + 2 < input_len && out_index < output_capacity) {
+        const uint8_t b0 = input[in_index];
+        const uint8_t b1 = input[in_index + 1];
+        const uint8_t b2 = input[in_index + 2];
+
+        if (b2 < 0x80 || b2 > 0xBF) break;
+
+        if (b0 >= 0xE1 && b0 <= 0xEC) {
+            if ((b1 & 0xC0) != 0x80) break;
+        } else if (b0 >= 0xEE && b0 <= 0xEF) {
+            if ((b1 & 0xC0) != 0x80) break;
+        } else if (b0 == 0xE0) {
+            if (b1 < 0xA0 || b1 > 0xBF) break;
+        } else if (b0 == 0xED) {
+            if (b1 < 0x80 || b1 > 0x9F) break;
+        } else {
+            break;
+        }
+
+        const uint32_t codepoint =
+            ((uint32_t)(b0 & 0x0F) << 12) |
+            ((uint32_t)(b1 & 0x3F) << 6) |
+            (uint32_t)(b2 & 0x3F);
+        if (!utf8_decoder_is_common_wide_three_byte_codepoint(codepoint)) break;
+
+        output[out_index++] = codepoint;
+        in_index += 3;
+    }
+
+    if (bytes_consumed) *bytes_consumed = in_index;
+    return out_index;
 }

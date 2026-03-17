@@ -495,6 +495,64 @@ final class TextModelTests: XCTestCase {
         XCTAssertEqual(grid.cell(at: 0, col: 5).codepoint, Cell.empty.codepoint)
     }
 
+    func testTerminalGridSparseDefaultUnicodeRowBehavesLikeBlankTailUntilMaterialized() {
+        let grid = TerminalGrid(rows: 1, cols: 8)
+        let codepoints: [UInt32] = [0x03B1, 0x03B2, 0x03B3]
+        codepoints.withUnsafeBufferPointer { buffer in
+            grid.writeSingleWidthDefaultCells(
+                buffer.baseAddress!,
+                count: buffer.count,
+                atRow: 0,
+                startCol: 0
+            )
+        }
+
+        XCTAssertEqual(grid.rowCells(0).map(\.codepoint), codepoints)
+        XCTAssertEqual(grid.cell(at: 0, col: 0).codepoint, 0x03B1)
+        XCTAssertEqual(grid.cell(at: 0, col: 3).codepoint, Cell.empty.codepoint)
+        XCTAssertEqual(grid.cell(at: 0, col: 7).codepoint, Cell.empty.codepoint)
+
+        grid.setCell(
+            Cell(codepoint: 0x03B6, attributes: .default, width: 1, isWideContinuation: false),
+            at: 0,
+            col: 5
+        )
+
+        XCTAssertEqual(grid.cell(at: 0, col: 0).codepoint, 0x03B1)
+        XCTAssertEqual(grid.cell(at: 0, col: 3).codepoint, Cell.empty.codepoint)
+        XCTAssertEqual(grid.cell(at: 0, col: 5).codepoint, 0x03B6)
+        XCTAssertEqual(grid.rowCells(0).count, 8)
+    }
+
+    func testTerminalGridSparseDefaultUnicodeRowCanExtendWithoutMaterializingBlankTail() {
+        let grid = TerminalGrid(rows: 1, cols: 8)
+        [UInt32(0x03B1), 0x03B2, 0x03B3].withUnsafeBufferPointer { buffer in
+            grid.writeSingleWidthDefaultCells(
+                buffer.baseAddress!,
+                count: buffer.count,
+                atRow: 0,
+                startCol: 0
+            )
+        }
+        [UInt32(0x03B4), 0x03B5].withUnsafeBufferPointer { buffer in
+            grid.writeSingleWidthDefaultCells(
+                buffer.baseAddress!,
+                count: buffer.count,
+                atRow: 0,
+                startCol: 3
+            )
+        }
+
+        switch grid.rowEncodingHint(0).kind {
+        case .compactDefault(let serializedCount):
+            XCTAssertEqual(serializedCount, 5)
+        default:
+            XCTFail("expected compact default hint after sparse Unicode append")
+        }
+        XCTAssertEqual(grid.rowCells(0).map(\.codepoint), [UInt32(0x03B1), 0x03B2, 0x03B3, 0x03B4, 0x03B5])
+        XCTAssertEqual(grid.cell(at: 0, col: 6).codepoint, Cell.empty.codepoint)
+    }
+
     func testTerminalGridOutOfBoundsAccessIsSafe() {
         let grid = TerminalGrid(rows: 2, cols: 2)
         XCTAssertEqual(grid.cell(at: -1, col: 0).codepoint, 0x20)

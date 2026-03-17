@@ -69,4 +69,30 @@ size_t utf8_decoder_decode_ascii_prefix(const uint8_t *input,
                                         uint32_t *output,
                                         size_t output_capacity);
 
+/*
+ * Decode the longest leading prefix consisting only of valid 3-byte UTF-8
+ * scalar sequences. Intended for Apple Silicon terminal workloads that contain
+ * long contiguous runs of CJK text. Returns the number of codepoints written
+ * and stores the consumed byte count in `bytes_consumed`.
+ */
+size_t utf8_decoder_decode_three_byte_prefix(const uint8_t *input,
+                                             size_t input_len,
+                                             uint32_t *output,
+                                             size_t output_capacity,
+                                             size_t *bytes_consumed);
+
+/*
+ * Decode the longest leading prefix consisting only of valid 3-byte UTF-8
+ * sequences that map to the terminal's common width-2 ranges (CJK, kana,
+ * hangul, fullwidth punctuation). This exists for the macOS + Apple Silicon
+ * terminal hot path where kitty-style Unicode workloads spend most of their
+ * time in these ranges. Returns the number of codepoints written and stores
+ * the consumed byte count in `bytes_consumed`.
+ */
+size_t utf8_decoder_decode_common_wide_three_byte_prefix(const uint8_t *input,
+                                                         size_t input_len,
+                                                         uint32_t *output,
+                                                         size_t output_capacity,
+                                                         size_t *bytes_consumed);
+
 #endif /* UTF8_DECODER_H */

@@ -1,6 +1,10 @@
 #include "vt_parser.h"
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <limits.h>
 
 /*
@@ -75,6 +79,7 @@ static inline bool bytes_have_high_bit_set(const uint8_t *bytes, size_t count) {
     return false;
 }
 
+#if !defined(__aarch64__)
 static inline bool word_has_zero_byte(size_t word) {
     const size_t ones = ~(size_t)0 / 0xFF;
     const size_t high_bits = ones << 7;
@@ -112,6 +117,7 @@ static inline bool word_has_non_text_ascii(size_t word) {
     }
     return false;
 }
+#endif
 
 typedef enum {
     ASCII_SCAN_INCOMPLETE = 0,
@@ -173,6 +179,53 @@ static AsciiStringScanResult scan_ascii_string_payload(
     return ASCII_SCAN_INCOMPLETE;
 }
 
+#if defined(__aarch64__)
+static inline size_t scan_printable_ascii_prefix_neon(
+    const uint8_t *bytes,
+    size_t count
+) {
+    const uint8x16_t space = vdupq_n_u8(0x20);
+    const uint8x16_t del = vdupq_n_u8(0x7F);
+    size_t index = 0;
+
+    while (index + 16 <= count) {
+        uint8x16_t chunk = vld1q_u8(bytes + index);
+        uint8x16_t bad = vorrq_u8(vcltq_u8(chunk, space), vcgeq_u8(chunk, del));
+        if (vmaxvq_u8(bad) != 0) break;
+        index += 16;
+    }
+
+    return index;
+}
+
+static inline size_t scan_text_ascii_prefix_neon(
+    const uint8_t *bytes,
+    size_t count
+) {
+    const uint8x16_t space = vdupq_n_u8(0x20);
+    const uint8x16_t del = vdupq_n_u8(0x7F);
+    const uint8x16_t ht = vdupq_n_u8(0x09);
+    const uint8x16_t lf = vdupq_n_u8(0x0A);
+    const uint8x16_t cr = vdupq_n_u8(0x0D);
+    size_t index = 0;
+
+    while (index + 16 <= count) {
+        uint8x16_t chunk = vld1q_u8(bytes + index);
+        uint8x16_t low = vcltq_u8(chunk, space);
+        uint8x16_t allowedLow = vorrq_u8(
+            vceqq_u8(chunk, ht),
+            vorrq_u8(vceqq_u8(chunk, lf), vceqq_u8(chunk, cr))
+        );
+        uint8x16_t badLow = vandq_u8(low, vmvnq_u8(allowedLow));
+        uint8x16_t bad = vorrq_u8(badLow, vcgeq_u8(chunk, del));
+        if (vmaxvq_u8(bad) != 0) break;
+        index += 16;
+    }
+
+    return index;
+}
+#endif
+
 size_t vt_parser_scan_printable_ascii_prefix(
     const uint8_t *bytes,
     size_t count
@@ -180,6 +233,9 @@ size_t vt_parser_scan_printable_ascii_prefix(
     if (!bytes || count == 0) return 0;
 
     size_t index = 0;
+#if defined(__aarch64__)
+    index = scan_printable_ascii_prefix_neon(bytes, count);
+#else
     while (index < count && ((uintptr_t)(bytes + index) & (sizeof(size_t) - 1)) != 0) {
         uint8_t byte = bytes[index];
         if (byte < 0x20 || byte >= 0x7F) return index;
@@ -192,6 +248,7 @@ size_t vt_parser_scan_printable_ascii_prefix(
         if (word_has_non_printable_ascii(word)) break;
         index += sizeof(size_t);
     }
+#endif
 
     while (index < count) {
         uint8_t byte = bytes[index];
@@ -209,6 +266,9 @@ size_t vt_parser_scan_text_ascii_prefix(
     if (!bytes || count == 0) return 0;
 
     size_t index = 0;
+#if defined(__aarch64__)
+    index = scan_text_ascii_prefix_neon(bytes, count);
+#else
     while (index < count && ((uintptr_t)(bytes + index) & (sizeof(size_t) - 1)) != 0) {
         uint8_t byte = bytes[index];
         if (!((byte >= 0x20 && byte < 0x7F) || byte == 0x09 || byte == 0x0A || byte == 0x0D)) {
@@ -223,6 +283,7 @@ size_t vt_parser_scan_text_ascii_prefix(
         if (word_has_non_text_ascii(word)) break;
         index += sizeof(size_t);
     }
+#endif
 
     while (index < count) {
         uint8_t byte = bytes[index];

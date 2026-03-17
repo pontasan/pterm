@@ -734,6 +734,16 @@ final class TerminalController {
                         }
                     }
 
+                    if self.canUseDirectUTF8WideGroundFastPath(input) {
+                        let consumed = self.consumeDirectUTF8WideGroundFastPath(input)
+                        if consumed > 0 {
+                            didMutateDisplay = true
+                            fastPathPointer = fastPathPointer.advanced(by: consumed)
+                            fastPathRemainingCount -= consumed
+                            continue
+                        }
+                    }
+
                     let ignoredStringBytes = vt_parser_consume_ascii_ignored_string_fast_path(
                         &self.parser,
                         fastPathPointer,
@@ -1019,6 +1029,69 @@ final class TerminalController {
         }
 
         return true
+    }
+
+    private func canUseDirectUTF8WideGroundFastPath(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard !bytes.isEmpty,
+              textEncoding == .utf8,
+              textDecoder.canDecodeDirectASCII,
+              parser.state == VT_STATE_GROUND,
+              model.canUseKnownWideUTF8GroundFastPath
+        else {
+            return false
+        }
+
+        return true
+    }
+
+    private func consumeDirectUTF8WideGroundFastPath(_ bytes: UnsafeBufferPointer<UInt8>) -> Int {
+        guard let baseAddress = bytes.baseAddress, !bytes.isEmpty else { return 0 }
+
+        var index = 0
+        while index < bytes.count {
+            let asciiInput = UnsafeBufferPointer(start: baseAddress.advanced(by: index), count: bytes.count - index)
+            let asciiConsumed = model.consumeGroundASCIIBytesFastPathPrefix(asciiInput)
+            if asciiConsumed > 0 {
+                index += asciiConsumed
+                continue
+            }
+
+            let remainingCount = bytes.count - index
+            ensureCodepointBufferCapacity(requiredCount: remainingCount / 3)
+
+            var bytesConsumed = 0
+            let decodedCount = codepointBuffer.withUnsafeMutableBufferPointer { buffer -> Int in
+                guard let outputBase = buffer.baseAddress else { return 0 }
+                return Int(
+                    utf8_decoder_decode_common_wide_three_byte_prefix(
+                        baseAddress.advanced(by: index),
+                        remainingCount,
+                        outputBase,
+                        buffer.count,
+                        &bytesConsumed
+                    )
+                )
+            }
+
+            if decodedCount > 0 {
+                codepointBuffer.withUnsafeBufferPointer { buffer in
+                    model.handleKnownDoubleWidthCodepointRun(
+                        UnsafeBufferPointer(start: buffer.baseAddress, count: decodedCount)
+                    )
+                }
+                index += bytesConsumed
+                continue
+            }
+
+            if model.consumeGroundExecuteFastPath(UInt32(baseAddress[index])) {
+                index += 1
+                continue
+            }
+
+            break
+        }
+
+        return index
     }
 
     private func beginParserScrollOutBatch() {

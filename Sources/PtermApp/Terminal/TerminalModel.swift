@@ -393,6 +393,10 @@ final class TerminalModel {
         cursor.autoWrapMode
     }
 
+    var canUseKnownWideUTF8GroundFastPath: Bool {
+        !insertModeEnabled
+    }
+
     /// Fast path for the common "ground-state text stream" case.
     ///
     /// When the VT parser is already in ground state and the incoming chunk
@@ -430,6 +434,22 @@ final class TerminalModel {
     }
 
     @discardableResult
+    func consumeGroundExecuteFastPath(_ codepoint: UInt32) -> Bool {
+        switch codepoint {
+        case 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F:
+            handleExecute(codepoint)
+            return true
+        default:
+            return false
+        }
+    }
+
+    func handleKnownDoubleWidthCodepointRun(_ codepoints: UnsafeBufferPointer<UInt32>) {
+        guard let baseAddress = codepoints.baseAddress, !codepoints.isEmpty else { return }
+        handleDoubleWidthCodepointRun(baseAddress, count: codepoints.count)
+    }
+
+    @discardableResult
     private func consumeGroundPrintableCodepointsFastPathPrefix(_ codepoints: UnsafeBufferPointer<UInt32>) -> Int {
         guard !codepoints.isEmpty else { return 0 }
         var index = 0
@@ -453,10 +473,8 @@ final class TerminalModel {
                 var runCount = 1
                 while runStart + runCount < codepoints.count {
                     let next = codepoints[runStart + runCount]
-                    if next == 0x1B || next == 0x18 || next == 0x1A || next == 0x7F || next < 0x20 {
-                        break
-                    }
-                    guard fastGroundPathWidth(of: next) == 1 else { break }
+                    let nextWidth = fastGroundPathWidth(of: next)
+                    guard nextWidth == 1 else { break }
                     runCount += 1
                 }
                 handleSingleWidthCodepointRun(codepoints.baseAddress!.advanced(by: runStart), count: runCount)
@@ -466,10 +484,8 @@ final class TerminalModel {
                 var runCount = 1
                 while runStart + runCount < codepoints.count {
                     let next = codepoints[runStart + runCount]
-                    if next == 0x1B || next == 0x18 || next == 0x1A || next == 0x7F || next < 0x20 {
-                        break
-                    }
-                    guard fastGroundPathWidth(of: next) == 2 else { break }
+                    let nextWidth = fastGroundPathWidth(of: next)
+                    guard nextWidth == 2 else { break }
                     runCount += 1
                 }
                 handleDoubleWidthCodepointRun(codepoints.baseAddress!.advanced(by: runStart), count: runCount)
@@ -484,20 +500,36 @@ final class TerminalModel {
     }
 
     private func fastGroundPathWidth(of codepoint: UInt32) -> Int {
-        if codepoint >= 0x4E00 && codepoint <= 0x9FFF { return 2 }
-        if codepoint >= 0x3400 && codepoint <= 0x4DBF { return 2 }
-        if codepoint >= 0x3040 && codepoint <= 0x30FF { return 2 }
-        if codepoint >= 0xAC00 && codepoint <= 0xD7AF { return 2 }
-        if codepoint >= 0x1F300 && codepoint <= 0x1FAFF { return 2 }
-
-        if codepoint >= 0x0300 && codepoint <= 0x036F { return 0 }
-        if codepoint >= 0x1AB0 && codepoint <= 0x1AFF { return 0 }
-        if codepoint >= 0x1DC0 && codepoint <= 0x1DFF { return 0 }
-        if codepoint >= 0x20D0 && codepoint <= 0x20FF { return 0 }
-        if codepoint >= 0xFE20 && codepoint <= 0xFE2F { return 0 }
-        if codepoint >= 0xFE00 && codepoint <= 0xFE0F { return 0 }
-        if codepoint == 0x200B || codepoint == 0x200C || codepoint == 0x200D || codepoint == 0x2060 || codepoint == 0xFEFF {
-            return 0
+        if codepoint >= 0x20 && codepoint <= 0x7E { return 1 }
+        if codepoint < 0x3000 {
+            if codepoint >= 0x00A0 && codepoint <= 0x02FF { return 1 }
+            if codepoint >= 0x0300 && codepoint <= 0x036F { return 0 }
+            if codepoint >= 0x0370 && codepoint <= 0x03FF { return 1 }
+            if codepoint >= 0x1AB0 && codepoint <= 0x1AFF { return 0 }
+            if codepoint >= 0x1DC0 && codepoint <= 0x1DFF { return 0 }
+            if codepoint >= 0x2000 && codepoint <= 0x206F {
+                if codepoint == 0x200B || codepoint == 0x200C || codepoint == 0x200D || codepoint == 0x2060 {
+                    return 0
+                }
+                return 1
+            }
+            if codepoint >= 0x20D0 && codepoint <= 0x20FF { return 0 }
+            if codepoint >= 0x2100 && codepoint <= 0x214F { return 1 }
+            if codepoint >= 0x2190 && codepoint <= 0x21FF { return 1 }
+            if codepoint >= 0x2200 && codepoint <= 0x22FF { return 1 }
+        } else if codepoint < 0x10000 {
+            if codepoint >= 0x3000 && codepoint <= 0x303F { return 2 }
+            if codepoint >= 0x3040 && codepoint <= 0x30FF { return 2 }
+            if codepoint >= 0x3400 && codepoint <= 0x4DBF { return 2 }
+            if codepoint >= 0x4E00 && codepoint <= 0x9FFF { return 2 }
+            if codepoint >= 0xAC00 && codepoint <= 0xD7AF { return 2 }
+            if codepoint >= 0xFE00 && codepoint <= 0xFE0F { return 0 }
+            if codepoint >= 0xFE20 && codepoint <= 0xFE2F { return 0 }
+            if codepoint == 0xFEFF { return 0 }
+            if codepoint >= 0xFF01 && codepoint <= 0xFF60 { return 2 }
+            if codepoint >= 0xFFE0 && codepoint <= 0xFFE6 { return 2 }
+        } else if codepoint >= 0x1F300 && codepoint <= 0x1FAFF {
+            return 2
         }
 
         return CharacterWidth.width(of: codepoint)
@@ -605,18 +637,16 @@ final class TerminalModel {
         count: Int
     ) {
         var pointer = bytes
-        let end = bytes.advanced(by: count)
+        var remainingCount = count
         let visibleCols = cols
 
-        while pointer < end {
-            var printableEnd = pointer
-            while printableEnd < end {
-                let byte = printableEnd.pointee
-                guard byte >= 0x20 && byte < 0x7F else { break }
-                printableEnd = printableEnd.advanced(by: 1)
-            }
-
-            let printableCount = pointer.distance(to: printableEnd)
+        while remainingCount > 0 {
+            let printableCount = Int(
+                vt_parser_scan_printable_ascii_prefix(
+                    pointer,
+                    remainingCount
+                )
+            )
             if printableCount > 0 {
                 var remainingPrintableBase = pointer
                 var remainingPrintableCount = printableCount
@@ -659,7 +689,8 @@ final class TerminalModel {
                     }
                 }
 
-                pointer = printableEnd
+                pointer = pointer.advanced(by: printableCount)
+                remainingCount -= printableCount
                 continue
             }
 
@@ -678,6 +709,7 @@ final class TerminalModel {
             }
 
             pointer = pointer.advanced(by: 1)
+            remainingCount -= 1
         }
     }
 
@@ -778,11 +810,13 @@ final class TerminalModel {
     private func handleSingleWidthCodepointRun(_ codepoints: UnsafePointer<UInt32>, count: Int) {
         guard count > 0 else { return }
         let attributes = currentPrintAttributes()
+        let usesDefaultAttributes = attributes == .default
         if grid.hasOnlySingleWidthLines {
             handleSingleWidthCodepointRunSingleWidthGrid(
                 codepoints,
                 count: count,
-                attributes: attributes
+                attributes: attributes,
+                usesDefaultAttributes: usesDefaultAttributes
             )
             return
         }
@@ -803,13 +837,22 @@ final class TerminalModel {
             guard available > 0 else { break }
 
             let chunkCount = min(remainingCount, available)
-            grid.writeSingleWidthCells(
-                remainingBase,
-                count: chunkCount,
-                attributes: attributes,
-                atRow: cursor.row,
-                startCol: cursor.col
-            )
+            if usesDefaultAttributes {
+                grid.writeSingleWidthDefaultCells(
+                    remainingBase,
+                    count: chunkCount,
+                    atRow: cursor.row,
+                    startCol: cursor.col
+                )
+            } else {
+                grid.writeSingleWidthCells(
+                    remainingBase,
+                    count: chunkCount,
+                    attributes: attributes,
+                    atRow: cursor.row,
+                    startCol: cursor.col
+                )
+            }
 
             cursor.col += chunkCount
             remainingBase = remainingBase.advanced(by: chunkCount)
@@ -835,7 +878,8 @@ final class TerminalModel {
     private func handleSingleWidthCodepointRunSingleWidthGrid(
         _ codepoints: UnsafePointer<UInt32>,
         count: Int,
-        attributes: CellAttributes
+        attributes: CellAttributes,
+        usesDefaultAttributes: Bool
     ) {
         var remainingBase = codepoints
         var remainingCount = count
@@ -853,13 +897,22 @@ final class TerminalModel {
             guard available > 0 else { break }
 
             let chunkCount = min(remainingCount, available)
-            grid.writeSingleWidthCells(
-                remainingBase,
-                count: chunkCount,
-                attributes: attributes,
-                atRow: cursor.row,
-                startCol: cursor.col
-            )
+            if usesDefaultAttributes {
+                grid.writeSingleWidthDefaultCells(
+                    remainingBase,
+                    count: chunkCount,
+                    atRow: cursor.row,
+                    startCol: cursor.col
+                )
+            } else {
+                grid.writeSingleWidthCells(
+                    remainingBase,
+                    count: chunkCount,
+                    attributes: attributes,
+                    atRow: cursor.row,
+                    startCol: cursor.col
+                )
+            }
 
             cursor.col += chunkCount
             remainingBase = remainingBase.advanced(by: chunkCount)
@@ -884,11 +937,13 @@ final class TerminalModel {
     private func handleDoubleWidthCodepointRun(_ codepoints: UnsafePointer<UInt32>, count: Int) {
         guard count > 0 else { return }
         let attributes = currentPrintAttributes()
+        let usesDefaultAttributes = attributes == .default
         if grid.hasOnlySingleWidthLines {
             handleDoubleWidthCodepointRunSingleWidthGrid(
                 codepoints,
                 count: count,
-                attributes: attributes
+                attributes: attributes,
+                usesDefaultAttributes: usesDefaultAttributes
             )
             return
         }
@@ -916,13 +971,22 @@ final class TerminalModel {
             }
 
             let chunkCount = min(remainingCount, available / 2)
-            grid.writeDoubleWidthCells(
-                remainingBase,
-                count: chunkCount,
-                attributes: attributes,
-                atRow: cursor.row,
-                startCol: cursor.col
-            )
+            if usesDefaultAttributes {
+                grid.writeDoubleWidthDefaultCells(
+                    remainingBase,
+                    count: chunkCount,
+                    atRow: cursor.row,
+                    startCol: cursor.col
+                )
+            } else {
+                grid.writeDoubleWidthCells(
+                    remainingBase,
+                    count: chunkCount,
+                    attributes: attributes,
+                    atRow: cursor.row,
+                    startCol: cursor.col
+                )
+            }
 
             cursor.col += chunkCount * 2
             remainingBase = remainingBase.advanced(by: chunkCount)
@@ -948,7 +1012,8 @@ final class TerminalModel {
     private func handleDoubleWidthCodepointRunSingleWidthGrid(
         _ codepoints: UnsafePointer<UInt32>,
         count: Int,
-        attributes: CellAttributes
+        attributes: CellAttributes,
+        usesDefaultAttributes: Bool
     ) {
         var remainingBase = codepoints
         var remainingCount = count
@@ -973,13 +1038,22 @@ final class TerminalModel {
             }
 
             let chunkCount = min(remainingCount, available / 2)
-            grid.writeDoubleWidthCells(
-                remainingBase,
-                count: chunkCount,
-                attributes: attributes,
-                atRow: cursor.row,
-                startCol: cursor.col
-            )
+            if usesDefaultAttributes {
+                grid.writeDoubleWidthDefaultCells(
+                    remainingBase,
+                    count: chunkCount,
+                    atRow: cursor.row,
+                    startCol: cursor.col
+                )
+            } else {
+                grid.writeDoubleWidthCells(
+                    remainingBase,
+                    count: chunkCount,
+                    attributes: attributes,
+                    atRow: cursor.row,
+                    startCol: cursor.col
+                )
+            }
 
             cursor.col += chunkCount * 2
             remainingBase = remainingBase.advanced(by: chunkCount)

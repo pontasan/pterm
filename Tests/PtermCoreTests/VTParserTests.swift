@@ -145,4 +145,20 @@ final class VTParserTests: XCTestCase {
         XCTAssertEqual(suffixConsumed, suffix.count)
         XCTAssertEqual(parser.state, VT_STATE_GROUND)
     }
+
+    func testScanPrintableASCIIPrefixStopsAtControlByte() {
+        let bytes: [UInt8] = Array("Hello, world!".utf8) + [0x0A, 0x41]
+        let scanned = bytes.withUnsafeBufferPointer {
+            vt_parser_scan_printable_ascii_prefix($0.baseAddress, $0.count)
+        }
+        XCTAssertEqual(scanned, 13)
+    }
+
+    func testScanTextASCIIPrefixIncludesWhitespaceControlsButStopsAtEscape() {
+        let bytes: [UInt8] = Array("abc".utf8) + [0x09, 0x0A, 0x0D] + Array("xyz".utf8) + [0x1B, 0x5B]
+        let scanned = bytes.withUnsafeBufferPointer {
+            vt_parser_scan_text_ascii_prefix($0.baseAddress, $0.count)
+        }
+        XCTAssertEqual(scanned, 9)
+    }
 }
