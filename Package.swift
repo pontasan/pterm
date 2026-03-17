@@ -34,6 +34,7 @@ let package = Package(
                 .linkedFramework("AppKit"),
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
+                .linkedFramework("Network"),
                 .linkedFramework("CoreText"),
                 .linkedFramework("QuartzCore"),
                 .linkedFramework("Security"),

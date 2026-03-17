@@ -71,6 +71,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var outputConfirmedInputAnimationCheck: NSButton?
     private var typewriterSoundCheck: NSButton?
     private var scrollPersistenceCheck: NSButton?
+    private var mcpServerEnabledCheck: NSButton?
+    private var mcpServerPortField: NSTextField?
     private var fontNameLabel: NSTextField?
     private var fontSizeStepper: NSStepper?
     private var fontSizeField: NSTextField?
@@ -196,6 +198,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             "paste_confirmation",
             "mouse_report_restrict_alternate_screen",
             "allow_window_resize_sequence"
+        ])
+        resetSection("mcp_server", removing: [
+            "enabled",
+            "port"
         ])
         resetSection("audit", removing: [
             "enabled",
@@ -389,6 +395,37 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         check.action = #selector(scrollPersistenceChanged(_:))
         scrollPersistenceCheck = check
         addView(check, 22)
+        addSpacing(16)
+
+        let mcpSection = (configData["mcp_server"] as? [String: Any]) ?? [:]
+        let mcpEnabled = (mcpSection["enabled"] as? Bool) ?? MCPServerConfiguration.default.enabled
+        let mcpEnabledCheck = makeCheckbox("Enable local MCP server", checked: mcpEnabled)
+        mcpEnabledCheck.target = self
+        mcpEnabledCheck.action = #selector(mcpServerEnabledChanged(_:))
+        mcpServerEnabledCheck = mcpEnabledCheck
+        addView(mcpEnabledCheck, 22)
+        addSpacing(12)
+
+        let mcpPort = MCPServerConfiguration.normalizedPort(intVal(mcpSection["port"]) ?? MCPServerConfiguration.default.port)
+        let (mcpPortRow, mcpPortField) = makeTextFieldRow(
+            label: "MCP Port:",
+            value: "\(mcpPort)",
+            width: width
+        )
+        mcpPortField.identifier = NSUserInterfaceItemIdentifier("mcpServerPortField")
+        mcpPortField.target = self
+        mcpPortField.action = #selector(mcpServerPortChanged(_:))
+        mcpPortField.isEnabled = mcpEnabled
+        self.mcpServerPortField = mcpPortField
+        addView(mcpPortRow, 28)
+        addSpacing(4)
+        addView(
+            makeDescriptionLabel(
+                "Local-only TCP MCP endpoint for LLM automation. Default: \(MCPServerConfiguration.defaultPort).",
+                width: width
+            ),
+            28
+        )
         addSpacing(20)
 
         let resetButton = NSButton(title: "Restore Defaults…", target: self, action: #selector(factoryResetClicked(_:)))
@@ -702,6 +739,28 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         var session = (configData["session"] as? [String: Any]) ?? [:]
         session["scroll_buffer_persistence"] = (sender.state == .on)
         configData["session"] = session
+        commitConfigChange()
+    }
+
+    @objc private func mcpServerEnabledChanged(_ sender: NSButton) {
+        var mcpServer = (configData["mcp_server"] as? [String: Any]) ?? [:]
+        let enabled = (sender.state == .on)
+        mcpServer["enabled"] = enabled
+        mcpServer["port"] = MCPServerConfiguration.normalizedPort(
+            Int(mcpServerPortField?.stringValue ?? "") ?? intVal(mcpServer["port"]) ?? MCPServerConfiguration.default.port
+        )
+        configData["mcp_server"] = mcpServer
+        mcpServerPortField?.isEnabled = enabled
+        commitConfigChange()
+    }
+
+    @objc private func mcpServerPortChanged(_ sender: NSTextField) {
+        let normalizedPort = MCPServerConfiguration.normalizedPort(Int(sender.stringValue))
+        sender.stringValue = "\(normalizedPort)"
+        var mcpServer = (configData["mcp_server"] as? [String: Any]) ?? [:]
+        mcpServer["enabled"] = (mcpServerEnabledCheck?.state == .on)
+        mcpServer["port"] = normalizedPort
+        configData["mcp_server"] = mcpServer
         commitConfigChange()
     }
 

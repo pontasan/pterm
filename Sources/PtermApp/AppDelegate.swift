@@ -65,6 +65,65 @@ final class PtermWindow: NSWindow {
 /// view switching between integrated view and focused view,
 /// and top-level keyboard shortcuts.
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    struct MCPTerminalObservation: Equatable {
+        let terminalID: UUID
+        let foregroundProcessName: String?
+        let screenRevision: UInt64
+        let lastOutputAt: Date?
+    }
+
+    struct MCPTerminalWaitCondition: Equatable {
+        let terminalID: UUID
+        let foregroundProcessName: String?
+        let screenRevisionGreaterThan: UInt64?
+        let idleForMilliseconds: Int?
+        let timeoutMilliseconds: Int
+
+        init(arguments: [String: Any]) throws {
+            guard let rawTerminalID = arguments["terminal_id"] as? String,
+                  let terminalID = UUID(uuidString: rawTerminalID) else {
+                throw MCPServerError.invalidRequest
+            }
+
+            let idleForMilliseconds = arguments["idle_for_ms"] as? Int
+            let timeoutMilliseconds = max(arguments["timeout_ms"] as? Int ?? 5_000, 1)
+            let screenRevisionGreaterThan: UInt64?
+            if let value = arguments["screen_revision_gt"] as? UInt64 {
+                screenRevisionGreaterThan = value
+            } else if let value = arguments["screen_revision_gt"] as? Int, value >= 0 {
+                screenRevisionGreaterThan = UInt64(value)
+            } else {
+                screenRevisionGreaterThan = nil
+            }
+
+            self.terminalID = terminalID
+            self.foregroundProcessName = arguments["foreground_process_name"] as? String
+            self.screenRevisionGreaterThan = screenRevisionGreaterThan
+            self.idleForMilliseconds = idleForMilliseconds
+            self.timeoutMilliseconds = timeoutMilliseconds
+        }
+
+        func isSatisfied(by observation: MCPTerminalObservation, now: Date = Date()) -> Bool {
+            guard observation.terminalID == terminalID else { return false }
+            if let foregroundProcessName,
+               observation.foregroundProcessName != foregroundProcessName {
+                return false
+            }
+            if let screenRevisionGreaterThan,
+               observation.screenRevision <= screenRevisionGreaterThan {
+                return false
+            }
+            if let idleForMilliseconds {
+                guard let lastOutputAt = observation.lastOutputAt else { return false }
+                let idleDuration = now.timeIntervalSince(lastOutputAt) * 1000
+                if idleDuration < Double(idleForMilliseconds) {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+
     private enum Layout {
         static let statusBarHeight: CGFloat = 24
         static let searchBarHeight: CGFloat = 40
@@ -105,6 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let clipboardFileStore = ClipboardFileStore()
     private let pastedImageRegistry = PastedImageRegistry()
     private var clipboardCleanupService: ClipboardCleanupService?
+    private var mcpServer: MCPServer?
     private let sessionStore = SessionStore()
     private let singleInstanceLock = SingleInstanceLock()
     private let appNoteStore = AppNoteStore()
@@ -153,6 +213,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var splitOriginAncestorControllers: [TerminalController]?
     /// Controllers saved when the current split itself should return to a previous split.
     private var splitReturnControllers: [TerminalController]?
+    private let launchOptions: LaunchOptions
+    private static let mcpDateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
 
     /// View mode
     private enum ViewMode {
@@ -188,6 +254,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminalBackgroundOpacity: Double
     ) -> Bool {
         isIntegratedViewVisible || terminalBackgroundOpacity < 0.999
+    }
+
+    init(launchOptions: LaunchOptions = LaunchOptions(profileRoot: nil, restoreSessionMode: .attempt, immediateAction: nil)) {
+        self.launchOptions = launchOptions
+        super.init()
     }
 
     static func reconcilePresentationAfterTerminalListChange(
@@ -587,6 +658,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Setup menu
         setupMenu()
+        configureMCPServer()
     }
 
     private func runNoteEditorSelfTestIfRequested() {
@@ -1398,6 +1470,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func reloadConfigurationFromDisk() {
         config = PtermConfigStore.load()
         TypewriterSoundPlayer.shared.configure(enabled: config.textInteraction.typewriterSoundEnabled)
+        configureMCPServer()
         manager.updateConfiguration(config)
         setupMenu()
         terminalView?.shortcutConfiguration = config.shortcuts
@@ -1958,6 +2031,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case .restore(let session):
                 return session
             case .requireUserConfirmation(let session):
+                if launchOptions.restoreSessionMode == .force {
+                    return session
+                }
+                if launchOptions.restoreSessionMode == .never {
+                    try sessionStore.clearSession()
+                    try sessionStore.markCleanShutdown()
+                    return nil
+                }
                 let alert = NSAlert.pterm()
                 alert.messageText = "Restore previous session?"
                 alert.informativeText = "The previous session did not exit cleanly. Restoring may cause the same issue again."
@@ -2678,6 +2759,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scrollbarOverlay = overlay
     }
 
+    private func configureMCPServer() {
+        stopMCPServer()
+        guard config.mcpServer.enabled else { return }
+
+        do {
+            let server = MCPServer(configuration: config.mcpServer, toolProvider: self)
+            try server.start()
+            mcpServer = server
+        } catch {
+            mcpServer = nil
+            presentMCPServerError(error)
+        }
+    }
+
+    private func stopMCPServer() {
+        mcpServer?.stop()
+        mcpServer = nil
+    }
+
+    private func presentMCPServerError(_ error: Error) {
+        let alert = NSAlert.pterm()
+        alert.messageText = "Failed to start MCP server"
+        alert.informativeText = "\(error.localizedDescription)\n\nChange the port in Settings > General and try again."
+        alert.alertStyle = .critical
+        alert.runModal()
+    }
+
+    private func terminateApplicationFromMCP() {
+        guard !isTerminating else {
+            NSApp.terminate(nil)
+            return
+        }
+
+        isTerminating = true
+        flushPendingSessionPersistence()
+        clipboardCleanupService?.stop()
+        manager.stopAll(
+            preserveScrollback: config.sessionScrollBufferPersistence,
+            waitForExit: false
+        )
+        try? sessionStore.markCleanShutdown()
+        singleInstanceLock.release()
+        stopMCPServer()
+        NSApp.terminate(nil)
+    }
+
     private func normalizedWorkspaceName(_ raw: String) -> String {
         FileNameSanitizer.sanitize(raw, fallback: WorkspaceNaming.uncategorized)
     }
@@ -3037,10 +3164,589 @@ extension AppDelegate: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         removeBackShortcutMonitor()
         stopConfigWatcher()
+        stopMCPServer()
         metricsMonitor?.stop()
         clipboardCleanupService?.stop()
         manager?.stopAll(preserveScrollback: config.sessionScrollBufferPersistence)
         try? sessionStore.markCleanShutdown()
         singleInstanceLock.release()
+    }
+}
+
+extension AppDelegate: MCPToolProvider {
+    func toolDefinitions() -> [MCPToolDefinition] {
+        [
+            MCPToolDefinition(
+                name: "describe_pterm_model",
+                description: "Explain pterm concepts, relationships, identifiers, and recommended MCP workflows for an LLM client.",
+                inputSchema: ["type": "object", "properties": [:]]
+            ),
+            MCPToolDefinition(
+                name: "list_state",
+                description: "List the full app state: workspace list, workspace-to-terminal relationships, all terminals, and current presentation state.",
+                inputSchema: ["type": "object", "properties": [:]]
+            ),
+            MCPToolDefinition(
+                name: "list_workspaces",
+                description: "List workspaces only, including each workspace's terminal IDs and counts.",
+                inputSchema: ["type": "object", "properties": [:]]
+            ),
+            MCPToolDefinition(
+                name: "list_terminals",
+                description: "List all terminals across the app, regardless of workspace.",
+                inputSchema: ["type": "object", "properties": [:]]
+            ),
+            MCPToolDefinition(
+                name: "get_terminal",
+                description: "Get one terminal with its identifiers, workspace relationship, lifecycle state, and current visible/full text.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "terminal_id": ["type": "string"]
+                    ],
+                    "required": ["terminal_id"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "create_workspace",
+                description: "Create a workspace if it does not already exist.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "name": ["type": "string"]
+                    ],
+                    "required": ["name"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "rename_workspace",
+                description: "Rename a workspace. All terminals in that workspace move with it.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "old_name": ["type": "string"],
+                        "new_name": ["type": "string"]
+                    ],
+                    "required": ["old_name", "new_name"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "remove_workspace",
+                description: "Remove a workspace and stop/remove all terminals inside it.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "name": ["type": "string"]
+                    ],
+                    "required": ["name"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "create_terminal",
+                description: "Create a terminal in a workspace. The returned terminal_id is the primary identifier for later terminal operations.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "workspace_name": ["type": "string"],
+                        "initial_directory": ["type": "string"],
+                        "title": ["type": "string"]
+                    ]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "move_terminal",
+                description: "Move a terminal from its current workspace into another workspace.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "terminal_id": ["type": "string"],
+                        "workspace_name": ["type": "string"]
+                    ],
+                    "required": ["terminal_id", "workspace_name"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "rename_terminal",
+                description: "Set or clear a terminal custom title.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "terminal_id": ["type": "string"],
+                        "title": ["type": "string"]
+                    ],
+                    "required": ["terminal_id"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "focus_terminal",
+                description: "Maximize a terminal into focused view. Recommended before interactive MCP-driven operation so the target terminal is shown at full size instead of the integrated overview.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "terminal_id": ["type": "string"]
+                    ],
+                    "required": ["terminal_id"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "show_integrated",
+                description: "Return to integrated overview mode.",
+                inputSchema: ["type": "object", "properties": [:]]
+            ),
+            MCPToolDefinition(
+                name: "send_input",
+                description: "Send plain text input to a terminal. For Enter, Escape, arrows, function keys, and control-key actions, prefer send_key instead of embedding control characters in text.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "terminal_id": ["type": "string"],
+                        "text": ["type": "string"]
+                    ],
+                    "required": ["terminal_id", "text"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "send_key",
+                description: "Send a named special key to a terminal using terminal-style key semantics. Use this for Enter, Escape, arrows, function keys, and control keys. Use send_input for plain text.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "terminal_id": ["type": "string"],
+                        "key": ["type": "string"]
+                    ],
+                    "required": ["terminal_id", "key"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "interrupt_terminal",
+                description: "Send Ctrl+C semantics to a terminal.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "terminal_id": ["type": "string"]
+                    ],
+                    "required": ["terminal_id"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "clear_scrollback",
+                description: "Clear a terminal's scrollback buffer.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "terminal_id": ["type": "string"]
+                    ],
+                    "required": ["terminal_id"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "refresh_terminal_directory",
+                description: "Refresh a terminal's current working directory from the shell process.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "terminal_id": ["type": "string"]
+                    ],
+                    "required": ["terminal_id"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "capture_terminal",
+                description: "Capture the complete and visible text for a terminal.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "terminal_id": ["type": "string"]
+                    ],
+                    "required": ["terminal_id"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "wait_for_terminal",
+                description: "Wait until a terminal reaches a minimally observable state such as a foreground process, a later screen revision, or output idleness.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "terminal_id": ["type": "string"],
+                        "foreground_process_name": ["type": "string"],
+                        "screen_revision_gt": ["type": "integer"],
+                        "idle_for_ms": ["type": "integer"],
+                        "timeout_ms": ["type": "integer"]
+                    ],
+                    "required": ["terminal_id"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "close_terminal",
+                description: "Stop and remove a terminal from the app.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "terminal_id": ["type": "string"]
+                    ],
+                    "required": ["terminal_id"]
+                ]
+            ),
+            MCPToolDefinition(
+                name: "terminate_app",
+                description: "Terminate the pterm application.",
+                inputSchema: ["type": "object", "properties": [:]]
+            )
+        ]
+    }
+
+    func callTool(named name: String, arguments: [String: Any]) throws -> String {
+        let payload: Any
+
+        switch name {
+        case "describe_pterm_model":
+            payload = mcpModelDescriptionPayload()
+        case "list_state":
+            payload = mcpStatePayload()
+        case "list_workspaces":
+            payload = [
+                "workspaces": mcpWorkspacePayloads(),
+                "note": "Each workspace contains zero or more terminal_ids. Use list_terminals or get_terminal for terminal details."
+            ]
+        case "list_terminals":
+            payload = [
+                "terminals": manager.terminals.map(mcpTerminalPayload(for:)),
+                "presentation": mcpPresentationPayload()
+            ]
+        case "get_terminal":
+            let controller = try mcpTerminal(from: arguments)
+            payload = mcpTerminalDetailsPayload(for: controller)
+        case "create_workspace":
+            guard let workspaceName = arguments["name"] as? String,
+                  !workspaceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw MCPServerError.invalidRequest
+            }
+            ensureWorkspaceExists(named: workspaceName)
+            requestSessionPersist()
+            payload = mcpStatePayload()
+        case "rename_workspace":
+            guard let oldName = arguments["old_name"] as? String,
+                  let newName = arguments["new_name"] as? String else {
+                throw MCPServerError.invalidRequest
+            }
+            renameWorkspace(from: oldName, to: newName)
+            payload = mcpStatePayload()
+        case "remove_workspace":
+            guard let workspaceName = arguments["name"] as? String else {
+                throw MCPServerError.invalidRequest
+            }
+            removeWorkspace(named: workspaceName)
+            payload = mcpStatePayload()
+        case "create_terminal":
+            let workspaceName = (arguments["workspace_name"] as? String) ?? WorkspaceNaming.uncategorized
+            let initialDirectory = arguments["initial_directory"] as? String
+            let title = arguments["title"] as? String
+            guard let controller = addNewTerminal(
+                initialDirectory: initialDirectory,
+                customTitle: title,
+                workspaceName: workspaceName,
+                startAsynchronously: true
+            ) else {
+                throw MCPServerError.invalidRequest
+            }
+            payload = [
+                "terminal": mcpTerminalPayload(for: controller),
+                "state": mcpStatePayload()
+            ]
+        case "move_terminal":
+            let controller = try mcpTerminal(from: arguments)
+            guard let workspaceName = arguments["workspace_name"] as? String else {
+                throw MCPServerError.invalidRequest
+            }
+            moveTerminal(controller, toWorkspace: workspaceName)
+            payload = [
+                "terminal": mcpTerminalPayload(for: controller),
+                "state": mcpStatePayload()
+            ]
+        case "rename_terminal":
+            let controller = try mcpTerminal(from: arguments)
+            let title = arguments["title"] as? String
+            renameTerminalTitle(controller, title: title)
+            payload = mcpTerminalDetailsPayload(for: controller)
+        case "focus_terminal":
+            let controller = try mcpTerminal(from: arguments)
+            switchToFocused(controller)
+            payload = [
+                "focused_terminal_id": controller.id.uuidString,
+                "state": mcpStatePayload()
+            ]
+        case "show_integrated":
+            switchToIntegrated()
+            payload = mcpStatePayload()
+        case "send_input":
+            let controller = try mcpTerminal(from: arguments)
+            guard let text = arguments["text"] as? String else {
+                throw MCPServerError.invalidRequest
+            }
+            controller.sendInput(text)
+            payload = [
+                "terminal_id": controller.id.uuidString,
+                "sent": text
+            ]
+        case "send_key":
+            let controller = try mcpTerminal(from: arguments)
+            guard let key = arguments["key"] as? String,
+                  let action = KeyboardHandler.mcpKeyAction(named: key, controller: controller) else {
+                throw MCPServerError.invalidRequest
+            }
+            switch action {
+            case .input(let text):
+                controller.sendInput(text)
+            case .interrupt(let controlCharacter):
+                controller.performInterrupt(controlCharacter: controlCharacter)
+            }
+            payload = [
+                "terminal_id": controller.id.uuidString,
+                "key": key
+            ]
+        case "interrupt_terminal":
+            let controller = try mcpTerminal(from: arguments)
+            controller.performInterrupt()
+            payload = [
+                "terminal_id": controller.id.uuidString,
+                "action": "interrupt_sent"
+            ]
+        case "clear_scrollback":
+            let controller = try mcpTerminal(from: arguments)
+            controller.clearScrollback()
+            payload = [
+                "terminal_id": controller.id.uuidString,
+                "action": "scrollback_cleared"
+            ]
+        case "refresh_terminal_directory":
+            let controller = try mcpTerminal(from: arguments)
+            let refreshed = controller.refreshCurrentDirectoryFromShellProcess()
+            payload = [
+                "terminal_id": controller.id.uuidString,
+                "refreshed": refreshed,
+                "terminal": mcpTerminalPayload(for: controller)
+            ]
+        case "capture_terminal":
+            let controller = try mcpTerminal(from: arguments)
+            payload = mcpTerminalDetailsPayload(for: controller)
+        case "wait_for_terminal":
+            let condition = try MCPTerminalWaitCondition(arguments: arguments)
+            payload = try waitForTerminal(condition)
+        case "close_terminal":
+            let controller = try mcpTerminal(from: arguments)
+            let terminalID = controller.id.uuidString
+            manager.removeTerminal(controller)
+            payload = [
+                "closed_terminal_id": terminalID,
+                "state": mcpStatePayload()
+            ]
+        case "terminate_app":
+            payload = [
+                "terminating": true
+            ]
+            DispatchQueue.main.async {
+                self.terminateApplicationFromMCP()
+            }
+        default:
+            throw MCPServerError.toolNotFound(name)
+        }
+
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func mcpTerminal(from arguments: [String: Any]) throws -> TerminalController {
+        guard let rawID = arguments["terminal_id"] as? String,
+              let id = UUID(uuidString: rawID),
+              let controller = manager.terminals.first(where: { $0.id == id }) else {
+            throw MCPServerError.invalidRequest
+        }
+        return controller
+    }
+
+    private func mcpStatePayload() -> [String: Any] {
+        [
+            "mcp_server": [
+                "enabled": config.mcpServer.enabled,
+                "port": config.mcpServer.port
+            ],
+            "relationships": [
+                "workspace_to_terminals": "Each workspace contains zero or more terminals.",
+                "terminal_to_workspace": "Each terminal belongs to exactly one workspace.",
+                "terminal_id_usage": "Use terminal_id for terminal operations such as focus, send_input, capture_terminal, close_terminal, rename_terminal, move_terminal, interrupt_terminal, clear_scrollback."
+            ],
+            "presentation": mcpPresentationPayload(),
+            "workspaces": mcpWorkspacePayloads(),
+            "terminals": manager.terminals.map(mcpTerminalPayload(for:))
+        ]
+    }
+
+    private func mcpModelDescriptionPayload() -> [String: Any] {
+        [
+            "concepts": [
+                [
+                    "name": "workspace",
+                    "description": "A logical group of terminals shown in the integrated overview.",
+                    "identifier": "workspace name"
+                ],
+                [
+                    "name": "terminal",
+                    "description": "A live terminal session. Every terminal belongs to exactly one workspace.",
+                    "identifier": "terminal_id"
+                ],
+                [
+                    "name": "presentation",
+                    "description": "The current app view mode: integrated, focused, or split."
+                ]
+            ],
+            "relationships": [
+                "A workspace contains zero or more terminals.",
+                "A terminal belongs to exactly one workspace.",
+                "The app also has a global terminal list that spans all workspaces.",
+                "For MCP-driven input, use send_input for plain text and send_key for Enter and other non-text keys."
+            ],
+            "recommended_workflows": [
+                [
+                    "goal": "Understand the current app state",
+                    "steps": ["call describe_pterm_model", "call list_state"]
+                ],
+                [
+                    "goal": "Create and operate a terminal in a workspace",
+                    "steps": ["call create_workspace if needed", "call create_terminal", "call focus_terminal before interactive work", "use send_input only for plain text", "use send_key for Enter, Escape, arrows, function keys, and control-key actions", "use wait_for_terminal and capture_terminal to observe progress", "call show_integrated when you want to return to the overview"]
+                ],
+                [
+                    "goal": "Inspect one terminal in detail",
+                    "steps": ["call focus_terminal when visual size matters", "call get_terminal or capture_terminal with terminal_id"]
+                ],
+                [
+                    "goal": "Move or reorganize terminals",
+                    "steps": ["call move_terminal, rename_terminal, rename_workspace, or remove_workspace"]
+                ]
+            ],
+            "interaction_guidance": [
+                "The integrated overview is useful for global state and navigation, but each terminal is smaller there.",
+                "Before interactive MCP-driven work such as shells, REPLs, full-screen TUIs, or CLI agents, prefer focus_terminal so the target terminal is shown at full size.",
+                "Use send_input only for plain text.",
+                "For Enter and other non-text input, prefer send_key. Do not rely on embedding newline or escape characters inside send_input when precise key semantics matter.",
+                "Use show_integrated when you are done and want to return to the overview."
+            ],
+            "available_tools": toolDefinitions().map(\.name)
+        ]
+    }
+
+    private func mcpWorkspacePayloads() -> [[String: Any]] {
+        let explicitNames = workspaceNames
+        let discoveredNames = manager.terminals.map { $0.sessionSnapshot.workspaceName }
+        let orderedNames = deduplicatedWorkspaceNamesPreservingOrder(explicitNames + discoveredNames)
+
+        return orderedNames.map { workspaceName in
+            let terminals = manager.terminals.filter { $0.sessionSnapshot.workspaceName == workspaceName }
+            return [
+                "name": workspaceName,
+                "terminal_count": terminals.count,
+                "terminal_ids": terminals.map { $0.id.uuidString }
+            ]
+        }
+    }
+
+    private func mcpPresentationPayload() -> [String: Any] {
+        switch viewMode {
+        case .integrated:
+            return ["mode": "integrated"]
+        case .focused(let controller):
+            return [
+                "mode": "focused",
+                "terminal_id": controller.id.uuidString
+            ]
+        case .split(let controllers):
+            return [
+                "mode": "split",
+                "terminal_ids": controllers.map { $0.id.uuidString }
+            ]
+        }
+    }
+
+    private func mcpTerminalPayload(for controller: TerminalController) -> [String: Any] {
+        let snapshot = controller.sessionSnapshot
+        return [
+            "id": controller.id.uuidString,
+            "title": controller.title,
+            "custom_title": controller.customTitle ?? NSNull(),
+            "workspace_name": snapshot.workspaceName,
+            "current_directory": snapshot.currentDirectory,
+            "is_alive": controller.isAlive,
+            "foreground_process_id": controller.foregroundProcessID.map { Int($0) } ?? NSNull(),
+            "foreground_process_name": controller.foregroundProcessName ?? NSNull(),
+            "screen_revision": controller.screenRevision,
+            "last_output_at": Self.mcpTimestampString(controller.lastOutputAt)
+        ]
+    }
+
+    private func mcpTerminalDetailsPayload(for controller: TerminalController) -> [String: Any] {
+        [
+            "terminal": mcpTerminalPayload(for: controller),
+            "all_text": controller.allText(),
+            "visible_text": mcpVisibleText(for: controller)
+        ]
+    }
+
+    private func mcpVisibleText(for controller: TerminalController) -> String {
+        controller.captureRenderSnapshot().visibleRows
+            .map { row in
+                String(row.cells.compactMap { cell in
+                    guard cell.codepoint != 0,
+                          let scalar = UnicodeScalar(cell.codepoint) else {
+                        return Character(" ")
+                    }
+                    return Character(scalar)
+                })
+                .trimmingCharacters(in: .whitespaces)
+            }
+            .joined(separator: "\n")
+    }
+
+    private func mcpObservation(for controller: TerminalController) -> MCPTerminalObservation {
+        MCPTerminalObservation(
+            terminalID: controller.id,
+            foregroundProcessName: controller.foregroundProcessName,
+            screenRevision: controller.screenRevision,
+            lastOutputAt: controller.lastOutputAt
+        )
+    }
+
+    private func waitForTerminal(_ condition: MCPTerminalWaitCondition) throws -> [String: Any] {
+        let deadline = Date().addingTimeInterval(Double(condition.timeoutMilliseconds) / 1000.0)
+        let pollInterval: TimeInterval = 0.1
+
+        while true {
+            guard let controller = manager.terminals.first(where: { $0.id == condition.terminalID }) else {
+                throw MCPServerError.invalidRequest
+            }
+
+            let observation = mcpObservation(for: controller)
+            let now = Date()
+            if condition.isSatisfied(by: observation, now: now) {
+                return [
+                    "matched": true,
+                    "timed_out": false,
+                    "terminal": mcpTerminalPayload(for: controller)
+                ]
+            }
+            if now >= deadline {
+                return [
+                    "matched": false,
+                    "timed_out": true,
+                    "terminal": mcpTerminalPayload(for: controller)
+                ]
+            }
+
+            let nextWake = min(deadline, now.addingTimeInterval(pollInterval))
+            RunLoop.current.run(mode: .default, before: nextWake)
+        }
+    }
+
+    private static func mcpTimestampString(_ date: Date?) -> Any {
+        guard let date else { return NSNull() }
+        return mcpDateFormatter.string(from: date)
     }
 }

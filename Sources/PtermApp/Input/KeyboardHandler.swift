@@ -10,6 +10,11 @@ import Carbon.HIToolbox
 /// - Function keys
 /// - Application cursor mode (DECCKM)
 final class KeyboardHandler {
+    enum MCPKeyAction: Equatable {
+        case input(String)
+        case interrupt(UInt8)
+    }
+
     private weak var controller: TerminalController?
     private let inputFeedbackPlayer: TypewriterKeyClicking
     private let inputFeedbackEnabled: () -> Bool
@@ -172,6 +177,108 @@ final class KeyboardHandler {
             guard inputFeedbackEnabled() else { return }
             inputFeedbackPlayer.playKeystroke()
         }
+    }
+
+    static func mcpKeyAction(
+        named rawKey: String,
+        controller: TerminalController
+    ) -> MCPKeyAction? {
+        let key = rawKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+        guard !key.isEmpty else { return nil }
+
+        switch key {
+        case "enter", "return":
+            return .input(controller.newlineKeyInput())
+        case "escape", "esc":
+            return .input("\u{1B}")
+        case "tab":
+            return .input("\t")
+        case "backtab", "shift_tab":
+            return .input("\u{1B}[Z")
+        case "backspace":
+            return .input(String(UnicodeScalar(0x7F)!))
+        case "delete":
+            return .input("\u{1B}[3~")
+        case "up":
+            return .input(namedArrowSequence(letter: "A", controller: controller))
+        case "down":
+            return .input(namedArrowSequence(letter: "B", controller: controller))
+        case "right":
+            return .input(namedArrowSequence(letter: "C", controller: controller))
+        case "left":
+            return .input(namedArrowSequence(letter: "D", controller: controller))
+        case "home":
+            let appCursor = controller.withModel { $0.applicationCursorKeys }
+            return .input(appCursor ? "\u{1B}OH" : "\u{1B}[H")
+        case "end":
+            let appCursor = controller.withModel { $0.applicationCursorKeys }
+            return .input(appCursor ? "\u{1B}OF" : "\u{1B}[F")
+        case "page_up", "pageup":
+            return .input("\u{1B}[5~")
+        case "page_down", "pagedown":
+            return .input("\u{1B}[6~")
+        case "f1": return .input("\u{1B}[11~")
+        case "f2": return .input("\u{1B}[12~")
+        case "f3": return .input("\u{1B}[13~")
+        case "f4": return .input("\u{1B}[14~")
+        case "f5": return .input("\u{1B}[15~")
+        case "f6": return .input("\u{1B}[17~")
+        case "f7": return .input("\u{1B}[18~")
+        case "f8": return .input("\u{1B}[19~")
+        case "f9": return .input("\u{1B}[20~")
+        case "f10": return .input("\u{1B}[21~")
+        case "f11": return .input("\u{1B}[23~")
+        case "f12": return .input("\u{1B}[24~")
+        case "f13": return .input("\u{1B}[25~")
+        case "f14": return .input("\u{1B}[26~")
+        case "f15", "help": return .input("\u{1B}[28~")
+        case "f16": return .input("\u{1B}[29~")
+        case "f17": return .input("\u{1B}[31~")
+        case "f18": return .input("\u{1B}[32~")
+        case "f19": return .input("\u{1B}[33~")
+        case "f20": return .input("\u{1B}[34~")
+        case "ctrl_c", "control_c":
+            return .interrupt(0x03)
+        case "ctrl_z", "control_z":
+            return .interrupt(0x1A)
+        case "ctrl_backslash", "control_backslash":
+            return .interrupt(0x1C)
+        case "ctrl_left_bracket", "control_left_bracket":
+            return .input("\u{1B}")
+        case "ctrl_right_bracket", "control_right_bracket":
+            return .input(String(UnicodeScalar(0x1D)!))
+        default:
+            if let controlAction = mcpControlCharacterAction(for: key) {
+                return controlAction
+            }
+            return nil
+        }
+    }
+
+    private static func namedArrowSequence(letter: String, controller: TerminalController) -> String {
+        let appCursor = controller.withModel { $0.applicationCursorKeys }
+        let prefix = appCursor ? "\u{1B}O" : "\u{1B}["
+        return "\(prefix)\(letter)"
+    }
+
+    private static func mcpControlCharacterAction(for key: String) -> MCPKeyAction? {
+        let prefixes = ["ctrl_", "control_"]
+        guard let prefix = prefixes.first(where: { key.hasPrefix($0) }) else {
+            return nil
+        }
+        let suffix = key.dropFirst(prefix.count)
+        guard suffix.count == 1, let scalar = suffix.unicodeScalars.first else {
+            return nil
+        }
+        let value = scalar.value
+        guard value >= 0x61 && value <= 0x7A else {
+            return nil
+        }
+        return .input(String(UnicodeScalar(value - 0x60)!))
     }
 
     private func translatedSpecialKeyInput(

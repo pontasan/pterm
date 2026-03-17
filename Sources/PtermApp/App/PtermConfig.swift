@@ -108,6 +108,27 @@ struct TextInteractionConfiguration: Equatable {
     )
 }
 
+struct MCPServerConfiguration: Equatable {
+    static let defaultPort = 46257
+    static let minimumPort = 1024
+    static let maximumPort = 65_535
+
+    let enabled: Bool
+    let port: Int
+
+    static let `default` = MCPServerConfiguration(enabled: true, port: defaultPort)
+
+    init(enabled: Bool, port: Int) {
+        self.enabled = enabled
+        self.port = Self.normalizedPort(port)
+    }
+
+    static func normalizedPort(_ value: Int?) -> Int {
+        guard let value else { return defaultPort }
+        return min(maximumPort, max(minimumPort, value))
+    }
+}
+
 struct PtermConfig {
     let term: String
     let textEncoding: TerminalTextEncoding
@@ -121,6 +142,7 @@ struct PtermConfig {
     let sessionScrollBufferPersistence: Bool
     let audit: AuditConfiguration
     let security: SecurityConfiguration
+    let mcpServer: MCPServerConfiguration
     let shortcuts: ShortcutConfiguration
     let workspaces: [ConfiguredWorkspace]
 
@@ -137,6 +159,7 @@ struct PtermConfig {
         sessionScrollBufferPersistence: false,
         audit: .disabled,
         security: .default,
+        mcpServer: .default,
         shortcuts: .default,
         workspaces: []
     )
@@ -240,6 +263,7 @@ enum PtermConfigStore {
         let session = dictionaryValue(root["session"])
         let audit = dictionaryValue(root["audit"])
         let security = dictionaryValue(root["security"])
+        let mcpServer = dictionaryValue(root["mcp_server"])
         let shortcuts = dictionaryValue(root["shortcuts"])
         let shells = dictionaryValue(root["shells"])
         let textInteraction = dictionaryValue(root["text_interaction"])
@@ -275,6 +299,10 @@ enum PtermConfigStore {
                 pasteConfirmation: boolValue(security?["paste_confirmation"]) ?? defaults.security.pasteConfirmation,
                 mouseReportRestrictAlternateScreen: boolValue(security?["mouse_report_restrict_alternate_screen"]) ?? defaults.security.mouseReportRestrictAlternateScreen,
                 allowWindowResizeSequence: boolValue(security?["allow_window_resize_sequence"]) ?? defaults.security.allowWindowResizeSequence
+            ),
+            mcpServer: MCPServerConfiguration(
+                enabled: boolValue(mcpServer?["enabled"]) ?? defaults.mcpServer.enabled,
+                port: MCPServerConfiguration.normalizedPort(intValue(mcpServer?["port"]) ?? defaults.mcpServer.port)
             ),
             shortcuts: ShortcutParser.parseMap(shortcuts?.compactMapValues(stringValue)),
             workspaces: workspaces

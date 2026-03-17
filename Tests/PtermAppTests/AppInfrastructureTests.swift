@@ -41,6 +41,64 @@ final class AppInfrastructureTests: XCTestCase {
         }
     }
 
+    func testLaunchOptionsDefaultsRestoreSessionModeToAttempt() throws {
+        let options = try LaunchOptions.parse(arguments: [])
+
+        XCTAssertEqual(options.restoreSessionMode, .attempt)
+        XCTAssertNil(options.profileRoot)
+        XCTAssertNil(options.immediateAction)
+    }
+
+    func testLaunchOptionsParsesRestoreSessionModeEqualsForm() throws {
+        let options = try LaunchOptions.parse(arguments: ["--restore-session=force"])
+
+        XCTAssertEqual(options.restoreSessionMode, .force)
+    }
+
+    func testLaunchOptionsParsesRestoreSessionModeSeparateValueForm() throws {
+        let options = try LaunchOptions.parse(arguments: ["--restore-session", "never"])
+
+        XCTAssertEqual(options.restoreSessionMode, .never)
+    }
+
+    func testLaunchOptionsRejectsInvalidRestoreSessionMode() {
+        XCTAssertThrowsError(try LaunchOptions.parse(arguments: ["--restore-session=maybe"])) { error in
+            XCTAssertEqual(error as? LaunchOptionsError, .invalidRestoreSessionMode("maybe"))
+        }
+    }
+
+    func testLaunchOptionsParsesHelpFlag() throws {
+        let options = try LaunchOptions.parse(arguments: ["--help"])
+
+        XCTAssertEqual(options.immediateAction, .help)
+    }
+
+    func testLaunchOptionsParsesVersionFlag() throws {
+        let options = try LaunchOptions.parse(arguments: ["--version"])
+
+        XCTAssertEqual(options.immediateAction, .version)
+    }
+
+    func testPtermCommandLineHelpTextMentionsSupportedOptions() {
+        let help = PtermCommandLine.helpText()
+
+        XCTAssertTrue(help.contains("--help"))
+        XCTAssertTrue(help.contains("--version"))
+        XCTAssertTrue(help.contains("--user-data-dir"))
+        XCTAssertTrue(help.contains("--restore-session"))
+        XCTAssertTrue(help.contains("attempt"))
+        XCTAssertTrue(help.contains("force"))
+        XCTAssertTrue(help.contains("never"))
+    }
+
+    func testPtermCommandLineVersionTextUsesBundleMetadata() {
+        final class DummyBundleToken {}
+        let bundle = Bundle(for: DummyBundleToken.self)
+        let version = PtermCommandLine.versionText(bundle: bundle)
+
+        XCTAssertFalse(version.isEmpty)
+    }
+
     func testPtermDirectoriesOverrideRebindsAllDerivedLocations() throws {
         let originalBase = PtermDirectories.base
         let originalConfig = PtermDirectories.config
@@ -891,6 +949,29 @@ final class AppInfrastructureTests: XCTestCase {
 
             let loaded = PtermConfigStore.load(from: configURL)
             XCTAssertFalse(loaded.textInteraction.typewriterSoundEnabled)
+        }
+    }
+
+    func testPtermConfigStoreDefaultsMCPServerToEnabledOnDefaultPort() {
+        let loaded = PtermConfigStore.load(from: URL(fileURLWithPath: "/nonexistent/config.json"))
+
+        XCTAssertEqual(loaded.mcpServer, .default)
+    }
+
+    func testPtermConfigStoreLoadsMCPServerSettings() throws {
+        try withTemporaryPtermConfig { configURL in
+            let json: [String: Any] = [
+                "mcp_server": [
+                    "enabled": false,
+                    "port": 48001
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try AtomicFileWriter.write(data, to: configURL, permissions: 0o600)
+
+            let loaded = PtermConfigStore.load(from: configURL)
+            XCTAssertFalse(loaded.mcpServer.enabled)
+            XCTAssertEqual(loaded.mcpServer.port, 48001)
         }
     }
 
@@ -1846,6 +1927,70 @@ final class AppInfrastructureTests: XCTestCase {
                 directory.resolvingSymlinksInPath().path
             )
         }
+    }
+
+    func testProcessInspectionCapturesCurrentProcessName() {
+        let name = ProcessInspection.processName(pid: getpid())
+
+        XCTAssertFalse((name ?? "").isEmpty)
+    }
+
+    func testTerminalControllerTracksLastOutputTimestampAndScreenRevision() {
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 256,
+            scrollbackMaxCapacity: 256,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+
+        XCTAssertNil(controller.lastOutputAt)
+        let initialRevision = controller.screenRevision
+
+        controller.debugProcessPTYOutputForTesting(Data("hello\n".utf8))
+
+        XCTAssertNotNil(controller.lastOutputAt)
+        XCTAssertGreaterThan(controller.screenRevision, initialRevision)
+    }
+
+    func testMCPTerminalWaitConditionMatchesForegroundRevisionAndIdleState() throws {
+        let terminalID = UUID()
+        let observation = AppDelegate.MCPTerminalObservation(
+            terminalID: terminalID,
+            foregroundProcessName: "claude",
+            screenRevision: 12,
+            lastOutputAt: Date().addingTimeInterval(-2.0)
+        )
+        let condition = try AppDelegate.MCPTerminalWaitCondition(arguments: [
+            "terminal_id": terminalID.uuidString,
+            "foreground_process_name": "claude",
+            "screen_revision_gt": 11,
+            "idle_for_ms": 500,
+            "timeout_ms": 1000
+        ])
+
+        XCTAssertTrue(condition.isSatisfied(by: observation, now: Date()))
+    }
+
+    func testMCPTerminalWaitConditionRejectsUnsatisfiedObservation() throws {
+        let terminalID = UUID()
+        let observation = AppDelegate.MCPTerminalObservation(
+            terminalID: terminalID,
+            foregroundProcessName: "zsh",
+            screenRevision: 4,
+            lastOutputAt: Date()
+        )
+        let condition = try AppDelegate.MCPTerminalWaitCondition(arguments: [
+            "terminal_id": terminalID.uuidString,
+            "foreground_process_name": "claude",
+            "screen_revision_gt": 10,
+            "idle_for_ms": 1000
+        ])
+
+        XCTAssertFalse(condition.isSatisfied(by: observation, now: Date()))
     }
 
     func testPTYStartsWithoutReadBufferAllocation() {

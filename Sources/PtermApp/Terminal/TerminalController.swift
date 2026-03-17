@@ -168,6 +168,7 @@ final class TerminalController {
     private var interruptDiscardingOutput = false
     private var pendingInterruptDrainCompletion: DispatchWorkItem?
     private var renderContentVersion: UInt64 = 0
+    private var lastOutputDate: Date?
     private var outputActivitySuppressedUntilUptime: TimeInterval = 0
     private let scrollbackCompactionLock = NSLock()
     private var pendingScrollbackCompaction: DispatchSourceTimer?
@@ -236,6 +237,24 @@ final class TerminalController {
         callbackLock.withLock {
             renderContentVersion
         }
+    }
+
+    var screenRevision: UInt64 {
+        callbackLock.withLock {
+            renderContentVersion
+        }
+    }
+
+    var lastOutputAt: Date? {
+        callbackLock.withLock {
+            lastOutputDate
+        }
+    }
+
+    var foregroundProcessName: String? {
+        let pid = foregroundProcessID ?? processID
+        guard pid > 0 else { return nil }
+        return ProcessInspection.processName(pid: pid)
     }
 
     var isRenderingSuppressed: Bool {
@@ -648,6 +667,9 @@ final class TerminalController {
 
     private func processPTYOutput(_ data: UnsafeBufferPointer<UInt8>, recordAudit: Bool) {
         guard !data.isEmpty else { return }
+        callbackLock.withLock {
+            lastOutputDate = Date()
+        }
         if recordAudit {
             auditLogger?.recordOutput(Data(bytes: data.baseAddress!, count: data.count))
         }

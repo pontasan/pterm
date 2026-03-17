@@ -16,6 +16,7 @@ final class TerminalManagerIntegrationTests: XCTestCase {
             sessionScrollBufferPersistence: false,
             audit: .disabled,
             security: .default,
+            mcpServer: .default,
             shortcuts: .default,
             workspaces: []
         )

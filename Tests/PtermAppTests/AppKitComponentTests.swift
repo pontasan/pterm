@@ -406,6 +406,54 @@ final class AppKitComponentTests: XCTestCase {
         }
     }
 
+    func testSettingsWindowGeneralSectionShowsMCPServerControlsWithDefaultValues() throws {
+        try withTemporaryPtermConfig { configURL in
+            try? FileManager.default.removeItem(at: configURL)
+            let controller = SettingsWindowController(configURL: configURL)
+
+            let enabledCheck = try XCTUnwrap(
+                allSubviews(in: controller.window?.contentView)
+                    .compactMap { $0 as? NSButton }
+                    .first(where: { $0.title == "Enable local MCP server" })
+            )
+            let portField = try XCTUnwrap(
+                allSubviews(in: controller.window?.contentView)
+                    .compactMap { $0 as? NSTextField }
+                    .first(where: { $0.identifier?.rawValue == "mcpServerPortField" })
+            )
+
+            XCTAssertEqual(enabledCheck.state, .on)
+            XCTAssertEqual(portField.stringValue, "\(MCPServerConfiguration.default.port)")
+            XCTAssertTrue(portField.isEnabled)
+        }
+    }
+
+    func testSettingsWindowPersistsMCPServerSettings() throws {
+        try withTemporaryPtermConfig { configURL in
+            let controller = SettingsWindowController(configURL: configURL)
+
+            let enabledCheck = try XCTUnwrap(
+                allSubviews(in: controller.window?.contentView)
+                    .compactMap { $0 as? NSButton }
+                    .first(where: { $0.title == "Enable local MCP server" })
+            )
+            let portField = try XCTUnwrap(
+                allSubviews(in: controller.window?.contentView)
+                    .compactMap { $0 as? NSTextField }
+                    .first(where: { $0.identifier?.rawValue == "mcpServerPortField" })
+            )
+
+            enabledCheck.state = .off
+            _ = enabledCheck.target?.perform(enabledCheck.action, with: enabledCheck)
+            portField.stringValue = "48002"
+            _ = portField.target?.perform(portField.action, with: portField)
+
+            let loaded = PtermConfigStore.load(from: configURL)
+            XCTAssertFalse(loaded.mcpServer.enabled)
+            XCTAssertEqual(loaded.mcpServer.port, 48002)
+        }
+    }
+
     func testSettingsWindowGeneralSectionShowsFactoryResetButton() throws {
         try withIsolatedSettingsController { controller in
             let buttons = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSButton }
@@ -635,6 +683,11 @@ final class AppKitComponentTests: XCTestCase {
                     "paste_confirmation": false,
                     "preserved_security_key": "keep"
                 ],
+                "mcp_server": [
+                    "enabled": false,
+                    "port": 48003,
+                    "preserved_mcp_key": "keep"
+                ],
                 "audit": [
                     "enabled": true,
                     "retention_days": 7,
@@ -689,6 +742,11 @@ final class AppKitComponentTests: XCTestCase {
             XCTAssertNil(security["paste_confirmation"])
             XCTAssertEqual(security["preserved_security_key"] as? String, "keep")
 
+            let mcpServer = try XCTUnwrap(root["mcp_server"] as? [String: Any])
+            XCTAssertNil(mcpServer["enabled"])
+            XCTAssertNil(mcpServer["port"])
+            XCTAssertEqual(mcpServer["preserved_mcp_key"] as? String, "keep")
+
             let audit = try XCTUnwrap(root["audit"] as? [String: Any])
             XCTAssertNil(audit["enabled"])
             XCTAssertNil(audit["retention_days"])
@@ -702,6 +760,7 @@ final class AppKitComponentTests: XCTestCase {
             XCTAssertEqual(loaded.textInteraction, PtermConfig.default.textInteraction)
             XCTAssertEqual(loaded.memoryMax, PtermConfig.default.memoryMax)
             XCTAssertEqual(loaded.terminalAppearance, PtermConfig.default.terminalAppearance)
+            XCTAssertEqual(loaded.mcpServer, PtermConfig.default.mcpServer)
         }
     }
 
@@ -2640,6 +2699,61 @@ final class AppKitComponentTests: XCTestCase {
             keyCode: 69
         ))
         XCTAssertEqual(handler.debugInputSequence(for: keypadPlus), "\u{1B}Ok")
+    }
+
+    func testKeyboardHandlerMCPKeyActionMapsEnterToTerminalNewlineInput() {
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+
+        XCTAssertEqual(
+            KeyboardHandler.mcpKeyAction(named: "enter", controller: controller),
+            .input("\r")
+        )
+
+        controller.withModel { $0.newLineMode = true }
+        XCTAssertEqual(
+            KeyboardHandler.mcpKeyAction(named: "enter", controller: controller),
+            .input("\r\n")
+        )
+    }
+
+    func testKeyboardHandlerMCPKeyActionMapsArrowsAndControlKeys() {
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+
+        XCTAssertEqual(
+            KeyboardHandler.mcpKeyAction(named: "up", controller: controller),
+            .input("\u{1B}[A")
+        )
+        controller.withModel { $0.applicationCursorKeys = true }
+        XCTAssertEqual(
+            KeyboardHandler.mcpKeyAction(named: "up", controller: controller),
+            .input("\u{1B}OA")
+        )
+        XCTAssertEqual(
+            KeyboardHandler.mcpKeyAction(named: "ctrl_c", controller: controller),
+            .interrupt(0x03)
+        )
+        XCTAssertEqual(
+            KeyboardHandler.mcpKeyAction(named: "ctrl_d", controller: controller),
+            .input(String(UnicodeScalar(0x04)!))
+        )
     }
 
     func testTerminalViewIdlePurgeReleasesKeyboardHandlerAndRecreatesItOnNextInput() throws {
@@ -5346,6 +5460,7 @@ final class AppKitComponentTests: XCTestCase {
             sessionScrollBufferPersistence: PtermConfig.default.sessionScrollBufferPersistence,
             audit: PtermConfig.default.audit,
             security: PtermConfig.default.security,
+            mcpServer: PtermConfig.default.mcpServer,
             shortcuts: PtermConfig.default.shortcuts,
             workspaces: PtermConfig.default.workspaces
         )
@@ -5429,6 +5544,7 @@ final class AppKitComponentTests: XCTestCase {
             sessionScrollBufferPersistence: PtermConfig.default.sessionScrollBufferPersistence,
             audit: PtermConfig.default.audit,
             security: PtermConfig.default.security,
+            mcpServer: PtermConfig.default.mcpServer,
             shortcuts: PtermConfig.default.shortcuts,
             workspaces: PtermConfig.default.workspaces
         )
