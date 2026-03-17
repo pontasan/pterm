@@ -13,6 +13,37 @@ private func durationNanoseconds(_ duration: Duration) -> UInt64 {
 
 @MainActor
 final class PerformanceRegressionTests: XCTestCase {
+    private enum KittyBenchmarkFixture {
+        static let asciiPrintable = #"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ  `~!@#$%^&*()_+-=[]{}\|;:'",<.>/?"#
+        static let controlChars = "\n\t"
+        static let chineseLoremIpsum = """
+
+旦海司有幼雞讀松鼻種比門真目怪少：扒裝虎怕您跑綠蝶黃，位香法士錯乙音造活羽詞坡村目園尺封鳥朋；法松夕點我冬停雪因科對只貓息加黃住蝶，明鴨乾春呢風乙時昔孝助？小紅女父故去。
+飯躲裝個哥害共買去隻把氣年，己你校跟飛百拉！快石牙飽知唱想土人吹象毛吉每浪四又連見、欠耍外豆雞秋鼻。住步帶。
+打六申幾麼：或皮又荷隻乙犬孝習秋還何氣；幾裏活打能花是入海乙山節會。種第共後陽沒喜姐三拍弟海肖，行知走亮包，他字幾，的木卜流旦乙左杯根毛。
+您皮買身苦八手牛目地止哥彩第合麻讀午。原朋河乾種果「才波久住這香松」兄主衣快他玉坐要羽和亭但小山吉也吃耳怕，也爪斗斥可害朋許波怎祖葉卜。
+行花兩耍許車丟學「示想百吃門高事」不耳見室九星枝買裝，枝十新央發旁品丁青給，科房火；事出出孝肉古：北裝愛升幸百東鼻到從會故北「可休笑物勿三游細斗」娘蛋占犬。我羊波雨跳風。
+牛大燈兆新七馬，叫這牙後戶耳、荷北吃穿停植身玩間告或西丟再呢，他禾七愛干寺服石安：他次唱息它坐屋父見這衣發現來，苗會開條弓世者吃英定豆哭；跳風掃叫美神。
+寸再了耍休壯植己，燈錯和，蝶幾欠雞定和愛，司紅後弓第樹會金拉快喝夕見往，半瓜日邊出讀雞苦歌許開；發火院爸乙；四帶亮錯鳥洋個讀。
+"""
+        static let miscUnicode = """
+
+‘’“”‹›«»‚„ 😀😛😇😈😉😍😎😮👍👎 —–§¶†‡©®™ →⇒•·°±−×÷¼½½¾
+…µ¢£€¿¡¨´¸ˆ˜ ÀÁÂÃÄÅÆÇÈÉÊË ÌÍÎÏÐÑÒÓÔÕÖØ ŒŠÙÚÛÜÝŸÞßàá âãäåæçèéêëìí
+îïðñòóôõöøœš ùúûüýÿþªºαΩ∞ ū̀n̂o᷵H̨a̠b̡͓̐c̡͓̐X̡͓̐
+"""
+    }
+
+    private struct DeterministicLCG {
+        private var state: UInt64 = 0xC0DEC0DE12345678
+
+        mutating func nextInt(upperBound: Int) -> Int {
+            precondition(upperBound > 0)
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return Int(state % UInt64(upperBound))
+        }
+    }
+
     private static let allowedRegressionMultiplier = 2.0
     private static var baselineResetPerformedForCurrentRun = false
 
@@ -237,6 +268,66 @@ final class PerformanceRegressionTests: XCTestCase {
         return Data(text.utf8)
     }
 
+    private func makeKittyBenchmarkASCIIData() -> Data {
+        let alphabet = Array((KittyBenchmarkFixture.asciiPrintable + KittyBenchmarkFixture.controlChars).utf8)
+        var rng = DeterministicLCG()
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(1024 * 2048 + 13)
+        for _ in 0..<(1024 * 2048 + 13) {
+            bytes.append(alphabet[rng.nextInt(upperBound: alphabet.count)])
+        }
+        return Data(bytes)
+    }
+
+    private func makeKittyBenchmarkUnicodeData() -> Data {
+        Data(String(repeating: KittyBenchmarkFixture.chineseLoremIpsum + KittyBenchmarkFixture.miscUnicode + KittyBenchmarkFixture.controlChars, count: 1024).utf8)
+    }
+
+    private func makeKittyBenchmarkCSIData() -> Data {
+        let targetSize = 1024 * 1024 + 17
+        let randomAlphabet = Array((KittyBenchmarkFixture.asciiPrintable + KittyBenchmarkFixture.controlChars).utf8)
+        let exactChunks = [
+            "\u{1B}[m\u{1B}[?1h\u{1B}[H",
+            "\u{1B}[1;2;3;4:3;31m",
+            "\u{1B}[38:5:24;48:2:125:136:147m",
+            "\u{1B}[58;5;44;2m",
+            "\u{1B}[m\u{1B}[10A\u{1B}[3E\u{1B}[2K",
+            "\u{1B}[39m\u{1B}[10`a\u{1B}[100b\u{1B}[?1l"
+        ]
+        var rng = DeterministicLCG()
+        var out = [UInt8]()
+        out.reserveCapacity(targetSize + 48)
+
+        func appendRandomChunk() {
+            let length = rng.nextInt(upperBound: 72) + 1
+            for _ in 0..<length {
+                out.append(randomAlphabet[rng.nextInt(upperBound: randomAlphabet.count)])
+            }
+        }
+
+        while out.count < targetSize {
+            let q = rng.nextInt(upperBound: 100)
+            switch q {
+            case 0..<10:
+                appendRandomChunk()
+            case 10..<30:
+                out.append(contentsOf: exactChunks[0].utf8)
+            case 30..<40:
+                out.append(contentsOf: exactChunks[1].utf8)
+            case 40..<50:
+                out.append(contentsOf: exactChunks[2].utf8)
+            case 50..<60:
+                out.append(contentsOf: exactChunks[3].utf8)
+            case 60..<80:
+                out.append(contentsOf: exactChunks[4].utf8)
+            default:
+                out.append(contentsOf: exactChunks[5].utf8)
+            }
+        }
+        out.append(contentsOf: "\u{1B}[m".utf8)
+        return Data(out)
+    }
+
     private func makeBenchmarkSelection() -> TerminalSelection {
         TerminalSelection(
             anchor: GridPosition(row: 2, col: 4),
@@ -381,6 +472,30 @@ final class PerformanceRegressionTests: XCTestCase {
         let payload = makeProcessOutputData()
         try benchmark("terminal_controller.process_pty_output", iterations: 10, warmupIterations: 1) {
             let controller = self.makeBenchmarkController(rows: 24, cols: 100, scrollbackRows: 64)
+            controller.debugProcessPTYOutputForTesting(payload)
+        }
+    }
+
+    func testTerminalControllerProcessKittyBenchmarkASCIIPerformanceRegression() throws {
+        let payload = makeKittyBenchmarkASCIIData()
+        try benchmark("terminal_controller.process_kitty_benchmark_ascii", iterations: 8, warmupIterations: 1) {
+            let controller = self.makeBenchmarkController(rows: 24, cols: 80, scrollbackRows: 0)
+            controller.debugProcessPTYOutputForTesting(payload)
+        }
+    }
+
+    func testTerminalControllerProcessKittyBenchmarkUnicodePerformanceRegression() throws {
+        let payload = makeKittyBenchmarkUnicodeData()
+        try benchmark("terminal_controller.process_kitty_benchmark_unicode", iterations: 6, warmupIterations: 1) {
+            let controller = self.makeBenchmarkController(rows: 24, cols: 80, scrollbackRows: 0)
+            controller.debugProcessPTYOutputForTesting(payload)
+        }
+    }
+
+    func testTerminalControllerProcessKittyBenchmarkCSIPerformanceRegression() throws {
+        let payload = makeKittyBenchmarkCSIData()
+        try benchmark("terminal_controller.process_kitty_benchmark_csi", iterations: 8, warmupIterations: 1) {
+            let controller = self.makeBenchmarkController(rows: 24, cols: 80, scrollbackRows: 0)
             controller.debugProcessPTYOutputForTesting(payload)
         }
     }

@@ -183,6 +183,7 @@ final class TerminalController {
     private var isBatchingParserScrollOut = false
     private var pendingParserScrollOutRows: [ScrollbackBuffer.BufferedRow] = []
     private var pendingParserScrollOffsetDelta = 0
+    private var pendingGroundBytes: [UInt8] = []
 
     /// Decode buffer for UTF-8 -> codepoints.
     /// Starts empty and grows on demand so idle terminals do not pay a
@@ -687,15 +688,15 @@ final class TerminalController {
         callbackLock.withLock {
             lastOutputDate = Date()
         }
-        if recordAudit {
-            auditLogger?.recordOutput(Data(bytes: data.baseAddress!, count: data.count))
+        if recordAudit, let auditLogger {
+            auditLogger.recordOutput(Data(bytes: data.baseAddress!, count: data.count))
         }
         var clearedScrollback = false
         var didMutateDisplay = false
         var renderingSuppressed = false
         var renderingSuppressedChanges: [Bool] = []
         var startedRenderingSuppressed = false
-        let pendingUpdateAnalysis = Self.analyzePendingUpdateSequences(in: data)
+        var shouldScheduleScrollbackCompaction = true
         let ptr = data.baseAddress!
         let count = data.count
 
@@ -703,57 +704,81 @@ final class TerminalController {
             startedRenderingSuppressed = terminalRenderingSuppressed
             beginParserScrollOutBatch()
             defer { endParserScrollOutBatch() }
-            var fastPathPointer = ptr
-            var fastPathRemainingCount = count
 
-            while fastPathRemainingCount > 0 {
-                let input = UnsafeBufferPointer(start: fastPathPointer, count: fastPathRemainingCount)
-
-                if canUseDirectASCIIGroundFastPath(input) {
-                    let consumed = model.consumeGroundASCIIBytesFastPathPrefix(input)
-                    if consumed > 0 {
-                        didMutateDisplay = true
-                        fastPathPointer = fastPathPointer.advanced(by: consumed)
-                        fastPathRemainingCount -= consumed
-                        continue
-                    }
-                }
-
-                let ignoredStringBytes = vt_parser_consume_ascii_ignored_string_fast_path(
-                    &parser,
-                    fastPathPointer,
-                    fastPathRemainingCount
-                )
-                if ignoredStringBytes > 0 {
-                    fastPathPointer = fastPathPointer.advanced(by: ignoredStringBytes)
-                    fastPathRemainingCount -= ignoredStringBytes
-                    continue
-                }
-
-                break
+            let workingBufferStorage: [UInt8]?
+            if pendingGroundBytes.isEmpty {
+                workingBufferStorage = nil
+            } else {
+                var combined = pendingGroundBytes
+                combined.reserveCapacity(combined.count + count)
+                combined.append(contentsOf: data)
+                pendingGroundBytes.removeAll(keepingCapacity: true)
+                workingBufferStorage = combined
             }
 
-            let remainingInput = UnsafeBufferPointer(start: fastPathPointer, count: fastPathRemainingCount)
+            let processInput: (UnsafeBufferPointer<UInt8>) -> Void = { [self] workingInput in
+                var fastPathPointer = workingInput.baseAddress!
+                var fastPathRemainingCount = workingInput.count
 
-            if !remainingInput.isEmpty {
-                ensureCodepointBufferCapacity(requiredCount: remainingInput.count)
-                let cpCount = textDecoder.decode(remainingInput, into: &codepointBuffer)
+                while fastPathRemainingCount > 0 {
+                    let input = UnsafeBufferPointer(start: fastPathPointer, count: fastPathRemainingCount)
 
-                // Feed codepoints to VT parser (which updates the model)
-                if cpCount > 0 {
-                    codepointBuffer.withUnsafeBufferPointer { buffer in
-                        let decoded = UnsafeBufferPointer(start: buffer.baseAddress, count: cpCount)
-                        if parser.state == VT_STATE_GROUND {
-                            let consumed = model.consumeGroundFastPathPrefix(decoded)
-                            if consumed < cpCount {
-                                vt_parser_feed(&parser, buffer.baseAddress!.advanced(by: consumed), cpCount - consumed)
-                            }
-                        } else {
-                            vt_parser_feed(&parser, codepointBuffer, cpCount)
+                    if self.canUseDirectASCIIGroundFastPath(input) {
+                        let consumed = self.model.consumeGroundASCIIBytesFastPathPrefix(input)
+                        if consumed > 0 {
+                            didMutateDisplay = true
+                            fastPathPointer = fastPathPointer.advanced(by: consumed)
+                            fastPathRemainingCount -= consumed
+                            continue
                         }
                     }
-                    didMutateDisplay = true
+
+                    let ignoredStringBytes = vt_parser_consume_ascii_ignored_string_fast_path(
+                        &self.parser,
+                        fastPathPointer,
+                        fastPathRemainingCount
+                    )
+                    if ignoredStringBytes > 0 {
+                        fastPathPointer = fastPathPointer.advanced(by: ignoredStringBytes)
+                        fastPathRemainingCount -= ignoredStringBytes
+                        continue
+                    }
+
+                    break
                 }
+
+                let remainingInput = UnsafeBufferPointer(start: fastPathPointer, count: fastPathRemainingCount)
+                if self.parser.state == VT_STATE_GROUND,
+                   self.shouldDeferIncompleteGroundSequence(remainingInput) {
+                    self.pendingGroundBytes = Array(remainingInput)
+                    return
+                }
+
+                if !remainingInput.isEmpty {
+                    self.ensureCodepointBufferCapacity(requiredCount: remainingInput.count)
+                    let cpCount = self.textDecoder.decode(remainingInput, into: &self.codepointBuffer)
+
+                    if cpCount > 0 {
+                        self.codepointBuffer.withUnsafeBufferPointer { buffer in
+                            let decoded = UnsafeBufferPointer(start: buffer.baseAddress, count: cpCount)
+                            if self.parser.state == VT_STATE_GROUND {
+                                let consumed = self.model.consumeGroundFastPathPrefix(decoded)
+                                if consumed < cpCount {
+                                    vt_parser_feed(&self.parser, buffer.baseAddress!.advanced(by: consumed), cpCount - consumed)
+                                }
+                            } else {
+                                vt_parser_feed(&self.parser, self.codepointBuffer, cpCount)
+                            }
+                        }
+                        didMutateDisplay = true
+                    }
+                }
+            }
+
+            if let workingBufferStorage {
+                workingBufferStorage.withUnsafeBufferPointer(processInput)
+            } else {
+                processInput(UnsafeBufferPointer(start: ptr, count: count))
             }
 
             if parserRequestedScrollbackClear {
@@ -774,9 +799,11 @@ final class TerminalController {
             renderingSuppressed = terminalRenderingSuppressed
             renderingSuppressedChanges = pendingRenderingSuppressedChanges
             pendingRenderingSuppressedChanges.removeAll(keepingCapacity: true)
+            shouldScheduleScrollbackCompaction = !model.isAlternateScreen || scrollback.rowCount > 0
         }
 
         if !renderingSuppressedChanges.isEmpty {
+            let pendingUpdateAnalysis = Self.analyzePendingUpdateSequences(in: data)
             let now = ProcessInfo.processInfo.systemUptime
             let shouldReportOutputActivity = callbackLock.withLock {
                 now >= outputActivitySuppressedUntilUptime
@@ -791,7 +818,9 @@ final class TerminalController {
                     stateChange: clearedScrollback,
                     endingSuppressed: true
                 )
-                scheduleScrollbackCompaction()
+                if shouldScheduleScrollbackCompaction {
+                    scheduleScrollbackCompaction()
+                }
                 return
             }
 
@@ -804,7 +833,9 @@ final class TerminalController {
                     stateChange: clearedScrollback
                 )
                 dispatchRenderingSuppressionChanges(renderingSuppressedChanges)
-                scheduleScrollbackCompaction()
+                if shouldScheduleScrollbackCompaction {
+                    scheduleScrollbackCompaction()
+                }
                 return
             }
 
@@ -812,7 +843,9 @@ final class TerminalController {
         }
 
         guard didMutateDisplay || clearedScrollback else {
-            scheduleScrollbackCompaction()
+            if shouldScheduleScrollbackCompaction {
+                scheduleScrollbackCompaction()
+            }
             return
         }
 
@@ -828,7 +861,52 @@ final class TerminalController {
             outputActivity: shouldReportOutputActivityNow,
             stateChange: clearedScrollback
         )
-        scheduleScrollbackCompaction()
+        if shouldScheduleScrollbackCompaction {
+            scheduleScrollbackCompaction()
+        }
+    }
+
+    private func shouldDeferIncompleteGroundSequence(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard !bytes.isEmpty,
+              bytes.count <= 64,
+              bytes[0] == 0x1B
+        else {
+            return false
+        }
+
+        guard bytes.count >= 2 else { return true }
+        let introducer = bytes[1]
+        switch introducer {
+        case UInt8(ascii: "["):
+            guard bytes.count >= 3 else { return true }
+            for index in 2..<bytes.count where bytes[index] >= 0x40 && bytes[index] <= 0x7E {
+                return false
+            }
+            return true
+
+        case UInt8(ascii: "]"), UInt8(ascii: "P"), UInt8(ascii: "X"), UInt8(ascii: "^"), UInt8(ascii: "_"):
+            var index = 2
+            while index < bytes.count {
+                let byte = bytes[index]
+                if byte == 0x07 {
+                    return false
+                }
+                if byte == 0x1B {
+                    guard index + 1 < bytes.count else { return true }
+                    if bytes[index + 1] == UInt8(ascii: "\\") {
+                        return false
+                    }
+                }
+                index += 1
+            }
+            return true
+
+        case 0x37, 0x38, 0x44, 0x45, 0x48, 0x4D, 0x3D, 0x3E, 0x63:
+            return false
+
+        default:
+            return bytes.count == 1
+        }
     }
 
     private struct PendingUpdateSequenceAnalysis {

@@ -59,4 +59,14 @@ size_t utf8_decoder_decode(Utf8Decoder *decoder,
                            const uint8_t *input, size_t input_len,
                            uint32_t *output, size_t output_capacity);
 
+/*
+ * Decode the longest leading prefix consisting only of ASCII bytes (< 0x80)
+ * directly into output codepoints. Returns the number of bytes/codepoints
+ * written. Intended for terminal hot paths that commonly see large ASCII runs.
+ */
+size_t utf8_decoder_decode_ascii_prefix(const uint8_t *input,
+                                        size_t input_len,
+                                        uint32_t *output,
+                                        size_t output_capacity);
+
 #endif /* UTF8_DECODER_H */

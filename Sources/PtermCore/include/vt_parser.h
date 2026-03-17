@@ -140,6 +140,21 @@ size_t vt_parser_consume_ascii_ignored_string_fast_path(
 );
 
 /*
+ * Return the length of the longest prefix consisting only of printable ASCII
+ * bytes (0x20...0x7E). Used by Swift-side ground-state fast paths to form
+ * large runs without per-byte classification overhead.
+ */
+size_t vt_parser_scan_printable_ascii_prefix(
+    const uint8_t *bytes,
+    size_t count
+);
+
+size_t vt_parser_scan_text_ascii_prefix(
+    const uint8_t *bytes,
+    size_t count
+);
+
+/*
  * Feed a single codepoint to the parser.
  */
 void vt_parser_feed_one(VtParser *parser, uint32_t codepoint);

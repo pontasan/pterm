@@ -1,4 +1,5 @@
 #include "utf8_decoder.h"
+#include <string.h>
 
 /*
  * DFA-based UTF-8 decoder.
@@ -145,4 +146,43 @@ size_t utf8_decoder_decode(Utf8Decoder *decoder,
     }
 
     return out_count;
+}
+
+size_t utf8_decoder_decode_ascii_prefix(const uint8_t *input,
+                                        size_t input_len,
+                                        uint32_t *output,
+                                        size_t output_capacity) {
+    if (!input || !output || output_capacity == 0) return 0;
+
+    size_t count = input_len < output_capacity ? input_len : output_capacity;
+    size_t index = 0;
+
+    const size_t word_mask = ~(size_t)0 / 0xFF;
+    const size_t high_bit_mask = word_mask << 7;
+
+    while (index < count && ((uintptr_t)(input + index) & (sizeof(size_t) - 1)) != 0) {
+        uint8_t byte = input[index];
+        if (byte & 0x80) return index;
+        output[index] = byte;
+        index++;
+    }
+
+    while (index + sizeof(size_t) <= count) {
+        size_t word;
+        memcpy(&word, input + index, sizeof(word));
+        if (word & high_bit_mask) break;
+        for (size_t offset = 0; offset < sizeof(size_t); offset++) {
+            output[index + offset] = input[index + offset];
+        }
+        index += sizeof(size_t);
+    }
+
+    while (index < count) {
+        uint8_t byte = input[index];
+        if (byte & 0x80) break;
+        output[index] = byte;
+        index++;
+    }
+
+    return index;
 }

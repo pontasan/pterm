@@ -169,103 +169,157 @@ final class TerminalTextDecoder {
     }
 
     private func decodeASCIIIfPossible(_ input: UnsafeBufferPointer<UInt8>, into output: inout [UInt32]) -> Int? {
-        guard input.count <= output.count else { return nil }
-        for byte in input where byte >= 0x80 {
-            return nil
+        let outputCount = output.count
+        guard input.count <= outputCount else { return nil }
+        let decodedCount = output.withUnsafeMutableBufferPointer { outputBuffer -> Int in
+            guard let outputBase = outputBuffer.baseAddress,
+                  let inputBase = input.baseAddress else { return 0 }
+            return Int(
+                utf8_decoder_decode_ascii_prefix(
+                    inputBase,
+                    input.count,
+                    outputBase,
+                    outputCount
+                )
+            )
         }
-        for (index, byte) in input.enumerated() {
-            output[index] = UInt32(byte)
-        }
-        return input.count
+        guard decodedCount == input.count else { return nil }
+        return decodedCount
     }
 
     private func decodeUTF8(_ input: UnsafeBufferPointer<UInt8>, into output: inout [UInt32]) -> Int {
-        var outCount = 0
-        var index = 0
+        output.withUnsafeMutableBufferPointer { outputBuffer in
+            guard let outputBase = outputBuffer.baseAddress else { return 0 }
 
-        while index < input.count {
-            guard outCount < output.count else { break }
-            let byte = input[index]
+            var outCount = 0
+            var index = 0
 
-            // Preserve raw 8-bit C1 controls when they occur at codepoint
-            // boundaries. Terminals must recognize these as control functions,
-            // not replacement glyphs.
-            if utf8Decoder.state == UTF8_ACCEPT, byte >= 0x80, byte <= 0x9F {
-                output[outCount] = UInt32(byte)
-                outCount += 1
-                index += 1
-                continue
-            }
+            while index < input.count {
+                guard outCount < outputBuffer.count else { break }
+                let byte = input[index]
 
-            if utf8Decoder.state == UTF8_ACCEPT {
-                if byte < 0x80 {
-                    output[outCount] = UInt32(byte)
+                // Preserve raw 8-bit C1 controls when they occur at codepoint
+                // boundaries. Terminals must recognize these as control functions,
+                // not replacement glyphs.
+                if utf8Decoder.state == UTF8_ACCEPT, byte >= 0x80, byte <= 0x9F {
+                    outputBase[outCount] = UInt32(byte)
                     outCount += 1
                     index += 1
                     continue
                 }
 
-                if byte >= 0xC2, byte <= 0xDF, index + 1 < input.count {
-                    let b1 = input[index + 1]
-                    if b1 & 0xC0 == 0x80 {
-                        output[outCount] = (UInt32(byte & 0x1F) << 6) | UInt32(b1 & 0x3F)
+                if utf8Decoder.state == UTF8_ACCEPT {
+                    if byte < 0x80 {
+                        outputBase[outCount] = UInt32(byte)
                         outCount += 1
-                        index += 2
+                        index += 1
                         continue
+                    }
+
+                    if byte >= 0xC2, byte <= 0xDF, index + 1 < input.count {
+                        let b1 = input[index + 1]
+                        if b1 & 0xC0 == 0x80 {
+                            outputBase[outCount] = (UInt32(byte & 0x1F) << 6) | UInt32(b1 & 0x3F)
+                            outCount += 1
+                            index += 2
+                            continue
+                        }
+                    }
+
+                    if byte >= 0xE0, byte <= 0xEF, index + 2 < input.count {
+                        let b1 = input[index + 1]
+                        let b2 = input[index + 2]
+                        if b2 & 0xC0 == 0x80 {
+                            if (byte >= 0xE1 && byte <= 0xEC) || (byte >= 0xEE && byte <= 0xEF) {
+                                if b1 & 0xC0 == 0x80 {
+                                    outputBase[outCount] =
+                                        (UInt32(byte & 0x0F) << 12) |
+                                        (UInt32(b1 & 0x3F) << 6) |
+                                        UInt32(b2 & 0x3F)
+                                    outCount += 1
+                                    index += 3
+                                    continue
+                                }
+                            } else if byte == 0xE0 {
+                                if b1 >= 0xA0 && b1 <= 0xBF {
+                                    outputBase[outCount] =
+                                        (UInt32(byte & 0x0F) << 12) |
+                                        (UInt32(b1 & 0x3F) << 6) |
+                                        UInt32(b2 & 0x3F)
+                                    outCount += 1
+                                    index += 3
+                                    continue
+                                }
+                            } else if byte == 0xED {
+                                if b1 >= 0x80 && b1 <= 0x9F {
+                                    outputBase[outCount] =
+                                        (UInt32(byte & 0x0F) << 12) |
+                                        (UInt32(b1 & 0x3F) << 6) |
+                                        UInt32(b2 & 0x3F)
+                                    outCount += 1
+                                    index += 3
+                                    continue
+                                }
+                            }
+                        }
+                    }
+
+                    if byte >= 0xF0, byte <= 0xF4, index + 3 < input.count {
+                        let b1 = input[index + 1]
+                        let b2 = input[index + 2]
+                        let b3 = input[index + 3]
+                        if b2 & 0xC0 == 0x80, b3 & 0xC0 == 0x80 {
+                            if byte >= 0xF1 && byte <= 0xF3 {
+                                if b1 & 0xC0 == 0x80 {
+                                    outputBase[outCount] =
+                                        (UInt32(byte & 0x07) << 18) |
+                                        (UInt32(b1 & 0x3F) << 12) |
+                                        (UInt32(b2 & 0x3F) << 6) |
+                                        UInt32(b3 & 0x3F)
+                                    outCount += 1
+                                    index += 4
+                                    continue
+                                }
+                            } else if byte == 0xF0 {
+                                if b1 >= 0x90 && b1 <= 0xBF {
+                                    outputBase[outCount] =
+                                        (UInt32(byte & 0x07) << 18) |
+                                        (UInt32(b1 & 0x3F) << 12) |
+                                        (UInt32(b2 & 0x3F) << 6) |
+                                        UInt32(b3 & 0x3F)
+                                    outCount += 1
+                                    index += 4
+                                    continue
+                                }
+                            } else if byte == 0xF4 {
+                                if b1 >= 0x80 && b1 <= 0x8F {
+                                    outputBase[outCount] =
+                                        (UInt32(byte & 0x07) << 18) |
+                                        (UInt32(b1 & 0x3F) << 12) |
+                                        (UInt32(b2 & 0x3F) << 6) |
+                                        UInt32(b3 & 0x3F)
+                                    outCount += 1
+                                    index += 4
+                                    continue
+                                }
+                            }
+                        }
                     }
                 }
 
-                if byte >= 0xE0, byte <= 0xEF, index + 2 < input.count {
-                    let b1 = input[index + 1]
-                    let b2 = input[index + 2]
-                    let isLegalSecondByte =
-                        (byte == 0xE0 && (0xA0...0xBF).contains(b1)) ||
-                        (byte == 0xED && (0x80...0x9F).contains(b1)) ||
-                        ((byte != 0xE0 && byte != 0xED) && (b1 & 0xC0 == 0x80))
-                    if isLegalSecondByte, b2 & 0xC0 == 0x80 {
-                        output[outCount] =
-                            (UInt32(byte & 0x0F) << 12) |
-                            (UInt32(b1 & 0x3F) << 6) |
-                            UInt32(b2 & 0x3F)
-                        outCount += 1
-                        index += 3
-                        continue
-                    }
+                let result = utf8_decoder_feed(&utf8Decoder, byte)
+                if result == UTF8_ACCEPT {
+                    outputBase[outCount] = utf8Decoder.codepoint
+                    outCount += 1
+                } else if result == UTF8_REJECT {
+                    outputBase[outCount] = UInt32(UTF8_REPLACEMENT_CHAR)
+                    outCount += 1
                 }
-
-                if byte >= 0xF0, byte <= 0xF4, index + 3 < input.count {
-                    let b1 = input[index + 1]
-                    let b2 = input[index + 2]
-                    let b3 = input[index + 3]
-                    let isLegalSecondByte =
-                        (byte == 0xF0 && (0x90...0xBF).contains(b1)) ||
-                        (byte == 0xF4 && (0x80...0x8F).contains(b1)) ||
-                        ((byte != 0xF0 && byte != 0xF4) && (b1 & 0xC0 == 0x80))
-                    if isLegalSecondByte, b2 & 0xC0 == 0x80, b3 & 0xC0 == 0x80 {
-                        output[outCount] =
-                            (UInt32(byte & 0x07) << 18) |
-                            (UInt32(b1 & 0x3F) << 12) |
-                            (UInt32(b2 & 0x3F) << 6) |
-                            UInt32(b3 & 0x3F)
-                        outCount += 1
-                        index += 4
-                        continue
-                    }
-                }
+                index += 1
             }
 
-            let result = utf8_decoder_feed(&utf8Decoder, byte)
-            if result == UTF8_ACCEPT {
-                output[outCount] = utf8Decoder.codepoint
-                outCount += 1
-            } else if result == UTF8_REJECT {
-                output[outCount] = UInt32(UTF8_REPLACEMENT_CHAR)
-                outCount += 1
-            }
-            index += 1
+            return outCount
         }
-
-        return outCount
     }
 
     private func decodeUTF16(_ input: UnsafeBufferPointer<UInt8>, into output: inout [UInt32]) -> Int {

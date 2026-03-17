@@ -2,13 +2,41 @@ import Foundation
 import Darwin
 import PtermCore
 
+private func cliWriteAll(to fileDescriptor: Int32, bytes: UnsafeBufferPointer<UInt8>) {
+    guard let baseAddress = bytes.baseAddress else { return }
+    var remaining = bytes.count
+    var current = baseAddress
+
+    while remaining > 0 {
+        let written = Darwin.write(fileDescriptor, current, remaining)
+        if written > 0 {
+            remaining -= written
+            current += written
+            continue
+        }
+        if written < 0 && errno == EINTR {
+            continue
+        }
+        return
+    }
+}
+
 private final class CLIEmulatorBridge {
+    private struct DebugStats {
+        var chunkCount = 0
+        var totalBytes = 0
+        var maxChunkBytes = 0
+    }
+
     private let lock = NSLock()
     private let model: TerminalModel
     private var parser = VtParser()
     private var textDecoder: TerminalTextDecoder
     private var codepointBuffer: [UInt32] = []
+    private var pendingGroundBytes: [UInt8] = []
     private let textEncoding: TerminalTextEncoding
+    private let debugStatsEnabled = ProcessInfo.processInfo.environment["PTERM_DEBUG_CLI_STATS"] == "1"
+    private var debugStats = DebugStats()
 
     init(rows: Int,
          cols: Int,
@@ -38,6 +66,11 @@ private final class CLIEmulatorBridge {
         vt_parser_destroy(&parser)
     }
 
+    func debugStatsSummary() -> String? {
+        guard debugStatsEnabled else { return nil }
+        return "pterm-cli-stats chunks=\(debugStats.chunkCount) total_bytes=\(debugStats.totalBytes) max_chunk=\(debugStats.maxChunkBytes)\n"
+    }
+
     func resize(rows: Int, cols: Int) {
         lock.lock()
         defer { lock.unlock() }
@@ -49,57 +82,134 @@ private final class CLIEmulatorBridge {
         lock.lock()
         defer { lock.unlock() }
 
-        var fastPathPointer = input.baseAddress!
-        var fastPathRemainingCount = input.count
+        if debugStatsEnabled {
+            debugStats.chunkCount += 1
+            debugStats.totalBytes += input.count
+            if input.count > debugStats.maxChunkBytes {
+                debugStats.maxChunkBytes = input.count
+            }
+        }
 
-        while fastPathRemainingCount > 0 {
-            let candidate = UnsafeBufferPointer(start: fastPathPointer, count: fastPathRemainingCount)
+        let workingBufferStorage: [UInt8]?
+        if pendingGroundBytes.isEmpty {
+            workingBufferStorage = nil
+        } else {
+            var combined = pendingGroundBytes
+            combined.reserveCapacity(combined.count + input.count)
+            combined.append(contentsOf: input)
+            pendingGroundBytes.removeAll(keepingCapacity: true)
+            workingBufferStorage = combined
+        }
 
-            if canUseDirectASCIIGroundFastPath(candidate) {
-                let consumed = model.consumeGroundASCIIBytesFastPathPrefix(candidate)
-                if consumed > 0 {
-                    fastPathPointer = fastPathPointer.advanced(by: consumed)
-                    fastPathRemainingCount -= consumed
+        let processInput: (UnsafeBufferPointer<UInt8>) -> Void = { [self] workingInput in
+            var fastPathPointer = workingInput.baseAddress!
+            var fastPathRemainingCount = workingInput.count
+
+            while fastPathRemainingCount > 0 {
+                let candidate = UnsafeBufferPointer(start: fastPathPointer, count: fastPathRemainingCount)
+
+                if self.canUseDirectASCIIGroundFastPath(candidate) {
+                    let consumed = self.model.consumeGroundASCIIBytesFastPathPrefix(candidate)
+                    if consumed > 0 {
+                        fastPathPointer = fastPathPointer.advanced(by: consumed)
+                        fastPathRemainingCount -= consumed
+                        continue
+                    }
+                }
+
+                let ignoredStringBytes = vt_parser_consume_ascii_ignored_string_fast_path(
+                    &self.parser,
+                    fastPathPointer,
+                    fastPathRemainingCount
+                )
+                if ignoredStringBytes > 0 {
+                    fastPathPointer = fastPathPointer.advanced(by: ignoredStringBytes)
+                    fastPathRemainingCount -= ignoredStringBytes
                     continue
                 }
+
+                break
             }
 
-            let ignoredStringBytes = vt_parser_consume_ascii_ignored_string_fast_path(
-                &parser,
-                fastPathPointer,
-                fastPathRemainingCount
-            )
-            if ignoredStringBytes > 0 {
-                fastPathPointer = fastPathPointer.advanced(by: ignoredStringBytes)
-                fastPathRemainingCount -= ignoredStringBytes
-                continue
+            let remainingInput = UnsafeBufferPointer(start: fastPathPointer, count: fastPathRemainingCount)
+            if self.parser.state == VT_STATE_GROUND,
+               self.shouldDeferIncompleteGroundSequence(remainingInput) {
+                self.pendingGroundBytes = Array(remainingInput)
+                return
+            }
+            guard !remainingInput.isEmpty else { return }
+
+            if self.codepointBuffer.count < remainingInput.count {
+                self.codepointBuffer = [UInt32](repeating: 0, count: remainingInput.count)
             }
 
-            break
-        }
+            let codepointCount = self.textDecoder.decode(remainingInput, into: &self.codepointBuffer)
+            guard codepointCount > 0 else { return }
 
-        let remainingInput = UnsafeBufferPointer(start: fastPathPointer, count: fastPathRemainingCount)
-        guard !remainingInput.isEmpty else { return }
-
-        if codepointBuffer.count < remainingInput.count {
-            codepointBuffer = [UInt32](repeating: 0, count: remainingInput.count)
-        }
-
-        let codepointCount = textDecoder.decode(remainingInput, into: &codepointBuffer)
-        guard codepointCount > 0 else { return }
-
-        codepointBuffer.withUnsafeBufferPointer { buffer in
-            guard let baseAddress = buffer.baseAddress else { return }
-            if parser.state == VT_STATE_GROUND {
-                let consumed = model.consumeGroundFastPathPrefix(
-                    UnsafeBufferPointer(start: baseAddress, count: codepointCount)
-                )
-                if consumed < codepointCount {
-                    vt_parser_feed(&parser, baseAddress.advanced(by: consumed), codepointCount - consumed)
+            self.codepointBuffer.withUnsafeBufferPointer { buffer in
+                guard let baseAddress = buffer.baseAddress else { return }
+                if self.parser.state == VT_STATE_GROUND {
+                    let consumed = self.model.consumeGroundFastPathPrefix(
+                        UnsafeBufferPointer(start: baseAddress, count: codepointCount)
+                    )
+                    if consumed < codepointCount {
+                        vt_parser_feed(&self.parser, baseAddress.advanced(by: consumed), codepointCount - consumed)
+                    }
+                } else {
+                    vt_parser_feed(&self.parser, baseAddress, codepointCount)
                 }
-            } else {
-                vt_parser_feed(&parser, baseAddress, codepointCount)
             }
+        }
+
+        if let workingBufferStorage {
+            workingBufferStorage.withUnsafeBufferPointer(processInput)
+        } else {
+            processInput(input)
+        }
+    }
+
+    private func shouldDeferIncompleteGroundSequence(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard let base = bytes.baseAddress,
+              !bytes.isEmpty,
+              bytes.count <= 64,
+              bytes[0] == 0x1B
+        else {
+            return false
+        }
+
+        guard bytes.count >= 2 else { return true }
+        let introducer = bytes[1]
+        switch introducer {
+        case UInt8(ascii: "["):
+            guard bytes.count >= 3 else { return true }
+            for index in 2..<bytes.count where bytes[index] >= 0x40 && bytes[index] <= 0x7E {
+                return false
+            }
+            return true
+
+        case UInt8(ascii: "]"), UInt8(ascii: "P"), UInt8(ascii: "X"), UInt8(ascii: "^"), UInt8(ascii: "_"):
+            var index = 2
+            while index < bytes.count {
+                let byte = bytes[index]
+                if byte == 0x07 {
+                    return false
+                }
+                if byte == 0x1B {
+                    guard index + 1 < bytes.count else { return true }
+                    if bytes[index + 1] == UInt8(ascii: "\\") {
+                        return false
+                    }
+                }
+                index += 1
+            }
+            return true
+
+        case 0x37, 0x38, 0x44, 0x45, 0x48, 0x4D, 0x3D, 0x3E, 0x63:
+            return false
+
+        default:
+            _ = base
+            return bytes.count == 1
         }
     }
 
@@ -123,9 +233,19 @@ final class CLITerminalOutputFilter {
     private var synchronizedOutputSuppressed = false
 
     func filter(_ input: UnsafeBufferPointer<UInt8>) -> Data {
-        guard !input.isEmpty else { return Data() }
+        let outputPipe = Pipe()
+        writeFiltered(input, to: outputPipe.fileHandleForWriting.fileDescriptor)
+        try? outputPipe.fileHandleForWriting.close()
+        let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        try? outputPipe.fileHandleForReading.close()
+        return data
+    }
+
+    func writeFiltered(_ input: UnsafeBufferPointer<UInt8>, to fileDescriptor: Int32) {
+        guard !input.isEmpty else { return }
         if pending.isEmpty {
-            return process(input)
+            process(input, to: fileDescriptor)
+            return
         }
 
         var combined = [UInt8]()
@@ -133,98 +253,124 @@ final class CLITerminalOutputFilter {
         combined.append(contentsOf: pending)
         pending.removeAll(keepingCapacity: true)
         combined.append(contentsOf: input)
-        return combined.withUnsafeBufferPointer(process)
+        combined.withUnsafeBufferPointer { buffer in
+            process(buffer, to: fileDescriptor)
+        }
     }
 
-    private func process(_ bytes: UnsafeBufferPointer<UInt8>) -> Data {
+    private func process(_ bytes: UnsafeBufferPointer<UInt8>, to fileDescriptor: Int32) {
         if synchronizedOutputSuppressed {
-            return filterWhileSynchronizedOutputSuppressed(bytes)
+            filterWhileSynchronizedOutputSuppressed(bytes, to: fileDescriptor)
+            return
         }
 
-        var output = Data()
-        output.reserveCapacity(bytes.count)
-
+        guard let baseAddress = bytes.baseAddress else { return }
         var index = 0
-        var passthroughStart = 0
         while index < bytes.count {
-            let byte = bytes[index]
-            if byte != 0x1B {
-                index += 1
-                continue
+            let remaining = bytes.count - index
+            guard let escPointer = memchr(baseAddress.advanced(by: index), Int32(0x1B), remaining) else {
+                cliWriteAll(
+                    to: fileDescriptor,
+                    bytes: UnsafeBufferPointer(
+                        start: baseAddress.advanced(by: index),
+                        count: remaining
+                    )
+                )
+                return
             }
 
-            if passthroughStart < index {
-                output.append(bytes.baseAddress!.advanced(by: passthroughStart), count: index - passthroughStart)
+            let escIndex = baseAddress.distance(to: escPointer.assumingMemoryBound(to: UInt8.self))
+            if index < escIndex {
+                cliWriteAll(
+                    to: fileDescriptor,
+                    bytes: UnsafeBufferPointer(
+                        start: baseAddress.advanced(by: index),
+                        count: escIndex - index
+                    )
+                )
             }
 
-            guard index + 1 < bytes.count else {
-                pending.append(bytes[index])
-                return output
+            guard escIndex + 1 < bytes.count else {
+                pending.append(0x1B)
+                return
             }
 
-            let next = bytes[index + 1]
+            let next = bytes[escIndex + 1]
             switch next {
             case UInt8(ascii: "Z"):
-                index += 2
+                index = escIndex + 2
 
             case UInt8(ascii: "["):
-                guard let endIndex = findCSITerminator(in: bytes, startingAt: index + 2) else {
-                    pending.append(contentsOf: UnsafeBufferPointer(start: bytes.baseAddress!.advanced(by: index), count: bytes.count - index))
-                    return output
+                guard let endIndex = findCSITerminator(in: bytes, startingAt: escIndex + 2) else {
+                    pending.append(
+                        contentsOf: UnsafeBufferPointer(
+                            start: baseAddress.advanced(by: escIndex),
+                            count: bytes.count - escIndex
+                        )
+                    )
+                    return
                 }
                 let finalByte = bytes[endIndex]
-                if isPendingUpdateModeSequence(in: bytes, from: index, through: endIndex) {
+                if isPendingUpdateModeSequence(in: bytes, from: escIndex, through: endIndex) {
                     synchronizedOutputSuppressed = finalByte == UInt8(ascii: "h")
                     index = endIndex + 1
-                    if synchronizedOutputSuppressed {
-                        passthroughStart = index
-                        if index < bytes.count {
-                            let suffix = filterWhileSynchronizedOutputSuppressed(
-                                UnsafeBufferPointer(start: bytes.baseAddress!.advanced(by: index), count: bytes.count - index)
-                            )
-                            if !suffix.isEmpty {
-                                output.append(suffix)
-                            }
-                        }
-                        return output
+                    if synchronizedOutputSuppressed, index < bytes.count {
+                        filterWhileSynchronizedOutputSuppressed(
+                            UnsafeBufferPointer(
+                                start: baseAddress.advanced(by: index),
+                                count: bytes.count - index
+                            ),
+                            to: fileDescriptor
+                        )
+                        return
                     }
                 } else if finalByte == UInt8(ascii: "c")
                     || finalByte == UInt8(ascii: "n")
                     || finalByte == UInt8(ascii: "x") {
                     index = endIndex + 1
-                } else if !synchronizedOutputSuppressed {
-                    output.append(bytes.baseAddress!.advanced(by: index), count: endIndex - index + 1)
-                    index = endIndex + 1
                 } else {
+                    cliWriteAll(
+                        to: fileDescriptor,
+                        bytes: UnsafeBufferPointer(
+                            start: baseAddress.advanced(by: escIndex),
+                            count: endIndex - escIndex + 1
+                        )
+                    )
                     index = endIndex + 1
                 }
 
             case UInt8(ascii: "P"):
-                guard let endIndex = findStringTerminator(in: bytes, startingAt: index + 2) else {
-                    pending.append(contentsOf: UnsafeBufferPointer(start: bytes.baseAddress!.advanced(by: index), count: bytes.count - index))
-                    return output
+                guard let endIndex = findStringTerminator(in: bytes, startingAt: escIndex + 2) else {
+                    pending.append(
+                        contentsOf: UnsafeBufferPointer(
+                            start: baseAddress.advanced(by: escIndex),
+                            count: bytes.count - escIndex
+                        )
+                    )
+                    return
                 }
                 index = endIndex
 
             default:
-                output.append(byte)
-                index += 1
+                cliWriteAll(
+                    to: fileDescriptor,
+                    bytes: UnsafeBufferPointer(
+                        start: baseAddress.advanced(by: escIndex),
+                        count: 1
+                    )
+                )
+                index = escIndex + 1
             }
-
-            passthroughStart = index
         }
-
-        if passthroughStart < bytes.count {
-            output.append(bytes.baseAddress!.advanced(by: passthroughStart), count: bytes.count - passthroughStart)
-        }
-
-        return output
     }
 
-    private func filterWhileSynchronizedOutputSuppressed(_ bytes: UnsafeBufferPointer<UInt8>) -> Data {
-        guard !bytes.isEmpty else { return Data() }
+    private func filterWhileSynchronizedOutputSuppressed(
+        _ bytes: UnsafeBufferPointer<UInt8>,
+        to fileDescriptor: Int32
+    ) {
+        guard !bytes.isEmpty else { return }
         let resume = Self.pendingUpdateDisableSequence
-        guard let baseAddress = bytes.baseAddress else { return Data() }
+        guard let baseAddress = bytes.baseAddress else { return }
         var index = 0
         while index + resume.count <= bytes.count {
             let remaining = bytes.count - index
@@ -245,13 +391,15 @@ final class CLITerminalOutputFilter {
             if matched {
                 synchronizedOutputSuppressed = false
                 let suffixStart = escIndex + resume.count
-                guard suffixStart < bytes.count else { return Data() }
-                return process(
+                guard suffixStart < bytes.count else { return }
+                process(
                     UnsafeBufferPointer(
                         start: baseAddress.advanced(by: suffixStart),
                         count: bytes.count - suffixStart
-                    )
+                    ),
+                    to: fileDescriptor
                 )
+                return
             }
             index = escIndex + 1
         }
@@ -265,7 +413,6 @@ final class CLITerminalOutputFilter {
                 )
             )
         }
-        return Data()
     }
 
     private func findCSITerminator(in bytes: UnsafeBufferPointer<UInt8>, startingAt start: Int) -> Int? {
@@ -354,12 +501,7 @@ final class CLILaunchSession {
 
         pty.onOutputBytes = { bytes in
             self.emulatorBridge?.consume(bytes)
-            let filtered = self.outputFilter.filter(bytes)
-            filtered.withUnsafeBytes { rawBuffer in
-                guard let baseAddress = rawBuffer.bindMemory(to: UInt8.self).baseAddress else { return }
-                Self.writeAll(to: STDOUT_FILENO,
-                              bytes: UnsafeBufferPointer(start: baseAddress, count: filtered.count))
-            }
+            self.outputFilter.writeFiltered(bytes, to: STDOUT_FILENO)
         }
         pty.onExit = { [weak self] in
             guard let self else { return }
@@ -491,6 +633,9 @@ final class CLILaunchSession {
         self.exitCode = exitCode
         stopEventSources()
         restoreTerminalInput()
+        if let summary = emulatorBridge?.debugStatsSummary() {
+            FileHandle.standardError.write(Data(summary.utf8))
+        }
         Darwin.exit(exitCode)
     }
 
@@ -506,22 +651,4 @@ final class CLILaunchSession {
         return (rows: 24, cols: 80)
     }
 
-    private static func writeAll(to fileDescriptor: Int32, bytes: UnsafeBufferPointer<UInt8>) {
-        guard let baseAddress = bytes.baseAddress else { return }
-        var remaining = bytes.count
-        var current = baseAddress
-
-        while remaining > 0 {
-            let written = Darwin.write(fileDescriptor, current, remaining)
-            if written > 0 {
-                remaining -= written
-                current += written
-                continue
-            }
-            if written < 0 && errno == EINTR {
-                continue
-            }
-            return
-        }
-    }
 }

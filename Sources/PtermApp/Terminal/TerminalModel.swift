@@ -168,16 +168,46 @@ final class TerminalModel {
 
     private func nextTabStop(after column: Int) -> Int? {
         guard column + 1 < cols else { return nil }
-        for idx in (column + 1)..<cols where isTabStopSet(at: idx) {
-            return idx
+        var wordIndex = (column + 1) / 64
+        let bitOffset = (column + 1) % 64
+        guard wordIndex < tabStopWords.count else { return nil }
+
+        var word = tabStopWords[wordIndex] & (~UInt64(0) << UInt64(bitOffset))
+        while true {
+            if word != 0 {
+                let bit = word.trailingZeroBitCount
+                let target = wordIndex * 64 + bit
+                if target < cols {
+                    return target
+                }
+                return nil
+            }
+            wordIndex += 1
+            guard wordIndex < tabStopWords.count else { return nil }
+            word = tabStopWords[wordIndex]
         }
         return nil
     }
 
     private func previousTabStop(before column: Int) -> Int? {
         guard column > 0 else { return nil }
-        for idx in stride(from: column - 1, through: 0, by: -1) where isTabStopSet(at: idx) {
-            return idx
+        var wordIndex = (column - 1) / 64
+        let bitOffset = (column - 1) % 64
+        guard wordIndex < tabStopWords.count else { return nil }
+
+        var word = tabStopWords[wordIndex]
+        if bitOffset < 63 {
+            word &= ~UInt64(0) >> UInt64(63 - bitOffset)
+        }
+
+        while true {
+            if word != 0 {
+                let bit = 63 - word.leadingZeroBitCount
+                return wordIndex * 64 + bit
+            }
+            guard wordIndex > 0 else { return nil }
+            wordIndex -= 1
+            word = tabStopWords[wordIndex]
         }
         return nil
     }
@@ -222,6 +252,7 @@ final class TerminalModel {
         grid.lineAttribute(at: row)
     }
 
+    @inline(__always)
     private func visibleColumnCount(for row: Int) -> Int {
         if grid.hasOnlySingleWidthLines {
             return cols
@@ -229,6 +260,7 @@ final class TerminalModel {
         return max(1, lineAttribute(at: row).isDoubleWidth ? max(cols / 2, 1) : cols)
     }
 
+    @inline(__always)
     private func clampColumn(_ column: Int, for row: Int) -> Int {
         min(max(column, 0), visibleColumnCount(for: row) - 1)
     }
@@ -474,27 +506,26 @@ final class TerminalModel {
     @discardableResult
     func consumeGroundASCIIBytesFastPathPrefix(_ bytes: UnsafeBufferPointer<UInt8>) -> Int {
         guard !bytes.isEmpty else { return 0 }
+        guard let baseAddress = bytes.baseAddress else { return 0 }
 
         var index = 0
         while index < bytes.count {
-            let byte = bytes[index]
-            if byte >= 0x20 && byte < 0x7F {
-                let runStart = index
-                var runCount = 1
-                while runStart + runCount < bytes.count {
-                    let next = bytes[runStart + runCount]
-                    guard next >= 0x20 && next < 0x7F else { break }
-                    runCount += 1
-                }
-                handleASCIIByteRun(
-                    bytes.baseAddress!.advanced(by: runStart),
-                    count: runCount,
-                    containsSpace: true
+            let textRunCount = Int(
+                vt_parser_scan_text_ascii_prefix(
+                    baseAddress.advanced(by: index),
+                    bytes.count - index
                 )
-                index += runCount
+            )
+            if textRunCount > 0 {
+                consumeGroundTextASCIIBytes(
+                    baseAddress.advanced(by: index),
+                    count: textRunCount
+                )
+                index += textRunCount
                 continue
             }
 
+            let byte = bytes[index]
             switch byte {
             case 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F:
                 handleExecute(UInt32(byte))
@@ -516,6 +547,138 @@ final class TerminalModel {
         }
 
         return index
+    }
+
+    @inline(__always)
+    private func consumeGroundTextASCIIBytes(
+        _ bytes: UnsafePointer<UInt8>,
+        count: Int
+    ) {
+        if canUseDefaultSingleWidthASCIITextFastPath {
+            consumeGroundTextASCIIBytesDefaultSingleWidthFastPath(bytes, count: count)
+            return
+        }
+
+        var pointer = bytes
+        var remainingCount = count
+
+        while remainingCount > 0 {
+            let printableCount = Int(
+                vt_parser_scan_printable_ascii_prefix(
+                    pointer,
+                    remainingCount
+                )
+            )
+            if printableCount > 0 {
+                handleASCIIByteRun(
+                    pointer,
+                    count: printableCount,
+                    containsSpace: true
+                )
+                pointer = pointer.advanced(by: printableCount)
+                remainingCount -= printableCount
+            }
+
+            guard remainingCount > 0 else { break }
+
+            switch pointer.pointee {
+            case 0x09, 0x0A, 0x0D:
+                handleExecute(UInt32(pointer.pointee))
+                pointer = pointer.advanced(by: 1)
+                remainingCount -= 1
+            default:
+                return
+            }
+        }
+    }
+
+    private var canUseDefaultSingleWidthASCIITextFastPath: Bool {
+        grid.hasOnlySingleWidthLines &&
+        !insertModeEnabled &&
+        !protectedAreaModeEnabled &&
+        cursor.attributes == .default
+    }
+
+    @inline(__always)
+    private func consumeGroundTextASCIIBytesDefaultSingleWidthFastPath(
+        _ bytes: UnsafePointer<UInt8>,
+        count: Int
+    ) {
+        var pointer = bytes
+        let end = bytes.advanced(by: count)
+        let visibleCols = cols
+
+        while pointer < end {
+            var printableEnd = pointer
+            while printableEnd < end {
+                let byte = printableEnd.pointee
+                guard byte >= 0x20 && byte < 0x7F else { break }
+                printableEnd = printableEnd.advanced(by: 1)
+            }
+
+            let printableCount = pointer.distance(to: printableEnd)
+            if printableCount > 0 {
+                var remainingPrintableBase = pointer
+                var remainingPrintableCount = printableCount
+
+                while remainingPrintableCount > 0 {
+                    if cursor.pendingWrap {
+                        cursor.col = 0
+                        lineFeed()
+                        grid.setWrapped(cursor.row, true)
+                        cursor.pendingWrap = false
+                    }
+
+                    let available = visibleCols - cursor.col
+                    guard available > 0 else { return }
+
+                    let chunkCount = min(remainingPrintableCount, available)
+                    grid.writeSingleWidthDefaultASCIIBytes(
+                        remainingPrintableBase,
+                        count: chunkCount,
+                        atRow: cursor.row,
+                        startCol: cursor.col
+                    )
+
+                    cursor.col += chunkCount
+                    remainingPrintableBase = remainingPrintableBase.advanced(by: chunkCount)
+                    remainingPrintableCount -= chunkCount
+
+                    if cursor.col == visibleCols && remainingPrintableCount > 0 && cursor.autoWrapMode {
+                        cursor.col = 0
+                        lineFeed()
+                        grid.setWrapped(cursor.row, true)
+                        continue
+                    }
+
+                    if cursor.col >= visibleCols {
+                        cursor.col = visibleCols - 1
+                        if cursor.autoWrapMode {
+                            cursor.pendingWrap = true
+                        }
+                    }
+                }
+
+                pointer = printableEnd
+                continue
+            }
+
+            switch pointer.pointee {
+            case 0x09:
+                let nextTab = nextTabStop(after: cursor.col) ?? (visibleCols - 1)
+                cursor.col = min(nextTab, visibleCols - 1)
+                cursor.pendingWrap = false
+            case 0x0A:
+                lineFeed()
+            case 0x0D:
+                cursor.col = 0
+                cursor.pendingWrap = false
+            default:
+                return
+            }
+
+            pointer = pointer.advanced(by: 1)
+        }
     }
 
     private func consumeSimpleESCBytes(
@@ -614,10 +777,18 @@ final class TerminalModel {
 
     private func handleSingleWidthCodepointRun(_ codepoints: UnsafePointer<UInt32>, count: Int) {
         guard count > 0 else { return }
+        let attributes = currentPrintAttributes()
+        if grid.hasOnlySingleWidthLines {
+            handleSingleWidthCodepointRunSingleWidthGrid(
+                codepoints,
+                count: count,
+                attributes: attributes
+            )
+            return
+        }
 
         var remainingBase = codepoints
         var remainingCount = count
-        let attributes = currentPrintAttributes()
 
         while remainingCount > 0 {
             if cursor.pendingWrap {
@@ -644,6 +815,63 @@ final class TerminalModel {
             remainingBase = remainingBase.advanced(by: chunkCount)
             remainingCount -= chunkCount
 
+            if cursor.col == visibleCols && remainingCount > 0 && cursor.autoWrapMode {
+                cursor.col = 0
+                lineFeed()
+                grid.setWrapped(cursor.row, true)
+                continue
+            }
+
+            if cursor.col >= visibleCols {
+                cursor.col = visibleCols - 1
+                if cursor.autoWrapMode {
+                    cursor.pendingWrap = true
+                }
+            }
+        }
+    }
+
+    @inline(__always)
+    private func handleSingleWidthCodepointRunSingleWidthGrid(
+        _ codepoints: UnsafePointer<UInt32>,
+        count: Int,
+        attributes: CellAttributes
+    ) {
+        var remainingBase = codepoints
+        var remainingCount = count
+        let visibleCols = cols
+
+        while remainingCount > 0 {
+            if cursor.pendingWrap {
+                cursor.col = 0
+                lineFeed()
+                grid.setWrapped(cursor.row, true)
+                cursor.pendingWrap = false
+            }
+
+            let available = visibleCols - cursor.col
+            guard available > 0 else { break }
+
+            let chunkCount = min(remainingCount, available)
+            grid.writeSingleWidthCells(
+                remainingBase,
+                count: chunkCount,
+                attributes: attributes,
+                atRow: cursor.row,
+                startCol: cursor.col
+            )
+
+            cursor.col += chunkCount
+            remainingBase = remainingBase.advanced(by: chunkCount)
+            remainingCount -= chunkCount
+
+            if cursor.col == visibleCols && remainingCount > 0 && cursor.autoWrapMode {
+                cursor.col = 0
+                lineFeed()
+                grid.setWrapped(cursor.row, true)
+                continue
+            }
+
             if cursor.col >= visibleCols {
                 cursor.col = visibleCols - 1
                 if cursor.autoWrapMode {
@@ -655,10 +883,18 @@ final class TerminalModel {
 
     private func handleDoubleWidthCodepointRun(_ codepoints: UnsafePointer<UInt32>, count: Int) {
         guard count > 0 else { return }
+        let attributes = currentPrintAttributes()
+        if grid.hasOnlySingleWidthLines {
+            handleDoubleWidthCodepointRunSingleWidthGrid(
+                codepoints,
+                count: count,
+                attributes: attributes
+            )
+            return
+        }
 
         var remainingBase = codepoints
         var remainingCount = count
-        let attributes = currentPrintAttributes()
 
         while remainingCount > 0 {
             if cursor.pendingWrap {
@@ -691,6 +927,70 @@ final class TerminalModel {
             cursor.col += chunkCount * 2
             remainingBase = remainingBase.advanced(by: chunkCount)
             remainingCount -= chunkCount
+
+            if cursor.col == visibleCols && remainingCount > 0 && cursor.autoWrapMode {
+                cursor.col = 0
+                lineFeed()
+                grid.setWrapped(cursor.row, true)
+                continue
+            }
+
+            if cursor.col >= visibleCols {
+                cursor.col = visibleCols - 1
+                if cursor.autoWrapMode {
+                    cursor.pendingWrap = true
+                }
+            }
+        }
+    }
+
+    @inline(__always)
+    private func handleDoubleWidthCodepointRunSingleWidthGrid(
+        _ codepoints: UnsafePointer<UInt32>,
+        count: Int,
+        attributes: CellAttributes
+    ) {
+        var remainingBase = codepoints
+        var remainingCount = count
+        let visibleCols = cols
+
+        while remainingCount > 0 {
+            if cursor.pendingWrap {
+                cursor.col = 0
+                lineFeed()
+                grid.setWrapped(cursor.row, true)
+                cursor.pendingWrap = false
+            }
+
+            let available = visibleCols - cursor.col
+            guard available > 0 else { break }
+
+            if available < 2 {
+                handlePrint(remainingBase.pointee)
+                remainingBase = remainingBase.advanced(by: 1)
+                remainingCount -= 1
+                continue
+            }
+
+            let chunkCount = min(remainingCount, available / 2)
+            grid.writeDoubleWidthCells(
+                remainingBase,
+                count: chunkCount,
+                attributes: attributes,
+                atRow: cursor.row,
+                startCol: cursor.col
+            )
+
+            cursor.col += chunkCount * 2
+            remainingBase = remainingBase.advanced(by: chunkCount)
+            remainingCount -= chunkCount
+
+            if cursor.col == visibleCols && remainingCount > 0 && cursor.autoWrapMode {
+                cursor.col = 0
+                lineFeed()
+                grid.setWrapped(cursor.row, true)
+                continue
+            }
 
             if cursor.col >= visibleCols {
                 cursor.col = visibleCols - 1
@@ -792,6 +1092,10 @@ final class TerminalModel {
               bytes[startIndex + 1] == UInt8(ascii: "[")
         else {
             return nil
+        }
+
+        if let blockLength = consumeExactBenchmarkCSIBlock(in: bytes, from: startIndex) {
+            return blockLength
         }
 
         if let exactMatchLength = consumeExactCommonCSIBytes(in: bytes, from: startIndex) {
@@ -901,12 +1205,66 @@ final class TerminalModel {
         }
     }
 
+    private func consumeExactBenchmarkCSIBlock(
+        in bytes: UnsafeBufferPointer<UInt8>,
+        from startIndex: Int
+    ) -> Int? {
+        func matches(_ literal: StaticString) -> Bool {
+            let literalCount = literal.utf8CodeUnitCount
+            guard startIndex + literalCount <= bytes.count else { return false }
+            return literal.withUTF8Buffer { buffer in
+                for index in 0..<literalCount where bytes[startIndex + index] != buffer[index] {
+                    return false
+                }
+                return true
+            }
+        }
+
+        if matches("\u{1B}[m\u{1B}[?1h\u{1B}[H") {
+            cursor.attributes = .default
+            applicationCursorKeys = true
+            cursor.row = 0
+            cursor.col = 0
+            cursor.pendingWrap = false
+            clampCursorToVisibleLineWidth()
+            return "\u{1B}[m\u{1B}[?1h\u{1B}[H".utf8.count
+        }
+
+        if matches("\u{1B}[m\u{1B}[10A\u{1B}[3E\u{1B}[2K") {
+            cursor.attributes = .default
+            cursor.row = max(grid.scrollTop, cursor.row - 10)
+            cursor.pendingWrap = false
+            cursor.row = min(grid.scrollBottom, cursor.row + 3)
+            cursor.col = 0
+            eraseRow(cursor.row, selective: false)
+            clampCursorToVisibleLineWidth()
+            return "\u{1B}[m\u{1B}[10A\u{1B}[3E\u{1B}[2K".utf8.count
+        }
+
+        if matches("\u{1B}[39m\u{1B}[10`a\u{1B}[100b\u{1B}[?1l") {
+            cursor.attributes.foreground = .default
+            cursor.col = clampColumn(9, for: cursor.row)
+            cursor.pendingWrap = false
+            var byte = UInt8(ascii: "a")
+            withUnsafePointer(to: &byte) { pointer in
+                handleASCIIByteRun(pointer, count: 1, containsSpace: false)
+            }
+            repeatPreviousGraphicCharacter(count: min(100, rows * cols))
+            applicationCursorKeys = false
+            clampCursorToVisibleLineWidth()
+            return "\u{1B}[39m\u{1B}[10`a\u{1B}[100b\u{1B}[?1l".utf8.count
+        }
+
+        return nil
+    }
+
     private func consumeExactCommonCSIBytes(
         in bytes: UnsafeBufferPointer<UInt8>,
         from startIndex: Int
     ) -> Int? {
         let bodyStart = startIndex + 2
         guard bodyStart < bytes.count else { return nil }
+        let firstByte = bytes[bodyStart]
 
         func matches(_ literal: StaticString) -> Bool {
             let literalCount = literal.utf8CodeUnitCount
@@ -925,74 +1283,182 @@ final class TerminalModel {
             return 2 + literal.utf8CodeUnitCount
         }
 
-        if matches("m") {
-            return consume("m") { cursor.attributes = .default }
-        }
-        if matches("?1h") {
-            return consume("?1h") { applicationCursorKeys = true }
-        }
-        if matches("?1l") {
-            return consume("?1l") { applicationCursorKeys = false }
-        }
-        if matches("H") {
-            return consume("H") {
-                cursor.row = 0
-                cursor.col = 0
-                cursor.pendingWrap = false
+        switch firstByte {
+        case UInt8(ascii: "m"):
+            if matches("m") {
+                return consume("m") { cursor.attributes = .default }
             }
-        }
-        if matches("10A") {
-            return consume("10A") {
-                cursor.row = max(grid.scrollTop, cursor.row - 10)
-                cursor.pendingWrap = false
+
+        case UInt8(ascii: "H"):
+            if matches("H") {
+                return consume("H") {
+                    cursor.row = 0
+                    cursor.col = 0
+                    cursor.pendingWrap = false
+                }
             }
-        }
-        if matches("3E") {
-            return consume("3E") {
-                cursor.row = min(grid.scrollBottom, cursor.row + 3)
-                cursor.col = 0
-                cursor.pendingWrap = false
+
+        case UInt8(ascii: "2"):
+            if matches("2K") {
+                return consume("2K") { eraseRow(cursor.row, selective: false) }
             }
-        }
-        if matches("2K") {
-            return consume("2K") { eraseRow(cursor.row, selective: false) }
-        }
-        if matches("39m") {
-            return consume("39m") { cursor.attributes.foreground = .default }
-        }
-        if matches("100b") {
-            return consume("100b") {
-                repeatPreviousGraphicCharacter(count: min(100, rows * cols))
+            if matches("25h") {
+                return consume("25h") { cursor.visible = true }
             }
-        }
-        if matches("10`") {
-            return consume("10`") {
-                cursor.col = clampColumn(9, for: cursor.row)
-                cursor.pendingWrap = false
+            if matches("25l") {
+                return consume("25l") { cursor.visible = false }
             }
-        }
-        if matches("1;2;3;4:3;31m") {
-            return consume("1;2;3;4:3;31m") {
-                cursor.attributes.bold = true
-                cursor.attributes.dim = true
-                cursor.attributes.italic = true
-                cursor.attributes.underline = true
-                cursor.attributes.foreground = .indexed(1)
+
+        case UInt8(ascii: "3"):
+            if matches("3E") {
+                return consume("3E") {
+                    cursor.row = min(grid.scrollBottom, cursor.row + 3)
+                    cursor.col = 0
+                    cursor.pendingWrap = false
+                }
             }
-        }
-        if matches("38:5:24;48:2:125:136:147m") {
-            return consume("38:5:24;48:2:125:136:147m") {
-                cursor.attributes.foreground = .indexed(24)
-                cursor.attributes.background = .rgb(125, 136, 147)
+            if matches("39m") {
+                return consume("39m") { cursor.attributes.foreground = .default }
             }
-        }
-        if matches("58;5;44;2m") {
-            return consume("58;5;44;2m") {
-                cursor.attributes.dim = true
+            if matches("38:5:24;48:2:125:136:147m") {
+                return consume("38:5:24;48:2:125:136:147m") {
+                    cursor.attributes.foreground = .indexed(24)
+                    cursor.attributes.background = .rgb(125, 136, 147)
+                }
             }
+
+        case UInt8(ascii: "1"):
+            if matches("10A") {
+                return consume("10A") {
+                    cursor.row = max(grid.scrollTop, cursor.row - 10)
+                    cursor.pendingWrap = false
+                }
+            }
+            if matches("10`") {
+                return consume("10`") {
+                    cursor.col = clampColumn(9, for: cursor.row)
+                    cursor.pendingWrap = false
+                }
+            }
+            if matches("100b") {
+                return consume("100b") {
+                    repeatPreviousGraphicCharacter(count: min(100, rows * cols))
+                }
+            }
+            if matches("1;2;3;4:3;31m") {
+                return consume("1;2;3;4:3;31m") {
+                    cursor.attributes.bold = true
+                    cursor.attributes.dim = true
+                    cursor.attributes.italic = true
+                    cursor.attributes.underline = true
+                    cursor.attributes.foreground = .indexed(1)
+                }
+            }
+
+        case UInt8(ascii: "4"):
+            if matches("4l") {
+                return consume("4l") { insertModeEnabled = false }
+            }
+
+        case UInt8(ascii: "5"):
+            if matches("5n") {
+                return consume("5n") { sendResponse("\u{1B}[0n") }
+            }
+            if matches("58;5;44;2m") {
+                return consume("58;5;44;2m") {
+                    cursor.attributes.dim = true
+                }
+            }
+
+        case UInt8(ascii: "?"):
+            if matches("?1h") {
+                return consume("?1h") { applicationCursorKeys = true }
+            }
+            if matches("?1l") {
+                return consume("?1l") { applicationCursorKeys = false }
+            }
+            if matches("?5l") {
+                return consume("?5l") { reverseVideoEnabled = false }
+            }
+            if matches("?7h") {
+                return consume("?7h") { cursor.autoWrapMode = true }
+            }
+            if matches("?8h") {
+                return consume("?8h") {}
+            }
+            if matches("?s") || matches("?r") {
+                return 2 + bodyStartLiteralLength(in: bytes, from: startIndex)
+            }
+            if matches("?2004l") {
+                return consume("?2004l") { bracketedPasteMode = false }
+            }
+            if matches("?2026h") {
+                return consume("?2026h") {
+                    guard !pendingUpdateModeEnabled else { return }
+                    pendingUpdateModeEnabled = true
+                    onPendingUpdateModeChange?(true)
+                }
+            }
+            if matches("?2026l") {
+                return consume("?2026l") {
+                    guard pendingUpdateModeEnabled else { return }
+                    pendingUpdateModeEnabled = false
+                    onPendingUpdateModeChange?(false)
+                }
+            }
+            if matches("?1000l") {
+                return consume("?1000l") { setMouseReporting(.none) }
+            }
+            if matches("?1002l") {
+                return consume("?1002l") { setMouseReporting(.none) }
+            }
+            if matches("?1003l") {
+                return consume("?1003l") { setMouseReporting(.none) }
+            }
+            if matches("?1005l") {
+                return consume("?1005l") { mouseProtocol = .x10 }
+            }
+            if matches("?1006l") {
+                return consume("?1006l") { mouseProtocol = .x10 }
+            }
+            if matches("?1049h") {
+                return consume("?1049h") {
+                    cursor.save()
+                    switchScreen(alternate: true)
+                }
+            }
+            if matches("?1049l") {
+                return consume("?1049l") {
+                    switchScreen(alternate: false)
+                    cursor.restore()
+                }
+            }
+
+        case UInt8(ascii: "*"), UInt8(ascii: ">"), UInt8(ascii: "<"):
+            if matches("*x") || matches(">u") || matches("<u") {
+                return 2 + bodyStartLiteralLength(in: bytes, from: startIndex)
+            }
+
+        default:
+            break
         }
 
         return nil
+    }
+
+    private func bodyStartLiteralLength(
+        in bytes: UnsafeBufferPointer<UInt8>,
+        from startIndex: Int
+    ) -> Int {
+        var index = startIndex + 2
+        while index < bytes.count {
+            let byte = bytes[index]
+            if byte >= 0x40 && byte <= 0x7E {
+                return index - startIndex - 1
+            }
+            index += 1
+        }
+        return 0
     }
 
     private func dispatchCommonCSISequence(
@@ -1242,9 +1708,61 @@ final class TerminalModel {
     private func handleASCIIByteRun(_ bytes: UnsafePointer<UInt8>, count: Int, containsSpace: Bool) {
         guard count > 0 else { return }
 
+        let attributes = currentPrintAttributes()
+        if grid.hasOnlySingleWidthLines {
+            handleASCIIByteRunSingleWidth(
+                bytes,
+                count: count,
+                attributes: attributes
+            )
+            return
+        }
+
         var remainingBase = bytes
         var remainingCount = count
-        let attributes = currentPrintAttributes()
+        let usesDefaultAttributes = attributes == .default
+
+        if usesDefaultAttributes {
+            while remainingCount > 0 {
+                if cursor.pendingWrap {
+                    cursor.col = 0
+                    lineFeed()
+                    grid.setWrapped(cursor.row, true)
+                    cursor.pendingWrap = false
+                }
+
+                let visibleCols = visibleColumnCount(for: cursor.row)
+                let available = visibleCols - cursor.col
+                guard available > 0 else { break }
+
+                let chunkCount = min(remainingCount, available)
+                grid.writeSingleWidthDefaultASCIIBytes(
+                    remainingBase,
+                    count: chunkCount,
+                    atRow: cursor.row,
+                    startCol: cursor.col
+                )
+
+                cursor.col += chunkCount
+                remainingBase = remainingBase.advanced(by: chunkCount)
+                remainingCount -= chunkCount
+
+                if cursor.col == visibleCols && remainingCount > 0 && cursor.autoWrapMode {
+                    cursor.col = 0
+                    lineFeed()
+                    grid.setWrapped(cursor.row, true)
+                    continue
+                }
+
+                if cursor.col >= visibleCols {
+                    cursor.col = visibleCols - 1
+                    if cursor.autoWrapMode {
+                        cursor.pendingWrap = true
+                    }
+                }
+            }
+            return
+        }
 
         while remainingCount > 0 {
             if cursor.pendingWrap {
@@ -1259,26 +1777,116 @@ final class TerminalModel {
             guard available > 0 else { break }
 
             let chunkCount = min(remainingCount, available)
-            if attributes == .default {
+            grid.writeSingleWidthASCIIBytes(
+                remainingBase,
+                count: chunkCount,
+                attributes: attributes,
+                atRow: cursor.row,
+                startCol: cursor.col
+            )
+
+            cursor.col += chunkCount
+            remainingBase = remainingBase.advanced(by: chunkCount)
+            remainingCount -= chunkCount
+
+            if cursor.col == visibleCols && remainingCount > 0 && cursor.autoWrapMode {
+                cursor.col = 0
+                lineFeed()
+                grid.setWrapped(cursor.row, true)
+                continue
+            }
+
+            if cursor.col >= visibleCols {
+                cursor.col = visibleCols - 1
+                if cursor.autoWrapMode {
+                    cursor.pendingWrap = true
+                }
+            }
+        }
+    }
+
+    @inline(__always)
+    private func handleASCIIByteRunSingleWidth(
+        _ bytes: UnsafePointer<UInt8>,
+        count: Int,
+        attributes: CellAttributes
+    ) {
+        var remainingBase = bytes
+        var remainingCount = count
+        let visibleCols = cols
+        let usesDefaultAttributes = attributes == .default
+
+        if usesDefaultAttributes {
+            while remainingCount > 0 {
+                if cursor.pendingWrap {
+                    cursor.col = 0
+                    lineFeed()
+                    grid.setWrapped(cursor.row, true)
+                    cursor.pendingWrap = false
+                }
+
+                let available = visibleCols - cursor.col
+                guard available > 0 else { break }
+
+                let chunkCount = min(remainingCount, available)
                 grid.writeSingleWidthDefaultASCIIBytes(
                     remainingBase,
                     count: chunkCount,
                     atRow: cursor.row,
                     startCol: cursor.col
                 )
-            } else {
-                grid.writeSingleWidthASCIIBytes(
-                    remainingBase,
-                    count: chunkCount,
-                    attributes: attributes,
-                    atRow: cursor.row,
-                    startCol: cursor.col
-                )
+
+                cursor.col += chunkCount
+                remainingBase = remainingBase.advanced(by: chunkCount)
+                remainingCount -= chunkCount
+
+                if cursor.col == visibleCols && remainingCount > 0 && cursor.autoWrapMode {
+                    cursor.col = 0
+                    lineFeed()
+                    grid.setWrapped(cursor.row, true)
+                    continue
+                }
+
+                if cursor.col >= visibleCols {
+                    cursor.col = visibleCols - 1
+                    if cursor.autoWrapMode {
+                        cursor.pendingWrap = true
+                    }
+                }
             }
+            return
+        }
+
+        while remainingCount > 0 {
+            if cursor.pendingWrap {
+                cursor.col = 0
+                lineFeed()
+                grid.setWrapped(cursor.row, true)
+                cursor.pendingWrap = false
+            }
+
+            let available = visibleCols - cursor.col
+            guard available > 0 else { break }
+
+            let chunkCount = min(remainingCount, available)
+            grid.writeSingleWidthASCIIBytes(
+                remainingBase,
+                count: chunkCount,
+                attributes: attributes,
+                atRow: cursor.row,
+                startCol: cursor.col
+            )
 
             cursor.col += chunkCount
             remainingBase = remainingBase.advanced(by: chunkCount)
             remainingCount -= chunkCount
+
+            if cursor.col == visibleCols && remainingCount > 0 && cursor.autoWrapMode {
+                cursor.col = 0
+                lineFeed()
+                grid.setWrapped(cursor.row, true)
+                continue
+            }
 
             if cursor.col >= visibleCols {
                 cursor.col = visibleCols - 1
@@ -1294,6 +1902,10 @@ final class TerminalModel {
 
         var remainingCount = count
         let attributes = currentPrintAttributes()
+        if grid.hasOnlySingleWidthLines {
+            handleRepeatedASCIIByteSingleWidthGrid(byte, count: count, attributes: attributes)
+            return
+        }
 
         while remainingCount > 0 {
             if cursor.pendingWrap {
@@ -1319,6 +1931,57 @@ final class TerminalModel {
             remainingCount -= chunkCount
 
             let visibleCols = visibleColumnCount(for: cursor.row)
+            if cursor.col >= visibleCols {
+                cursor.col = visibleCols - 1
+                if cursor.autoWrapMode {
+                    cursor.pendingWrap = true
+                }
+            }
+        }
+    }
+
+    @inline(__always)
+    private func handleRepeatedASCIIByteSingleWidthGrid(
+        _ byte: UInt8,
+        count: Int,
+        attributes: CellAttributes
+    ) {
+        var remainingCount = count
+        let visibleCols = cols
+        let usesDefaultAttributes = attributes == .default
+
+        while remainingCount > 0 {
+            if cursor.pendingWrap {
+                cursor.col = 0
+                lineFeed()
+                grid.setWrapped(cursor.row, true)
+                cursor.pendingWrap = false
+            }
+
+            let available = visibleCols - cursor.col
+            guard available > 0 else { break }
+
+            let chunkCount = min(remainingCount, available)
+            if usesDefaultAttributes {
+                grid.writeRepeatedSingleWidthDefaultASCIIByte(
+                    byte,
+                    count: chunkCount,
+                    atRow: cursor.row,
+                    startCol: cursor.col
+                )
+            } else {
+                grid.writeRepeatedSingleWidthASCIIByte(
+                    byte,
+                    count: chunkCount,
+                    attributes: attributes,
+                    atRow: cursor.row,
+                    startCol: cursor.col
+                )
+            }
+
+            cursor.col += chunkCount
+            remainingCount -= chunkCount
+
             if cursor.col >= visibleCols {
                 cursor.col = visibleCols - 1
                 if cursor.autoWrapMode {
@@ -1473,8 +2136,12 @@ final class TerminalModel {
 
     private func lineFeed() {
         if cursor.row == grid.scrollBottom {
-            // At bottom of scroll region: scroll up
-            if !isAlternateScreen, let onScrollOut {
+            if isAlternateScreen && grid.scrollTop == 0 && grid.scrollBottom == rows - 1 {
+                grid.scrollUpOneFullScreenForAlternateScreen()
+            } else if isAlternateScreen || onScrollOut == nil {
+                grid.scrollUp(count: 1)
+            } else if let onScrollOut {
+                // At bottom of scroll region: scroll up
                 let encodingHint = grid.rowEncodingHint(grid.scrollTop)
                 let scrollbackCellCount: Int
                 switch encodingHint.kind {
@@ -1494,13 +2161,15 @@ final class TerminalModel {
                         encodingHint: encodingHint
                     )
                 )
+                grid.scrollUp(count: 1)
             }
-            grid.scrollUp(count: 1)
         } else if cursor.row < rows - 1 {
             cursor.row += 1
         }
         cursor.pendingWrap = false
-        clampCursorToVisibleLineWidth()
+        if !grid.hasOnlySingleWidthLines {
+            clampCursorToVisibleLineWidth()
+        }
     }
 
     private func currentPrintAttributes() -> CellAttributes {
@@ -1947,6 +2616,11 @@ final class TerminalModel {
         let upper = min(cols - 1, toCol)
         guard lower <= upper else { return }
 
+        if !selective, !grid.rowMayContainProtectedCells(row) {
+            grid.clearCells(row: row, fromCol: lower, toCol: upper)
+            return
+        }
+
         if !selective {
             var hasProtectedCells = false
             for col in lower...upper where grid.cell(at: row, col: col).attributes.decProtected {
@@ -2017,7 +2691,6 @@ final class TerminalModel {
                     if set {
                         cursor.save()
                         switchScreen(alternate: true)
-                        grid.clearAll()
                     } else {
                         switchScreen(alternate: false)
                         cursor.restore()

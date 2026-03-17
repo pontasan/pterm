@@ -1366,6 +1366,59 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertEqual(bulkCursor.2, byteWiseCursor.2)
     }
 
+    func testDebugProcessPTYOutputMatchesByteWiseProcessingForKittyBenchmarkSetupAndTeardown() {
+        let bulk = makeController(rows: 24, cols: 80)
+        let byteWise = makeController(rows: 24, cols: 80)
+        let payloadString =
+            "\u{1B}7\u{1B}[?s\u{1B}[*x\u{1B}[4l\u{1B}[?1l\u{1B}[?5l\u{1B}[?2004l"
+            + "\u{1B}[?1000l\u{1B}[?1002l\u{1B}[?1003l\u{1B}[?1005l\u{1B}[?1006l"
+            + "\u{1B}[?8h\u{1B}[?7h\u{1B}[?25h\u{1B}[?1049h\u{1B}[H\u{1B}[2J\u{1B}[>u\u{1B}[?25l"
+            + "Running: Warmup\r\n"
+            + "\u{1B}[?2026h"
+            + "abc"
+            + "\u{1B}[?2026l\u{1B}[5n"
+            + "\u{1B}[<u\u{1B}[?1049l\u{1B}[?r"
+        let payload = Data(payloadString.utf8)
+
+        bulk.debugProcessPTYOutputForTesting(payload)
+        for byte in payload {
+            byteWise.debugProcessPTYOutputForTesting(Data([byte]))
+        }
+
+        XCTAssertEqual(bulk.allText(), byteWise.allText())
+        let bulkCursor = bulk.withModel { ($0.cursor.row, $0.cursor.col, $0.cursor.visible) }
+        let byteWiseCursor = byteWise.withModel { ($0.cursor.row, $0.cursor.col, $0.cursor.visible) }
+        XCTAssertEqual(bulkCursor.0, byteWiseCursor.0)
+        XCTAssertEqual(bulkCursor.1, byteWiseCursor.1)
+        XCTAssertEqual(bulkCursor.2, byteWiseCursor.2)
+    }
+
+    func testDebugProcessPTYOutputMatchesByteWiseProcessingForKittyGraphicsPayload() {
+        let bulk = makeController(rows: 24, cols: 80)
+        let byteWise = makeController(rows: 24, cols: 80)
+        let imageChunk = String(repeating: "QUJDREVGR0g=", count: 256)
+        let payloadString =
+            "\u{1B}[?2026h"
+            + "Running: Images\r\n"
+            + "\u{1B}_Ga=T,f=100,t=d;"
+            + imageChunk
+            + "\u{1B}\\"
+            + "\u{1B}[?2026l\u{1B}[5n"
+        let payload = Data(payloadString.utf8)
+
+        bulk.debugProcessPTYOutputForTesting(payload)
+        for byte in payload {
+            byteWise.debugProcessPTYOutputForTesting(Data([byte]))
+        }
+
+        XCTAssertEqual(bulk.allText(), byteWise.allText())
+        let bulkState = bulk.withModel { ($0.cursor.row, $0.cursor.col, $0.cursor.visible) }
+        let byteWiseState = byteWise.withModel { ($0.cursor.row, $0.cursor.col, $0.cursor.visible) }
+        XCTAssertEqual(bulkState.0, byteWiseState.0)
+        XCTAssertEqual(bulkState.1, byteWiseState.1)
+        XCTAssertEqual(bulkState.2, byteWiseState.2)
+    }
+
     func testAlternateScreenScrollDoesNotAppendScrollback() {
         let controller = makeController(rows: 3, cols: 6)
         let payload = Data(("\u{1B}[?1049h" + "1\n2\n3\n4\n5\n").utf8)

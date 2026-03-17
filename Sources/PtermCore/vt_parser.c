@@ -48,6 +48,193 @@ static inline bool osc_command_should_capture(uint32_t command, bool has_digits)
     }
 }
 
+static inline bool bytes_have_high_bit_set(const uint8_t *bytes, size_t count) {
+    if (!bytes || count == 0) return false;
+
+    const size_t word_mask = ~(size_t)0 / 0xFF;
+    const size_t high_bit_mask = word_mask << 7;
+
+    while (count > 0 && ((uintptr_t)bytes & (sizeof(size_t) - 1)) != 0) {
+        if (*bytes & 0x80) return true;
+        bytes++;
+        count--;
+    }
+
+    const size_t *words = (const size_t *)bytes;
+    while (count >= sizeof(size_t)) {
+        if ((*words & high_bit_mask) != 0) return true;
+        words++;
+        count -= sizeof(size_t);
+    }
+
+    bytes = (const uint8_t *)words;
+    while (count-- > 0) {
+        if (*bytes & 0x80) return true;
+        bytes++;
+    }
+    return false;
+}
+
+static inline bool word_has_zero_byte(size_t word) {
+    const size_t ones = ~(size_t)0 / 0xFF;
+    const size_t high_bits = ones << 7;
+    return ((word - ones) & ~word & high_bits) != 0;
+}
+
+static inline bool word_has_non_printable_ascii(size_t word) {
+    const size_t ones = ~(size_t)0 / 0xFF;
+    const size_t high_bits = ones << 7;
+
+    if ((word & high_bits) != 0) {
+        return true;
+    }
+
+    const size_t spaces = ones * 0x20;
+    if (((word - spaces) & ~word & high_bits) != 0) {
+        return true;
+    }
+
+    return word_has_zero_byte(word ^ (ones * 0x7F));
+}
+
+static inline bool word_has_non_text_ascii(size_t word) {
+    if (!word_has_non_printable_ascii(word)) {
+        return false;
+    }
+
+    const uint8_t *bytes = (const uint8_t *)&word;
+    for (size_t i = 0; i < sizeof(size_t); i++) {
+        const uint8_t byte = bytes[i];
+        if ((byte >= 0x20 && byte < 0x7F) || byte == 0x09 || byte == 0x0A || byte == 0x0D) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+typedef enum {
+    ASCII_SCAN_INCOMPLETE = 0,
+    ASCII_SCAN_BEL,
+    ASCII_SCAN_ST,
+    ASCII_SCAN_ESCAPE,
+    ASCII_SCAN_NON_ASCII,
+} AsciiStringScanResult;
+
+static AsciiStringScanResult scan_ascii_string_payload(
+    const uint8_t *bytes,
+    size_t count,
+    bool allow_bel,
+    size_t *terminator_index
+) {
+    size_t index = 0;
+
+    while (index < count) {
+        const uint8_t *cursor = bytes + index;
+        size_t remaining = count - index;
+        const uint8_t *esc = memchr(cursor, 0x1B, remaining);
+        const uint8_t *bel = allow_bel ? memchr(cursor, 0x07, remaining) : NULL;
+        const uint8_t *next = NULL;
+
+        if (esc && bel) {
+            next = esc < bel ? esc : bel;
+        } else {
+            next = esc ? esc : bel;
+        }
+
+        size_t span = next ? (size_t)(next - cursor) : remaining;
+        if (bytes_have_high_bit_set(cursor, span)) {
+            return ASCII_SCAN_NON_ASCII;
+        }
+        index += span;
+
+        if (!next) {
+            return ASCII_SCAN_INCOMPLETE;
+        }
+
+        if (*next == 0x07) {
+            if (terminator_index) *terminator_index = index;
+            return ASCII_SCAN_BEL;
+        }
+
+        if (index + 1 >= count) {
+            if (terminator_index) *terminator_index = index;
+            return ASCII_SCAN_INCOMPLETE;
+        }
+        if (bytes[index + 1] == '\\') {
+            if (terminator_index) *terminator_index = index;
+            return ASCII_SCAN_ST;
+        }
+
+        if (terminator_index) *terminator_index = index;
+        return ASCII_SCAN_ESCAPE;
+    }
+
+    return ASCII_SCAN_INCOMPLETE;
+}
+
+size_t vt_parser_scan_printable_ascii_prefix(
+    const uint8_t *bytes,
+    size_t count
+) {
+    if (!bytes || count == 0) return 0;
+
+    size_t index = 0;
+    while (index < count && ((uintptr_t)(bytes + index) & (sizeof(size_t) - 1)) != 0) {
+        uint8_t byte = bytes[index];
+        if (byte < 0x20 || byte >= 0x7F) return index;
+        index++;
+    }
+
+    while (index + sizeof(size_t) <= count) {
+        size_t word;
+        memcpy(&word, bytes + index, sizeof(word));
+        if (word_has_non_printable_ascii(word)) break;
+        index += sizeof(size_t);
+    }
+
+    while (index < count) {
+        uint8_t byte = bytes[index];
+        if (byte < 0x20 || byte >= 0x7F) break;
+        index++;
+    }
+
+    return index;
+}
+
+size_t vt_parser_scan_text_ascii_prefix(
+    const uint8_t *bytes,
+    size_t count
+) {
+    if (!bytes || count == 0) return 0;
+
+    size_t index = 0;
+    while (index < count && ((uintptr_t)(bytes + index) & (sizeof(size_t) - 1)) != 0) {
+        uint8_t byte = bytes[index];
+        if (!((byte >= 0x20 && byte < 0x7F) || byte == 0x09 || byte == 0x0A || byte == 0x0D)) {
+            return index;
+        }
+        index++;
+    }
+
+    while (index + sizeof(size_t) <= count) {
+        size_t word;
+        memcpy(&word, bytes + index, sizeof(word));
+        if (word_has_non_text_ascii(word)) break;
+        index += sizeof(size_t);
+    }
+
+    while (index < count) {
+        uint8_t byte = bytes[index];
+        if (!((byte >= 0x20 && byte < 0x7F) || byte == 0x09 || byte == 0x0A || byte == 0x0D)) {
+            break;
+        }
+        index++;
+    }
+
+    return index;
+}
+
 static void parser_string_put(VtParser *parser, uint8_t byte) {
     if (parser->string_len >= VT_PARSER_MAX_STRING) {
         parser->string_overflow = true;
@@ -543,113 +730,93 @@ size_t vt_parser_consume_ascii_ignored_string_fast_path(
             parser->osc_ignore_payload = true;
             index++;
 
-            for (; index < count; index++) {
-                const uint8_t byte = bytes[index];
-                if (byte == 0x07) {
+            size_t terminator_index = 0;
+            switch (scan_ascii_string_payload(bytes + index, count - index, true, &terminator_index)) {
+                case ASCII_SCAN_BEL:
                     emit(parser, VT_ACTION_OSC_END, 0);
                     parser->state = VT_STATE_GROUND;
-                    return index + 1;
-                }
-                if (byte == 0x1B) {
-                    if (index + 1 >= count) {
-                        return index;
-                    }
-                    if (bytes[index + 1] == '\\') {
-                        emit(parser, VT_ACTION_OSC_END, 0);
-                        parser_clear(parser);
-                        parser->state = VT_STATE_GROUND;
-                        return index + 2;
-                    }
+                    return index + terminator_index + 1;
+                case ASCII_SCAN_ST:
+                    emit(parser, VT_ACTION_OSC_END, 0);
+                    parser_clear(parser);
+                    parser->state = VT_STATE_GROUND;
+                    return index + terminator_index + 2;
+                case ASCII_SCAN_ESCAPE:
                     emit(parser, VT_ACTION_OSC_END, 0);
                     parser_clear(parser);
                     parser->state = VT_STATE_ESCAPE;
-                    return index + 1;
-                }
-                if (byte >= 0x80) {
+                    return index + terminator_index + 1;
+                case ASCII_SCAN_NON_ASCII:
                     return 0;
-                }
+                case ASCII_SCAN_INCOMPLETE:
+                    return count;
             }
-            return count;
         }
 
         if (bytes[1] == 'X' || bytes[1] == '^' || bytes[1] == '_') {
             parser->state = VT_STATE_SOS_PM_APC_STRING;
-            for (size_t i = 2; i < count; i++) {
-                const uint8_t byte = bytes[i];
-                if (byte == 0x1B) {
-                    if (i + 1 >= count) {
-                        return i;
-                    }
-                    if (bytes[i + 1] == '\\') {
-                        parser_clear(parser);
-                        parser->state = VT_STATE_GROUND;
-                        return i + 2;
-                    }
+            size_t terminator_index = 0;
+            switch (scan_ascii_string_payload(bytes + 2, count - 2, false, &terminator_index)) {
+                case ASCII_SCAN_ST:
+                    parser_clear(parser);
+                    parser->state = VT_STATE_GROUND;
+                    return 2 + terminator_index + 2;
+                case ASCII_SCAN_ESCAPE:
                     parser_clear(parser);
                     parser->state = VT_STATE_ESCAPE;
-                    return i + 1;
-                }
-                if (byte >= 0x80) {
+                    return 2 + terminator_index + 1;
+                case ASCII_SCAN_NON_ASCII:
                     return 0;
-                }
+                case ASCII_SCAN_BEL:
+                case ASCII_SCAN_INCOMPLETE:
+                    return count;
             }
-            return count;
         }
     }
 
     if (parser->state == VT_STATE_OSC_STRING &&
         parser->osc_saw_separator &&
         parser->osc_ignore_payload) {
-        for (size_t i = 0; i < count; i++) {
-            const uint8_t byte = bytes[i];
-            if (byte == 0x07) {
+        size_t terminator_index = 0;
+        switch (scan_ascii_string_payload(bytes, count, true, &terminator_index)) {
+            case ASCII_SCAN_BEL:
                 emit(parser, VT_ACTION_OSC_END, 0);
                 parser->state = VT_STATE_GROUND;
-                return i + 1;
-            }
-            if (byte == 0x1B) {
-                if (i + 1 >= count) {
-                    return i;
-                }
-                if (bytes[i + 1] == '\\') {
-                    emit(parser, VT_ACTION_OSC_END, 0);
-                    parser_clear(parser);
-                    parser->state = VT_STATE_GROUND;
-                    return i + 2;
-                }
+                return terminator_index + 1;
+            case ASCII_SCAN_ST:
+                emit(parser, VT_ACTION_OSC_END, 0);
+                parser_clear(parser);
+                parser->state = VT_STATE_GROUND;
+                return terminator_index + 2;
+            case ASCII_SCAN_ESCAPE:
                 emit(parser, VT_ACTION_OSC_END, 0);
                 parser_clear(parser);
                 parser->state = VT_STATE_ESCAPE;
-                return i + 1;
-            }
-            if (byte >= 0x80) {
+                return terminator_index + 1;
+            case ASCII_SCAN_NON_ASCII:
                 return 0;
-            }
+            case ASCII_SCAN_INCOMPLETE:
+                return count;
         }
-        return count;
     }
 
     if (parser->state == VT_STATE_SOS_PM_APC_STRING) {
-        for (size_t i = 0; i < count; i++) {
-            const uint8_t byte = bytes[i];
-            if (byte == 0x1B) {
-                if (i + 1 >= count) {
-                    return i;
-                }
-                if (bytes[i + 1] == '\\') {
-                    parser_clear(parser);
-                    parser->state = VT_STATE_GROUND;
-                    return i + 2;
-                }
+        size_t terminator_index = 0;
+        switch (scan_ascii_string_payload(bytes, count, false, &terminator_index)) {
+            case ASCII_SCAN_ST:
+                parser_clear(parser);
+                parser->state = VT_STATE_GROUND;
+                return terminator_index + 2;
+            case ASCII_SCAN_ESCAPE:
                 parser_clear(parser);
                 parser->state = VT_STATE_ESCAPE;
-                return i + 1;
-            }
-            if (byte >= 0x80) {
+                return terminator_index + 1;
+            case ASCII_SCAN_NON_ASCII:
                 return 0;
-            }
+            case ASCII_SCAN_BEL:
+            case ASCII_SCAN_INCOMPLETE:
+                return count;
         }
-        return count;
     }
 
     return 0;

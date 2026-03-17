@@ -16,7 +16,7 @@ final class TerminalGrid {
         case dirty
     }
 
-    private static let defaultASCIICells: [Cell] = (0..<128).map { byte in
+    private static let defaultASCIIByteCells: [Cell] = (0..<128).map { byte in
         if byte == 0x20 {
             return .empty
         }
@@ -53,6 +53,7 @@ final class TerminalGrid {
     private var physicalWrappedFlags: [Bool]
     private var physicalLineAttributes: [TerminalLineAttribute]
     private var nonSingleWidthLineCount: Int
+    private var physicalMayContainProtectedCells: [Bool]
     /// Blank rows are tracked as metadata so scroll-heavy workloads can expose
     /// fresh empty rows without touching `cols` cells on every line feed.
     /// Writers materialize the row lazily before mutating individual cells.
@@ -88,6 +89,7 @@ final class TerminalGrid {
         self.physicalWrappedFlags = Array(repeating: false, count: rows)
         self.physicalLineAttributes = Array(repeating: .singleWidth, count: rows)
         self.nonSingleWidthLineCount = 0
+        self.physicalMayContainProtectedCells = Array(repeating: false, count: rows)
         self.physicalBlankRows = Array(repeating: true, count: rows)
         self.physicalSparseCompactDefaultPrefixCounts = Array(repeating: 0, count: rows)
     }
@@ -113,8 +115,12 @@ final class TerminalGrid {
     /// Set cell at (row, col). No-op if out of bounds.
     func setCell(_ cell: Cell, at row: Int, col: Int) {
         guard row >= 0, row < rows, col >= 0, col < cols else { return }
-        materializeRowIfNeeded(row)
-        cells[cellIndex(row: row, col: col)] = cell
+        let physicalRow = physicalRow(for: row)
+        materializePhysicalRowIfNeeded(physicalRow)
+        if cell.attributes.decProtected {
+            physicalMayContainProtectedCells[physicalRow] = true
+        }
+        cells[physicalRow * cols + col] = cell
         guard tracksPreciseRowEncodingHints else { return }
         markRowEncodingHintDirty(row)
     }
@@ -145,38 +151,12 @@ final class TerminalGrid {
         startCol: Int
     ) {
         guard count > 0 else { return }
-        materializeRowIfNeeded(row)
-        let offset = rowBaseOffset(for: row) + startCol
-        if count == 1 {
-            cells[offset] = Cell(
-                codepoint: codepoints[0],
-                attributes: attributes,
-                width: 1,
-                isWideContinuation: false
-            )
-            guard tracksPreciseRowEncodingHints else {
-                markRowEncodingHintDirty(row)
-                return
-            }
-            updateCompactDefaultHintIfPossible(
-                row: row,
-                startCol: startCol,
-                scalarProvider: { codepoints[$0] },
-                count: 1,
-                attributes: attributes
-            )
-            return
-        }
-        cells.withUnsafeMutableBufferPointer { buffer in
-            guard let destinationBase = buffer.baseAddress?.advanced(by: offset) else { return }
-            for index in 0..<count {
-                destinationBase[index] = Cell(
-                    codepoint: codepoints[index],
-                    attributes: attributes,
-                    width: 1,
-                    isWideContinuation: false
-                )
-            }
+        let physicalRow = physicalRow(for: row)
+        materializePhysicalRowIfNeeded(physicalRow)
+        let offset = physicalRow * cols + startCol
+        initializeSingleWidthCells(at: offset, codepoints: codepoints, count: count, attributes: attributes)
+        if attributes.decProtected {
+            physicalMayContainProtectedCells[physicalRow] = true
         }
         guard tracksPreciseRowEncodingHints else {
             markRowEncodingHintDirty(row)
@@ -199,38 +179,12 @@ final class TerminalGrid {
         startCol: Int
     ) {
         guard count > 0 else { return }
-        materializeRowIfNeeded(row)
-        let offset = rowBaseOffset(for: row) + startCol
-        if count == 1 {
-            cells[offset] = Cell(
-                codepoint: UInt32(bytes[0]),
-                attributes: attributes,
-                width: 1,
-                isWideContinuation: false
-            )
-            guard tracksPreciseRowEncodingHints else {
-                markRowEncodingHintDirty(row)
-                return
-            }
-            updateCompactDefaultHintIfPossible(
-                row: row,
-                startCol: startCol,
-                scalarProvider: { UInt32(bytes[$0]) },
-                count: 1,
-                attributes: attributes
-            )
-            return
-        }
-        cells.withUnsafeMutableBufferPointer { buffer in
-            guard let destinationBase = buffer.baseAddress?.advanced(by: offset) else { return }
-            for index in 0..<count {
-                destinationBase[index] = Cell(
-                    codepoint: UInt32(bytes[index]),
-                    attributes: attributes,
-                    width: 1,
-                    isWideContinuation: false
-                )
-            }
+        let physicalRow = physicalRow(for: row)
+        materializePhysicalRowIfNeeded(physicalRow)
+        let offset = physicalRow * cols + startCol
+        initializeSingleWidthASCIIBytes(at: offset, bytes: bytes, count: count, attributes: attributes)
+        if attributes.decProtected {
+            physicalMayContainProtectedCells[physicalRow] = true
         }
         guard tracksPreciseRowEncodingHints else {
             markRowEncodingHintDirty(row)
@@ -258,27 +212,17 @@ final class TerminalGrid {
         let canExtendSparseFastPath = priorSparsePrefixCount > 0 && startCol == priorSparsePrefixCount
 
         if canUseSparseFastPath || canExtendSparseFastPath {
-            let offset = rowBaseOffset(for: row) + startCol
-            cells.withUnsafeMutableBufferPointer { buffer in
-                guard let destinationBase = buffer.baseAddress?.advanced(by: offset) else { return }
-                for index in 0..<count {
-                    destinationBase[index] = Self.defaultASCIICells[Int(bytes[index])]
-                }
-            }
+            let offset = physicalRow * cols + startCol
+            initializeDefaultASCIIBytes(at: offset, bytes: bytes, count: count)
             physicalBlankRows[physicalRow] = false
             physicalSparseCompactDefaultPrefixCounts[physicalRow] = startCol + count
             rowEncodingHintStates[physicalRow] = .compactDefault(serializedCount: startCol + count)
             return
         }
 
-        materializeRowIfNeeded(row)
-        let offset = rowBaseOffset(for: row) + startCol
-        cells.withUnsafeMutableBufferPointer { buffer in
-            guard let destinationBase = buffer.baseAddress?.advanced(by: offset) else { return }
-            for index in 0..<count {
-                destinationBase[index] = Self.defaultASCIICells[Int(bytes[index])]
-            }
-        }
+        materializePhysicalRowIfNeeded(physicalRow)
+        let offset = physicalRow * cols + startCol
+        initializeDefaultASCIIBytes(at: offset, bytes: bytes, count: count)
 
         switch rowEncodingHintStates[physicalRow] {
         case .dirty:
@@ -316,19 +260,18 @@ final class TerminalGrid {
             return
         }
 
-        materializeRowIfNeeded(row)
-        let offset = rowBaseOffset(for: row) + startCol
+        let physicalRow = physicalRow(for: row)
+        materializePhysicalRowIfNeeded(physicalRow)
+        let offset = physicalRow * cols + startCol
         let cell = Cell(
             codepoint: UInt32(byte),
             attributes: attributes,
             width: 1,
             isWideContinuation: false
         )
-        cells.withUnsafeMutableBufferPointer { buffer in
-            guard let destinationBase = buffer.baseAddress?.advanced(by: offset) else { return }
-            for index in 0..<count {
-                destinationBase[index] = cell
-            }
+        fillCells(cell, count: count, at: offset)
+        if attributes.decProtected {
+            physicalMayContainProtectedCells[physicalRow] = true
         }
         guard tracksPreciseRowEncodingHints else {
             markRowEncodingHintDirty(row)
@@ -354,30 +297,20 @@ final class TerminalGrid {
         let priorSparsePrefixCount = physicalSparseCompactDefaultPrefixCounts[physicalRow]
         let canUseSparseFastPath = startCol == 0 && isPhysicalRowBlank(physicalRow)
         let canExtendSparseFastPath = priorSparsePrefixCount > 0 && startCol == priorSparsePrefixCount
-        let cell = Self.defaultASCIICells[Int(byte)]
+        let cell = Self.defaultASCIIByteCells[Int(byte)]
 
         if canUseSparseFastPath || canExtendSparseFastPath {
-            let offset = rowBaseOffset(for: row) + startCol
-            cells.withUnsafeMutableBufferPointer { buffer in
-                guard let destinationBase = buffer.baseAddress?.advanced(by: offset) else { return }
-                for index in 0..<count {
-                    destinationBase[index] = cell
-                }
-            }
+            let offset = physicalRow * cols + startCol
+            fillCells(cell, count: count, at: offset)
             physicalBlankRows[physicalRow] = false
             physicalSparseCompactDefaultPrefixCounts[physicalRow] = startCol + count
             rowEncodingHintStates[physicalRow] = .compactDefault(serializedCount: startCol + count)
             return
         }
 
-        materializeRowIfNeeded(row)
-        let offset = rowBaseOffset(for: row) + startCol
-        cells.withUnsafeMutableBufferPointer { buffer in
-            guard let destinationBase = buffer.baseAddress?.advanced(by: offset) else { return }
-            for index in 0..<count {
-                destinationBase[index] = cell
-            }
-        }
+        materializePhysicalRowIfNeeded(physicalRow)
+        let offset = physicalRow * cols + startCol
+        fillCells(cell, count: count, at: offset)
 
         switch rowEncodingHintStates[physicalRow] {
         case .dirty:
@@ -401,25 +334,12 @@ final class TerminalGrid {
         startCol: Int
     ) {
         guard count > 0 else { return }
-        materializeRowIfNeeded(row)
-        let offset = rowBaseOffset(for: row) + startCol
-        cells.withUnsafeMutableBufferPointer { buffer in
-            guard let destinationBase = buffer.baseAddress?.advanced(by: offset) else { return }
-            for index in 0..<count {
-                let cellOffset = index * 2
-                destinationBase[cellOffset] = Cell(
-                    codepoint: codepoints[index],
-                    attributes: attributes,
-                    width: 2,
-                    isWideContinuation: false
-                )
-                destinationBase[cellOffset + 1] = Cell(
-                    codepoint: 0,
-                    attributes: attributes,
-                    width: 0,
-                    isWideContinuation: true
-                )
-            }
+        let physicalRow = physicalRow(for: row)
+        materializePhysicalRowIfNeeded(physicalRow)
+        let offset = physicalRow * cols + startCol
+        initializeDoubleWidthCells(at: offset, codepoints: codepoints, count: count, attributes: attributes)
+        if attributes.decProtected {
+            physicalMayContainProtectedCells[physicalRow] = true
         }
         markRowEncodingHintDirty(row)
     }
@@ -430,7 +350,9 @@ final class TerminalGrid {
     /// Mark a row as a soft-wrapped continuation of the previous row.
     func setWrapped(_ row: Int, _ wrapped: Bool) {
         guard row >= 0, row < rows else { return }
-        physicalWrappedFlags[physicalRow(for: row)] = wrapped
+        let physicalRow = physicalRow(for: row)
+        guard physicalWrappedFlags[physicalRow] != wrapped else { return }
+        physicalWrappedFlags[physicalRow] = wrapped
     }
 
     /// Check if a row is soft-wrapped.
@@ -452,6 +374,7 @@ final class TerminalGrid {
         guard row >= 0, row < rows else { return }
         let physicalRow = physicalRow(for: row)
         let previous = physicalLineAttributes[physicalRow]
+        guard previous != attribute else { return }
         if previous.isDoubleWidth && !attribute.isDoubleWidth {
             nonSingleWidthLineCount -= 1
         } else if !previous.isDoubleWidth && attribute.isDoubleWidth {
@@ -465,13 +388,22 @@ final class TerminalGrid {
     /// Clear a range of cells in a row to empty.
     func clearCells(row: Int, fromCol: Int, toCol: Int) {
         guard row >= 0, row < rows else { return }
-        materializeRowIfNeeded(row)
         let start = max(0, fromCol)
         let end = min(cols, toCol + 1)
-        let offset = rowBaseOffset(for: row)
-        for col in start..<end {
-            cells[offset + col] = Cell.empty
+        guard start < end else { return }
+
+        let physicalRow = physicalRow(for: row)
+        if start == 0, end == cols {
+            setPhysicalRowBlank(physicalRow)
+            if tracksPreciseRowEncodingHints {
+                rowEncodingHintStates[physicalRow] = .blankDefault
+            }
+            return
         }
+
+        materializeRowIfNeeded(row)
+        let offset = rowBaseOffset(for: row) + start
+        fillCells(.empty, count: end - start, at: offset)
         guard tracksPreciseRowEncodingHints else { return }
         markRowEncodingHintDirty(row)
     }
@@ -479,10 +411,7 @@ final class TerminalGrid {
     /// Clear entire row.
     func clearRow(_ row: Int) {
         guard row >= 0, row < rows else { return }
-        setPhysicalRowBlank(physicalRow(for: row))
-        setWrapped(row, false)
-        setLineAttribute(.singleWidth, at: row)
-        setRowEncodingHintBlank(row)
+        clearPhysicalRow(physicalRow(for: row))
     }
 
     /// Clear entire grid.
@@ -495,6 +424,7 @@ final class TerminalGrid {
         physicalWrappedFlags = Array(repeating: false, count: rows)
         physicalLineAttributes = Array(repeating: .singleWidth, count: rows)
         nonSingleWidthLineCount = 0
+        physicalMayContainProtectedCells = Array(repeating: false, count: rows)
         physicalBlankRows = Array(repeating: true, count: rows)
     }
 
@@ -518,15 +448,18 @@ final class TerminalGrid {
         if count == 1 {
             ensureRowOrderMaterialized()
             if top == 0 && bottom == rows - 1 {
+                let clearedPhysicalRow = rowOrder[rowOrderHead]
                 rowOrderHead += 1
                 if rowOrderHead == rows {
                     rowOrderHead = 0
                 }
+                clearPhysicalRow(clearedPhysicalRow)
             } else {
                 rotateRowOrder(in: top...bottom, leftBy: 1)
+                hasRowPermutation = true
+                clearPhysicalRow(physicalRow(for: bottom))
             }
             hasRowPermutation = true
-            clearRow(bottom)
             return
         }
 
@@ -534,8 +467,16 @@ final class TerminalGrid {
             ensureRowOrderMaterialized()
             rowOrderHead = (rowOrderHead + count) % rows
             hasRowPermutation = true
-            for row in (bottom - count + 1)...bottom {
-                clearRow(row)
+            var rowOrderIndex = rowOrderHead - count
+            if rowOrderIndex < 0 {
+                rowOrderIndex += rows
+            }
+            for _ in 0..<count {
+                clearPhysicalRow(rowOrder[rowOrderIndex])
+                rowOrderIndex += 1
+                if rowOrderIndex == rows {
+                    rowOrderIndex = 0
+                }
             }
             return
         }
@@ -546,7 +487,7 @@ final class TerminalGrid {
 
         // Clear newly exposed lines at bottom
         for row in (bottom - count + 1)...bottom {
-            clearRow(row)
+            clearPhysicalRow(physicalRow(for: row))
         }
     }
 
@@ -567,13 +508,21 @@ final class TerminalGrid {
 
         if top == 0 && bottom == rows - 1 {
             ensureRowOrderMaterialized()
+            var rowOrderIndex = rowOrderHead - count
+            if rowOrderIndex < 0 {
+                rowOrderIndex += rows
+            }
             rowOrderHead -= count
             if rowOrderHead < 0 {
                 rowOrderHead += rows
             }
             hasRowPermutation = true
-            for row in top..<(top + count) {
-                clearRow(row)
+            for _ in 0..<count {
+                clearPhysicalRow(rowOrder[rowOrderIndex])
+                rowOrderIndex += 1
+                if rowOrderIndex == rows {
+                    rowOrderIndex = 0
+                }
             }
             return
         }
@@ -584,8 +533,20 @@ final class TerminalGrid {
 
         // Clear newly exposed lines at top
         for row in top..<(top + count) {
-            clearRow(row)
+            clearPhysicalRow(physicalRow(for: row))
         }
+    }
+
+    @inline(__always)
+    func scrollUpOneFullScreenForAlternateScreen() {
+        ensureRowOrderMaterialized()
+        let clearedPhysicalRow = rowOrder[rowOrderHead]
+        rowOrderHead += 1
+        if rowOrderHead == rows {
+            rowOrderHead = 0
+        }
+        clearPhysicalRow(clearedPhysicalRow)
+        hasRowPermutation = true
     }
 
     /// A row that was trimmed from the grid during resize.
@@ -716,6 +677,9 @@ final class TerminalGrid {
                 count += 1
             }
         }
+        self.physicalMayContainProtectedCells = stride(from: 0, to: newCells.count, by: newCols).map { start in
+            newCells[start..<(start + newCols)].contains { $0.attributes.decProtected }
+        }
         self.physicalBlankRows = stride(from: 0, to: newCells.count, by: newCols).map { start in
             newCells[start..<(start + newCols)].allSatisfy { cell in
                 cell.codepoint == Cell.empty.codepoint &&
@@ -784,6 +748,9 @@ final class TerminalGrid {
             if attribute.isDoubleWidth {
                 count += 1
             }
+        }
+        physicalMayContainProtectedCells = logicalRows.map { row in
+            row.contains { $0.attributes.decProtected }
         }
         physicalBlankRows = logicalRows.map { row in
             row.allSatisfy { cell in
@@ -1028,6 +995,7 @@ final class TerminalGrid {
         copy.physicalWrappedFlags = Array(physicalWrappedFlags)
         copy.physicalLineAttributes = Array(physicalLineAttributes)
         copy.nonSingleWidthLineCount = nonSingleWidthLineCount
+        copy.physicalMayContainProtectedCells = Array(physicalMayContainProtectedCells)
         copy.physicalBlankRows = Array(physicalBlankRows)
         copy.physicalSparseCompactDefaultPrefixCounts = Array(physicalSparseCompactDefaultPrefixCounts)
         copy.scrollTop = scrollTop
@@ -1036,9 +1004,11 @@ final class TerminalGrid {
         return copy
     }
 
+    @inline(__always)
     private func physicalRow(for logicalRow: Int) -> Int {
         guard hasRowPermutation else { return logicalRow }
-        return rowOrder[(rowOrderHead + logicalRow) % rows]
+        let index = rowOrderHead + logicalRow
+        return rowOrder[index < rows ? index : index - rows]
     }
 
     private func markRowEncodingHintDirty(_ logicalRow: Int) {
@@ -1140,45 +1110,176 @@ final class TerminalGrid {
         rowOrderHead = 0
     }
 
+    @inline(__always)
+    private func initializeSingleWidthCells(
+        at offset: Int,
+        codepoints: UnsafePointer<UInt32>,
+        count: Int,
+        attributes: CellAttributes
+    ) {
+        cells.withUnsafeMutableBufferPointer { buffer in
+            guard var destination = buffer.baseAddress?.advanced(by: offset) else { return }
+            var source = codepoints
+            var remaining = count
+            while remaining > 0 {
+                destination.pointee = Cell(
+                    codepoint: source.pointee,
+                    attributes: attributes,
+                    width: 1,
+                    isWideContinuation: false
+                )
+                destination += 1
+                source += 1
+                remaining -= 1
+            }
+        }
+    }
+
+    @inline(__always)
+    private func initializeSingleWidthASCIIBytes(
+        at offset: Int,
+        bytes: UnsafePointer<UInt8>,
+        count: Int,
+        attributes: CellAttributes
+    ) {
+        cells.withUnsafeMutableBufferPointer { buffer in
+            guard var destination = buffer.baseAddress?.advanced(by: offset) else { return }
+            var source = bytes
+            var remaining = count
+            while remaining > 0 {
+                destination.pointee = Cell(
+                    codepoint: UInt32(source.pointee),
+                    attributes: attributes,
+                    width: 1,
+                    isWideContinuation: false
+                )
+                destination += 1
+                source += 1
+                remaining -= 1
+            }
+        }
+    }
+
+    @inline(__always)
+    private func initializeDefaultASCIIBytes(
+        at offset: Int,
+        bytes: UnsafePointer<UInt8>,
+        count: Int
+    ) {
+        cells.withUnsafeMutableBufferPointer { destinationBuffer in
+            guard var destination = destinationBuffer.baseAddress?.advanced(by: offset) else { return }
+            Self.defaultASCIIByteCells.withUnsafeBufferPointer { lookupBuffer in
+                guard let lookup = lookupBuffer.baseAddress else { return }
+                var source = bytes
+                var remaining = count
+                while remaining > 0 {
+                    destination.pointee = lookup[Int(source.pointee)]
+                    destination += 1
+                    source += 1
+                    remaining -= 1
+                }
+            }
+        }
+    }
+
+    @inline(__always)
+    private func fillCells(
+        _ cell: Cell,
+        count: Int,
+        at offset: Int
+    ) {
+        cells.withUnsafeMutableBufferPointer { buffer in
+            guard let destination = buffer.baseAddress?.advanced(by: offset) else { return }
+            destination.update(repeating: cell, count: count)
+        }
+    }
+
+    @inline(__always)
+    private func initializeDoubleWidthCells(
+        at offset: Int,
+        codepoints: UnsafePointer<UInt32>,
+        count: Int,
+        attributes: CellAttributes
+    ) {
+        cells.withUnsafeMutableBufferPointer { buffer in
+            guard var destination = buffer.baseAddress?.advanced(by: offset) else { return }
+            var source = codepoints
+            var remaining = count
+            while remaining > 0 {
+                destination.pointee = Cell(
+                    codepoint: source.pointee,
+                    attributes: attributes,
+                    width: 2,
+                    isWideContinuation: false
+                )
+                destination.advanced(by: 1).pointee = Cell(
+                    codepoint: 0,
+                    attributes: attributes,
+                    width: 0,
+                    isWideContinuation: true
+                )
+                destination += 2
+                source += 1
+                remaining -= 1
+            }
+        }
+    }
+
+    @inline(__always)
     private func rowBaseOffset(for row: Int) -> Int {
         physicalRow(for: row) * cols
     }
 
+    @inline(__always)
     private func isPhysicalRowBlank(_ physicalRow: Int) -> Bool {
         physicalBlankRows[physicalRow]
     }
 
+    @inline(__always)
+    func rowMayContainProtectedCells(_ row: Int) -> Bool {
+        guard row >= 0, row < rows else { return false }
+        return physicalMayContainProtectedCells[physicalRow(for: row)]
+    }
+
+    @inline(__always)
     private func setPhysicalRowBlank(_ physicalRow: Int) {
         physicalBlankRows[physicalRow] = true
         physicalSparseCompactDefaultPrefixCounts[physicalRow] = 0
     }
 
+    @inline(__always)
+    private func clearPhysicalRow(_ physicalRow: Int) {
+        setPhysicalRowBlank(physicalRow)
+        physicalWrappedFlags[physicalRow] = false
+        let previous = physicalLineAttributes[physicalRow]
+        if previous.isDoubleWidth {
+            nonSingleWidthLineCount -= 1
+        }
+        physicalLineAttributes[physicalRow] = .singleWidth
+        physicalMayContainProtectedCells[physicalRow] = false
+        rowEncodingHintStates[physicalRow] = .blankDefault
+    }
+
+    @inline(__always)
     private func materializeRowIfNeeded(_ logicalRow: Int) {
-        let physicalRow = physicalRow(for: logicalRow)
+        materializePhysicalRowIfNeeded(physicalRow(for: logicalRow))
+    }
+
+    @inline(__always)
+    private func materializePhysicalRowIfNeeded(_ physicalRow: Int) {
         let sparsePrefixCount = physicalSparseCompactDefaultPrefixCounts[physicalRow]
         if sparsePrefixCount > 0 {
             let offset = physicalRow * cols + sparsePrefixCount
             let remainingCount = cols - sparsePrefixCount
             if remainingCount > 0 {
-                cells.withUnsafeMutableBufferPointer { destination in
-                    emptyRowTemplate.withUnsafeBufferPointer { source in
-                        destination.baseAddress!.advanced(by: offset).update(
-                            from: source.baseAddress!.advanced(by: sparsePrefixCount),
-                            count: remainingCount
-                        )
-                    }
-                }
+                fillCells(.empty, count: remainingCount, at: offset)
             }
             physicalSparseCompactDefaultPrefixCounts[physicalRow] = 0
             return
         }
         guard physicalBlankRows[physicalRow] else { return }
         let offset = physicalRow * cols
-        cells.withUnsafeMutableBufferPointer { destination in
-            emptyRowTemplate.withUnsafeBufferPointer { source in
-                destination.baseAddress!.advanced(by: offset).update(from: source.baseAddress!, count: cols)
-            }
-        }
+        fillCells(.empty, count: cols, at: offset)
         physicalBlankRows[physicalRow] = false
     }
 
