@@ -14,6 +14,11 @@ import Dispatch
 /// lock for the entire decode+parse operation, while rendering and search
 /// paths take shared read locks.
 final class TerminalController {
+    private static let kittyImagePersistenceQueue = DispatchQueue(
+        label: "com.tranworks.pterm.kitty-image-persistence",
+        qos: .utility
+    )
+
     private struct ViewportRow {
         let cells: [Cell]
         let isWrapped: Bool
@@ -58,6 +63,7 @@ final class TerminalController {
     struct RenderRowSnapshot {
         let cells: [Cell]
         let lineAttribute: TerminalLineAttribute
+        let isWrapped: Bool
     }
 
     /// The minimum self-contained state required to render one frame safely.
@@ -184,6 +190,7 @@ final class TerminalController {
     private var pendingParserScrollOutRows: [ScrollbackBuffer.BufferedRow] = []
     private var pendingParserScrollOffsetDelta = 0
     private var pendingGroundBytes: [UInt8] = []
+    private var pendingKittyGraphicsBytes: [UInt8] = []
 
     /// Decode buffer for UTF-8 -> codepoints.
     /// Starts empty and grows on demand so idle terminals do not pay a
@@ -405,6 +412,23 @@ final class TerminalController {
             if self.terminalRenderingSuppressed != suppressed {
                 self.terminalRenderingSuppressed = suppressed
                 self.pendingRenderingSuppressedChanges.append(suppressed)
+            }
+        }
+
+        model.onKittyImagePayload = { [weak self] index, data, format, pixelWidth, pixelHeight, columns, rows in
+            Self.kittyImagePersistenceQueue.async {
+                _ = try? PastedImageRegistry.shared.register(
+                    imageData: data,
+                    format: format,
+                    placeholderIndex: index,
+                    pixelWidth: pixelWidth,
+                    pixelHeight: pixelHeight,
+                    columns: columns,
+                    rows: rows
+                )
+                DispatchQueue.main.async {
+                    self?.onNeedsDisplay?()
+                }
             }
         }
 
@@ -723,6 +747,13 @@ final class TerminalController {
 
                 while fastPathRemainingCount > 0 {
                     let input = UnsafeBufferPointer(start: fastPathPointer, count: fastPathRemainingCount)
+
+                    if let consumed = self.consumeKittyGraphicsPayloadPrefix(input), consumed > 0 {
+                        didMutateDisplay = true
+                        fastPathPointer = fastPathPointer.advanced(by: consumed)
+                        fastPathRemainingCount -= consumed
+                        continue
+                    }
 
                     if self.canUseDirectASCIIGroundFastPath(input) {
                         let consumed = self.model.consumeGroundASCIIBytesFastPathPrefix(input)
@@ -1044,6 +1075,71 @@ final class TerminalController {
         return true
     }
 
+    private func consumeKittyGraphicsPayloadPrefix(_ bytes: UnsafeBufferPointer<UInt8>) -> Int? {
+        guard textEncoding == .utf8,
+              parser.state == VT_STATE_GROUND
+        else {
+            return nil
+        }
+
+        if pendingKittyGraphicsBytes.isEmpty {
+            if bytes.count == 2,
+               bytes[0] == 0x1B,
+               bytes[1] == UInt8(ascii: "_") {
+                pendingKittyGraphicsBytes.append(contentsOf: bytes)
+                return bytes.count
+            }
+            guard bytes.count >= 3,
+                  bytes[0] == 0x1B,
+                  bytes[1] == UInt8(ascii: "_"),
+                  bytes[2] == UInt8(ascii: "G")
+            else {
+                return nil
+            }
+        }
+
+        if pendingKittyGraphicsBytes.isEmpty {
+            if let terminatorOffset = asciiSTTerminatorOffset(in: bytes) {
+                let payloadBytes = UnsafeBufferPointer(start: bytes.baseAddress!.advanced(by: 2), count: terminatorOffset - 2)
+                if let payload = String(bytes: payloadBytes, encoding: .isoLatin1) {
+                    model.handleKittyGraphicsAPCPayload(payload)
+                }
+                return terminatorOffset + 2
+            }
+            pendingKittyGraphicsBytes.append(contentsOf: bytes)
+            return bytes.count
+        }
+
+        let existingCount = pendingKittyGraphicsBytes.count
+        pendingKittyGraphicsBytes.append(contentsOf: bytes)
+        if let terminatorOffset = asciiSTTerminatorOffset(in: pendingKittyGraphicsBytes) {
+            let payloadStart = 2
+            let payloadCount = terminatorOffset - payloadStart
+            if payloadCount > 0 {
+                let payloadSlice = pendingKittyGraphicsBytes[payloadStart..<(payloadStart + payloadCount)]
+                if let payload = String(bytes: payloadSlice, encoding: .isoLatin1) {
+                    model.handleKittyGraphicsAPCPayload(payload)
+                }
+            }
+            let consumedFromPendingChunk = max(0, min(bytes.count, terminatorOffset + 2 - existingCount))
+            pendingKittyGraphicsBytes.removeAll(keepingCapacity: true)
+            return consumedFromPendingChunk
+        }
+        return bytes.count
+    }
+
+    private func asciiSTTerminatorOffset(in bytes: UnsafeBufferPointer<UInt8>) -> Int? {
+        guard let base = bytes.baseAddress, bytes.count >= 2 else { return nil }
+        for index in 0..<(bytes.count - 1) where base[index] == 0x1B && base[index + 1] == UInt8(ascii: "\\") {
+            return index
+        }
+        return nil
+    }
+
+    private func asciiSTTerminatorOffset(in bytes: [UInt8]) -> Int? {
+        bytes.withUnsafeBufferPointer(asciiSTTerminatorOffset)
+    }
+
     private func consumeDirectUTF8WideGroundFastPath(_ bytes: UnsafeBufferPointer<UInt8>) -> Int {
         guard let baseAddress = bytes.baseAddress, !bytes.isEmpty else { return 0 }
 
@@ -1310,7 +1406,11 @@ final class TerminalController {
                 : scrollback.rowCount
 
             let renderRows = visibleRows.map { row in
-                RenderRowSnapshot(cells: row.cells, lineAttribute: row.lineAttribute)
+                RenderRowSnapshot(
+                    cells: row.cells,
+                    lineAttribute: row.lineAttribute,
+                    isWrapped: row.isWrapped
+                )
             }
 
             return RenderSnapshot(
@@ -1489,39 +1589,20 @@ final class TerminalController {
 
     func detectedImagePlaceholder(at position: GridPosition) -> DetectedImagePlaceholder? {
         lock.withReadLock {
-            let rows = visibleRowsLocked()
-            guard position.row >= 0, position.row < rows.count else { return nil }
-
-            let row = rows[position.row]
-            let projection = Self.projectVisibleText(from: row.cells)
-            guard !projection.text.isEmpty,
-                  position.col >= 0,
-                  let characterIndex = projection.characterIndexByColumn[position.col] else {
-                return nil
+            let visibleRows = visibleRowsLocked().map { row in
+                RenderRowSnapshot(
+                    cells: row.cells,
+                    lineAttribute: row.lineAttribute,
+                    isWrapped: row.isWrapped
+                )
             }
-
-            let text = projection.text as NSString
-            let searchRange = NSRange(location: 0, length: text.length)
-            let regex = Self.imagePlaceholderRegex
-            let matches = regex.matches(in: projection.text, options: [], range: searchRange)
-            for match in matches {
-                guard match.numberOfRanges >= 2,
-                      NSLocationInRange(characterIndex, match.range),
-                      let range = Range(match.range(at: 1), in: projection.text),
-                      let index = Int(projection.text[range]) else {
-                    continue
-                }
-                let matchStart = match.range.location
-                let matchEnd = matchStart + match.range.length - 1
-                guard let startCol = projection.columnByCharacterIndex[matchStart],
-                      let endCol = projection.columnByCharacterIndex[matchEnd] else {
-                    continue
-                }
+            for placement in TerminalInlineImageSupport.detectPlacements(in: visibleRows)
+            where placement.row == position.row && position.col >= placement.startCol && position.col <= placement.endCol {
                 return DetectedImagePlaceholder(
-                    index: index,
-                    originalText: text.substring(with: match.range),
-                    startCol: startCol,
-                    endCol: endCol
+                    index: placement.index,
+                    originalText: placement.originalText,
+                    startCol: placement.startCol,
+                    endCol: placement.endCol
                 )
             }
             return nil
@@ -1931,10 +2012,8 @@ final class TerminalController {
         for column in start...end {
             guard column >= 0, column < row.count else { continue }
             let cell = row[column]
-            if cell.isWideContinuation { continue }
-            if let scalar = Unicode.Scalar(cell.codepoint) {
-                output.append(Character(scalar))
-            }
+            if cell.isWideContinuation || cell.hasInlineImage { continue }
+            output.append(cell.renderedString())
         }
     }
 
@@ -1988,9 +2067,10 @@ final class TerminalController {
         columnsBuffer.removeAll(keepingCapacity: true)
         columnsBuffer.reserveCapacity(cells.count)
         for (index, cell) in cells.enumerated() {
-            if cell.isWideContinuation { continue }
-            if let scalar = Unicode.Scalar(cell.codepoint) {
-                text.append(Character(scalar))
+            if cell.isWideContinuation || cell.hasInlineImage { continue }
+            let rendered = cell.renderedString()
+            if !rendered.isEmpty {
+                text.append(rendered)
                 columnsBuffer.append(index)
             }
         }
@@ -2017,11 +2097,12 @@ final class TerminalController {
         var charToCol: [Int: Int] = [:]
 
         for (column, cell) in cells.enumerated() {
-            if cell.isWideContinuation { continue }
-            guard let scalar = Unicode.Scalar(cell.codepoint) else { continue }
+            if cell.isWideContinuation || cell.hasInlineImage { continue }
+            let rendered = cell.renderedString()
+            guard !rendered.isEmpty else { continue }
             // Use UTF-16 offset for NSRange compatibility with NSDataDetector
             let utf16Offset = text.utf16.count
-            text.append(Character(scalar))
+            text.append(rendered)
             colToChar[column] = utf16Offset
             charToCol[utf16Offset] = column
         }
@@ -2036,8 +2117,6 @@ final class TerminalController {
     static func debugSuggestedSearchReserveCapacity(scrollbackRows: Int) -> Int {
         suggestedSearchReserveCapacity(scrollbackRows: scrollbackRows)
     }
-
-    private static let imagePlaceholderRegex = try! NSRegularExpression(pattern: #"\[Image #([0-9]+)\]"#)
 }
 
 private extension NSLock {

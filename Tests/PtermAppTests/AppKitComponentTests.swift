@@ -904,6 +904,178 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertFalse(view.hasActiveImagePreviewWindow)
     }
 
+    func testTerminalViewInlineKittyImageLayerAppearsForVisiblePlaceholder() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 20,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/inline-image-terminal-view"
+        )
+        defer { controller.stop(waitForExit: true) }
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 200), renderer: renderer)
+        let imageURL = try writeTemporaryPNGImage(size: NSSize(width: 1, height: 1))
+        PastedImageRegistry.shared.reset()
+        PastedImageRegistry.shared.register(url: imageURL, forPlaceholderIndex: 1)
+        defer { PastedImageRegistry.shared.reset() }
+
+        view.terminalController = controller
+        view.imagePreviewURLProvider = { PastedImageRegistry.shared.url(forPlaceholderIndex: $0) }
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}_Gi=1,a=T,t=d,c=1,r=1;\u{1B}\\".utf8))
+        view.debugRefreshInlineImagesForTesting()
+
+        XCTAssertEqual(view.debugInlineImageLayerCount, 1)
+        let frame = try XCTUnwrap(view.debugInlineImageLayerFrames().first)
+        XCTAssertGreaterThan(frame.width, 0)
+        XCTAssertGreaterThan(frame.height, 0)
+    }
+
+    func testTerminalViewInlineKittyImageUsesRegisteredCellPlacement() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 6,
+            cols: 24,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/inline-image-placement"
+        )
+        defer { controller.stop(waitForExit: true) }
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 360, height: 240), renderer: renderer)
+        defer { PastedImageRegistry.shared.reset() }
+
+        try withTemporaryPtermConfig { _ in
+            PastedImageRegistry.shared.reset()
+            _ = try PastedImageRegistry.shared.register(
+                imageData: try makePNGImageData(size: NSSize(width: 2, height: 2)),
+                format: .png,
+                placeholderIndex: 3,
+                columns: 4,
+                rows: 2
+            )
+
+            view.terminalController = controller
+            view.imagePreviewURLProvider = { PastedImageRegistry.shared.url(forPlaceholderIndex: $0) }
+            controller.debugProcessPTYOutputForTesting(Data("\u{1B}_Gi=3,a=T,t=d,c=4,r=2;\u{1B}\\".utf8))
+            view.debugRefreshInlineImagesForTesting()
+        }
+
+        let frame = try XCTUnwrap(view.debugInlineImageLayerFrames().first)
+        XCTAssertEqual(frame.width, renderer.glyphAtlas.cellWidth * 4, accuracy: 1.0)
+        XCTAssertEqual(frame.height, renderer.glyphAtlas.cellHeight * 2, accuracy: 1.0)
+    }
+
+    func testRendererSuppressesKittyImagePlaceholderGlyphsWhenInlineImageIsPresent() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 24,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/inline-image-render-suppression"
+        )
+        defer { controller.stop(waitForExit: true) }
+        defer { PastedImageRegistry.shared.reset() }
+
+        try withTemporaryPtermConfig { _ in
+            PastedImageRegistry.shared.reset()
+            _ = try PastedImageRegistry.shared.register(
+                imageData: try makePNGImageData(size: NSSize(width: 1, height: 1)),
+                format: .png,
+                placeholderIndex: 8,
+                columns: 3,
+                rows: 1
+            )
+            controller.debugProcessPTYOutputForTesting(Data("\u{1B}_Gi=8,a=T,t=d,c=3,r=1;\u{1B}\\".utf8))
+            let snapshot = controller.captureRenderSnapshot()
+            let vertexData = renderer.debugBuildVertexDataForTesting(snapshot: snapshot)
+            XCTAssertTrue(vertexData.glyphVertices.isEmpty)
+        }
+    }
+
+    func testRendererSuppressesWrappedKittyImagePlaceholderGlyphs() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 8,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/inline-image-render-wrapped-suppression"
+        )
+        defer { controller.stop(waitForExit: true) }
+        defer { PastedImageRegistry.shared.reset() }
+
+        try withTemporaryPtermConfig { _ in
+            PastedImageRegistry.shared.reset()
+            _ = try PastedImageRegistry.shared.register(
+                imageData: try makePNGImageData(size: NSSize(width: 1, height: 1)),
+                format: .png,
+                placeholderIndex: 12345,
+                columns: 3,
+                rows: 1
+            )
+            controller.debugProcessPTYOutputForTesting(Data("\u{1B}_Gi=12345,a=T,t=d,c=3,r=1;\u{1B}\\".utf8))
+            let snapshot = controller.captureRenderSnapshot()
+            let vertexData = renderer.debugBuildVertexDataForTesting(snapshot: snapshot)
+            XCTAssertTrue(vertexData.glyphVertices.isEmpty)
+        }
+    }
+
+    func testSplitRenderViewInlineKittyImageLayerAppearsForVisiblePlaceholder() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 20,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/inline-image-split-view"
+        )
+        defer { controller.stop(waitForExit: true) }
+        let terminalView = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        terminalView.terminalController = controller
+        let splitView = SplitRenderView(frame: NSRect(x: 0, y: 0, width: 400, height: 240), renderer: renderer)
+        splitView.cellRefs = [
+            SplitRenderView.CellRef(
+                terminalView: terminalView,
+                controller: controller,
+                frame: NSRect(x: 20, y: 30, width: 320, height: 160)
+            )
+        ]
+        let imageURL = try writeTemporaryPNGImage(size: NSSize(width: 1, height: 1))
+        PastedImageRegistry.shared.reset()
+        PastedImageRegistry.shared.register(url: imageURL, forPlaceholderIndex: 2)
+        defer { PastedImageRegistry.shared.reset() }
+        terminalView.imagePreviewURLProvider = { PastedImageRegistry.shared.url(forPlaceholderIndex: $0) }
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}_Gi=2,a=T,t=d,c=1,r=1;\u{1B}\\".utf8))
+
+        splitView.debugRefreshInlineImagesForTesting()
+
+        XCTAssertEqual(splitView.debugInlineImageLayerCount, 1)
+        let frame = try XCTUnwrap(splitView.debugInlineImageLayerFrames().first)
+        XCTAssertGreaterThan(frame.minX, 0)
+        XCTAssertGreaterThan(frame.minY, 0)
+    }
+
     func testIntegratedViewUsesSRGBRenderTargetConfiguration() throws {
         let renderer = try makeRendererOrSkip()
         let manager = TerminalManager(rows: 24, cols: 80, config: .default)
@@ -1305,6 +1477,96 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(secondGlyphMinX - firstGlyphMinX, expectedDelta, accuracy: 0.5)
     }
 
+    func testRendererRoutesEmojiToColorGlyphVertices() throws {
+        let renderer = try makeRendererOrSkip()
+        let model = TerminalModel(rows: 1, cols: 2)
+        model.grid.setCell(
+            Cell(codepoint: 0x1F600, attributes: .default, width: 2, isWideContinuation: false),
+            at: 0,
+            col: 0
+        )
+        model.grid.setCell(
+            Cell(codepoint: 0, attributes: .default, width: 0, isWideContinuation: true),
+            at: 0,
+            col: 1
+        )
+
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: model, scrollback: scrollback)
+
+        XCTAssertEqual(vertexData.glyphVertices.count, 0)
+        XCTAssertEqual(vertexData.colorGlyphVertices.count, 72)
+        XCTAssertNotNil(renderer.glyphAtlas.colorGlyphInfo(for: "\u{1F600}"))
+    }
+
+    func testRendererProducesNonMonochromePixelsForEmoji() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let model = TerminalModel(rows: 1, cols: 2)
+        model.grid.setCell(
+            Cell(codepoint: 0x1F600, attributes: .default, width: 2, isWideContinuation: false),
+            at: 0,
+            col: 0
+        )
+        model.grid.setCell(
+            Cell(codepoint: 0, attributes: .default, width: 0, isWideContinuation: true),
+            at: 0,
+            col: 1
+        )
+
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: MetalRenderer.renderTargetPixelFormat,
+            width: 256,
+            height: 128,
+            mipmapped: false
+        )
+        descriptor.storageMode = .shared
+        descriptor.usage = [.renderTarget, .shaderRead]
+        let texture = try XCTUnwrap(renderer.device.makeTexture(descriptor: descriptor))
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+
+        renderer.debugRenderToTextureForTesting(model: model, scrollback: scrollback, texture: texture)
+
+        let bytesPerRow = texture.width * 4
+        var bytes = [UInt8](repeating: 0, count: bytesPerRow * texture.height)
+        texture.getBytes(
+            &bytes,
+            bytesPerRow: bytesPerRow,
+            from: MTLRegionMake2D(0, 0, texture.width, texture.height),
+            mipmapLevel: 0
+        )
+
+        let hasColoredPixel = stride(from: 0, to: bytes.count, by: 4).contains { index in
+            let blue = bytes[index]
+            let green = bytes[index + 1]
+            let red = bytes[index + 2]
+            let alpha = bytes[index + 3]
+            return alpha > 0 && (red != green || green != blue)
+        }
+
+        XCTAssertTrue(hasColoredPixel)
+    }
+
+    func testRendererColorEmojiPlacementDoesNotOverlapNeighboringASCII() throws {
+        let renderer = try makeRendererOrSkip()
+        let model = TerminalModel(rows: 1, cols: 6)
+        model.grid.setCell(Cell(codepoint: 0x31, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 0)
+        model.grid.setCell(Cell(codepoint: 0x32, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 1)
+        var emojiCell = Cell(codepoint: 0x1F469, attributes: .default, width: 2, isWideContinuation: false)
+        emojiCell.appendGraphemeScalar(0x200D)
+        emojiCell.appendGraphemeScalar(0x1F4BB)
+        model.grid.setCell(emojiCell, at: 0, col: 2)
+        model.grid.setCell(Cell(codepoint: 0, attributes: .default, width: 0, isWideContinuation: true), at: 0, col: 3)
+        model.grid.setCell(Cell(codepoint: 0x33, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 4)
+        model.grid.setCell(Cell(codepoint: 0x34, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 5)
+
+        let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        let vertexData = renderer.debugBuildVertexDataForTesting(model: model, scrollback: scrollback)
+
+        XCTAssertEqual(vertexData.glyphVertices.count, 72 * 4)
+        XCTAssertEqual(vertexData.colorGlyphVertices.count, 72)
+        XCTAssertNotNil(glyphBounds(in: vertexData.colorGlyphVertices))
+    }
+
     func testRendererMixedASCIIAndJapaneseGlyphsPreserveCellBoundaries() throws {
         let renderer = try makeRendererOrSkip()
         let model = TerminalModel(rows: 1, cols: 6)
@@ -1428,6 +1690,7 @@ final class AppKitComponentTests: XCTestCase {
         let scrollback = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
         var bgVertices: [Float] = []
         var glyphVertices: [Float] = []
+        var colorGlyphVertices: [Float] = []
         renderer.appendThumbnailVertexData(
             model: model,
             scrollback: scrollback,
@@ -1435,7 +1698,8 @@ final class AppKitComponentTests: XCTestCase {
             thumbnailRect: NSRect(x: 0, y: 0, width: 200, height: 100),
             scaleFactor: Float(renderer.glyphAtlas.scaleFactor),
             bgVertices: &bgVertices,
-            glyphVertices: &glyphVertices
+            glyphVertices: &glyphVertices,
+            colorGlyphVertices: &colorGlyphVertices
         )
 
         XCTAssertEqual(glyphVertices.count, 72)
@@ -2717,6 +2981,118 @@ final class AppKitComponentTests: XCTestCase {
             keyCode: 69
         ))
         XCTAssertEqual(handler.debugInputSequence(for: keypadPlus), "\u{1B}Ok")
+    }
+
+    func testKeyboardHandlerUsesKittyKeyboardProtocolWhenEnabled() throws {
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[>u".utf8))
+        let handler = KeyboardHandler(controller: controller)
+
+        let ctrlShiftA = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.control, .shift],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "A",
+            charactersIgnoringModifiers: "a",
+            isARepeat: false,
+            keyCode: 0
+        ))
+        XCTAssertEqual(handler.debugInputSequence(for: ctrlShiftA), "\u{1B}[97;6u")
+
+        let shiftUpArrow = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.shift],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: String(UnicodeScalar(NSUpArrowFunctionKey)!),
+            charactersIgnoringModifiers: String(UnicodeScalar(NSUpArrowFunctionKey)!),
+            isARepeat: false,
+            keyCode: 126
+        ))
+        XCTAssertEqual(handler.debugInputSequence(for: shiftUpArrow), "\u{1B}[1;2A")
+
+        let shiftF5 = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.shift],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "",
+            charactersIgnoringModifiers: "",
+            isARepeat: false,
+            keyCode: 96
+        ))
+        XCTAssertEqual(handler.debugInputSequence(for: shiftF5), "\u{1B}[15;2~")
+    }
+
+    func testKeyboardHandlerEncodesModifiedArrowsWithoutKittyProtocol() throws {
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let handler = KeyboardHandler(controller: controller)
+        let altUpArrow = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.option],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: String(UnicodeScalar(NSUpArrowFunctionKey)!),
+            charactersIgnoringModifiers: String(UnicodeScalar(NSUpArrowFunctionKey)!),
+            isARepeat: false,
+            keyCode: 126
+        ))
+        XCTAssertEqual(handler.debugInputSequence(for: altUpArrow), "\u{1B}[1;3A")
+    }
+
+    func testKeyboardHandlerPrefixesOptionModifiedTextWithEscape() throws {
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let handler = KeyboardHandler(controller: controller)
+        let optionA = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.option],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "a",
+            charactersIgnoringModifiers: "a",
+            isARepeat: false,
+            keyCode: 0
+        ))
+
+        XCTAssertEqual(handler.debugResolvedInput(for: optionA), "\u{1B}a")
     }
 
     func testKeyboardHandlerMCPKeyActionMapsEnterToTerminalNewlineInput() {
@@ -8450,6 +8826,46 @@ final class AppKitComponentTests: XCTestCase {
             width: (maxX - minX) + 1,
             height: (maxY - minY) + 1
         )
+    }
+
+    private func writeTemporaryPNGImage(size: NSSize) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("png")
+        try makePNGImageData(size: size).write(to: url)
+        return url
+    }
+
+    private func makePNGImageData(size: NSSize) throws -> Data {
+        let pixelWidth = max(Int(size.width), 1)
+        let pixelHeight = max(Int(size.height), 1)
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelWidth,
+            pixelsHigh: pixelHeight,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+
+        NSGraphicsContext.saveGraphicsState()
+        let context = NSGraphicsContext(bitmapImageRep: bitmap)
+        NSGraphicsContext.current = context
+        NSColor.systemRed.setFill()
+        NSBezierPath(rect: NSRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight)).fill()
+        context?.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+
+        guard let data = bitmap.representation(using: .png, properties: [:]) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        return data
     }
 
     private func findSubview(in view: NSView?, matching predicate: (NSView) -> Bool) -> NSView? {

@@ -194,9 +194,17 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var hoveredImagePlaceholder: TerminalController.DetectedImagePlaceholder?
     private var imagePreviewWindow: NSWindow?
     private var imagePreviewView: NSImageView?
+    private var inlineImageLayers: [Int: CALayer] = [:]
     private var lastDrawnRenderContentVersion: UInt64 = 0
 
     var hasActiveImagePreviewWindow: Bool { imagePreviewWindow != nil }
+    var debugInlineImageLayerCount: Int { inlineImageLayers.count }
+    func debugInlineImageLayerFrames() -> [CGRect] {
+        inlineImageLayers.values.map(\.frame).sorted { lhs, rhs in
+            if lhs.minY == rhs.minY { return lhs.minX < rhs.minX }
+            return lhs.minY < rhs.minY
+        }
+    }
     var debugHasKeyboardHandler: Bool { keyboardHandler != nil }
     var debugHasMarkedTextStorage: Bool { markedTextStorage != nil }
     var debugHasOutputPulseTimer: Bool { outputPulseTimer != nil }
@@ -236,6 +244,14 @@ final class TerminalView: MTKView, NSTextInputClient {
         hideImagePreview()
     }
 
+    func debugRefreshInlineImagesForTesting() {
+        guard let controller = terminalController else {
+            clearInlineImageLayers()
+            return
+        }
+        updateInlineImageLayers(with: controller.captureRenderSnapshot())
+    }
+
     func debugRenderFrameToTextureForTesting(_ texture: MTLTexture) {
         guard let controller = terminalController,
               let renderer else { return }
@@ -256,6 +272,11 @@ final class TerminalView: MTKView, NSTextInputClient {
     @discardableResult
     func handlePriorityInterruptShortcut() -> Bool {
         guard let controller = terminalController else { return false }
+        if controller.withModel({ $0.kittyKeyboardProtocolEnabled }) {
+            controller.sendInput("\u{1B}[99;5u")
+            queueInputFeedbackIfEnabled()
+            return true
+        }
         controller.performInterrupt()
         queueInputFeedbackIfEnabled()
         return true
@@ -547,6 +568,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         terminalController?.onNeedsDisplay = nil
         terminalController?.onRenderingSuppressedChange = nil
         keyboardHandler = nil
+        clearInlineImageLayers()
     }
 
     private func setupController() {
@@ -582,6 +604,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         cancelDeferredResizeNotifications()
         removeWindowObservers()
         hideImagePreview()
+        clearInlineImageLayers()
         renderer?.removeBuffers(for: self)
     }
 
@@ -654,6 +677,64 @@ final class TerminalView: MTKView, NSTextInputClient {
         committedTextPreviews.removeAll(keepingCapacity: false)
         recentCommittedInsertions.removeAll(keepingCapacity: false)
         pendingCommittedTextIntents.removeAll(keepingCapacity: false)
+    }
+
+    private func clearInlineImageLayers() {
+        inlineImageLayers.values.forEach { $0.removeFromSuperlayer() }
+        inlineImageLayers.removeAll(keepingCapacity: false)
+    }
+
+    private func updateInlineImageLayers(with snapshot: TerminalController.RenderSnapshot) {
+        guard imagePreviewURLProvider != nil,
+              let renderer,
+              let hostLayer = layer else {
+            clearInlineImageLayers()
+            return
+        }
+
+        let placements = TerminalInlineImageSupport.detectPlacements(in: snapshot)
+        guard !placements.isEmpty else {
+            clearInlineImageLayers()
+            return
+        }
+
+        var activeIndices = Set<Int>()
+        for placement in placements {
+            guard let registeredImage = PastedImageRegistry.shared.registeredImage(forPlaceholderIndex: placement.index),
+                  let image = TerminalInlineImageSupport.image(for: registeredImage.url),
+                  let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                continue
+            }
+
+            activeIndices.insert(placement.index)
+            let frame = TerminalInlineImageSupport.frame(
+                for: placement,
+                registeredImage: registeredImage,
+                gridPadding: renderer.gridPadding,
+                cellWidth: renderer.glyphAtlas.cellWidth,
+                cellHeight: renderer.glyphAtlas.cellHeight,
+                viewHeight: bounds.height
+            )
+            let imageLayer = inlineImageLayers[placement.index] ?? {
+                let layer = CALayer()
+                layer.contentsGravity = .resizeAspect
+                layer.masksToBounds = true
+                layer.backgroundColor = NSColor.black.cgColor
+                hostLayer.addSublayer(layer)
+                inlineImageLayers[placement.index] = layer
+                return layer
+            }()
+            imageLayer.frame = frame
+            imageLayer.contents = cgImage
+            imageLayer.isHidden = false
+        }
+
+        let staleIndices = inlineImageLayers.keys.filter { !activeIndices.contains($0) }
+        for index in staleIndices {
+            guard let layer = inlineImageLayers[index] else { continue }
+            layer.removeFromSuperlayer()
+            inlineImageLayers.removeValue(forKey: index)
+        }
     }
 
     private func requestDisplayUpdate() {
@@ -1286,6 +1367,12 @@ final class TerminalView: MTKView, NSTextInputClient {
         case .sgr:
             let suffix = phase == .up ? "m" : "M"
             return "\u{1B}[<\(baseCode);\(col);\(row)\(suffix)"
+        case .utf8:
+            let bytes: [UInt8] = [
+                0x1B, 0x5B, 0x4D,
+                UInt8(min(255, 32 + baseCode))
+            ] + utf8MouseCoordinateBytes(33 + col) + utf8MouseCoordinateBytes(33 + row)
+            return String(decoding: bytes, as: UTF8.self)
         case .x10:
             let bytes: [UInt8] = [
                 0x1B, 0x5B, 0x4D,
@@ -1295,6 +1382,11 @@ final class TerminalView: MTKView, NSTextInputClient {
             ]
             return String(decoding: bytes, as: UTF8.self)
         }
+    }
+
+    private func utf8MouseCoordinateBytes(_ value: Int) -> [UInt8] {
+        let clamped = max(0, min(value, 0x10FFFF))
+        return Array(String(UnicodeScalar(clamped)!).utf8)
     }
 
     // MARK: - Selection API
@@ -2140,6 +2232,7 @@ extension TerminalView: MTKViewDelegate {
             suppressCursorBlink: suppressCursorBlink,
             in: view
         )
+        updateInlineImageLayers(with: snapshot)
         lastDrawnRenderContentVersion = currentVersion
         scheduleIdleBufferRelease()
 

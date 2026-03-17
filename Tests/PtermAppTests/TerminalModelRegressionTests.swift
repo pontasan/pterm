@@ -766,6 +766,37 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(harness.model.mouseProtocol, .x10)
     }
 
+    func testTerminalModelUTF8MouseModeToggles() {
+        let harness = TerminalModelHarness()
+        harness.feed("\u{1B}[?1005h")
+        XCTAssertEqual(harness.model.mouseProtocol, .utf8)
+
+        harness.feed("\u{1B}[?1005l")
+        XCTAssertEqual(harness.model.mouseProtocol, .x10)
+    }
+
+    func testTerminalModelCombinesZWJEmojiIntoSingleAnchorCell() {
+        let harness = TerminalModelHarness(rows: 2, cols: 8)
+        harness.feed("👩‍💻")
+
+        let anchor = harness.model.grid.cell(at: 0, col: 0)
+        XCTAssertTrue(anchor.hasGraphemeTail)
+        XCTAssertEqual(anchor.width, 2)
+        XCTAssertEqual(anchor.renderedString(), "👩‍💻")
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 1).isWideContinuation)
+    }
+
+    func testTerminalModelCombinesRegionalIndicatorFlagIntoWideCell() {
+        let harness = TerminalModelHarness(rows: 2, cols: 8)
+        harness.feed("🇯🇵")
+
+        let anchor = harness.model.grid.cell(at: 0, col: 0)
+        XCTAssertTrue(anchor.hasGraphemeTail)
+        XCTAssertEqual(anchor.width, 2)
+        XCTAssertEqual(anchor.renderedString(), "🇯🇵")
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 1).isWideContinuation)
+    }
+
     func testTerminalModelApplicationCursorKeysModeToggles() {
         let harness = TerminalModelHarness()
 
@@ -986,6 +1017,57 @@ final class TerminalModelRegressionTests: XCTestCase {
         harness.feed("\u{1B}[0mY")
         let reset = harness.model.grid.cell(at: 0, col: 1)
         XCTAssertEqual(reset.attributes, .default)
+    }
+
+    func testTerminalModelSGRUnderlineStyleAndUnderlineColorRoundTrip() {
+        let harness = TerminalModelHarness()
+
+        harness.feed("\u{1B}[4:3;58:5:44mX")
+        let styled = harness.model.grid.cell(at: 0, col: 0)
+        XCTAssertTrue(styled.attributes.underline)
+        XCTAssertEqual(styled.attributes.underlineStyle, .curly)
+        XCTAssertEqual(styled.attributes.underlineColor, .indexed(44))
+
+        harness.feed("\u{1B}[59;24mY")
+        let reset = harness.model.grid.cell(at: 0, col: 1)
+        XCTAssertFalse(reset.attributes.underline)
+        XCTAssertEqual(reset.attributes.underlineStyle, .single)
+        XCTAssertEqual(reset.attributes.underlineColor, .default)
+    }
+
+    func testTerminalModelKittyKeyboardProtocolToggleSequencesUpdateMode() {
+        let harness = TerminalModelHarness()
+        harness.feed("\u{1B}[>u")
+        XCTAssertTrue(harness.model.kittyKeyboardProtocolEnabled)
+        harness.feed("\u{1B}[<u")
+        XCTAssertFalse(harness.model.kittyKeyboardProtocolEnabled)
+    }
+
+    func testTerminalModelKittyGraphicsPayloadDecodesImageAndReportsMetadata() throws {
+        let harness = TerminalModelHarness()
+        let expectedPayload = Data([0x89, 0x50, 0x4E, 0x47, 0x01, 0x02, 0x03, 0x04])
+        let payload = expectedPayload.base64EncodedString()
+        var captured: (index: Int, data: Data, format: TerminalImagePayloadFormat, width: Int?, height: Int?, columns: Int?, rows: Int?)?
+        harness.model.onKittyImagePayload = { index, data, format, width, height, columns, rows in
+            captured = (index, data, format, width, height, columns, rows)
+        }
+
+        harness.model.handleKittyGraphicsAPCPayload("Gi=7,a=T,f=100,t=d,s=2,v=1,c=4,r=3;\(payload)")
+
+        XCTAssertEqual(captured?.index, 7)
+        XCTAssertEqual(captured?.data, expectedPayload)
+        XCTAssertEqual(captured?.format, .png)
+        XCTAssertEqual(captured?.width, 2)
+        XCTAssertEqual(captured?.height, 1)
+        XCTAssertEqual(captured?.columns, 4)
+        XCTAssertEqual(captured?.rows, 3)
+        let anchor = harness.model.grid.cell(at: 0, col: 0)
+        XCTAssertTrue(anchor.hasInlineImage)
+        XCTAssertEqual(anchor.imageID, 7)
+        XCTAssertEqual(anchor.imageColumns, 4)
+        XCTAssertEqual(anchor.imageRows, 3)
+        XCTAssertEqual(anchor.imageOriginColOffset, 0)
+        XCTAssertEqual(anchor.imageOriginRowOffset, 0)
     }
 
     func testTerminalModelSaveRestoreCursorRoundTripsPositionAndAttributes() {

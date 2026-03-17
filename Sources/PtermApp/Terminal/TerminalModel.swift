@@ -90,6 +90,7 @@ final class TerminalModel {
     var onWindowPixelResizeRequest: ((_ width: Int, _ height: Int) -> Void)?
     var onClearScrollback: (() -> Void)?
     var onPendingUpdateModeChange: ((Bool) -> Void)?
+    var onKittyImagePayload: ((_ index: Int, _ data: Data, _ format: TerminalImagePayloadFormat, _ pixelWidth: Int?, _ pixelHeight: Int?, _ columns: Int?, _ rows: Int?) -> Void)?
 
     /// OSC string accumulator
     private var oscString: String = ""
@@ -121,6 +122,7 @@ final class TerminalModel {
 
     enum MouseProtocol {
         case x10
+        case utf8
         case sgr
     }
 
@@ -128,8 +130,10 @@ final class TerminalModel {
     var focusTrackingEnabled: Bool = false
     private(set) var pendingUpdateModeEnabled: Bool = false
     private(set) var reverseVideoEnabled = false
+    private(set) var kittyKeyboardProtocolEnabled = false
     private var insertModeEnabled = false
     private var protectedAreaModeEnabled = false
+    private var nextKittyImagePlaceholderIndex = 1
     private static let answerbackMessage = "pterm"
 
     init(rows: Int, cols: Int) {
@@ -500,6 +504,7 @@ final class TerminalModel {
     }
 
     private func fastGroundPathWidth(of codepoint: UInt32) -> Int {
+        if requiresClusterAwarePrint(codepoint) { return 0 }
         if codepoint >= 0x20 && codepoint <= 0x7E { return 1 }
         if codepoint < 0x3000 {
             if codepoint >= 0x00A0 && codepoint <= 0x02FF { return 1 }
@@ -533,6 +538,97 @@ final class TerminalModel {
         }
 
         return CharacterWidth.width(of: codepoint)
+    }
+
+    private func requiresClusterAwarePrint(_ codepoint: UInt32) -> Bool {
+        isRegionalIndicator(codepoint) || isEmojiModifier(codepoint)
+    }
+
+    private func isRegionalIndicator(_ codepoint: UInt32) -> Bool {
+        codepoint >= 0x1F1E6 && codepoint <= 0x1F1FF
+    }
+
+    private func isEmojiModifier(_ codepoint: UInt32) -> Bool {
+        codepoint >= 0x1F3FB && codepoint <= 0x1F3FF
+    }
+
+    private func graphemeDisplayWidth(for cell: Cell) -> Int {
+        let scalars = cell.graphemeScalars()
+        if scalars.contains(0x200D) || scalars.contains(0x20E3) || scalars.contains(where: isEmojiModifier) {
+            return 2
+        }
+        if scalars.count == 2 && isRegionalIndicator(scalars[0]) && isRegionalIndicator(scalars[1]) {
+            return 2
+        }
+        if scalars.contains(0xFE0F) {
+            return 2
+        }
+        return max(Int(cell.width), CharacterWidth.width(of: cell.codepoint), 1)
+    }
+
+    private func previousGraphemeAnchorPosition() -> (row: Int, col: Int)? {
+        let visibleCols = visibleColumnCount(for: cursor.row)
+        guard visibleCols > 0 else { return nil }
+        var column = cursor.pendingWrap ? visibleCols - 1 : cursor.col - 1
+        while column >= 0 {
+            let cell = grid.cell(at: cursor.row, col: column)
+            if cell.isWideContinuation {
+                column -= 1
+                continue
+            }
+            guard cell.codepoint != 0x20 || cell.hasGraphemeTail else { return nil }
+            return (cursor.row, column)
+        }
+        return nil
+    }
+
+    private func tryAppendToPreviousGraphemeCluster(_ codepoint: UInt32, width: Int) -> Bool {
+        guard let anchor = previousGraphemeAnchorPosition() else { return false }
+        var cell = grid.cell(at: anchor.row, col: anchor.col)
+        guard !cell.hasInlineImage, !cell.isWideContinuation else { return false }
+
+        let lastScalar = cell.lastGraphemeScalar()
+        let shouldAppend: Bool
+        if width == 0 {
+            shouldAppend = true
+        } else if isEmojiModifier(codepoint) {
+            shouldAppend = CharacterWidth.width(of: cell.codepoint) == 2 || cell.hasGraphemeTail
+        } else if isRegionalIndicator(codepoint) {
+            let scalars = cell.graphemeScalars()
+            shouldAppend = scalars.count == 1 && isRegionalIndicator(scalars[0])
+        } else if lastScalar == 0x200D {
+            shouldAppend = true
+        } else {
+            shouldAppend = false
+        }
+        guard shouldAppend, cell.appendGraphemeScalar(codepoint) else { return false }
+
+        let oldWidth = Int(max(cell.width, 1))
+        let newWidth = graphemeDisplayWidth(for: cell)
+        let visibleCols = visibleColumnCount(for: anchor.row)
+        guard anchor.col + newWidth <= visibleCols else { return false }
+
+        cell.width = UInt8(newWidth)
+        grid.setCell(cell, at: anchor.row, col: anchor.col)
+        if newWidth == 2, anchor.col + 1 < visibleCols {
+            let continuation = Cell(
+                codepoint: 0,
+                attributes: cell.attributes,
+                width: 0,
+                isWideContinuation: true
+            )
+            grid.setCell(continuation, at: anchor.row, col: anchor.col + 1)
+        } else if oldWidth == 2, anchor.col + 1 < visibleCols {
+            grid.setCell(.empty, at: anchor.row, col: anchor.col + 1)
+        }
+
+        cursor.pendingWrap = false
+        cursor.col = min(anchor.col + newWidth, visibleCols - 1)
+        if anchor.col + newWidth >= visibleCols, cursor.autoWrapMode {
+            cursor.pendingWrap = true
+            cursor.col = visibleCols - 1
+        }
+        return true
     }
 
     @discardableResult
@@ -1425,6 +1521,7 @@ final class TerminalModel {
                     cursor.attributes.dim = true
                     cursor.attributes.italic = true
                     cursor.attributes.underline = true
+                    cursor.attributes.underlineStyle = .curly
                     cursor.attributes.foreground = .indexed(1)
                 }
             }
@@ -1441,6 +1538,7 @@ final class TerminalModel {
             if matches("58;5;44;2m") {
                 return consume("58;5;44;2m") {
                     cursor.attributes.dim = true
+                    cursor.attributes.underlineColor = .indexed(44)
                 }
             }
 
@@ -1509,8 +1607,14 @@ final class TerminalModel {
             }
 
         case UInt8(ascii: "*"), UInt8(ascii: ">"), UInt8(ascii: "<"):
-            if matches("*x") || matches(">u") || matches("<u") {
+            if matches("*x") {
                 return 2 + bodyStartLiteralLength(in: bytes, from: startIndex)
+            }
+            if matches(">u") {
+                return consume(">u") { kittyKeyboardProtocolEnabled = true }
+            }
+            if matches("<u") {
+                return consume("<u") { kittyKeyboardProtocolEnabled = false }
             }
 
         default:
@@ -1545,7 +1649,7 @@ final class TerminalModel {
 
         let privateMarker: UInt8? = {
             guard let first = intermediates.first,
-                  first == UInt8(ascii: "?") || first == UInt8(ascii: ">") || first == UInt8(ascii: "=")
+                  first == UInt8(ascii: "?") || first == UInt8(ascii: ">") || first == UInt8(ascii: "=") || first == UInt8(ascii: "<")
             else {
                 return nil
             }
@@ -1614,6 +1718,12 @@ final class TerminalModel {
                 return handleCommonPrivateMode(params: params, set: false)
             case 0x6D: // SGR
                 handleParsedSGR(params: params, paramHasSub: paramHasSub)
+                return true
+            case 0x75 where privateMarker == UInt8(ascii: ">"):
+                kittyKeyboardProtocolEnabled = true
+                return true
+            case 0x75 where privateMarker == UInt8(ascii: "<"):
+                kittyKeyboardProtocolEnabled = false
                 return true
             default:
                 break
@@ -1688,6 +1798,14 @@ final class TerminalModel {
                 attributes.italic = true
             case 4:
                 attributes.underline = true
+                if paramHasSub,
+                   index + 1 < params.count,
+                   let style = underlineStyle(for: Int(params[index + 1])) {
+                    attributes.underlineStyle = style
+                    index += 1
+                } else {
+                    attributes.underlineStyle = .single
+                }
             case 5, 6:
                 attributes.blink = true
             case 7:
@@ -1705,6 +1823,8 @@ final class TerminalModel {
                 attributes.italic = false
             case 24:
                 attributes.underline = false
+                attributes.underlineStyle = .single
+                attributes.underlineColor = .default
             case 25:
                 attributes.blink = false
             case 27:
@@ -1725,53 +1845,82 @@ final class TerminalModel {
                 index = parseParsedSGRColor(params: params, startIndex: index, isForeground: false, attributes: &attributes)
             case 49:
                 attributes.background = .default
+            case 58:
+                index = parseParsedSGRColor(params: params, startIndex: index, isForeground: false, attributes: &attributes, target: .underline)
+            case 59:
+                attributes.underlineColor = .default
             case 90...97:
                 attributes.foreground = .indexed(UInt8(param - 90 + 8))
             case 100...107:
                 attributes.background = .indexed(UInt8(param - 100 + 8))
             default:
-                if paramHasSub && param == 58 {
-                    // kitty benchmark emits underline-color SGR, which we currently
-                    // ignore just like the parser-backed path does.
-                }
+                break
             }
             index += 1
         }
         cursor.attributes = attributes
     }
 
+    private enum SGRColorTarget {
+        case foreground
+        case background
+        case underline
+    }
+
     private func parseParsedSGRColor(
         params: UnsafeBufferPointer<Int32>,
         startIndex: Int,
         isForeground: Bool,
-        attributes: inout CellAttributes
+        attributes: inout CellAttributes,
+        target: SGRColorTarget? = nil
     ) -> Int {
         var index = startIndex + 1
         let mode = parsedParam(params, index: index, default: 0)
+        let colorTarget = target ?? (isForeground ? .foreground : .background)
         switch mode {
         case 5:
             index += 1
             let color = TerminalColor.indexed(UInt8(clamping: parsedParam(params, index: index, default: 0)))
-            if isForeground {
-                attributes.foreground = color
-            } else {
-                attributes.background = color
-            }
+            applySGRColor(color, target: colorTarget, attributes: &attributes)
         case 2:
             let r = UInt8(clamping: parsedParam(params, index: index + 1, default: 0))
             let g = UInt8(clamping: parsedParam(params, index: index + 2, default: 0))
             let b = UInt8(clamping: parsedParam(params, index: index + 3, default: 0))
             let color = TerminalColor.rgb(r, g, b)
-            if isForeground {
-                attributes.foreground = color
-            } else {
-                attributes.background = color
-            }
+            applySGRColor(color, target: colorTarget, attributes: &attributes)
             index += 3
         default:
             break
         }
         return index
+    }
+
+    private func applySGRColor(_ color: TerminalColor, target: SGRColorTarget, attributes: inout CellAttributes) {
+        switch target {
+        case .foreground:
+            attributes.foreground = color
+        case .background:
+            attributes.background = color
+        case .underline:
+            attributes.underlineColor = color
+        }
+    }
+
+    private func underlineStyle(for parameter: Int) -> UnderlineStyle? {
+        switch parameter {
+        case 0, 1:
+            return .single
+        case 2:
+            return .double
+        case 3:
+            return .curly
+        case 4:
+            return .dotted
+        case 5:
+            return .dashed
+        default:
+            return nil
+        }
     }
 
     private func handleASCIIByteRun(_ bytes: UnsafeBufferPointer<UInt8>) {
@@ -2083,6 +2232,10 @@ final class TerminalModel {
         }
         guard width >= 0 else { return } // Non-printable
 
+        if tryAppendToPreviousGraphemeCluster(translatedCodepoint, width: width) {
+            return
+        }
+
         // Handle pending wrap
         if cursor.pendingWrap {
             cursor.col = 0
@@ -2274,7 +2427,8 @@ final class TerminalModel {
         let firstIntermediate = intermediateCount > 0 ? intermediates.0 : 0
         let hasPrivateMarker = firstIntermediate == UInt8(ascii: "?") ||
             firstIntermediate == UInt8(ascii: ">") ||
-            firstIntermediate == UInt8(ascii: "=")
+            firstIntermediate == UInt8(ascii: "=") ||
+            firstIntermediate == UInt8(ascii: "<")
         let privateMarker = hasPrivateMarker ? firstIntermediate : 0
         let effectiveIntermediateCount = hasPrivateMarker ? max(0, intermediateCount - 1) : intermediateCount
         let effectiveFirstIntermediate: UInt8
@@ -2558,6 +2712,12 @@ final class TerminalModel {
         case 0x6E: // DSR - Device Status Report
             handleDSR(parser: parser)
 
+        case 0x75 where privateMarker == UInt8(ascii: ">"):
+            kittyKeyboardProtocolEnabled = true
+
+        case 0x75 where privateMarker == UInt8(ascii: "<"):
+            kittyKeyboardProtocolEnabled = false
+
         case 0x63: // DA - Device Attributes
             handleDeviceAttributes(privateMarker: privateMarker)
 
@@ -2759,6 +2919,8 @@ final class TerminalModel {
                     setMouseReporting(set ? .anyEvent : .none)
                 case 1004: // Focus tracking
                     focusTrackingEnabled = set
+                case 1005: // UTF-8 mouse mode
+                    mouseProtocol = set ? .utf8 : .x10
                 case 1006: // SGR mouse mode
                     mouseProtocol = set ? .sgr : .x10
                 case 1049: // Alternate Screen + save cursor
@@ -2832,6 +2994,7 @@ final class TerminalModel {
         let paramCount = parser.pointee.param_count == 0 ? 1 : parser.pointee.param_count
         var i: UInt32 = 0
         var attributes = cursor.attributes
+        let paramHasSub = parser.pointee.param_has_sub
 
         while i < paramCount {
             let param = vt_parser_param(parser, i, 0)
@@ -2846,6 +3009,14 @@ final class TerminalModel {
                 attributes.italic = true
             case 4:
                 attributes.underline = true
+                if paramHasSub,
+                   i + 1 < paramCount,
+                   let style = underlineStyle(for: Int(vt_parser_param(parser, i + 1, 0))) {
+                    attributes.underlineStyle = style
+                    i += 1
+                } else {
+                    attributes.underlineStyle = .single
+                }
             case 5, 6:
                 attributes.blink = true
             case 7:
@@ -2863,6 +3034,8 @@ final class TerminalModel {
                 attributes.italic = false
             case 24:
                 attributes.underline = false
+                attributes.underlineStyle = .single
+                attributes.underlineColor = .default
             case 25:
                 attributes.blink = false
             case 27:
@@ -2883,6 +3056,10 @@ final class TerminalModel {
                 i = parseSGRColor(parser: parser, startIndex: i, isForeground: false, attributes: &attributes)
             case 49: // Default background
                 attributes.background = .default
+            case 58: // Underline color
+                i = parseSGRColor(parser: parser, startIndex: i, isForeground: false, attributes: &attributes, target: .underline)
+            case 59:
+                attributes.underlineColor = .default
             case 90...97: // Bright foreground colors
                 attributes.foreground = .indexed(UInt8(param - 90 + 8))
             case 100...107: // Bright background colors
@@ -2899,31 +3076,25 @@ final class TerminalModel {
     private func parseSGRColor(parser: UnsafePointer<VtParser>,
                                 startIndex: UInt32,
                                 isForeground: Bool,
-                                attributes: inout CellAttributes) -> UInt32 {
+                                attributes: inout CellAttributes,
+                                target: SGRColorTarget? = nil) -> UInt32 {
         var i = startIndex + 1
         let mode = vt_parser_param(parser, i, 0)
+        let colorTarget = target ?? (isForeground ? .foreground : .background)
 
         switch mode {
         case 5: // 256-color: 38;5;N
             i += 1
             let colorIdx = UInt8(clamping: vt_parser_param(parser, i, 0))
             let color = TerminalColor.indexed(colorIdx)
-            if isForeground {
-                attributes.foreground = color
-            } else {
-                attributes.background = color
-            }
+            applySGRColor(color, target: colorTarget, attributes: &attributes)
 
         case 2: // TrueColor: 38;2;R;G;B
             let r = UInt8(clamping: vt_parser_param(parser, i + 1, 0))
             let g = UInt8(clamping: vt_parser_param(parser, i + 2, 0))
             let b = UInt8(clamping: vt_parser_param(parser, i + 3, 0))
             let color = TerminalColor.rgb(r, g, b)
-            if isForeground {
-                attributes.foreground = color
-            } else {
-                attributes.background = color
-            }
+            applySGRColor(color, target: colorTarget, attributes: &attributes)
             i += 3
 
         default:
@@ -3457,6 +3628,113 @@ final class TerminalModel {
         }
     }
 
+    func handleKittyGraphicsAPCPayload(_ payload: String) {
+        guard payload.first == "G" else { return }
+        let body = payload.dropFirst()
+        let parts = body.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let controlPart = parts.first else { return }
+
+        var options: [Substring: Substring] = [:]
+        for entry in controlPart.split(separator: ",", omittingEmptySubsequences: true) {
+            let kv = entry.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard let key = kv.first, kv.count == 2 else { continue }
+            options[key] = kv[1]
+        }
+
+        let action = options["a"].flatMap(\.first) ?? "t"
+        guard action == "T" || action == "t" else { return }
+
+        let transmission = options["t"].flatMap(\.first) ?? "d"
+        let encodedPayload = parts.count == 2 ? String(parts[1]) : ""
+        let decodedPayload: Data?
+        switch transmission {
+        case "d":
+            decodedPayload = Data(base64Encoded: encodedPayload)
+        default:
+            decodedPayload = nil
+        }
+
+        let imageIndex: Int
+        if let parsed = options["i"].flatMap({ Int($0) }) {
+            imageIndex = parsed
+            nextKittyImagePlaceholderIndex = max(nextKittyImagePlaceholderIndex, parsed + 1)
+        } else {
+            imageIndex = nextKittyImagePlaceholderIndex
+            nextKittyImagePlaceholderIndex += 1
+        }
+
+        let columnSpan = max(options["c"].flatMap { Int($0) } ?? 1, 1)
+        let rowSpan = max(options["r"].flatMap { Int($0) } ?? 1, 1)
+        placeInlineImage(
+            imageIndex: imageIndex,
+            columns: columnSpan,
+            rows: rowSpan
+        )
+
+        guard let decodedPayload,
+              !decodedPayload.isEmpty else {
+            return
+        }
+
+        let format = options["f"]
+            .flatMap { Int($0) }
+            .flatMap(TerminalImagePayloadFormat.init(kittyFormatCode:))
+            ?? inferredKittyImagePayloadFormat(for: decodedPayload)
+        guard let format else { return }
+
+        let pixelWidth = options["s"].flatMap { Int($0) }
+        let pixelHeight = options["v"].flatMap { Int($0) }
+        onKittyImagePayload?(imageIndex, decodedPayload, format, pixelWidth, pixelHeight, columnSpan, rowSpan)
+    }
+
+    private func placeInlineImage(imageIndex: Int, columns: Int, rows rowSpan: Int) {
+        let startRow = cursor.row
+        let startCol = cursor.col
+        let clampedColumns = max(1, min(columns, cols - startCol))
+        let clampedRows = max(1, min(rowSpan, self.rows - startRow))
+        guard clampedColumns > 0, clampedRows > 0 else { return }
+
+        for rowOffset in 0..<clampedRows {
+            for colOffset in 0..<clampedColumns {
+                grid.setCell(
+                    .inlineImage(
+                        id: imageIndex,
+                        columns: clampedColumns,
+                        rows: clampedRows,
+                        originColOffset: colOffset,
+                        originRowOffset: rowOffset
+                    ),
+                    at: startRow + rowOffset,
+                    col: startCol + colOffset
+                )
+            }
+        }
+
+        if startCol + clampedColumns >= cols {
+            cursor.col = cols - 1
+            cursor.pendingWrap = true
+        } else {
+            cursor.col = startCol + clampedColumns
+            cursor.pendingWrap = false
+        }
+    }
+
+    private func inferredKittyImagePayloadFormat(for payload: Data) -> TerminalImagePayloadFormat? {
+        if payload.starts(with: [0x89, 0x50, 0x4E, 0x47]) {
+            return .png
+        }
+        if payload.starts(with: [0xFF, 0xD8, 0xFF]) {
+            return .jpeg
+        }
+        if payload.starts(with: Array("GIF8".utf8)) {
+            return .gif
+        }
+        if payload.starts(with: Array("RIFF".utf8)), payload.dropFirst(8).starts(with: Array("WEBP".utf8)) {
+            return .webp
+        }
+        return nil
+    }
+
     private func performScreenAlignmentDisplay() {
         cursor.originMode = false
         cursor.row = 0
@@ -3605,6 +3883,15 @@ final class TerminalModel {
             ? grid.cell(at: cursor.row, col: cursor.col - 1)
             : Cell.empty
         guard prevCell.codepoint != 0 else { return }
+        if prevCell.hasGraphemeTail {
+            let scalars = prevCell.graphemeScalars()
+            for _ in 0..<count {
+                for scalar in scalars {
+                    handlePrint(scalar)
+                }
+            }
+            return
+        }
 
         let currentAttributes = currentPrintAttributes()
         if prevCell.width == 1,
@@ -3682,7 +3969,15 @@ final class TerminalModel {
         lhs.codepoint == rhs.codepoint &&
         lhs.attributes == rhs.attributes &&
         lhs.width == rhs.width &&
-        lhs.isWideContinuation == rhs.isWideContinuation
+        lhs.isWideContinuation == rhs.isWideContinuation &&
+        lhs.graphemeTailCount == rhs.graphemeTailCount &&
+        lhs.graphemeTail0 == rhs.graphemeTail0 &&
+        lhs.graphemeTail1 == rhs.graphemeTail1 &&
+        lhs.graphemeTail2 == rhs.graphemeTail2 &&
+        lhs.graphemeTail3 == rhs.graphemeTail3 &&
+        lhs.graphemeTail4 == rhs.graphemeTail4 &&
+        lhs.graphemeTail5 == rhs.graphemeTail5 &&
+        lhs.graphemeTail6 == rhs.graphemeTail6
     }
 
     func notifyFocusChanged(_ isFocused: Bool) {

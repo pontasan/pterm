@@ -50,6 +50,23 @@ final class MetalRenderer {
         glyph.cellOffsetX + ((spanWidth - singleCellWidth) * 0.5)
     }
 
+    private static func imagePlaceholderColumns(for rows: [TerminalController.RenderRowSnapshot]) -> [IndexSet] {
+        TerminalInlineImageSupport.hiddenPlaceholderColumns(in: rows)
+    }
+
+    private static func shouldAttemptColorEmoji(for cell: Cell) -> Bool {
+        guard cell.codepoint > 0x20 else { return false }
+        let scalars = cell.renderedString().unicodeScalars
+        return scalars.contains { scalar in
+            scalar.properties.isEmojiPresentation ||
+            scalar.value == 0x200D ||
+            scalar.value == 0xFE0F ||
+            scalar.value == 0x20E3 ||
+            (0x1F1E6...0x1F1FF).contains(scalar.value) ||
+            (0x1F3FB...0x1F3FF).contains(scalar.value)
+        }
+    }
+
     struct TerminalAppearance {
         var defaultForeground: (r: Float, g: Float, b: Float)
         var defaultBackground: (r: Float, g: Float, b: Float, a: Float)
@@ -64,12 +81,14 @@ final class MetalRenderer {
     final class VertexData {
         var bgVertices: [Float] = []
         var glyphVertices: [Float] = []
+        var colorGlyphVertices: [Float] = []
         var cursorVertices: [Float] = []
         var overlayVertices: [Float] = []
 
         func reset(keepingCapacity: Bool = true) {
             bgVertices.removeAll(keepingCapacity: keepingCapacity)
             glyphVertices.removeAll(keepingCapacity: keepingCapacity)
+            colorGlyphVertices.removeAll(keepingCapacity: keepingCapacity)
             cursorVertices.removeAll(keepingCapacity: keepingCapacity)
             overlayVertices.removeAll(keepingCapacity: keepingCapacity)
         }
@@ -122,11 +141,13 @@ final class MetalRenderer {
     final class ViewBufferSet {
         var bgBuffer: MTLBuffer?
         var glyphBuffer: MTLBuffer?
+        var colorGlyphBuffer: MTLBuffer?
         var cursorBuffer: MTLBuffer?
         var overlayBuffer: MTLBuffer?
         var borderBuffer: MTLBuffer?
         var splitBgBuffer: MTLBuffer?
         var splitGlyphBuffer: MTLBuffer?
+        var splitColorGlyphBuffer: MTLBuffer?
         var splitCursorBuffer: MTLBuffer?
         var splitOverlayBuffer: MTLBuffer?
         var splitBorderBuffer: MTLBuffer?
@@ -235,11 +256,13 @@ final class MetalRenderer {
         let allBuffers: [MTLBuffer?] = [
             bufferSet.bgBuffer,
             bufferSet.glyphBuffer,
+            bufferSet.colorGlyphBuffer,
             bufferSet.cursorBuffer,
             bufferSet.overlayBuffer,
             bufferSet.borderBuffer,
             bufferSet.splitBgBuffer,
             bufferSet.splitGlyphBuffer,
+            bufferSet.splitColorGlyphBuffer,
             bufferSet.splitCursorBuffer,
             bufferSet.splitOverlayBuffer,
             bufferSet.splitBorderBuffer,
@@ -261,6 +284,7 @@ final class MetalRenderer {
         guard let bufferSet = viewBuffers[ObjectIdentifier(view)] else { return }
         bufferSet.bgBuffer = nil
         bufferSet.glyphBuffer = nil
+        bufferSet.colorGlyphBuffer = nil
         bufferSet.cursorBuffer = nil
         bufferSet.overlayBuffer = nil
         bufferSet.borderBuffer = nil
@@ -275,6 +299,7 @@ final class MetalRenderer {
         guard let bufferSet = viewBuffers[ObjectIdentifier(view)] else { return }
         bufferSet.splitBgBuffer = nil
         bufferSet.splitGlyphBuffer = nil
+        bufferSet.splitColorGlyphBuffer = nil
         bufferSet.splitCursorBuffer = nil
         bufferSet.splitOverlayBuffer = nil
         bufferSet.splitBorderBuffer = nil
@@ -303,6 +328,7 @@ final class MetalRenderer {
         return [
             bufferSet.bgBuffer,
             bufferSet.glyphBuffer,
+            bufferSet.colorGlyphBuffer,
             bufferSet.cursorBuffer,
             bufferSet.overlayBuffer,
             bufferSet.borderBuffer,
@@ -314,6 +340,7 @@ final class MetalRenderer {
         return [
             bufferSet.splitBgBuffer,
             bufferSet.splitGlyphBuffer,
+            bufferSet.splitColorGlyphBuffer,
             bufferSet.splitCursorBuffer,
             bufferSet.splitOverlayBuffer,
             bufferSet.splitBorderBuffer,
@@ -623,6 +650,42 @@ final class MetalRenderer {
 
     // MARK: - Rendering
 
+    private func drawMonochromeGlyphVertices(
+        _ vertices: [Float],
+        encoder: MTLRenderCommandEncoder,
+        uniforms: inout MetalUniforms,
+        buffer: MTLBuffer?
+    ) {
+        guard !vertices.isEmpty,
+              let pipeline = glyphPipelineForCurrentOutput(),
+              let atlas = glyphAtlas.texture,
+              let buffer else { return }
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+        encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+        encoder.setFragmentTexture(atlas, index: 0)
+        encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count / floatsPerVertex)
+    }
+
+    private func drawColorGlyphVertices(
+        _ vertices: [Float],
+        encoder: MTLRenderCommandEncoder,
+        uniforms: inout MetalUniforms,
+        buffer: MTLBuffer?
+    ) {
+        guard !vertices.isEmpty,
+              let pipeline = texturePipeline,
+              let atlas = glyphAtlas.colorTexture,
+              let buffer else { return }
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+        encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+        encoder.setFragmentTexture(atlas, index: 0)
+        encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count / floatsPerVertex)
+    }
+
     /// Build vertex data from terminal model and render.
     /// When scrollOffset > 0, mixes scrollback rows with active grid rows
     /// to show historical content (virtualized: only visible rows are processed).
@@ -708,17 +771,18 @@ final class MetalRenderer {
         }
 
         // 2. Draw glyphs
-        if !vd.glyphVertices.isEmpty, let pipeline = glyphPipelineForCurrentOutput(),
-           let atlas = glyphAtlas.texture,
-           let buf = updateVertexBuffer(&bs.glyphBuffer, vertices: vd.glyphVertices) {
-            encoder.setRenderPipelineState(pipeline)
-            encoder.setVertexBuffer(buf, offset: 0, index: 0)
-            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
-            encoder.setFragmentTexture(atlas, index: 0)
-            encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
-                                  vertexCount: vd.glyphVertices.count / floatsPerVertex)
-        }
+        drawMonochromeGlyphVertices(
+            vd.glyphVertices,
+            encoder: encoder,
+            uniforms: &uniforms,
+            buffer: updateVertexBuffer(&bs.glyphBuffer, vertices: vd.glyphVertices)
+        )
+        drawColorGlyphVertices(
+            vd.colorGlyphVertices,
+            encoder: encoder,
+            uniforms: &uniforms,
+            buffer: updateVertexBuffer(&bs.colorGlyphBuffer, vertices: vd.colorGlyphVertices)
+        )
 
         // 3. Draw cursor (only when at the bottom of scrollback)
         if !vd.cursorVertices.isEmpty, let pipeline = cursorPipeline,
@@ -851,17 +915,18 @@ final class MetalRenderer {
                                    vertexCount: vd.bgVertices.count / floatsPerVertex)
         }
 
-        if !vd.glyphVertices.isEmpty, let pipeline = glyphPipelineForCurrentOutput(),
-           let atlas = glyphAtlas.texture,
-           let buf = updateVertexBuffer(&bs.glyphBuffer, vertices: vd.glyphVertices) {
-            encoder.setRenderPipelineState(pipeline)
-            encoder.setVertexBuffer(buf, offset: 0, index: 0)
-            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
-            encoder.setFragmentTexture(atlas, index: 0)
-            encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
-                                   vertexCount: vd.glyphVertices.count / floatsPerVertex)
-        }
+        drawMonochromeGlyphVertices(
+            vd.glyphVertices,
+            encoder: encoder,
+            uniforms: &uniforms,
+            buffer: updateVertexBuffer(&bs.glyphBuffer, vertices: vd.glyphVertices)
+        )
+        drawColorGlyphVertices(
+            vd.colorGlyphVertices,
+            encoder: encoder,
+            uniforms: &uniforms,
+            buffer: updateVertexBuffer(&bs.colorGlyphBuffer, vertices: vd.colorGlyphVertices)
+        )
 
         if !vd.cursorVertices.isEmpty, let pipeline = cursorPipeline,
            let buf = updateVertexBuffer(&bs.cursorBuffer, vertices: vd.cursorVertices) {
@@ -962,6 +1027,7 @@ final class MetalRenderer {
         // don't repeatedly grow the backing arrays while streaming output.
         vd.bgVertices.reserveCapacity(approximateCellCount * floatsPerQuad)
         vd.glyphVertices.reserveCapacity(approximateCellCount * floatsPerQuad * 2)
+        vd.colorGlyphVertices.reserveCapacity(approximateCellCount * floatsPerQuad)
         vd.cursorVertices.reserveCapacity(floatsPerQuad)
         vd.overlayVertices.reserveCapacity(approximateCellCount * floatsPerQuad * 2)
 
@@ -999,6 +1065,14 @@ final class MetalRenderer {
             return nil
         }
 
+        @inline(__always)
+        func glyphInfoForCell(_ cell: Cell) -> GlyphAtlas.GlyphInfo? {
+            if cell.hasGraphemeTail {
+                return glyphAtlas.glyphInfo(for: cell.renderedString())
+            }
+            return glyphInfo(for: cell.codepoint)
+        }
+
         // Build per-visible-row search match lists once so we can walk them linearly.
         prepareTerminalSearchMatchesScratch(in: bufferSet, rowCount: viewRows)
         if let sh = searchHighlight {
@@ -1010,6 +1084,37 @@ final class MetalRenderer {
                 )
             }
         }
+
+        var visibleRowsForPlaceholderDetection: [TerminalController.RenderRowSnapshot] = []
+        visibleRowsForPlaceholderDetection.reserveCapacity(viewRows)
+        for row in 0..<viewRows {
+            let absoluteRow = firstAbsolute + row
+            let isScrollbackRow = absoluteRow < sbCount
+            if isScrollbackRow, bufferSet.terminalScrollbackRowHasData[row] {
+                visibleRowsForPlaceholderDetection.append(
+                    TerminalController.RenderRowSnapshot(
+                        cells: bufferSet.terminalScrollbackRowsScratch[row],
+                        lineAttribute: .singleWidth,
+                        isWrapped: scrollback.isRowWrapped(at: absoluteRow)
+                    )
+                )
+            } else {
+                let gridRow = absoluteRow - sbCount
+                var cells: [Cell] = []
+                cells.reserveCapacity(viewCols)
+                for col in 0..<viewCols {
+                    cells.append(model.grid.cell(at: gridRow, col: col))
+                }
+                visibleRowsForPlaceholderDetection.append(
+                    TerminalController.RenderRowSnapshot(
+                        cells: cells,
+                        lineAttribute: model.grid.lineAttribute(at: gridRow),
+                        isWrapped: model.grid.isWrapped(gridRow)
+                    )
+                )
+            }
+        }
+        let hiddenPlaceholderColumns = Self.imagePlaceholderColumns(for: visibleRowsForPlaceholderDetection)
 
         for row in 0..<viewRows {
             let absoluteRow = firstAbsolute + row
@@ -1051,6 +1156,7 @@ final class MetalRenderer {
                     col >= $0.col &&
                     col < ($0.col + $0.columnWidth)
                 }
+                let suppressPlaceholderGlyph = hiddenPlaceholderColumns[row].contains(col)
 
                 let cell: Cell
                 if let sbRow = scrollbackRow {
@@ -1126,7 +1232,7 @@ final class MetalRenderer {
                 }
 
                 // Block/quadrant elements render more faithfully as geometry.
-                if transientTextOverlayCoversCell {
+                if transientTextOverlayCoversCell || suppressPlaceholderGlyph {
                     // Keep the layout/background space, but defer visible glyphs to the transient overlay.
                 } else if renderBlockElementIfNeeded(
                     codepoint: cell.codepoint,
@@ -1135,9 +1241,15 @@ final class MetalRenderer {
                     vertices: &vd.overlayVertices
                 ) {
                     // no-op
-                } else if cell.codepoint > 0x20, // Skip spaces
-                   let glyph = glyphInfo(for: cell.codepoint),
-                   glyph.pixelWidth > 0 {
+                } else if cell.codepoint > 0x20 { // Skip spaces
+                    let renderedText = cell.renderedString()
+                    let colorGlyph = Self.shouldAttemptColorEmoji(for: cell)
+                        ? glyphAtlas.colorGlyphInfo(for: renderedText)
+                        : nil
+                    let glyph = colorGlyph ?? glyphInfoForCell(cell)
+                    guard let glyph, glyph.pixelWidth > 0 else {
+                        continue
+                    }
 
                     let rawGlyphX: Float
                     if cell.width == 1 {
@@ -1159,30 +1271,44 @@ final class MetalRenderer {
                     let glyphW = Float(glyph.pixelWidth)
                     let glyphH = Float(glyph.pixelHeight)
 
-                    addQuad(to: &vd.glyphVertices,
-                           x: glyphX, y: glyphY, w: glyphW, h: glyphH,
-                           tx: glyph.textureX, ty: glyph.textureY,
-                           tw: glyph.textureW, th: glyph.textureH,
-                           fg: (fgColor.r, fgColor.g, fgColor.b, 1),
-                           bg: (0, 0, 0, 0))
-
-                    if cell.attributes.bold {
-                        let boldOffset = max(1.0, ceil(scaleFactor * 0.5))
+                    if colorGlyph != nil {
+                        addQuad(to: &vd.colorGlyphVertices,
+                               x: glyphX, y: glyphY, w: glyphW, h: glyphH,
+                               tx: glyph.textureX, ty: glyph.textureY,
+                               tw: glyph.textureW, th: glyph.textureH,
+                               fg: (1, 1, 1, 1),
+                               bg: (0, 0, 0, 0))
+                    } else {
                         addQuad(to: &vd.glyphVertices,
-                               x: glyphX + boldOffset, y: glyphY, w: glyphW, h: glyphH,
+                               x: glyphX, y: glyphY, w: glyphW, h: glyphH,
                                tx: glyph.textureX, ty: glyph.textureY,
                                tw: glyph.textureW, th: glyph.textureH,
                                fg: (fgColor.r, fgColor.g, fgColor.b, 1),
                                bg: (0, 0, 0, 0))
+
+                        if cell.attributes.bold {
+                            let boldOffset = max(1.0, ceil(scaleFactor * 0.5))
+                            addQuad(to: &vd.glyphVertices,
+                                   x: glyphX + boldOffset, y: glyphY, w: glyphW, h: glyphH,
+                                   tx: glyph.textureX, ty: glyph.textureY,
+                                   tw: glyph.textureW, th: glyph.textureH,
+                                   fg: (fgColor.r, fgColor.g, fgColor.b, 1),
+                                   bg: (0, 0, 0, 0))
+                        }
                     }
                 }
 
                 if cell.attributes.underline {
-                    let underlineY = y + h - lineThickness
-                    addQuad(to: &vd.overlayVertices, x: x, y: underlineY, w: w, h: lineThickness,
-                           tx: 0, ty: 0, tw: 0, th: 0,
-                           fg: (fgColor.r, fgColor.g, fgColor.b, 1),
-                           bg: (fgColor.r, fgColor.g, fgColor.b, 1))
+                    addUnderlineDecoration(
+                        to: &vd.overlayVertices,
+                        cell: cell,
+                        x: x,
+                        y: y,
+                        width: w,
+                        height: h,
+                        lineThickness: lineThickness,
+                        color: effectiveUnderlineColor(for: cell, fallback: fgColor)
+                    )
                 }
 
                 if cell.attributes.strikethrough {
@@ -1271,6 +1397,7 @@ final class MetalRenderer {
         let approximateCellCount = max(1, viewRows * viewCols)
         vd.bgVertices.reserveCapacity(approximateCellCount * floatsPerQuad)
         vd.glyphVertices.reserveCapacity(approximateCellCount * floatsPerQuad * 2)
+        vd.colorGlyphVertices.reserveCapacity(approximateCellCount * floatsPerQuad)
         vd.cursorVertices.reserveCapacity(floatsPerQuad)
         vd.overlayVertices.reserveCapacity(approximateCellCount * floatsPerQuad * 2)
 
@@ -1299,6 +1426,14 @@ final class MetalRenderer {
             return nil
         }
 
+        @inline(__always)
+        func glyphInfoForCell(_ cell: Cell) -> GlyphAtlas.GlyphInfo? {
+            if cell.hasGraphemeTail {
+                return glyphAtlas.glyphInfo(for: cell.renderedString())
+            }
+            return glyphInfo(for: cell.codepoint)
+        }
+
         prepareTerminalSearchMatchesScratch(in: bufferSet, rowCount: viewRows)
         if let sh = searchHighlight {
             for (i, match) in sh.matches.enumerated() {
@@ -1309,6 +1444,7 @@ final class MetalRenderer {
                 )
             }
         }
+        let hiddenPlaceholderColumns = Self.imagePlaceholderColumns(for: snapshot.visibleRows)
 
         for row in 0..<viewRows {
             let rowSnapshot = snapshot.visibleRows[row]
@@ -1354,6 +1490,7 @@ final class MetalRenderer {
                     col >= $0.col &&
                     col < ($0.col + $0.columnWidth)
                 }
+                let suppressPlaceholderGlyph = hiddenPlaceholderColumns[row].contains(col)
 
                 let cell = col < rowSnapshot.cells.count ? rowSnapshot.cells[col] : .empty
 
@@ -1416,7 +1553,7 @@ final class MetalRenderer {
                             bg: (bgColor.r, bgColor.g, bgColor.b, bgColor.a))
                 }
 
-                if transientTextOverlayCoversCell {
+                if transientTextOverlayCoversCell || suppressPlaceholderGlyph {
                     // Keep the layout/background space, but defer visible glyphs to the transient overlay.
                 } else if renderBlockElementIfNeeded(
                     codepoint: cell.codepoint,
@@ -1425,9 +1562,15 @@ final class MetalRenderer {
                     vertices: &vd.overlayVertices
                 ) {
                     // no-op
-                } else if cell.codepoint > 0x20,
-                          let glyph = glyphInfo(for: cell.codepoint),
-                          glyph.pixelWidth > 0 {
+                } else if cell.codepoint > 0x20 {
+                    let renderedText = cell.renderedString()
+                    let colorGlyph = Self.shouldAttemptColorEmoji(for: cell)
+                        ? glyphAtlas.colorGlyphInfo(for: renderedText)
+                        : nil
+                    let glyph = colorGlyph ?? glyphInfoForCell(cell)
+                    guard let glyph, glyph.pixelWidth > 0 else {
+                        continue
+                    }
 
                     let rawGlyphX: Float
                     if cell.width == 1 {
@@ -1457,30 +1600,44 @@ final class MetalRenderer {
                         }
                     }()
 
-                    addQuad(to: &vd.glyphVertices,
-                            x: glyphX, y: glyphY, w: glyphW, h: glyphH,
-                            tx: glyph.textureX, ty: textureY,
-                            tw: glyph.textureW, th: textureH,
-                            fg: (fgColor.r, fgColor.g, fgColor.b, 1),
-                            bg: (0, 0, 0, 0))
-
-                    if cell.attributes.bold {
-                        let boldOffset = max(1.0, ceil(scaleFactor * 0.5))
+                    if colorGlyph != nil {
+                        addQuad(to: &vd.colorGlyphVertices,
+                                x: glyphX, y: glyphY, w: glyphW, h: glyphH,
+                                tx: glyph.textureX, ty: textureY,
+                                tw: glyph.textureW, th: textureH,
+                                fg: (1, 1, 1, 1),
+                                bg: (0, 0, 0, 0))
+                    } else {
                         addQuad(to: &vd.glyphVertices,
-                                x: glyphX + boldOffset, y: glyphY, w: glyphW, h: glyphH,
+                                x: glyphX, y: glyphY, w: glyphW, h: glyphH,
                                 tx: glyph.textureX, ty: textureY,
                                 tw: glyph.textureW, th: textureH,
                                 fg: (fgColor.r, fgColor.g, fgColor.b, 1),
                                 bg: (0, 0, 0, 0))
+
+                        if cell.attributes.bold {
+                            let boldOffset = max(1.0, ceil(scaleFactor * 0.5))
+                            addQuad(to: &vd.glyphVertices,
+                                    x: glyphX + boldOffset, y: glyphY, w: glyphW, h: glyphH,
+                                    tx: glyph.textureX, ty: textureY,
+                                    tw: glyph.textureW, th: textureH,
+                                    fg: (fgColor.r, fgColor.g, fgColor.b, 1),
+                                    bg: (0, 0, 0, 0))
+                        }
                     }
                 }
 
                 if cell.attributes.underline {
-                    let underlineY = y + h - lineThickness
-                    addQuad(to: &vd.overlayVertices, x: x, y: underlineY, w: w, h: lineThickness,
-                            tx: 0, ty: 0, tw: 0, th: 0,
-                            fg: (fgColor.r, fgColor.g, fgColor.b, 1),
-                            bg: (fgColor.r, fgColor.g, fgColor.b, 1))
+                    addUnderlineDecoration(
+                        to: &vd.overlayVertices,
+                        cell: cell,
+                        x: x,
+                        y: y,
+                        width: w,
+                        height: h,
+                        lineThickness: lineThickness,
+                        color: effectiveUnderlineColor(for: cell, fallback: fgColor)
+                    )
                 }
 
                 if cell.attributes.strikethrough {
@@ -1631,17 +1788,18 @@ final class MetalRenderer {
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexData.bgVertices.count / floatsPerVertex)
         }
 
-        if !vertexData.glyphVertices.isEmpty,
-           let pipeline = glyphPipelineForCurrentOutput(),
-           let atlas = glyphAtlas.texture,
-           let buffer = makeTemporaryBuffer(vertices: vertexData.glyphVertices) {
-            encoder.setRenderPipelineState(pipeline)
-            encoder.setVertexBuffer(buffer, offset: 0, index: 0)
-            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
-            encoder.setFragmentTexture(atlas, index: 0)
-            encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexData.glyphVertices.count / floatsPerVertex)
-        }
+        drawMonochromeGlyphVertices(
+            vertexData.glyphVertices,
+            encoder: encoder,
+            uniforms: &uniforms,
+            buffer: makeTemporaryBuffer(vertices: vertexData.glyphVertices)
+        )
+        drawColorGlyphVertices(
+            vertexData.colorGlyphVertices,
+            encoder: encoder,
+            uniforms: &uniforms,
+            buffer: makeTemporaryBuffer(vertices: vertexData.colorGlyphVertices)
+        )
 
         if !vertexData.cursorVertices.isEmpty,
            let pipeline = cursorPipeline,
@@ -1715,17 +1873,18 @@ final class MetalRenderer {
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexData.bgVertices.count / floatsPerVertex)
         }
 
-        if !vertexData.glyphVertices.isEmpty,
-           let pipeline = glyphPipelineForCurrentOutput(),
-           let atlas = glyphAtlas.texture,
-           let buffer = makeTemporaryBuffer(vertices: vertexData.glyphVertices) {
-            encoder.setRenderPipelineState(pipeline)
-            encoder.setVertexBuffer(buffer, offset: 0, index: 0)
-            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
-            encoder.setFragmentTexture(atlas, index: 0)
-            encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexData.glyphVertices.count / floatsPerVertex)
-        }
+        drawMonochromeGlyphVertices(
+            vertexData.glyphVertices,
+            encoder: encoder,
+            uniforms: &uniforms,
+            buffer: makeTemporaryBuffer(vertices: vertexData.glyphVertices)
+        )
+        drawColorGlyphVertices(
+            vertexData.colorGlyphVertices,
+            encoder: encoder,
+            uniforms: &uniforms,
+            buffer: makeTemporaryBuffer(vertices: vertexData.colorGlyphVertices)
+        )
 
         if !vertexData.cursorVertices.isEmpty,
            let pipeline = cursorPipeline,
@@ -1926,6 +2085,88 @@ final class MetalRenderer {
         }
 
         return resolveForegroundColor(cell.attributes.foreground)
+    }
+
+    private func effectiveUnderlineColor(
+        for cell: Cell,
+        fallback: (r: Float, g: Float, b: Float)
+    ) -> (Float, Float, Float, Float) {
+        if cell.attributes.underlineColor.isDefaultColor {
+            return (fallback.r, fallback.g, fallback.b, 1.0)
+        }
+        let resolved = resolveForegroundColor(cell.attributes.underlineColor)
+        return (resolved.r, resolved.g, resolved.b, 1.0)
+    }
+
+    private func addUnderlineDecoration(
+        to vertices: inout [Float],
+        cell: Cell,
+        x: Float,
+        y: Float,
+        width: Float,
+        height: Float,
+        lineThickness: Float,
+        color: (Float, Float, Float, Float)
+    ) {
+        let underlineY = y + height - lineThickness
+        switch cell.attributes.underlineStyle {
+        case .single:
+            addUnderlineQuad(to: &vertices, x: x, y: underlineY, width: width, thickness: lineThickness, color: color)
+        case .double:
+            addUnderlineQuad(to: &vertices, x: x, y: underlineY, width: width, thickness: lineThickness, color: color)
+            let secondY = max(y, underlineY - lineThickness * 2.0)
+            addUnderlineQuad(to: &vertices, x: x, y: secondY, width: width, thickness: lineThickness, color: color)
+        case .curly:
+            let segmentWidth = max(lineThickness * 2.0, width / 6.0)
+            var offset: Float = 0
+            var high = false
+            while offset < width {
+                let segment = min(segmentWidth, width - offset)
+                let segmentY = underlineY - (high ? lineThickness : 0)
+                addUnderlineQuad(to: &vertices, x: x + offset, y: segmentY, width: segment, thickness: lineThickness, color: color)
+                high.toggle()
+                offset += segmentWidth
+            }
+        case .dotted:
+            let dotWidth = max(lineThickness, width / 10.0)
+            let spacing = dotWidth
+            var offset: Float = 0
+            while offset < width {
+                addUnderlineQuad(to: &vertices, x: x + offset, y: underlineY, width: min(dotWidth, width - offset), thickness: lineThickness, color: color)
+                offset += dotWidth + spacing
+            }
+        case .dashed:
+            let dashWidth = max(lineThickness * 3.0, width / 5.0)
+            let gapWidth = max(lineThickness, dashWidth * 0.4)
+            var offset: Float = 0
+            while offset < width {
+                addUnderlineQuad(to: &vertices, x: x + offset, y: underlineY, width: min(dashWidth, width - offset), thickness: lineThickness, color: color)
+                offset += dashWidth + gapWidth
+            }
+        }
+    }
+
+    private func addUnderlineQuad(
+        to vertices: inout [Float],
+        x: Float,
+        y: Float,
+        width: Float,
+        thickness: Float,
+        color: (Float, Float, Float, Float)
+    ) {
+        addQuad(
+            to: &vertices,
+            x: x,
+            y: y,
+            w: width,
+            h: thickness,
+            tx: 0,
+            ty: 0,
+            tw: 0,
+            th: 0,
+            fg: color,
+            bg: color
+        )
     }
 
     private func resolveForegroundColor(_ color: TerminalColor) -> (r: Float, g: Float, b: Float) {
@@ -2156,7 +2397,8 @@ final class MetalRenderer {
         scaleFactor: Float,
         commandBuffer: MTLCommandBuffer,
         bgScratch: inout [Float],
-        glyphScratch: inout [Float]
+        glyphScratch: inout [Float],
+        colorGlyphScratch: inout [Float]
     ) {
         let renderPassDescriptor = MTLRenderPassDescriptor()
         renderPassDescriptor.colorAttachments[0].texture = texture
@@ -2177,7 +2419,8 @@ final class MetalRenderer {
             thumbnailRect: NSRect(origin: .zero, size: thumbnailSize),
             scaleFactor: scaleFactor,
             bgScratch: &bgScratch,
-            glyphScratch: &glyphScratch
+            glyphScratch: &glyphScratch,
+            colorGlyphScratch: &colorGlyphScratch
         )
 
         encoder.endEncoding()
@@ -2236,9 +2479,11 @@ final class MetalRenderer {
                          viewportSize: SIMD2<Float>, thumbnailRect: NSRect,
                          scaleFactor: Float,
                          bgScratch: inout [Float],
-                         glyphScratch: inout [Float]) {
+                         glyphScratch: inout [Float],
+                         colorGlyphScratch: inout [Float]) {
         bgScratch.removeAll(keepingCapacity: true)
         glyphScratch.removeAll(keepingCapacity: true)
+        colorGlyphScratch.removeAll(keepingCapacity: true)
         appendThumbnailVertexData(
             model: model,
             scrollback: scrollback,
@@ -2246,7 +2491,8 @@ final class MetalRenderer {
             thumbnailRect: thumbnailRect,
             scaleFactor: scaleFactor,
             bgVertices: &bgScratch,
-            glyphVertices: &glyphScratch
+            glyphVertices: &glyphScratch,
+            colorGlyphVertices: &colorGlyphScratch
         )
 
         // Draw thumbnail backgrounds
@@ -2267,24 +2513,26 @@ final class MetalRenderer {
         }
 
         // Draw thumbnail glyphs (linear filtering for scaled-down text)
-        if !glyphScratch.isEmpty, let pipeline = glyphPipelineForCurrentOutput(),
-           let atlas = glyphAtlas.texture,
-           let buf = makeTemporaryBuffer(vertices: glyphScratch) {
-            encoder.setRenderPipelineState(pipeline)
-            encoder.setVertexBuffer(buf, offset: 0, index: 0)
-            encoder.setVertexBytes(&thumbUniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
-            encoder.setFragmentTexture(atlas, index: 0)
-            encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
-                                  vertexCount: glyphScratch.count / floatsPerVertex)
-        }
+        drawMonochromeGlyphVertices(
+            glyphScratch,
+            encoder: encoder,
+            uniforms: &thumbUniforms,
+            buffer: makeTemporaryBuffer(vertices: glyphScratch)
+        )
+        drawColorGlyphVertices(
+            colorGlyphScratch,
+            encoder: encoder,
+            uniforms: &thumbUniforms,
+            buffer: makeTemporaryBuffer(vertices: colorGlyphScratch)
+        )
     }
 
     func appendThumbnailVertexData(model: TerminalModel, scrollback: ScrollbackBuffer,
                                    scrollOffset: Int, thumbnailRect: NSRect,
                                    scaleFactor: Float,
                                    bgVertices: inout [Float],
-                                   glyphVertices: inout [Float]) {
+                                   glyphVertices: inout [Float],
+                                   colorGlyphVertices: inout [Float]) {
         var cachedGlyphs: [UInt32: GlyphAtlas.GlyphInfo] = [:]
         var missingGlyphs: Set<UInt32> = []
         let cellW = Float(glyphAtlas.cellWidth) * scaleFactor
@@ -2300,6 +2548,7 @@ final class MetalRenderer {
         // grow the backing arrays while streaming output.
         bgVertices.reserveCapacity(bgVertices.count + approximateCellCount * floatsPerQuad)
         glyphVertices.reserveCapacity(glyphVertices.count + approximateCellCount * floatsPerQuad)
+        colorGlyphVertices.reserveCapacity(colorGlyphVertices.count + approximateCellCount * floatsPerQuad)
 
         // Compute the full terminal size in pixels (as if rendering at full size)
         let termW = padX * 2 + Float(viewCols) * cellW
@@ -2353,6 +2602,14 @@ final class MetalRenderer {
             return nil
         }
 
+        @inline(__always)
+        func glyphInfoForCell(_ cell: Cell) -> GlyphAtlas.GlyphInfo? {
+            if cell.hasGraphemeTail {
+                return glyphAtlas.glyphInfo(for: cell.renderedString())
+            }
+            return glyphInfo(for: cell.codepoint)
+        }
+
         for row in 0..<viewRows {
             let absoluteRow = firstAbsolute + row
             let isScrollbackRow = absoluteRow < sbCount
@@ -2403,9 +2660,15 @@ final class MetalRenderer {
                 }
 
                 // Glyph
-                if cell.codepoint > 0x20,
-                   let glyph = glyphInfo(for: cell.codepoint),
-                   glyph.pixelWidth > 0 {
+                if cell.codepoint > 0x20 {
+                    let renderedText = cell.renderedString()
+                    let colorGlyph = Self.shouldAttemptColorEmoji(for: cell)
+                        ? glyphAtlas.colorGlyphInfo(for: renderedText)
+                        : nil
+                    let glyph = colorGlyph ?? glyphInfoForCell(cell)
+                    guard let glyph, glyph.pixelWidth > 0 else {
+                        continue
+                    }
                     let glyphFullX = fullX + (
                         cell.width == 1
                             ? glyph.cellOffsetX
@@ -2426,12 +2689,21 @@ final class MetalRenderer {
                     let gw = glyphFullW * thumbScale
                     let gh = glyphFullH * thumbScale
 
-                    addQuad(to: &glyphVertices,
-                           x: gx, y: gy, w: gw, h: gh,
-                           tx: glyph.textureX, ty: glyph.textureY,
-                           tw: glyph.textureW, th: glyph.textureH,
-                           fg: (fgColor.r, fgColor.g, fgColor.b, 1),
-                           bg: (0, 0, 0, 0))
+                    if colorGlyph != nil {
+                        addQuad(to: &colorGlyphVertices,
+                               x: gx, y: gy, w: gw, h: gh,
+                               tx: glyph.textureX, ty: glyph.textureY,
+                               tw: glyph.textureW, th: glyph.textureH,
+                               fg: (1, 1, 1, 1),
+                               bg: (0, 0, 0, 0))
+                    } else {
+                        addQuad(to: &glyphVertices,
+                               x: gx, y: gy, w: gw, h: gh,
+                               tx: glyph.textureX, ty: glyph.textureY,
+                               tw: glyph.textureW, th: glyph.textureH,
+                               fg: (fgColor.r, fgColor.g, fgColor.b, 1),
+                               bg: (0, 0, 0, 0))
+                    }
                 }
             }
         }
@@ -2501,18 +2773,18 @@ final class MetalRenderer {
         }
 
         // 2. Glyphs
-        if !vd.glyphVertices.isEmpty, let pipeline = glyphPipelineForCurrentOutput(),
-           let atlas = glyphAtlas.texture {
-            if let buf = makeTemporaryBuffer(vertices: vd.glyphVertices) {
-                encoder.setRenderPipelineState(pipeline)
-                encoder.setVertexBuffer(buf, offset: 0, index: 0)
-                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
-                encoder.setFragmentTexture(atlas, index: 0)
-                encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
-                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
-                                      vertexCount: vd.glyphVertices.count / floatsPerVertex)
-            }
-        }
+        drawMonochromeGlyphVertices(
+            vd.glyphVertices,
+            encoder: encoder,
+            uniforms: &uniforms,
+            buffer: makeTemporaryBuffer(vertices: vd.glyphVertices)
+        )
+        drawColorGlyphVertices(
+            vd.colorGlyphVertices,
+            encoder: encoder,
+            uniforms: &uniforms,
+            buffer: makeTemporaryBuffer(vertices: vd.colorGlyphVertices)
+        )
 
         // 3. Cursor
         if !vd.cursorVertices.isEmpty, let pipeline = cursorPipeline {
@@ -2645,18 +2917,18 @@ final class MetalRenderer {
             }
         }
 
-        if !vd.glyphVertices.isEmpty, let pipeline = glyphPipelineForCurrentOutput(),
-           let atlas = glyphAtlas.texture {
-            if let buf = makeTemporaryBuffer(vertices: vd.glyphVertices) {
-                encoder.setRenderPipelineState(pipeline)
-                encoder.setVertexBuffer(buf, offset: 0, index: 0)
-                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
-                encoder.setFragmentTexture(atlas, index: 0)
-                encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
-                encoder.drawPrimitives(type: .triangle, vertexStart: 0,
-                                       vertexCount: vd.glyphVertices.count / floatsPerVertex)
-            }
-        }
+        drawMonochromeGlyphVertices(
+            vd.glyphVertices,
+            encoder: encoder,
+            uniforms: &uniforms,
+            buffer: makeTemporaryBuffer(vertices: vd.glyphVertices)
+        )
+        drawColorGlyphVertices(
+            vd.colorGlyphVertices,
+            encoder: encoder,
+            uniforms: &uniforms,
+            buffer: makeTemporaryBuffer(vertices: vd.colorGlyphVertices)
+        )
 
         if !vd.cursorVertices.isEmpty, let pipeline = cursorPipeline {
             if let buf = makeTemporaryBuffer(vertices: vd.cursorVertices) {

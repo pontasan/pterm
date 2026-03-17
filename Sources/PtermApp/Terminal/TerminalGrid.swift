@@ -84,20 +84,24 @@ final class TerminalGrid {
     /// hint maintenance can be disabled there to keep mutation hot paths lean.
     var tracksPreciseRowEncodingHints = true
 
-    init(rows: Int, cols: Int) {
+    convenience init(rows: Int, cols: Int) {
+        self.init(rows: rows, cols: cols, allocateStorage: true)
+    }
+
+    private init(rows: Int, cols: Int, allocateStorage: Bool) {
         self.rows = rows
         self.cols = cols
         self.scrollBottom = rows - 1
-        self.cells = Array(repeating: Cell.empty, count: rows * cols)
-        self.emptyRowTemplate = Array(repeating: Cell.empty, count: cols)
-        self.rowEncodingHintStates = Array(repeating: .blankDefault, count: rows)
+        self.cells = allocateStorage ? Array(repeating: Cell.empty, count: rows * cols) : []
+        self.emptyRowTemplate = allocateStorage ? Array(repeating: Cell.empty, count: cols) : []
+        self.rowEncodingHintStates = allocateStorage ? Array(repeating: .blankDefault, count: rows) : []
         self.rowOrder = []
-        self.physicalWrappedFlags = Array(repeating: false, count: rows)
-        self.physicalLineAttributes = Array(repeating: .singleWidth, count: rows)
+        self.physicalWrappedFlags = allocateStorage ? Array(repeating: false, count: rows) : []
+        self.physicalLineAttributes = allocateStorage ? Array(repeating: .singleWidth, count: rows) : []
         self.nonSingleWidthLineCount = 0
-        self.physicalMayContainProtectedCells = Array(repeating: false, count: rows)
-        self.physicalBlankRows = Array(repeating: true, count: rows)
-        self.physicalSparseCompactDefaultPrefixCounts = Array(repeating: 0, count: rows)
+        self.physicalMayContainProtectedCells = allocateStorage ? Array(repeating: false, count: rows) : []
+        self.physicalBlankRows = allocateStorage ? Array(repeating: true, count: rows) : []
+        self.physicalSparseCompactDefaultPrefixCounts = allocateStorage ? Array(repeating: 0, count: rows) : []
     }
 
     // MARK: - Cell Access
@@ -1083,23 +1087,21 @@ final class TerminalGrid {
 
     /// Return an immutable copy of the grid contents for diagnostics and benchmarks.
     func snapshot() -> TerminalGrid {
-        let copy = TerminalGrid(rows: rows, cols: cols)
-        // Force independent storage for snapshots so hot-path mutations on the live
-        // grid do not trigger whole-grid COW copies while a snapshot is still alive.
-        copy.cells = Array(cells)
-        copy.emptyRowTemplate = Array(emptyRowTemplate)
-        copy.rowEncodingHintStates = Array(rowEncodingHintStates)
+        let copy = TerminalGrid(rows: rows, cols: cols, allocateStorage: false)
+        copy.cells = cells
+        copy.emptyRowTemplate = emptyRowTemplate
+        copy.rowEncodingHintStates = rowEncodingHintStates
         copy.hasRowPermutation = hasRowPermutation
         if hasRowPermutation {
-            copy.rowOrder = Array(rowOrder)
+            copy.rowOrder = rowOrder
             copy.rowOrderHead = rowOrderHead
         }
-        copy.physicalWrappedFlags = Array(physicalWrappedFlags)
-        copy.physicalLineAttributes = Array(physicalLineAttributes)
+        copy.physicalWrappedFlags = physicalWrappedFlags
+        copy.physicalLineAttributes = physicalLineAttributes
         copy.nonSingleWidthLineCount = nonSingleWidthLineCount
-        copy.physicalMayContainProtectedCells = Array(physicalMayContainProtectedCells)
-        copy.physicalBlankRows = Array(physicalBlankRows)
-        copy.physicalSparseCompactDefaultPrefixCounts = Array(physicalSparseCompactDefaultPrefixCounts)
+        copy.physicalMayContainProtectedCells = physicalMayContainProtectedCells
+        copy.physicalBlankRows = physicalBlankRows
+        copy.physicalSparseCompactDefaultPrefixCounts = physicalSparseCompactDefaultPrefixCounts
         copy.scrollTop = scrollTop
         copy.scrollBottom = scrollBottom
         copy.tracksPreciseRowEncodingHints = tracksPreciseRowEncodingHints

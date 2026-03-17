@@ -18,10 +18,8 @@ final class TerminalControllerTests: XCTestCase {
 
         let initialRowCapacity = initialRowIndexCapacity(for: initialCapacity)
         let serializedCellRow: [UInt8] = [
+            0x01,
             UInt8(codepoint & 0xFF), UInt8((codepoint >> 8) & 0xFF), UInt8((codepoint >> 16) & 0xFF), UInt8((codepoint >> 24) & 0xFF),
-            0, 0, 0, 0,
-            0, 0, 0, 0,
-            0, 1, 0, 0
         ]
         for _ in 0..<(Int(initialRowCapacity) + 8) {
             serializedCellRow.withUnsafeBufferPointer { pointer in
@@ -99,6 +97,13 @@ final class TerminalControllerTests: XCTestCase {
         }
 
         XCTAssertEqual(bulk.allText(), byteWise.allText())
+    }
+
+    func testDebugProcessPTYOutputKeepsCompositeEmojiAsSingleVisibleGrapheme() {
+        let controller = makeController(rows: 2, cols: 12)
+        controller.debugProcessPTYOutputForTesting(Data("👩‍💻 🇯🇵".utf8))
+
+        XCTAssertTrue(controller.allText().contains("👩‍💻 🇯🇵"))
     }
 
     func testInputWithoutNewlineSuppressesOutputActivityIndicator() {
@@ -472,7 +477,7 @@ final class TerminalControllerTests: XCTestCase {
 
             XCTAssertGreaterThan(controller.scrollback.capacity, 16)
             XCTAssertTrue(controller.debugCompactScrollbackNow())
-            XCTAssertEqual(controller.scrollback.capacity, 128)
+            XCTAssertEqual(controller.scrollback.capacity, 64)
             XCTAssertEqual(controller.scrollback.rowIndexCapacity, 16)
             XCTAssertEqual(controller.scrollback.rowCount, 1)
             XCTAssertEqual(controller.scrollback.getRow(at: 0)?.first?.codepoint, 77)
@@ -481,12 +486,7 @@ final class TerminalControllerTests: XCTestCase {
 
     func testDetectedImagePlaceholderReturnsHoveredPlaceholderRangeAndIndex() {
         let controller = makeController(rows: 2, cols: 16)
-        controller.withModel { model in
-            let text = "[Image #12]"
-            for (index, scalar) in text.unicodeScalars.enumerated() {
-                model.grid.setCell(Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: index)
-            }
-        }
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}_Gi=12,a=T,t=d,c=11,r=1;\u{1B}\\".utf8))
 
         let detected = controller.detectedImagePlaceholder(at: .init(row: 0, col: 5))
 
@@ -1473,6 +1473,8 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertEqual(bulkCursor.0, byteWiseCursor.0)
         XCTAssertEqual(bulkCursor.1, byteWiseCursor.1)
         XCTAssertEqual(bulkCursor.2, byteWiseCursor.2)
+        XCTAssertFalse(bulk.withModel { $0.kittyKeyboardProtocolEnabled })
+        XCTAssertFalse(byteWise.withModel { $0.kittyKeyboardProtocolEnabled })
     }
 
     func testDebugProcessPTYOutputMatchesByteWiseProcessingForKittyGraphicsPayload() {
@@ -1494,11 +1496,43 @@ final class TerminalControllerTests: XCTestCase {
         }
 
         XCTAssertEqual(bulk.allText(), byteWise.allText())
+        XCTAssertFalse(bulk.allText().contains("[Image #1]"))
         let bulkState = bulk.withModel { ($0.cursor.row, $0.cursor.col, $0.cursor.visible) }
         let byteWiseState = byteWise.withModel { ($0.cursor.row, $0.cursor.col, $0.cursor.visible) }
         XCTAssertEqual(bulkState.0, byteWiseState.0)
         XCTAssertEqual(bulkState.1, byteWiseState.1)
         XCTAssertEqual(bulkState.2, byteWiseState.2)
+    }
+
+    func testKittyGraphicsPayloadPersistsPreviewableImageData() throws {
+        try withTemporaryPtermConfig { _ in
+            PastedImageRegistry.shared.reset()
+            defer { PastedImageRegistry.shared.reset() }
+
+            let controller = makeController(rows: 24, cols: 80)
+            let pngBytes = Data([
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+                0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52
+            ])
+            let payload = Data("\u{1B}_Gi=3,a=T,f=100,t=d;\(pngBytes.base64EncodedString())\u{1B}\\".utf8)
+
+            controller.debugProcessPTYOutputForTesting(payload)
+
+            var resolvedURL: URL?
+            for _ in 0..<50 {
+                if let url = PastedImageRegistry.shared.url(forPlaceholderIndex: 3) {
+                    resolvedURL = url
+                    break
+                }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+
+            let url = try XCTUnwrap(resolvedURL)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+            XCTAssertEqual(try Data(contentsOf: url), pngBytes)
+            XCTAssertFalse(controller.allText().contains("[Image #3]"))
+            XCTAssertEqual(controller.detectedImagePlaceholder(at: .init(row: 0, col: 0))?.index, 3)
+        }
     }
 
     func testDebugProcessPTYOutputMatchesByteWiseProcessingForMixedWideUnicodeAndASCII() {

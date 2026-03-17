@@ -32,6 +32,14 @@ final class KeyboardHandler {
         guard let controller = controller else { return false }
 
         let modifiers = event.modifierFlags
+        let kittyKeyboardProtocolEnabled = controller.withModel { $0.kittyKeyboardProtocolEnabled }
+
+        if kittyKeyboardProtocolEnabled,
+           let kittySequence = kittyKeyboardInputSequence(for: event) {
+            controller.sendInput(kittySequence)
+            playInputFeedbackIfEnabled()
+            return true
+        }
 
         // Control key combinations
         if modifiers.contains(.control) {
@@ -82,6 +90,16 @@ final class KeyboardHandler {
             return true
         }
 
+        if modifiers.contains(.option),
+           !modifiers.contains(.command),
+           !modifiers.contains(.control),
+           let characters = event.characters,
+           !characters.isEmpty {
+            controller.sendInput("\u{1B}" + characters)
+            playInputFeedbackIfEnabled()
+            return true
+        }
+
         // Regular text input
         if let characters = event.characters {
             controller.sendInput(characters)
@@ -106,13 +124,32 @@ final class KeyboardHandler {
     func debugInputSequence(for event: NSEvent) -> String? {
         guard let controller = controller else { return nil }
         let modes = controller.withModel { model in
-            (appCursor: model.applicationCursorKeys, appKeypad: model.applicationKeypadMode)
+            (appCursor: model.applicationCursorKeys, appKeypad: model.applicationKeypadMode, kittyKeyboard: model.kittyKeyboardProtocolEnabled)
+        }
+        if modes.kittyKeyboard,
+           let kittySequence = kittyKeyboardInputSequence(for: event) {
+            return kittySequence
         }
         return translatedSpecialKeyInput(
             for: event,
             applicationCursorKeys: modes.appCursor,
             applicationKeypadMode: modes.appKeypad
         )
+    }
+
+    func debugResolvedInput(for event: NSEvent) -> String? {
+        if let special = debugInputSequence(for: event) {
+            return special
+        }
+        let modifiers = event.modifierFlags
+        if modifiers.contains(.option),
+           !modifiers.contains(.command),
+           !modifiers.contains(.control),
+           let characters = event.characters,
+           !characters.isEmpty {
+            return "\u{1B}" + characters
+        }
+        return event.characters
     }
 
     func debugSpecialKeySelector(for event: NSEvent) -> Selector? {
@@ -287,6 +324,9 @@ final class KeyboardHandler {
         applicationKeypadMode appKeypad: Bool
     ) -> String? {
         let prefix: String = appCursor ? "\u{1B}O" : "\u{1B}["
+        let relevantModifiers = event.modifierFlags.intersection([.shift, .control, .option, .command])
+        let modifierParameter = xtermModifierParameter(for: relevantModifiers)
+        let hasExplicitModifiers = modifierParameter != 1
 
         if appKeypad, let keypadSequence = applicationKeypadSequence(for: event) {
             return keypadSequence
@@ -294,57 +334,157 @@ final class KeyboardHandler {
 
         switch event.keyCode {
         case 126: // Up
-            return "\(prefix)A"
+            return hasExplicitModifiers ? "\u{1B}[1;\(modifierParameter)A" : "\(prefix)A"
         case 125: // Down
-            return "\(prefix)B"
+            return hasExplicitModifiers ? "\u{1B}[1;\(modifierParameter)B" : "\(prefix)B"
         case 124: // Right
-            return "\(prefix)C"
+            return hasExplicitModifiers ? "\u{1B}[1;\(modifierParameter)C" : "\(prefix)C"
         case 123: // Left
-            return "\(prefix)D"
+            return hasExplicitModifiers ? "\u{1B}[1;\(modifierParameter)D" : "\(prefix)D"
         case 115: // Home
-            return appCursor ? "\u{1B}OH" : "\u{1B}[H"
+            return hasExplicitModifiers ? "\u{1B}[1;\(modifierParameter)H" : (appCursor ? "\u{1B}OH" : "\u{1B}[H")
         case 119: // End
-            return appCursor ? "\u{1B}OF" : "\u{1B}[F"
+            return hasExplicitModifiers ? "\u{1B}[1;\(modifierParameter)F" : (appCursor ? "\u{1B}OF" : "\u{1B}[F")
         case 116: // PageUp
-            return "\u{1B}[5~"
+            return hasExplicitModifiers ? "\u{1B}[5;\(modifierParameter)~" : "\u{1B}[5~"
         case 121: // PageDown
-            return "\u{1B}[6~"
+            return hasExplicitModifiers ? "\u{1B}[6;\(modifierParameter)~" : "\u{1B}[6~"
         case 117: // Delete (forward)
-            return "\u{1B}[3~"
+            return hasExplicitModifiers ? "\u{1B}[3;\(modifierParameter)~" : "\u{1B}[3~"
         case 51: // Backspace
+            if hasExplicitModifiers {
+                return "\u{1B}[127;\(modifierParameter)u"
+            }
             return String(UnicodeScalar(0x7F)!)
         case 53: // Escape
+            if hasExplicitModifiers {
+                return "\u{1B}[27;\(modifierParameter)u"
+            }
             return "\u{1B}"
         case 76: // Enter (numpad)
+            if hasExplicitModifiers {
+                return "\u{1B}[13;\(modifierParameter)u"
+            }
             return "\r"
         case 36: // Return
+            if hasExplicitModifiers {
+                return "\u{1B}[13;\(modifierParameter)u"
+            }
             return "\r"
         case 48: // Tab
+            if hasExplicitModifiers {
+                return "\u{1B}[9;\(modifierParameter)u"
+            }
             if event.modifierFlags.contains(.shift) {
                 return "\u{1B}[Z" // Backtab
             }
             return "\t"
         // Function keys
-        case UInt16(kVK_F1): return "\u{1B}[11~" // F1
-        case UInt16(kVK_F2): return "\u{1B}[12~" // F2
-        case UInt16(kVK_F3): return "\u{1B}[13~" // F3
-        case UInt16(kVK_F4): return "\u{1B}[14~" // F4
-        case 96:  return "\u{1B}[15~" // F5
-        case 97:  return "\u{1B}[17~" // F6
-        case 98:  return "\u{1B}[18~" // F7
-        case 100: return "\u{1B}[19~" // F8
-        case 101: return "\u{1B}[20~" // F9
-        case UInt16(kVK_F10): return "\u{1B}[21~" // F10
-        case UInt16(kVK_F11): return "\u{1B}[23~" // F11
-        case UInt16(kVK_F12): return "\u{1B}[24~" // F12
-        case UInt16(kVK_F13): return "\u{1B}[25~" // F13
-        case UInt16(kVK_F14): return "\u{1B}[26~" // F14
-        case UInt16(kVK_F15), UInt16(kVK_Help): return "\u{1B}[28~" // Help (F15)
-        case UInt16(kVK_F16): return "\u{1B}[29~" // Do (F16)
-        case UInt16(kVK_F17): return "\u{1B}[31~" // F17
-        case UInt16(kVK_F18): return "\u{1B}[32~" // F18
-        case UInt16(kVK_F19): return "\u{1B}[33~" // F19
-        case UInt16(kVK_F20): return "\u{1B}[34~" // F20
+        case UInt16(kVK_F1): return hasExplicitModifiers ? "\u{1B}[11;\(modifierParameter)~" : "\u{1B}[11~"
+        case UInt16(kVK_F2): return hasExplicitModifiers ? "\u{1B}[12;\(modifierParameter)~" : "\u{1B}[12~"
+        case UInt16(kVK_F3): return hasExplicitModifiers ? "\u{1B}[13;\(modifierParameter)~" : "\u{1B}[13~"
+        case UInt16(kVK_F4): return hasExplicitModifiers ? "\u{1B}[14;\(modifierParameter)~" : "\u{1B}[14~"
+        case 96:  return hasExplicitModifiers ? "\u{1B}[15;\(modifierParameter)~" : "\u{1B}[15~"
+        case 97:  return hasExplicitModifiers ? "\u{1B}[17;\(modifierParameter)~" : "\u{1B}[17~"
+        case 98:  return hasExplicitModifiers ? "\u{1B}[18;\(modifierParameter)~" : "\u{1B}[18~"
+        case 100: return hasExplicitModifiers ? "\u{1B}[19;\(modifierParameter)~" : "\u{1B}[19~"
+        case 101: return hasExplicitModifiers ? "\u{1B}[20;\(modifierParameter)~" : "\u{1B}[20~"
+        case UInt16(kVK_F10): return hasExplicitModifiers ? "\u{1B}[21;\(modifierParameter)~" : "\u{1B}[21~"
+        case UInt16(kVK_F11): return hasExplicitModifiers ? "\u{1B}[23;\(modifierParameter)~" : "\u{1B}[23~"
+        case UInt16(kVK_F12): return hasExplicitModifiers ? "\u{1B}[24;\(modifierParameter)~" : "\u{1B}[24~"
+        case UInt16(kVK_F13): return hasExplicitModifiers ? "\u{1B}[25;\(modifierParameter)~" : "\u{1B}[25~"
+        case UInt16(kVK_F14): return hasExplicitModifiers ? "\u{1B}[26;\(modifierParameter)~" : "\u{1B}[26~"
+        case UInt16(kVK_F15), UInt16(kVK_Help): return hasExplicitModifiers ? "\u{1B}[28;\(modifierParameter)~" : "\u{1B}[28~"
+        case UInt16(kVK_F16): return hasExplicitModifiers ? "\u{1B}[29;\(modifierParameter)~" : "\u{1B}[29~"
+        case UInt16(kVK_F17): return hasExplicitModifiers ? "\u{1B}[31;\(modifierParameter)~" : "\u{1B}[31~"
+        case UInt16(kVK_F18): return hasExplicitModifiers ? "\u{1B}[32;\(modifierParameter)~" : "\u{1B}[32~"
+        case UInt16(kVK_F19): return hasExplicitModifiers ? "\u{1B}[33;\(modifierParameter)~" : "\u{1B}[33~"
+        case UInt16(kVK_F20): return hasExplicitModifiers ? "\u{1B}[34;\(modifierParameter)~" : "\u{1B}[34~"
+        default:
+            return nil
+        }
+    }
+
+    private func xtermModifierParameter(for modifiers: NSEvent.ModifierFlags) -> Int {
+        var value = 1
+        if modifiers.contains(.shift) { value += 1 }
+        if modifiers.contains(.option) { value += 2 }
+        if modifiers.contains(.control) { value += 4 }
+        if modifiers.contains(.command) { value += 8 }
+        return value
+    }
+
+    private func kittyKeyboardInputSequence(for event: NSEvent) -> String? {
+        let relevantModifiers = event.modifierFlags.intersection([.shift, .control, .option, .command])
+        if let special = kittySpecialKeySequence(for: event, modifiers: relevantModifiers) {
+            return special
+        }
+
+        guard let chars = event.charactersIgnoringModifiers,
+              let scalar = chars.unicodeScalars.first
+        else {
+            return nil
+        }
+
+        if relevantModifiers.isEmpty {
+            return nil
+        }
+
+        let modifierValue = kittyModifierValue(for: relevantModifiers)
+        return "\u{1B}[\(scalar.value);\(modifierValue)u"
+    }
+
+    private func kittyModifierValue(for modifiers: NSEvent.ModifierFlags) -> Int {
+        var value = 1
+        if modifiers.contains(.shift) { value += 1 }
+        if modifiers.contains(.option) { value += 2 }
+        if modifiers.contains(.control) { value += 4 }
+        if modifiers.contains(.command) { value += 8 }
+        return value
+    }
+
+    private func kittySpecialKeySequence(for event: NSEvent, modifiers: NSEvent.ModifierFlags) -> String? {
+        let modifierValue = kittyModifierValue(for: modifiers)
+        let hasExplicitModifiers = modifierValue != 1
+
+        switch event.keyCode {
+        case UInt16(kVK_F1): return hasExplicitModifiers ? "\u{1B}[11;\(modifierValue)~" : nil
+        case UInt16(kVK_F2): return hasExplicitModifiers ? "\u{1B}[12;\(modifierValue)~" : nil
+        case UInt16(kVK_F3): return hasExplicitModifiers ? "\u{1B}[13;\(modifierValue)~" : nil
+        case UInt16(kVK_F4): return hasExplicitModifiers ? "\u{1B}[14;\(modifierValue)~" : nil
+        case 96: return hasExplicitModifiers ? "\u{1B}[15;\(modifierValue)~" : nil
+        case 97: return hasExplicitModifiers ? "\u{1B}[17;\(modifierValue)~" : nil
+        case 98: return hasExplicitModifiers ? "\u{1B}[18;\(modifierValue)~" : nil
+        case 100: return hasExplicitModifiers ? "\u{1B}[19;\(modifierValue)~" : nil
+        case 101: return hasExplicitModifiers ? "\u{1B}[20;\(modifierValue)~" : nil
+        case UInt16(kVK_F10): return hasExplicitModifiers ? "\u{1B}[21;\(modifierValue)~" : nil
+        case UInt16(kVK_F11): return hasExplicitModifiers ? "\u{1B}[23;\(modifierValue)~" : nil
+        case UInt16(kVK_F12): return hasExplicitModifiers ? "\u{1B}[24;\(modifierValue)~" : nil
+        case UInt16(kVK_F13): return hasExplicitModifiers ? "\u{1B}[25;\(modifierValue)~" : nil
+        case UInt16(kVK_F14): return hasExplicitModifiers ? "\u{1B}[26;\(modifierValue)~" : nil
+        case UInt16(kVK_F15), UInt16(kVK_Help): return hasExplicitModifiers ? "\u{1B}[28;\(modifierValue)~" : nil
+        case UInt16(kVK_F16): return hasExplicitModifiers ? "\u{1B}[29;\(modifierValue)~" : nil
+        case UInt16(kVK_F17): return hasExplicitModifiers ? "\u{1B}[31;\(modifierValue)~" : nil
+        case UInt16(kVK_F18): return hasExplicitModifiers ? "\u{1B}[32;\(modifierValue)~" : nil
+        case UInt16(kVK_F19): return hasExplicitModifiers ? "\u{1B}[33;\(modifierValue)~" : nil
+        case UInt16(kVK_F20): return hasExplicitModifiers ? "\u{1B}[34;\(modifierValue)~" : nil
+        case 126: return hasExplicitModifiers ? "\u{1B}[1;\(modifierValue)A" : nil
+        case 125: return hasExplicitModifiers ? "\u{1B}[1;\(modifierValue)B" : nil
+        case 124: return hasExplicitModifiers ? "\u{1B}[1;\(modifierValue)C" : nil
+        case 123: return hasExplicitModifiers ? "\u{1B}[1;\(modifierValue)D" : nil
+        case 115: return hasExplicitModifiers ? "\u{1B}[1;\(modifierValue)H" : nil
+        case 119: return hasExplicitModifiers ? "\u{1B}[1;\(modifierValue)F" : nil
+        case 116: return hasExplicitModifiers ? "\u{1B}[5;\(modifierValue)~" : nil
+        case 121: return hasExplicitModifiers ? "\u{1B}[6;\(modifierValue)~" : nil
+        case 117: return hasExplicitModifiers ? "\u{1B}[3;\(modifierValue)~" : nil
+        case 51:
+            return hasExplicitModifiers ? "\u{1B}[127;\(modifierValue)u" : nil
+        case 53:
+            return hasExplicitModifiers ? "\u{1B}[27;\(modifierValue)u" : nil
+        case 36, 76:
+            return hasExplicitModifiers ? "\u{1B}[13;\(modifierValue)u" : nil
+        case 48:
+            return hasExplicitModifiers ? "\u{1B}[9;\(modifierValue)u" : nil
         default:
             return nil
         }

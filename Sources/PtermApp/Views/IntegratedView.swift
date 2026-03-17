@@ -446,6 +446,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     private var stagingCircleVertices: [Float] = []
     private var thumbnailCacheBuildBgScratch: [Float] = []
     private var thumbnailCacheBuildGlyphScratch: [Float] = []
+    private var thumbnailCacheBuildColorGlyphScratch: [Float] = []
     private var scrollInteractionTimer: Timer?
     private var idleBufferReleaseTimer: Timer?
     private var outputPulseTimer: Timer?
@@ -713,7 +714,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
                 scaleFactor: scaleFactor,
                 commandBuffer: commandBuffer,
                 bgScratch: &thumbnailCacheBuildBgScratch,
-                glyphScratch: &thumbnailCacheBuildGlyphScratch
+                glyphScratch: &thumbnailCacheBuildGlyphScratch,
+                colorGlyphScratch: &thumbnailCacheBuildColorGlyphScratch
             )
         }
         if let blit = commandBuffer.makeBlitCommandEncoder() {
@@ -755,7 +757,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
                 scaleFactor: scaleFactor,
                 commandBuffer: commandBuffer,
                 bgScratch: &thumbnailCacheBuildBgScratch,
-                glyphScratch: &thumbnailCacheBuildGlyphScratch
+                glyphScratch: &thumbnailCacheBuildGlyphScratch,
+                colorGlyphScratch: &thumbnailCacheBuildColorGlyphScratch
             )
         }
         commandBuffer.commit()
@@ -772,6 +775,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         return layout.controller.withViewport { model, scrollback, scrollOffset in
             var bgVertices: [Float] = []
             var glyphVertices: [Float] = []
+            var colorGlyphVertices: [Float] = []
             renderer.appendThumbnailVertexData(
                 model: model,
                 scrollback: scrollback,
@@ -779,11 +783,12 @@ final class IntegratedView: MTKView, NSDraggingSource {
                 thumbnailRect: layout.thumbnail,
                 scaleFactor: scaleFactor,
                 bgVertices: &bgVertices,
-                glyphVertices: &glyphVertices
+                glyphVertices: &glyphVertices,
+                colorGlyphVertices: &colorGlyphVertices
             )
             return (
                 background: bgVertices.count / 12,
-                glyph: glyphVertices.count / 12
+                glyph: (glyphVertices.count + colorGlyphVertices.count) / 12
             )
         }
     }
@@ -805,6 +810,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         return layout.controller.withViewport { model, scrollback, scrollOffset in
             var bgVertices: [Float] = []
             var glyphVertices: [Float] = []
+            var colorGlyphVertices: [Float] = []
             renderer.appendThumbnailVertexData(
                 model: model,
                 scrollback: scrollback,
@@ -812,9 +818,10 @@ final class IntegratedView: MTKView, NSDraggingSource {
                 thumbnailRect: NSRect(origin: .zero, size: layout.thumbnail.size),
                 scaleFactor: scaleFactor,
                 bgVertices: &bgVertices,
-                glyphVertices: &glyphVertices
+                glyphVertices: &glyphVertices,
+                colorGlyphVertices: &colorGlyphVertices
             )
-            let vertices = includeGlyphs ? glyphVertices : bgVertices
+            let vertices = includeGlyphs ? (glyphVertices + colorGlyphVertices) : bgVertices
             guard !vertices.isEmpty else { return nil }
             var minX = Float.greatestFiniteMagnitude
             var minY = Float.greatestFiniteMagnitude
@@ -1548,6 +1555,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         stagingCircleVertices = []
         thumbnailCacheBuildBgScratch = []
         thumbnailCacheBuildGlyphScratch = []
+        thumbnailCacheBuildColorGlyphScratch = []
     }
 
     private func releaseAuxiliaryOverviewResources() {
@@ -1570,6 +1578,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
         stagingCircleVertices.removeAll(keepingCapacity: true)
         thumbnailCacheBuildBgScratch.removeAll(keepingCapacity: true)
         thumbnailCacheBuildGlyphScratch.removeAll(keepingCapacity: true)
+        thumbnailCacheBuildColorGlyphScratch.removeAll(keepingCapacity: true)
     }
 
     private func beginOverviewScrollInteraction() {
@@ -1725,7 +1734,8 @@ final class IntegratedView: MTKView, NSDraggingSource {
                 scaleFactor: scaleFactor,
                 commandBuffer: commandBuffer,
                 bgScratch: &thumbnailCacheBuildBgScratch,
-                glyphScratch: &thumbnailCacheBuildGlyphScratch
+                glyphScratch: &thumbnailCacheBuildGlyphScratch,
+                colorGlyphScratch: &thumbnailCacheBuildColorGlyphScratch
             )
             let cached = CachedThumbnailSurface(
                 signature: signature,

@@ -121,9 +121,7 @@ struct TerminalSelection {
                 for col in colStart...colEnd {
                     let cell = grid.cell(at: row, col: col)
                     if cell.isWideContinuation { continue }
-                    if let scalar = Unicode.Scalar(cell.codepoint) {
-                        result.append(Character(scalar))
-                    }
+                    result.append(cell.renderedString())
                 }
 
                 // Add newline between rows (not after the last row)
@@ -143,9 +141,7 @@ struct TerminalSelection {
                 for col in s.col...min(e.col, grid.cols - 1) {
                     let cell = grid.cell(at: row, col: col)
                     if cell.isWideContinuation { continue }
-                    if let scalar = Unicode.Scalar(cell.codepoint) {
-                        result.append(Character(scalar))
-                    }
+                    result.append(cell.renderedString())
                 }
                 if row < e.row {
                     while result.hasSuffix(" ") {

@@ -165,7 +165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Tracks terminals that have been idle at least once (initial output burst is over).
     private var terminalsEverIdle: Set<UUID> = []
     private let clipboardFileStore = ClipboardFileStore()
-    private let pastedImageRegistry = PastedImageRegistry()
+    private let pastedImageRegistry = PastedImageRegistry.shared
     private var clipboardCleanupService: ClipboardCleanupService?
     private var mcpServer: MCPServer?
     private let sessionStore = SessionStore()

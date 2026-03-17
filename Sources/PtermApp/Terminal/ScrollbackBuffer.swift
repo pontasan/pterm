@@ -3,7 +3,7 @@ import PtermCore
 
 /// Swift wrapper around the C ring buffer for terminal scrollback storage.
 ///
-/// Serializes Cell arrays to a compact binary format (16 bytes per cell)
+/// Serializes Cell arrays to a compact binary format
 /// and stores them in the circular ring buffer. When the buffer is full,
 /// the oldest rows are automatically evicted.
 ///
@@ -141,12 +141,13 @@ final class ScrollbackBuffer {
     private static let serializationBufferPageSize = 4096
 
     /// Bytes per cell in binary format
-    static let bytesPerCell = 16
+    static let bytesPerCell = fullCellBytes
     private static let compactRowHeaderBytes = 1
     private static let compactTrimmedRowHeaderBytes = 3
-    private static let uniformAttributesHeaderBytes = 10
-    private static let uniformAttributesTrimmedHeaderBytes = 12
+    private static let uniformAttributesHeaderBytes = 15
+    private static let uniformAttributesTrimmedHeaderBytes = 17
     private static let uniformAttributesBytesPerCell = 5
+    private static let fullCellBytes = 60
     // Treat large heap-backed startup budgets as permission to pre-size row metadata so
     // short-row workloads (like line-oriented logs or `seq`) do not immediately grow the
     // row index. Small budgets keep the ring buffer's default row floor so metadata cannot
@@ -442,11 +443,13 @@ final class ScrollbackBuffer {
             let sharedAttributes = Self.deserializeAttributes(
                 foregroundPtr: ptr + 1,
                 backgroundPtr: ptr + 5,
-                flags: ptr[9]
+                flags: ptr[9],
+                underlineStyleRaw: ptr[10],
+                underlineColorPtr: ptr + 11
             )
             let headerBytes = trimmed ? Self.uniformAttributesTrimmedHeaderBytes : Self.uniformAttributesHeaderBytes
             let serializedCount = (Int(length) - headerBytes) / Self.uniformAttributesBytesPerCell
-            cellCount = trimmed ? Int(Self.deserializeUInt16(from: ptr + 10)) : serializedCount
+            cellCount = trimmed ? Int(Self.deserializeUInt16(from: ptr + 15)) : serializedCount
             destination.reserveCapacity(cellCount)
             var offset = headerBytes
             for _ in 0..<serializedCount {
@@ -600,11 +603,13 @@ final class ScrollbackBuffer {
             let sharedAttributes = Self.deserializeAttributes(
                 foregroundPtr: ptr + 1,
                 backgroundPtr: ptr + 5,
-                flags: ptr[9]
+                flags: ptr[9],
+                underlineStyleRaw: ptr[10],
+                underlineColorPtr: ptr + 11
             )
             let headerBytes = trimmed ? Self.uniformAttributesTrimmedHeaderBytes : Self.uniformAttributesHeaderBytes
             let serializedCount = (length - headerBytes) / Self.uniformAttributesBytesPerCell
-            cellCount = trimmed ? Int(Self.deserializeUInt16(from: ptr + 10)) : serializedCount
+            cellCount = trimmed ? Int(Self.deserializeUInt16(from: ptr + 15)) : serializedCount
             destination.reserveCapacity(cellCount)
             var offset = headerBytes
             for _ in 0..<serializedCount {
@@ -629,7 +634,7 @@ final class ScrollbackBuffer {
 
     // MARK: - Cell Serialization
 
-    /// Binary format per cell (16 bytes):
+    /// Binary format per full cell (20 bytes):
     ///   [0..3]  codepoint (UInt32, little-endian)
     ///   [4]     fg_type (0=default, 1=indexed, 2=rgb)
     ///   [5]     fg_data1 (index or R)
@@ -642,7 +647,19 @@ final class ScrollbackBuffer {
     ///   [12]    attr_flags (8 booleans packed into bits)
     ///   [13]    width
     ///   [14]    isWideContinuation
-    ///   [15]    reserved
+    ///   [15]    underline_style
+    ///   [16]    underline_color_type
+    ///   [17]    underline_color_data1
+    ///   [18]    underline_color_data2
+    ///   [19]    underline_color_data3
+    ///   [20..23] image_id (UInt32, little-endian)
+    ///   [24..25] image_columns (UInt16, little-endian)
+    ///   [26..27] image_rows (UInt16, little-endian)
+    ///   [28]     image_origin_col_offset
+    ///   [29]     image_origin_row_offset
+    ///   [30]     grapheme_tail_count
+    ///   [31..58] grapheme tail scalars (7 * UInt32, little-endian)
+    ///   [59]     reserved
 
     private static func serializeCell(_ cell: Cell, to ptr: UnsafeMutablePointer<UInt8>) {
         // Codepoint (little-endian)
@@ -664,7 +681,26 @@ final class ScrollbackBuffer {
         // Width and continuation
         ptr[13] = cell.width
         ptr[14] = cell.isWideContinuation ? 1 : 0
-        ptr[15] = 0
+        ptr[15] = cell.attributes.underlineStyle.rawValue
+        serializeColor(cell.attributes.underlineColor, to: ptr + 16)
+        let imageID = cell.imageID
+        ptr[20] = UInt8(imageID & 0xFF)
+        ptr[21] = UInt8((imageID >> 8) & 0xFF)
+        ptr[22] = UInt8((imageID >> 16) & 0xFF)
+        ptr[23] = UInt8((imageID >> 24) & 0xFF)
+        serializeUInt16(cell.imageColumns, to: ptr + 24)
+        serializeUInt16(cell.imageRows, to: ptr + 26)
+        ptr[28] = UInt8(truncatingIfNeeded: cell.imageOriginColOffset)
+        ptr[29] = UInt8(truncatingIfNeeded: cell.imageOriginRowOffset)
+        ptr[30] = cell.graphemeTailCount
+        serializeCodepoint(cell.graphemeTail0, to: ptr + 31)
+        serializeCodepoint(cell.graphemeTail1, to: ptr + 35)
+        serializeCodepoint(cell.graphemeTail2, to: ptr + 39)
+        serializeCodepoint(cell.graphemeTail3, to: ptr + 43)
+        serializeCodepoint(cell.graphemeTail4, to: ptr + 47)
+        serializeCodepoint(cell.graphemeTail5, to: ptr + 51)
+        serializeCodepoint(cell.graphemeTail6, to: ptr + 55)
+        ptr[59] = 0
     }
 
     private static func serializeColor(_ color: TerminalColor, to ptr: UnsafeMutablePointer<UInt8>) {
@@ -855,9 +891,11 @@ final class ScrollbackBuffer {
             serializeColor(sharedAttributes.foreground, to: buf + 1)
             serializeColor(sharedAttributes.background, to: buf + 5)
             buf[9] = serializeAttributeFlags(sharedAttributes)
+            buf[10] = sharedAttributes.underlineStyle.rawValue
+            serializeColor(sharedAttributes.underlineColor, to: buf + 11)
             var offset = trimmed ? uniformAttributesTrimmedHeaderBytes : uniformAttributesHeaderBytes
             if trimmed {
-                serializeUInt16(UInt16(cellCount), to: buf + 10)
+                serializeUInt16(UInt16(cellCount), to: buf + 15)
             }
             precondition(cells.count >= serializedCount, "Uniform row missing serialized cells")
             for index in 0..<serializedCount {
@@ -902,25 +940,46 @@ final class ScrollbackBuffer {
         cell.codepoint == other.codepoint &&
         cell.attributes == other.attributes &&
         cell.width == other.width &&
-        cell.isWideContinuation == other.isWideContinuation
+        cell.isWideContinuation == other.isWideContinuation &&
+        cell.imageID == other.imageID &&
+        cell.imageColumns == other.imageColumns &&
+        cell.imageRows == other.imageRows &&
+        cell.imageOriginColOffset == other.imageOriginColOffset &&
+        cell.imageOriginRowOffset == other.imageOriginRowOffset &&
+        cell.graphemeTailCount == other.graphemeTailCount &&
+        cell.graphemeTail0 == other.graphemeTail0 &&
+        cell.graphemeTail1 == other.graphemeTail1 &&
+        cell.graphemeTail2 == other.graphemeTail2 &&
+        cell.graphemeTail3 == other.graphemeTail3 &&
+        cell.graphemeTail4 == other.graphemeTail4 &&
+        cell.graphemeTail5 == other.graphemeTail5 &&
+        cell.graphemeTail6 == other.graphemeTail6
     }
 
     private static func isCompactDefaultCell(_ cell: Cell) -> Bool {
-        cell.attributes == .default && cell.width == 1 && !cell.isWideContinuation
+        !cell.hasInlineImage &&
+        !cell.hasGraphemeTail &&
+        cell.attributes == .default &&
+        cell.width == 1 &&
+        !cell.isWideContinuation
     }
 
     private static func isDefaultBlankCell(_ cell: Cell) -> Bool {
         cell.codepoint == Cell.empty.codepoint &&
         cell.attributes == Cell.empty.attributes &&
         cell.width == Cell.empty.width &&
-        !cell.isWideContinuation
+        !cell.isWideContinuation &&
+        !cell.hasInlineImage &&
+        !cell.hasGraphemeTail
     }
 
     private static func isUniformBlankCell(_ cell: Cell, sharedAttributes: CellAttributes) -> Bool {
         cell.codepoint == Cell.empty.codepoint &&
         cell.attributes == sharedAttributes &&
         cell.width == Cell.empty.width &&
-        !cell.isWideContinuation
+        !cell.isWideContinuation &&
+        !cell.hasInlineImage &&
+        !cell.hasGraphemeTail
     }
 
     private static func serializeUInt16(_ value: UInt16, to ptr: UnsafeMutablePointer<UInt8>) {
@@ -933,11 +992,7 @@ final class ScrollbackBuffer {
     }
 
     private static func serializeCompactDefaultCell(_ cell: Cell, to ptr: UnsafeMutablePointer<UInt8>) {
-        let cp = cell.codepoint
-        ptr[0] = UInt8(cp & 0xFF)
-        ptr[1] = UInt8((cp >> 8) & 0xFF)
-        ptr[2] = UInt8((cp >> 16) & 0xFF)
-        ptr[3] = UInt8((cp >> 24) & 0xFF)
+        serializeCodepoint(cell.codepoint, to: ptr)
     }
 
     private static func serializeCompactUniformAttributeCell(_ cell: Cell, to ptr: UnsafeMutablePointer<UInt8>) {
@@ -964,13 +1019,28 @@ final class ScrollbackBuffer {
 
         let attrs = deserializeAttributes(foregroundPtr: ptr + 4,
                                           backgroundPtr: ptr + 8,
-                                          flags: ptr[12])
+                                          flags: ptr[12],
+                                          underlineStyleRaw: ptr[15],
+                                          underlineColorPtr: ptr + 16)
 
         return Cell(
             codepoint: codepoint,
             attributes: attrs,
             width: ptr[13],
-            isWideContinuation: ptr[14] != 0
+            isWideContinuation: ptr[14] != 0,
+            imageID: deserializeCodepoint(from: ptr + 20),
+            imageColumns: deserializeUInt16(from: ptr + 24),
+            imageRows: deserializeUInt16(from: ptr + 26),
+            imageOriginColOffset: UInt16(ptr[28]),
+            imageOriginRowOffset: UInt16(ptr[29]),
+            graphemeTailCount: ptr[30],
+            graphemeTail0: deserializeCodepoint(from: ptr + 31),
+            graphemeTail1: deserializeCodepoint(from: ptr + 35),
+            graphemeTail2: deserializeCodepoint(from: ptr + 39),
+            graphemeTail3: deserializeCodepoint(from: ptr + 43),
+            graphemeTail4: deserializeCodepoint(from: ptr + 47),
+            graphemeTail5: deserializeCodepoint(from: ptr + 51),
+            graphemeTail6: deserializeCodepoint(from: ptr + 55)
         )
     }
 
@@ -1005,10 +1075,19 @@ final class ScrollbackBuffer {
             | (UInt32(ptr[3]) << 24)
     }
 
+    private static func serializeCodepoint(_ codepoint: UInt32, to ptr: UnsafeMutablePointer<UInt8>) {
+        ptr[0] = UInt8(codepoint & 0xFF)
+        ptr[1] = UInt8((codepoint >> 8) & 0xFF)
+        ptr[2] = UInt8((codepoint >> 16) & 0xFF)
+        ptr[3] = UInt8((codepoint >> 24) & 0xFF)
+    }
+
     private static func deserializeAttributes(
         foregroundPtr: UnsafePointer<UInt8>,
         backgroundPtr: UnsafePointer<UInt8>,
-        flags: UInt8
+        flags: UInt8,
+        underlineStyleRaw: UInt8 = 0,
+        underlineColorPtr: UnsafePointer<UInt8>? = nil
     ) -> CellAttributes {
         CellAttributes(
             foreground: deserializeColor(from: foregroundPtr),
@@ -1020,7 +1099,9 @@ final class ScrollbackBuffer {
             inverse:       flags & 0x10 != 0,
             hidden:        flags & 0x20 != 0,
             dim:           flags & 0x40 != 0,
-            blink:         flags & 0x80 != 0
+            blink:         flags & 0x80 != 0,
+            underlineStyle: UnderlineStyle(rawValue: underlineStyleRaw) ?? .single,
+            underlineColor: underlineColorPtr.map(deserializeColor(from:)) ?? .default
         )
     }
 

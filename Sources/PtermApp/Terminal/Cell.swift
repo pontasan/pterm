@@ -31,12 +31,137 @@ struct Cell {
     /// Whether this cell is the second half of a double-width character
     var isWideContinuation: Bool
 
+    /// Inline image metadata. A value of 0 means this cell is plain text.
+    var imageID: UInt32 = 0
+    var imageColumns: UInt16 = 0
+    var imageRows: UInt16 = 0
+    var imageOriginColOffset: UInt16 = 0
+    var imageOriginRowOffset: UInt16 = 0
+
+    /// Fixed-size grapheme tail for combined emoji / combining sequences.
+    /// The anchor scalar remains in `codepoint`; these slots hold trailing scalars.
+    var graphemeTailCount: UInt8 = 0
+    var graphemeTail0: UInt32 = 0
+    var graphemeTail1: UInt32 = 0
+    var graphemeTail2: UInt32 = 0
+    var graphemeTail3: UInt32 = 0
+    var graphemeTail4: UInt32 = 0
+    var graphemeTail5: UInt32 = 0
+    var graphemeTail6: UInt32 = 0
+
+    var hasInlineImage: Bool {
+        imageID != 0
+    }
+
+    var hasGraphemeTail: Bool {
+        graphemeTailCount > 0
+    }
+
     static let empty = Cell(
         codepoint: 0x20, // space
         attributes: .default,
         width: 1,
-        isWideContinuation: false
+        isWideContinuation: false,
+        imageID: 0,
+        imageColumns: 0,
+        imageRows: 0,
+        imageOriginColOffset: 0,
+        imageOriginRowOffset: 0,
+        graphemeTailCount: 0,
+        graphemeTail0: 0,
+        graphemeTail1: 0,
+        graphemeTail2: 0,
+        graphemeTail3: 0,
+        graphemeTail4: 0,
+        graphemeTail5: 0,
+        graphemeTail6: 0
     )
+
+    static func inlineImage(
+        id: Int,
+        columns: Int,
+        rows: Int,
+        originColOffset: Int,
+        originRowOffset: Int
+    ) -> Cell {
+        Cell(
+            codepoint: 0x20,
+            attributes: .default,
+            width: 1,
+            isWideContinuation: false,
+            imageID: UInt32(max(id, 0)),
+            imageColumns: UInt16(max(columns, 0)),
+            imageRows: UInt16(max(rows, 0)),
+            imageOriginColOffset: UInt16(max(originColOffset, 0)),
+            imageOriginRowOffset: UInt16(max(originRowOffset, 0)),
+            graphemeTailCount: 0,
+            graphemeTail0: 0,
+            graphemeTail1: 0,
+            graphemeTail2: 0,
+            graphemeTail3: 0,
+            graphemeTail4: 0,
+            graphemeTail5: 0,
+            graphemeTail6: 0
+        )
+    }
+
+    mutating func appendGraphemeScalar(_ codepoint: UInt32) -> Bool {
+        switch graphemeTailCount {
+        case 0: graphemeTail0 = codepoint
+        case 1: graphemeTail1 = codepoint
+        case 2: graphemeTail2 = codepoint
+        case 3: graphemeTail3 = codepoint
+        case 4: graphemeTail4 = codepoint
+        case 5: graphemeTail5 = codepoint
+        case 6: graphemeTail6 = codepoint
+        default: return false
+        }
+        graphemeTailCount &+= 1
+        return true
+    }
+
+    func graphemeScalars() -> [UInt32] {
+        guard hasGraphemeTail else { return [codepoint] }
+        var scalars = [UInt32]()
+        scalars.reserveCapacity(1 + Int(graphemeTailCount))
+        scalars.append(codepoint)
+        if graphemeTailCount >= 1 { scalars.append(graphemeTail0) }
+        if graphemeTailCount >= 2 { scalars.append(graphemeTail1) }
+        if graphemeTailCount >= 3 { scalars.append(graphemeTail2) }
+        if graphemeTailCount >= 4 { scalars.append(graphemeTail3) }
+        if graphemeTailCount >= 5 { scalars.append(graphemeTail4) }
+        if graphemeTailCount >= 6 { scalars.append(graphemeTail5) }
+        if graphemeTailCount >= 7 { scalars.append(graphemeTail6) }
+        return scalars
+    }
+
+    func renderedString() -> String {
+        if hasInlineImage {
+            return ""
+        }
+        return TerminalTextEncoding.string(from: graphemeScalars()) ?? ""
+    }
+
+    func lastGraphemeScalar() -> UInt32 {
+        switch graphemeTailCount {
+        case 0: return codepoint
+        case 1: return graphemeTail0
+        case 2: return graphemeTail1
+        case 3: return graphemeTail2
+        case 4: return graphemeTail3
+        case 5: return graphemeTail4
+        case 6: return graphemeTail5
+        default: return graphemeTail6
+        }
+    }
+}
+
+enum UnderlineStyle: UInt8, Equatable {
+    case single = 0
+    case double = 1
+    case curly = 2
+    case dotted = 3
+    case dashed = 4
 }
 
 /// SGR (Select Graphic Rendition) attributes for a cell.
@@ -52,6 +177,38 @@ struct CellAttributes: Equatable {
     var dim: Bool
     var blink: Bool
     var decProtected: Bool = false
+    var underlineStyle: UnderlineStyle = .single
+    var underlineColor: TerminalColor = .default
+
+    init(
+        foreground: TerminalColor,
+        background: TerminalColor,
+        bold: Bool,
+        italic: Bool,
+        underline: Bool,
+        strikethrough: Bool,
+        inverse: Bool,
+        hidden: Bool,
+        dim: Bool,
+        blink: Bool,
+        decProtected: Bool = false,
+        underlineStyle: UnderlineStyle = .single,
+        underlineColor: TerminalColor = .default
+    ) {
+        self.foreground = foreground
+        self.background = background
+        self.bold = bold
+        self.italic = italic
+        self.underline = underline
+        self.strikethrough = strikethrough
+        self.inverse = inverse
+        self.hidden = hidden
+        self.dim = dim
+        self.blink = blink
+        self.decProtected = decProtected
+        self.underlineStyle = underlineStyle
+        self.underlineColor = underlineColor
+    }
 
     static let `default` = CellAttributes(
         foreground: .default,
@@ -64,7 +221,9 @@ struct CellAttributes: Equatable {
         hidden: false,
         dim: false,
         blink: false,
-        decProtected: false
+        decProtected: false,
+        underlineStyle: .single,
+        underlineColor: .default
     )
 }
 

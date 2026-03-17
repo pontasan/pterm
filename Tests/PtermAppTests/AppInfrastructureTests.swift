@@ -793,6 +793,59 @@ final class AppInfrastructureTests: XCTestCase {
         }
     }
 
+    func testPastedImageRegistrySupportsExplicitPlaceholderIndices() throws {
+        try withTemporaryDirectory { directory in
+            let image = directory.appendingPathComponent("preview.png")
+            try Data([0x89, 0x50, 0x4E, 0x47]).write(to: image)
+
+            let registry = PastedImageRegistry()
+            registry.register(url: image, forPlaceholderIndex: 7)
+
+            XCTAssertNil(registry.url(forPlaceholderIndex: 1))
+            XCTAssertEqual(registry.url(forPlaceholderIndex: 7), image)
+        }
+    }
+
+    func testPastedImageRegistryCanPersistRawRGBAKittyPayloadAsPNG() throws {
+        try withTemporaryPtermConfig { _ in
+            let registry = PastedImageRegistry()
+            let rawRGBA = Data([255, 0, 0, 255, 0, 255, 0, 255])
+
+            let url = try registry.register(
+                imageData: rawRGBA,
+                format: .rawRGBA,
+                placeholderIndex: 2,
+                pixelWidth: 2,
+                pixelHeight: 1
+            )
+
+            XCTAssertEqual(url.pathExtension, "png")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+            XCTAssertEqual(registry.url(forPlaceholderIndex: 2), url)
+            XCTAssertNotNil(NSImage(contentsOf: url))
+        }
+    }
+
+    func testPastedImageRegistryPreservesKittyCellPlacementMetadata() throws {
+        try withTemporaryPtermConfig { _ in
+            let registry = PastedImageRegistry()
+            let pngData = Data([0x89, 0x50, 0x4E, 0x47])
+
+            let url = try registry.register(
+                imageData: pngData,
+                format: .png,
+                placeholderIndex: 5,
+                columns: 4,
+                rows: 3
+            )
+
+            let registered = try XCTUnwrap(registry.registeredImage(forPlaceholderIndex: 5))
+            XCTAssertEqual(registered.url, url)
+            XCTAssertEqual(registered.columns, 4)
+            XCTAssertEqual(registered.rows, 3)
+        }
+    }
+
     func testTerminalColorDefaultDetectionOnlyMatchesDefaultCase() {
         XCTAssertTrue(TerminalColor.default.isDefaultColor)
         XCTAssertFalse(TerminalColor.indexed(0).isDefaultColor)

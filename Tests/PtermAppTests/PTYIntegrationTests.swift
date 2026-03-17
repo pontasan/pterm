@@ -304,7 +304,7 @@ final class PTYIntegrationTests: XCTestCase {
             let controller = TerminalController(
                 rows: 24,
                 cols: 100,
-                termEnv: "xterm-256color",
+                termEnv: "xterm-kitty",
                 textEncoding: .utf8,
                 scrollbackInitialCapacity: 16 * 1024 * 1024,
                 scrollbackMaxCapacity: 16 * 1024 * 1024,
@@ -367,6 +367,65 @@ final class PTYIntegrationTests: XCTestCase {
                 benchmarkOutput.contains("Long escape codes"),
                 "benchmark progress should include long OSC stage. file tail=\(String(benchmarkOutput.suffix(500)))"
             )
+        }
+    }
+
+    @MainActor
+    func testTerminalControllerRealPTYKittenImagesStageUsesInlineImagesWithoutPlaceholderText() throws {
+        guard let kittenPath = Self.findExecutable(named: "kitten") else {
+            throw XCTSkip("kitten is not installed in this environment")
+        }
+
+        try withTemporaryPtermConfig { _ in
+            PastedImageRegistry.shared.reset()
+            defer { PastedImageRegistry.shared.reset() }
+
+            let controller = TerminalController(
+                rows: 24,
+                cols: 100,
+                termEnv: "xterm-256color",
+                textEncoding: .utf8,
+                scrollbackInitialCapacity: 16 * 1024 * 1024,
+                scrollbackMaxCapacity: 16 * 1024 * 1024,
+                fontName: "Menlo",
+                fontSize: 13
+            )
+            defer { controller.stop(waitForExit: true) }
+
+            let doneMarker = "__PTERM_KITTEN_IMAGES_DONE__"
+            let exitExpectation = expectation(description: "controller-exit-kitten-images")
+            let imageStageExpectation = expectation(description: "controller-kitten-images-stage-visible")
+            var exited = false
+            var sawImagesStage = false
+
+            controller.onExit = {
+                guard !exited else { return }
+                exited = true
+                exitExpectation.fulfill()
+            }
+            controller.onOutputActivity = {
+                let text = controller.allText()
+                if !sawImagesStage, text.contains("Running: Images") {
+                    sawImagesStage = true
+                    imageStageExpectation.fulfill()
+                }
+            }
+
+            try controller.start()
+            try Self.waitForTerminalText(controller, toContain: "%", timeout: 8.0)
+            controller.sendInput(
+                "'\(Self.shellSingleQuoted(kittenPath))' __benchmark__ --repetitions 1 images; "
+                + "printf '\(doneMarker)\\n'; "
+                + "exit\n"
+            )
+
+            wait(for: [imageStageExpectation, exitExpectation], timeout: 30.0)
+            drainMainQueue(testCase: self)
+
+            let terminalText = controller.allText()
+            XCTAssertTrue(terminalText.contains(doneMarker))
+            XCTAssertFalse(terminalText.contains("[Image #"))
+
         }
     }
 

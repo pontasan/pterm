@@ -930,8 +930,39 @@ final class TextModelTests: XCTestCase {
         XCTAssertTrue(buffer.isRowWrapped(at: 0))
     }
 
+    func testScrollbackBufferPreservesUnderlineColorAndStyle() throws {
+        let buffer = ScrollbackBuffer(initialCapacity: 256, maxCapacity: 256)
+        let styledRow: ArraySlice<Cell> = [
+            Cell(
+                codepoint: 0x41,
+                attributes: CellAttributes(
+                    foreground: .indexed(196),
+                    background: .rgb(1, 2, 3),
+                    bold: true,
+                    italic: false,
+                    underline: true,
+                    strikethrough: false,
+                    inverse: false,
+                    hidden: false,
+                    dim: false,
+                    blink: false,
+                    underlineStyle: .curly,
+                    underlineColor: .indexed(44)
+                ),
+                width: 1,
+                isWideContinuation: false
+            )
+        ][0...0]
+
+        buffer.appendRow(styledRow, isWrapped: false)
+
+        let row = try XCTUnwrap(buffer.getRow(at: 0))
+        XCTAssertEqual(row[0].attributes.underlineStyle, .curly)
+        XCTAssertEqual(row[0].attributes.underlineColor, .indexed(44))
+    }
+
     func testScrollbackBufferCompactUniformAttributeRowsFitMoreHistoryWithinSameCapacity() throws {
-        let buffer = ScrollbackBuffer(initialCapacity: 120, maxCapacity: 120)
+        let buffer = ScrollbackBuffer(initialCapacity: 140, maxCapacity: 140)
         let sharedAttributes = CellAttributes(
             foreground: .indexed(196),
             background: .default,
@@ -1140,7 +1171,8 @@ final class TextModelTests: XCTestCase {
     }
 
     func testScrollbackBufferIdleCompactionReleasesSerializationScratchCompletely() throws {
-        let buffer = ScrollbackBuffer(initialCapacity: 8192, maxCapacity: 8192)
+        let capacity = max(16 * 1024, ScrollbackBuffer.bytesPerCell * 512)
+        let buffer = ScrollbackBuffer(initialCapacity: capacity, maxCapacity: capacity)
         let longRow = ArraySlice((0..<300).map { index in
             Cell(
                 codepoint: 0x41,
@@ -1177,7 +1209,8 @@ final class TextModelTests: XCTestCase {
     }
 
     func testScrollbackBufferAppendPathShrinksOversizedSerializationScratchForSmallRows() {
-        let buffer = ScrollbackBuffer(initialCapacity: 8192, maxCapacity: 8192)
+        let capacity = max(16 * 1024, ScrollbackBuffer.bytesPerCell * 512)
+        let buffer = ScrollbackBuffer(initialCapacity: capacity, maxCapacity: capacity)
         let largeRow = ArraySlice((0..<300).map { index in
             Cell(
                 codepoint: 0x41,

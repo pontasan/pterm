@@ -34,8 +34,16 @@ final class SplitRenderView: MTKView {
     private var viewIsOpaque = false
     private var idleBufferReleaseTimer: Timer?
     private var outputPulseTimer: Timer?
+    private var inlineImageLayers: [String: CALayer] = [:]
 
     var debugHasOutputPulseTimer: Bool { outputPulseTimer != nil }
+    var debugInlineImageLayerCount: Int { inlineImageLayers.count }
+    func debugInlineImageLayerFrames() -> [CGRect] {
+        inlineImageLayers.values.map(\.frame).sorted { lhs, rhs in
+            if lhs.minY == rhs.minY { return lhs.minX < rhs.minX }
+            return lhs.minY < rhs.minY
+        }
+    }
 
     init(frame: NSRect, renderer: MetalRenderer) {
         self.renderer = renderer
@@ -62,6 +70,7 @@ final class SplitRenderView: MTKView {
     deinit {
         idleBufferReleaseTimer?.invalidate()
         outputPulseTimer?.invalidate()
+        clearInlineImageLayers()
         renderer.removeBuffers(for: self)
     }
 
@@ -127,8 +136,70 @@ final class SplitRenderView: MTKView {
         drawableSize = .zero
     }
 
+    private func clearInlineImageLayers() {
+        inlineImageLayers.values.forEach { $0.removeFromSuperlayer() }
+        inlineImageLayers.removeAll(keepingCapacity: false)
+    }
+
+    private func updateInlineImageLayers(using snapshots: [(cellRect: NSRect, snapshot: TerminalController.RenderSnapshot)]) {
+        guard let hostLayer = layer else {
+            clearInlineImageLayers()
+            return
+        }
+
+        var activeKeys = Set<String>()
+        for item in snapshots {
+            for placement in TerminalInlineImageSupport.detectPlacements(in: item.snapshot) {
+                guard let registeredImage = PastedImageRegistry.shared.registeredImage(forPlaceholderIndex: placement.index),
+                      let image = TerminalInlineImageSupport.image(for: registeredImage.url),
+                      let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                    continue
+                }
+
+                let key = "\(ObjectIdentifier(hostLayer).hashValue)-\(placement.index)-\(Int(item.cellRect.origin.x))-\(Int(item.cellRect.origin.y))"
+                activeKeys.insert(key)
+                let frame = TerminalInlineImageSupport.frame(
+                    for: placement,
+                    registeredImage: registeredImage,
+                    gridPadding: renderer.gridPadding,
+                    cellWidth: renderer.glyphAtlas.cellWidth,
+                    cellHeight: renderer.glyphAtlas.cellHeight,
+                    viewHeight: item.cellRect.height,
+                    offsetX: item.cellRect.origin.x,
+                    offsetY: item.cellRect.origin.y
+                )
+                let imageLayer = inlineImageLayers[key] ?? {
+                    let layer = CALayer()
+                    layer.contentsGravity = .resizeAspect
+                    layer.masksToBounds = true
+                    layer.backgroundColor = NSColor.black.cgColor
+                    hostLayer.addSublayer(layer)
+                    inlineImageLayers[key] = layer
+                    return layer
+                }()
+                imageLayer.frame = frame
+                imageLayer.contents = cgImage
+                imageLayer.isHidden = false
+            }
+        }
+
+        let staleKeys = inlineImageLayers.keys.filter { !activeKeys.contains($0) }
+        for key in staleKeys {
+            guard let layer = inlineImageLayers[key] else { continue }
+            layer.removeFromSuperlayer()
+            inlineImageLayers.removeValue(forKey: key)
+        }
+    }
+
     func debugReleaseIdleBuffersNow() {
         releaseIdleReusableBuffersNow()
+    }
+
+    func debugRefreshInlineImagesForTesting() {
+        let snapshots = cellRefs.map { ref in
+            (cellRect: ref.frame, snapshot: ref.controller.captureRenderSnapshot())
+        }
+        updateInlineImageLayers(using: snapshots)
     }
 
     func debugRenderFrameToTextureForTesting(_ texture: MTLTexture) {
@@ -148,6 +219,8 @@ final class SplitRenderView: MTKView {
 
         let viewportSize = SIMD2<Float>(Float(texture.width), Float(texture.height))
         let scaleFactor = Float(renderer.glyphAtlas.scaleFactor)
+        var renderedSnapshots: [(cellRect: NSRect, snapshot: TerminalController.RenderSnapshot)] = []
+        renderedSnapshots.reserveCapacity(cellRefs.count)
         for ref in cellRefs {
             guard let terminalView = ref.terminalView else { continue }
             let selection = terminalView.selection
@@ -155,6 +228,7 @@ final class SplitRenderView: MTKView {
             // Freeze each cell's visible terminal state before the expensive
             // shared render pass so PTY writers are not blocked by vertex work.
             let snapshot = ref.controller.captureRenderSnapshot()
+            renderedSnapshots.append((cellRect: ref.frame, snapshot: snapshot))
             renderer.renderSplitCell(
                 snapshot: snapshot,
                 selection: selection,
@@ -305,6 +379,8 @@ extension SplitRenderView: MTKViewDelegate {
         let sf = Float(renderer.glyphAtlas.scaleFactor)
 
         let viewHeight = bounds.height
+        var renderedSnapshots: [(cellRect: NSRect, snapshot: TerminalController.RenderSnapshot)] = []
+        renderedSnapshots.reserveCapacity(cellRefs.count)
 
         for ref in cellRefs {
             // Read live state from TerminalView each frame
@@ -328,6 +404,7 @@ extension SplitRenderView: MTKViewDelegate {
             // The snapshot must be captured before rendering so split terminals
             // all read coherent controller state without holding locks in Metal work.
             let snapshot = ref.controller.captureRenderSnapshot()
+            renderedSnapshots.append((cellRect: ref.frame, snapshot: snapshot))
             renderer.renderSplitCell(
                 snapshot: snapshot,
                 selection: selection,
@@ -346,6 +423,7 @@ extension SplitRenderView: MTKViewDelegate {
         encoder.endEncoding()
         commandBuffer.present(drawable)
         commandBuffer.commit()
+        updateInlineImageLayers(using: renderedSnapshots)
         scheduleIdleBufferRelease()
     }
 }
