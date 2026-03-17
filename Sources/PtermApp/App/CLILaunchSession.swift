@@ -8,6 +8,7 @@ private final class CLIEmulatorBridge {
     private var parser = VtParser()
     private var textDecoder: TerminalTextDecoder
     private var codepointBuffer: [UInt32] = []
+    private let textEncoding: TerminalTextEncoding
 
     init(rows: Int,
          cols: Int,
@@ -15,6 +16,7 @@ private final class CLIEmulatorBridge {
          responseWriter: @escaping (Data) -> Void) {
         model = TerminalModel(rows: rows, cols: cols)
         textDecoder = TerminalTextDecoder(encoding: textEncoding)
+        self.textEncoding = textEncoding
         model.onResponseData = { data in
             responseWriter(data)
         }
@@ -47,56 +49,117 @@ private final class CLIEmulatorBridge {
         lock.lock()
         defer { lock.unlock() }
 
-        if codepointBuffer.count < input.count {
-            codepointBuffer = [UInt32](repeating: 0, count: input.count)
+        var fastPathPointer = input.baseAddress!
+        var fastPathRemainingCount = input.count
+
+        while fastPathRemainingCount > 0 {
+            let candidate = UnsafeBufferPointer(start: fastPathPointer, count: fastPathRemainingCount)
+
+            if canUseDirectASCIIGroundFastPath(candidate) {
+                let consumed = model.consumeGroundASCIIBytesFastPathPrefix(candidate)
+                if consumed > 0 {
+                    fastPathPointer = fastPathPointer.advanced(by: consumed)
+                    fastPathRemainingCount -= consumed
+                    continue
+                }
+            }
+
+            let ignoredStringBytes = vt_parser_consume_ascii_ignored_string_fast_path(
+                &parser,
+                fastPathPointer,
+                fastPathRemainingCount
+            )
+            if ignoredStringBytes > 0 {
+                fastPathPointer = fastPathPointer.advanced(by: ignoredStringBytes)
+                fastPathRemainingCount -= ignoredStringBytes
+                continue
+            }
+
+            break
         }
 
-        let codepointCount = textDecoder.decode(input, into: &codepointBuffer)
+        let remainingInput = UnsafeBufferPointer(start: fastPathPointer, count: fastPathRemainingCount)
+        guard !remainingInput.isEmpty else { return }
+
+        if codepointBuffer.count < remainingInput.count {
+            codepointBuffer = [UInt32](repeating: 0, count: remainingInput.count)
+        }
+
+        let codepointCount = textDecoder.decode(remainingInput, into: &codepointBuffer)
         guard codepointCount > 0 else { return }
 
         codepointBuffer.withUnsafeBufferPointer { buffer in
             guard let baseAddress = buffer.baseAddress else { return }
-            vt_parser_feed(&parser, baseAddress, codepointCount)
+            if parser.state == VT_STATE_GROUND {
+                let consumed = model.consumeGroundFastPathPrefix(
+                    UnsafeBufferPointer(start: baseAddress, count: codepointCount)
+                )
+                if consumed < codepointCount {
+                    vt_parser_feed(&parser, baseAddress.advanced(by: consumed), codepointCount - consumed)
+                }
+            } else {
+                vt_parser_feed(&parser, baseAddress, codepointCount)
+            }
         }
+    }
+
+    private func canUseDirectASCIIGroundFastPath(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard !bytes.isEmpty,
+              textEncoding == .utf8,
+              textDecoder.canDecodeDirectASCII,
+              parser.state == VT_STATE_GROUND,
+              model.canUseASCIIGroundFastPath
+        else {
+            return false
+        }
+
+        return true
     }
 }
 
-private final class CLITerminalOutputFilter {
-    private var pending = Data()
+final class CLITerminalOutputFilter {
+    private static let pendingUpdateDisableSequence = Array("\u{1B}[?2026l".utf8)
+    private var pending: [UInt8] = []
+    private var synchronizedOutputSuppressed = false
 
     func filter(_ input: UnsafeBufferPointer<UInt8>) -> Data {
         guard !input.isEmpty else { return Data() }
-
-        var source = Data()
-        source.reserveCapacity(pending.count + input.count)
-        if !pending.isEmpty {
-            source.append(pending)
-            pending.removeAll(keepingCapacity: true)
+        if pending.isEmpty {
+            return process(input)
         }
-        source.append(input.baseAddress!, count: input.count)
+
+        var combined = [UInt8]()
+        combined.reserveCapacity(pending.count + input.count)
+        combined.append(contentsOf: pending)
+        pending.removeAll(keepingCapacity: true)
+        combined.append(contentsOf: input)
+        return combined.withUnsafeBufferPointer(process)
+    }
+
+    private func process(_ bytes: UnsafeBufferPointer<UInt8>) -> Data {
+        if synchronizedOutputSuppressed {
+            return filterWhileSynchronizedOutputSuppressed(bytes)
+        }
 
         var output = Data()
-        output.reserveCapacity(source.count)
+        output.reserveCapacity(bytes.count)
 
-        let bytes = [UInt8](source)
         var index = 0
+        var passthroughStart = 0
         while index < bytes.count {
             let byte = bytes[index]
-
-            if byte == 0x05 {
+            if byte != 0x1B {
                 index += 1
                 continue
             }
 
-            guard byte == 0x1B else {
-                output.append(byte)
-                index += 1
-                continue
+            if passthroughStart < index {
+                output.append(bytes.baseAddress!.advanced(by: passthroughStart), count: index - passthroughStart)
             }
 
             guard index + 1 < bytes.count else {
-                pending.append(contentsOf: bytes[index...])
-                break
+                pending.append(bytes[index])
+                return output
             }
 
             let next = bytes[index + 1]
@@ -105,39 +168,107 @@ private final class CLITerminalOutputFilter {
                 index += 2
 
             case UInt8(ascii: "["):
-                if let endIndex = findCSITerminator(in: bytes, startingAt: index + 2) {
-                    let finalByte = bytes[endIndex]
-                    if finalByte == UInt8(ascii: "c")
-                        || finalByte == UInt8(ascii: "n")
-                        || finalByte == UInt8(ascii: "x") {
-                        index = endIndex + 1
-                    } else {
-                        output.append(contentsOf: bytes[index...endIndex])
-                        index = endIndex + 1
+                guard let endIndex = findCSITerminator(in: bytes, startingAt: index + 2) else {
+                    pending.append(contentsOf: UnsafeBufferPointer(start: bytes.baseAddress!.advanced(by: index), count: bytes.count - index))
+                    return output
+                }
+                let finalByte = bytes[endIndex]
+                if isPendingUpdateModeSequence(in: bytes, from: index, through: endIndex) {
+                    synchronizedOutputSuppressed = finalByte == UInt8(ascii: "h")
+                    index = endIndex + 1
+                    if synchronizedOutputSuppressed {
+                        passthroughStart = index
+                        if index < bytes.count {
+                            let suffix = filterWhileSynchronizedOutputSuppressed(
+                                UnsafeBufferPointer(start: bytes.baseAddress!.advanced(by: index), count: bytes.count - index)
+                            )
+                            if !suffix.isEmpty {
+                                output.append(suffix)
+                            }
+                        }
+                        return output
                     }
+                } else if finalByte == UInt8(ascii: "c")
+                    || finalByte == UInt8(ascii: "n")
+                    || finalByte == UInt8(ascii: "x") {
+                    index = endIndex + 1
+                } else if !synchronizedOutputSuppressed {
+                    output.append(bytes.baseAddress!.advanced(by: index), count: endIndex - index + 1)
+                    index = endIndex + 1
                 } else {
-                    pending.append(contentsOf: bytes[index...])
-                    index = bytes.count
+                    index = endIndex + 1
                 }
 
             case UInt8(ascii: "P"):
-                if let endIndex = findStringTerminator(in: bytes, startingAt: index + 2) {
-                    index = endIndex
-                } else {
-                    pending.append(contentsOf: bytes[index...])
-                    index = bytes.count
+                guard let endIndex = findStringTerminator(in: bytes, startingAt: index + 2) else {
+                    pending.append(contentsOf: UnsafeBufferPointer(start: bytes.baseAddress!.advanced(by: index), count: bytes.count - index))
+                    return output
                 }
+                index = endIndex
 
             default:
                 output.append(byte)
                 index += 1
             }
+
+            passthroughStart = index
+        }
+
+        if passthroughStart < bytes.count {
+            output.append(bytes.baseAddress!.advanced(by: passthroughStart), count: bytes.count - passthroughStart)
         }
 
         return output
     }
 
-    private func findCSITerminator(in bytes: [UInt8], startingAt start: Int) -> Int? {
+    private func filterWhileSynchronizedOutputSuppressed(_ bytes: UnsafeBufferPointer<UInt8>) -> Data {
+        guard !bytes.isEmpty else { return Data() }
+        let resume = Self.pendingUpdateDisableSequence
+        guard let baseAddress = bytes.baseAddress else { return Data() }
+        var index = 0
+        while index + resume.count <= bytes.count {
+            let remaining = bytes.count - index
+            guard let escPointer = memchr(baseAddress.advanced(by: index), Int32(0x1B), remaining) else {
+                break
+            }
+            let escIndex = baseAddress.distance(to: escPointer.assumingMemoryBound(to: UInt8.self))
+            guard escIndex + resume.count <= bytes.count else {
+                index = escIndex
+                break
+            }
+
+            var matched = true
+            for offset in 0..<resume.count where bytes[escIndex + offset] != resume[offset] {
+                matched = false
+                break
+            }
+            if matched {
+                synchronizedOutputSuppressed = false
+                let suffixStart = escIndex + resume.count
+                guard suffixStart < bytes.count else { return Data() }
+                return process(
+                    UnsafeBufferPointer(
+                        start: baseAddress.advanced(by: suffixStart),
+                        count: bytes.count - suffixStart
+                    )
+                )
+            }
+            index = escIndex + 1
+        }
+
+        let keepCount = min(resume.count - 1, bytes.count)
+        if keepCount > 0 {
+            pending.append(
+                contentsOf: UnsafeBufferPointer(
+                    start: baseAddress.advanced(by: bytes.count - keepCount),
+                    count: keepCount
+                )
+            )
+        }
+        return Data()
+    }
+
+    private func findCSITerminator(in bytes: UnsafeBufferPointer<UInt8>, startingAt start: Int) -> Int? {
         var index = start
         while index < bytes.count {
             let byte = bytes[index]
@@ -149,7 +280,7 @@ private final class CLITerminalOutputFilter {
         return nil
     }
 
-    private func findStringTerminator(in bytes: [UInt8], startingAt start: Int) -> Int? {
+    private func findStringTerminator(in bytes: UnsafeBufferPointer<UInt8>, startingAt start: Int) -> Int? {
         var index = start
         while index < bytes.count {
             let byte = bytes[index]
@@ -165,6 +296,20 @@ private final class CLITerminalOutputFilter {
             index += 1
         }
         return nil
+    }
+
+    private func isPendingUpdateModeSequence(
+        in bytes: UnsafeBufferPointer<UInt8>,
+        from start: Int,
+        through end: Int
+    ) -> Bool {
+        guard end == start + 7 else { return false }
+        return bytes[start + 2] == UInt8(ascii: "?")
+            && bytes[start + 3] == UInt8(ascii: "2")
+            && bytes[start + 4] == UInt8(ascii: "0")
+            && bytes[start + 5] == UInt8(ascii: "2")
+            && bytes[start + 6] == UInt8(ascii: "6")
+            && (bytes[end] == UInt8(ascii: "h") || bytes[end] == UInt8(ascii: "l"))
     }
 }
 
@@ -216,6 +361,10 @@ final class CLILaunchSession {
                               bytes: UnsafeBufferPointer(start: baseAddress, count: filtered.count))
             }
         }
+        pty.onExit = { [weak self] in
+            guard let self else { return }
+            self.finish(with: self.pty.normalizedExitCode)
+        }
 
         try pty.start(
             rows: initialSize.rows,
@@ -231,7 +380,6 @@ final class CLILaunchSession {
         installSTDINBridge()
         installWindowResizeBridge()
         installTerminationSignalHandlers()
-        monitorProcessExit()
 
         dispatchMain()
     }
@@ -321,16 +469,6 @@ final class CLILaunchSession {
             }
             terminationSignalSources.append(source)
             source.resume()
-        }
-    }
-
-    private func monitorProcessExit() {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            self.pty.waitForExit()
-            DispatchQueue.main.async {
-                self.finish(with: self.pty.normalizedExitCode)
-            }
         }
     }
 

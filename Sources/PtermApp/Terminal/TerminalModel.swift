@@ -223,7 +223,10 @@ final class TerminalModel {
     }
 
     private func visibleColumnCount(for row: Int) -> Int {
-        max(1, lineAttribute(at: row).isDoubleWidth ? max(cols / 2, 1) : cols)
+        if grid.hasOnlySingleWidthLines {
+            return cols
+        }
+        return max(1, lineAttribute(at: row).isDoubleWidth ? max(cols / 2, 1) : cols)
     }
 
     private func clampColumn(_ column: Int, for row: Int) -> Int {
@@ -369,7 +372,7 @@ final class TerminalModel {
     func consumeGroundFastPathPrefix(_ codepoints: UnsafeBufferPointer<UInt32>) -> Int {
         guard !codepoints.isEmpty else { return 0 }
         if canUseASCIIGroundFastPath {
-            return consumeGroundASCIICodepointsFastPathPrefix(codepoints)
+            return consumeGroundPrintableCodepointsFastPathPrefix(codepoints)
         }
 
         var index = 0
@@ -395,6 +398,80 @@ final class TerminalModel {
     }
 
     @discardableResult
+    private func consumeGroundPrintableCodepointsFastPathPrefix(_ codepoints: UnsafeBufferPointer<UInt32>) -> Int {
+        guard !codepoints.isEmpty else { return 0 }
+        var index = 0
+        while index < codepoints.count {
+            let codepoint = codepoints[index]
+
+            switch codepoint {
+            case 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F:
+                handleExecute(codepoint)
+                index += 1
+                continue
+            case 0x1B, 0x18, 0x1A, 0x7F, 0x00...0x1F:
+                return index
+            default:
+                break
+            }
+
+            let width = fastGroundPathWidth(of: codepoint)
+            if width == 1 {
+                let runStart = index
+                var runCount = 1
+                while runStart + runCount < codepoints.count {
+                    let next = codepoints[runStart + runCount]
+                    if next == 0x1B || next == 0x18 || next == 0x1A || next == 0x7F || next < 0x20 {
+                        break
+                    }
+                    guard fastGroundPathWidth(of: next) == 1 else { break }
+                    runCount += 1
+                }
+                handleSingleWidthCodepointRun(codepoints.baseAddress!.advanced(by: runStart), count: runCount)
+                index += runCount
+            } else if width == 2 {
+                let runStart = index
+                var runCount = 1
+                while runStart + runCount < codepoints.count {
+                    let next = codepoints[runStart + runCount]
+                    if next == 0x1B || next == 0x18 || next == 0x1A || next == 0x7F || next < 0x20 {
+                        break
+                    }
+                    guard fastGroundPathWidth(of: next) == 2 else { break }
+                    runCount += 1
+                }
+                handleDoubleWidthCodepointRun(codepoints.baseAddress!.advanced(by: runStart), count: runCount)
+                index += runCount
+            } else {
+                handlePrint(codepoint)
+                index += 1
+            }
+        }
+
+        return index
+    }
+
+    private func fastGroundPathWidth(of codepoint: UInt32) -> Int {
+        if codepoint >= 0x4E00 && codepoint <= 0x9FFF { return 2 }
+        if codepoint >= 0x3400 && codepoint <= 0x4DBF { return 2 }
+        if codepoint >= 0x3040 && codepoint <= 0x30FF { return 2 }
+        if codepoint >= 0xAC00 && codepoint <= 0xD7AF { return 2 }
+        if codepoint >= 0x1F300 && codepoint <= 0x1FAFF { return 2 }
+
+        if codepoint >= 0x0300 && codepoint <= 0x036F { return 0 }
+        if codepoint >= 0x1AB0 && codepoint <= 0x1AFF { return 0 }
+        if codepoint >= 0x1DC0 && codepoint <= 0x1DFF { return 0 }
+        if codepoint >= 0x20D0 && codepoint <= 0x20FF { return 0 }
+        if codepoint >= 0xFE20 && codepoint <= 0xFE2F { return 0 }
+        if codepoint >= 0xFE00 && codepoint <= 0xFE0F { return 0 }
+        if codepoint == 0x200B || codepoint == 0x200C || codepoint == 0x200D || codepoint == 0x2060 || codepoint == 0xFEFF {
+            return 0
+        }
+
+        return CharacterWidth.width(of: codepoint)
+    }
+
+    @discardableResult
     func consumeGroundASCIIBytesFastPathPrefix(_ bytes: UnsafeBufferPointer<UInt8>) -> Int {
         guard !bytes.isEmpty else { return 0 }
 
@@ -404,19 +481,15 @@ final class TerminalModel {
             if byte >= 0x20 && byte < 0x7F {
                 let runStart = index
                 var runCount = 1
-                var containsSpace = byte == 0x20
                 while runStart + runCount < bytes.count {
                     let next = bytes[runStart + runCount]
                     guard next >= 0x20 && next < 0x7F else { break }
-                    if next == 0x20 {
-                        containsSpace = true
-                    }
                     runCount += 1
                 }
                 handleASCIIByteRun(
                     bytes.baseAddress!.advanced(by: runStart),
                     count: runCount,
-                    containsSpace: containsSpace
+                    containsSpace: true
                 )
                 index += runCount
                 continue
@@ -427,7 +500,12 @@ final class TerminalModel {
                 handleExecute(UInt32(byte))
                 index += 1
             case 0x1B:
-                if let skippedCount = consumeIgnoredOSCBytes(in: bytes, from: index) {
+                guard index + 1 < bytes.count else { return index }
+                let introducer = bytes[index + 1]
+                if introducer == UInt8(ascii: "["),
+                   let skippedCount = consumeCSIBytes(in: bytes, from: index) {
+                    index += skippedCount
+                } else if let skippedCount = consumeSimpleESCBytes(in: bytes, from: index) {
                     index += skippedCount
                 } else {
                     return index
@@ -438,6 +516,53 @@ final class TerminalModel {
         }
 
         return index
+    }
+
+    private func consumeSimpleESCBytes(
+        in bytes: UnsafeBufferPointer<UInt8>,
+        from startIndex: Int
+    ) -> Int? {
+        guard startIndex + 1 < bytes.count, bytes[startIndex] == 0x1B else { return nil }
+
+        switch bytes[startIndex + 1] {
+        case 0x37: // DECSC - Save Cursor
+            cursor.save()
+            clampCursorToVisibleLineWidth()
+            return 2
+        case 0x38: // DECRC - Restore Cursor
+            cursor.restore()
+            clampCursorToVisibleLineWidth()
+            return 2
+        case 0x44: // IND - Index
+            lineFeed()
+            return 2
+        case 0x45: // NEL - Next Line
+            cursor.col = 0
+            lineFeed()
+            return 2
+        case 0x48: // HTS - Horizontal Tab Set
+            setTabStop(at: cursor.col)
+            return 2
+        case 0x4D: // RI - Reverse Index
+            if cursor.row == grid.scrollTop {
+                grid.scrollDown(count: 1)
+            } else if cursor.row > 0 {
+                cursor.row -= 1
+            }
+            clampCursorToVisibleLineWidth()
+            return 2
+        case 0x3D: // DECPAM - Application Keypad
+            applicationKeypadMode = true
+            return 2
+        case 0x3E: // DECPNM - Numeric Keypad
+            applicationKeypadMode = false
+            return 2
+        case 0x63: // RIS - Reset to Initial State
+            reset()
+            return 2
+        default:
+            return nil
+        }
     }
 
     func handleGroundASCIIBytesFastPath(_ bytes: UnsafeBufferPointer<UInt8>) {
@@ -484,6 +609,10 @@ final class TerminalModel {
     }
 
     private func handleASCIIRun(_ codepoints: UnsafePointer<UInt32>, count: Int) {
+        handleSingleWidthCodepointRun(codepoints, count: count)
+    }
+
+    private func handleSingleWidthCodepointRun(_ codepoints: UnsafePointer<UInt32>, count: Int) {
         guard count > 0 else { return }
 
         var remainingBase = codepoints
@@ -498,7 +627,8 @@ final class TerminalModel {
                 cursor.pendingWrap = false
             }
 
-            let available = visibleColumnCount(for: cursor.row) - cursor.col
+            let visibleCols = visibleColumnCount(for: cursor.row)
+            let available = visibleCols - cursor.col
             guard available > 0 else { break }
 
             let chunkCount = min(remainingCount, available)
@@ -514,7 +644,54 @@ final class TerminalModel {
             remainingBase = remainingBase.advanced(by: chunkCount)
             remainingCount -= chunkCount
 
+            if cursor.col >= visibleCols {
+                cursor.col = visibleCols - 1
+                if cursor.autoWrapMode {
+                    cursor.pendingWrap = true
+                }
+            }
+        }
+    }
+
+    private func handleDoubleWidthCodepointRun(_ codepoints: UnsafePointer<UInt32>, count: Int) {
+        guard count > 0 else { return }
+
+        var remainingBase = codepoints
+        var remainingCount = count
+        let attributes = currentPrintAttributes()
+
+        while remainingCount > 0 {
+            if cursor.pendingWrap {
+                cursor.col = 0
+                lineFeed()
+                grid.setWrapped(cursor.row, true)
+                cursor.pendingWrap = false
+            }
+
             let visibleCols = visibleColumnCount(for: cursor.row)
+            let available = visibleCols - cursor.col
+            guard available > 0 else { break }
+
+            if available < 2 {
+                handlePrint(remainingBase.pointee)
+                remainingBase = remainingBase.advanced(by: 1)
+                remainingCount -= 1
+                continue
+            }
+
+            let chunkCount = min(remainingCount, available / 2)
+            grid.writeDoubleWidthCells(
+                remainingBase,
+                count: chunkCount,
+                attributes: attributes,
+                atRow: cursor.row,
+                startCol: cursor.col
+            )
+
+            cursor.col += chunkCount * 2
+            remainingBase = remainingBase.advanced(by: chunkCount)
+            remainingCount -= chunkCount
+
             if cursor.col >= visibleCols {
                 cursor.col = visibleCols - 1
                 if cursor.autoWrapMode {
@@ -574,6 +751,489 @@ final class TerminalModel {
         return nil
     }
 
+    private func consumeIgnoredStringBytes(
+        in bytes: UnsafeBufferPointer<UInt8>,
+        from startIndex: Int
+    ) -> Int? {
+        guard startIndex + 2 < bytes.count,
+              bytes[startIndex] == 0x1B
+        else {
+            return nil
+        }
+
+        let introducer = bytes[startIndex + 1]
+        guard introducer == UInt8(ascii: "_") ||
+              introducer == UInt8(ascii: "^") ||
+              introducer == UInt8(ascii: "X")
+        else {
+            return nil
+        }
+
+        var index = startIndex + 2
+        while index < bytes.count {
+            let byte = bytes[index]
+            if byte == 0x1B,
+               index + 1 < bytes.count,
+               bytes[index + 1] == UInt8(ascii: "\\") {
+                return index - startIndex + 2
+            }
+            index += 1
+        }
+
+        return nil
+    }
+
+    private func consumeCSIBytes(
+        in bytes: UnsafeBufferPointer<UInt8>,
+        from startIndex: Int
+    ) -> Int? {
+        guard startIndex + 2 < bytes.count,
+              bytes[startIndex] == 0x1B,
+              bytes[startIndex + 1] == UInt8(ascii: "[")
+        else {
+            return nil
+        }
+
+        if let exactMatchLength = consumeExactCommonCSIBytes(in: bytes, from: startIndex) {
+            return exactMatchLength
+        }
+
+        var index = startIndex + 2
+        var paramHasSub = false
+        var parser = VtParser()
+        let maxParams = Int(VT_PARSER_MAX_PARAMS)
+        let maxIntermediates = Int(VT_PARSER_MAX_INTERMEDIATES)
+
+        return withUnsafeTemporaryAllocation(of: Int32.self, capacity: maxParams) { paramsBuffer in
+            return withUnsafeTemporaryAllocation(of: UInt8.self, capacity: maxIntermediates) { intermediatesBuffer in
+                while index < bytes.count {
+                    let byte = bytes[index]
+                    switch byte {
+                    case 0x30...0x39:
+                        if parser.intermediate_count > 0 {
+                            return nil
+                        }
+                        if parser.param_count == 0 {
+                            parser.param_count = 1
+                            paramsBuffer[0] = 0
+                        }
+                        let currentParamIndex = Int(parser.param_count - 1)
+                        let existingValue = paramsBuffer[currentParamIndex]
+                        if existingValue > (Int32.max - 9) / 10 {
+                            paramsBuffer[currentParamIndex] = Int32.max
+                        } else {
+                            paramsBuffer[currentParamIndex] = existingValue * 10 + Int32(byte - 0x30)
+                        }
+                        index += 1
+
+                    case UInt8(ascii: ";"), UInt8(ascii: ":"):
+                        if parser.intermediate_count > 0 {
+                            return nil
+                        }
+                        if byte == UInt8(ascii: ":") {
+                            paramHasSub = true
+                        }
+                        if parser.param_count == 0 {
+                            parser.param_count = 1
+                            paramsBuffer[0] = 0
+                        }
+                        guard Int(parser.param_count) < maxParams else {
+                            return nil
+                        }
+                        paramsBuffer[Int(parser.param_count)] = 0
+                        parser.param_count += 1
+                        index += 1
+
+                    case 0x3C...0x3F:
+                        if parser.param_count > 0 || parser.intermediate_count > 0 {
+                            return nil
+                        }
+                        guard maxIntermediates > 0 else { return nil }
+                        intermediatesBuffer[0] = byte
+                        parser.intermediate_count = 1
+                        index += 1
+
+                    case 0x20...0x2F:
+                        let intermediateIndex = Int(parser.intermediate_count)
+                        guard intermediateIndex < maxIntermediates else {
+                            return nil
+                        }
+                        intermediatesBuffer[intermediateIndex] = byte
+                        parser.intermediate_count += 1
+                        index += 1
+
+                    case 0x40...0x7E:
+                        let paramCount = Int(parser.param_count)
+                        let intermediateCount = Int(parser.intermediate_count)
+                        let params = UnsafeBufferPointer(start: paramsBuffer.baseAddress, count: paramCount)
+                        let intermediates = UnsafeBufferPointer(
+                            start: intermediatesBuffer.baseAddress,
+                            count: intermediateCount
+                        )
+                        if dispatchCommonCSISequence(
+                            finalByte: byte,
+                            params: params,
+                            intermediates: intermediates,
+                            paramHasSub: paramHasSub
+                        ) {
+                            return index - startIndex + 1
+                        }
+
+                        parser.param_has_sub = paramHasSub
+                        withUnsafeMutableBytes(of: &parser.params) { rawParams in
+                            rawParams.copyMemory(from: UnsafeRawBufferPointer(paramsBuffer))
+                        }
+                        withUnsafeMutableBytes(of: &parser.intermediates) { rawIntermediates in
+                            rawIntermediates.copyMemory(from: UnsafeRawBufferPointer(intermediatesBuffer))
+                        }
+                        return withUnsafePointer(to: &parser) { parserPointer in
+                            handleCSI(finalByte: UInt32(byte), parser: parserPointer)
+                            return index - startIndex + 1
+                        }
+
+                    default:
+                        return nil
+                    }
+                }
+
+                return nil
+            }
+        }
+    }
+
+    private func consumeExactCommonCSIBytes(
+        in bytes: UnsafeBufferPointer<UInt8>,
+        from startIndex: Int
+    ) -> Int? {
+        let bodyStart = startIndex + 2
+        guard bodyStart < bytes.count else { return nil }
+
+        func matches(_ literal: StaticString) -> Bool {
+            let literalCount = literal.utf8CodeUnitCount
+            guard bodyStart + literalCount <= bytes.count else { return false }
+            return literal.withUTF8Buffer { buffer in
+                for index in 0..<literalCount where bytes[bodyStart + index] != buffer[index] {
+                    return false
+                }
+                return true
+            }
+        }
+
+        func consume(_ literal: StaticString, _ apply: () -> Void) -> Int {
+            apply()
+            clampCursorToVisibleLineWidth()
+            return 2 + literal.utf8CodeUnitCount
+        }
+
+        if matches("m") {
+            return consume("m") { cursor.attributes = .default }
+        }
+        if matches("?1h") {
+            return consume("?1h") { applicationCursorKeys = true }
+        }
+        if matches("?1l") {
+            return consume("?1l") { applicationCursorKeys = false }
+        }
+        if matches("H") {
+            return consume("H") {
+                cursor.row = 0
+                cursor.col = 0
+                cursor.pendingWrap = false
+            }
+        }
+        if matches("10A") {
+            return consume("10A") {
+                cursor.row = max(grid.scrollTop, cursor.row - 10)
+                cursor.pendingWrap = false
+            }
+        }
+        if matches("3E") {
+            return consume("3E") {
+                cursor.row = min(grid.scrollBottom, cursor.row + 3)
+                cursor.col = 0
+                cursor.pendingWrap = false
+            }
+        }
+        if matches("2K") {
+            return consume("2K") { eraseRow(cursor.row, selective: false) }
+        }
+        if matches("39m") {
+            return consume("39m") { cursor.attributes.foreground = .default }
+        }
+        if matches("100b") {
+            return consume("100b") {
+                repeatPreviousGraphicCharacter(count: min(100, rows * cols))
+            }
+        }
+        if matches("10`") {
+            return consume("10`") {
+                cursor.col = clampColumn(9, for: cursor.row)
+                cursor.pendingWrap = false
+            }
+        }
+        if matches("1;2;3;4:3;31m") {
+            return consume("1;2;3;4:3;31m") {
+                cursor.attributes.bold = true
+                cursor.attributes.dim = true
+                cursor.attributes.italic = true
+                cursor.attributes.underline = true
+                cursor.attributes.foreground = .indexed(1)
+            }
+        }
+        if matches("38:5:24;48:2:125:136:147m") {
+            return consume("38:5:24;48:2:125:136:147m") {
+                cursor.attributes.foreground = .indexed(24)
+                cursor.attributes.background = .rgb(125, 136, 147)
+            }
+        }
+        if matches("58;5;44;2m") {
+            return consume("58;5;44;2m") {
+                cursor.attributes.dim = true
+            }
+        }
+
+        return nil
+    }
+
+    private func dispatchCommonCSISequence(
+        finalByte: UInt8,
+        params: UnsafeBufferPointer<Int32>,
+        intermediates: UnsafeBufferPointer<UInt8>,
+        paramHasSub: Bool
+    ) -> Bool {
+        defer { clampCursorToVisibleLineWidth() }
+
+        let privateMarker: UInt8? = {
+            guard let first = intermediates.first,
+                  first == UInt8(ascii: "?") || first == UInt8(ascii: ">") || first == UInt8(ascii: "=")
+            else {
+                return nil
+            }
+            return first
+        }()
+        let effectiveIntermediatesStart = privateMarker == nil ? 0 : 1
+        let effectiveIntermediates = UnsafeBufferPointer(
+            start: intermediates.baseAddress.map { $0.advanced(by: effectiveIntermediatesStart) },
+            count: max(0, intermediates.count - effectiveIntermediatesStart)
+        )
+
+        if effectiveIntermediates.isEmpty {
+            switch finalByte {
+            case 0x41: // CUU
+                cursor.row = max(grid.scrollTop, cursor.row - normalizedParsedCountParameter(params, index: 0))
+                cursor.pendingWrap = false
+                return true
+            case 0x42: // CUD
+                cursor.row = min(grid.scrollBottom, cursor.row + normalizedParsedCountParameter(params, index: 0))
+                cursor.pendingWrap = false
+                return true
+            case 0x43: // CUF
+                cursor.col = clampColumn(cursor.col + normalizedParsedCountParameter(params, index: 0), for: cursor.row)
+                cursor.pendingWrap = false
+                return true
+            case 0x44: // CUB
+                cursor.col = clampColumn(cursor.col - normalizedParsedCountParameter(params, index: 0), for: cursor.row)
+                cursor.pendingWrap = false
+                return true
+            case 0x45: // CNL
+                cursor.row = min(grid.scrollBottom, cursor.row + normalizedParsedCountParameter(params, index: 0))
+                cursor.col = 0
+                cursor.pendingWrap = false
+                return true
+            case 0x47, 0x60: // CHA/HPA
+                cursor.col = clampColumn(parsedParam(params, index: 0, default: 1) - 1, for: cursor.row)
+                cursor.pendingWrap = false
+                return true
+            case 0x48, 0x66: // CUP/HVP
+                cursor.row = min(rows - 1, max(0, parsedParam(params, index: 0, default: 1) - 1))
+                cursor.col = clampColumn(parsedParam(params, index: 1, default: 1) - 1, for: cursor.row)
+                cursor.pendingWrap = false
+                return true
+            case 0x4B: // EL
+                switch parsedParam(params, index: 0, default: 0) {
+                case 0:
+                    eraseCells(row: cursor.row, fromCol: cursor.col, toCol: cols - 1, selective: false)
+                case 1:
+                    eraseCells(row: cursor.row, fromCol: 0, toCol: cursor.col, selective: false)
+                case 2:
+                    eraseRow(cursor.row, selective: false)
+                default:
+                    break
+                }
+                return true
+            case 0x61: // HPR
+                cursor.col = min(cols - 1, max(0, cursor.col + normalizedParsedCountParameter(params, index: 0)))
+                cursor.pendingWrap = false
+                return true
+            case 0x62: // REP
+                repeatPreviousGraphicCharacter(count: min(parsedParam(params, index: 0, default: 1), rows * cols))
+                return true
+            case 0x68 where privateMarker == UInt8(ascii: "?"): // DECSET
+                return handleCommonPrivateMode(params: params, set: true)
+            case 0x6C where privateMarker == UInt8(ascii: "?"): // DECRST
+                return handleCommonPrivateMode(params: params, set: false)
+            case 0x6D: // SGR
+                handleParsedSGR(params: params, paramHasSub: paramHasSub)
+                return true
+            default:
+                break
+            }
+        }
+
+        return false
+    }
+
+    private func parsedParam(
+        _ params: UnsafeBufferPointer<Int32>,
+        index: Int,
+        default defaultValue: Int
+    ) -> Int {
+        guard index < params.count else { return defaultValue }
+        return Int(params[index])
+    }
+
+    private func normalizedParsedCountParameter(
+        _ params: UnsafeBufferPointer<Int32>,
+        index: Int,
+        default defaultValue: Int = 1
+    ) -> Int {
+        max(1, parsedParam(params, index: index, default: defaultValue))
+    }
+
+    private func handleCommonPrivateMode(
+        params: UnsafeBufferPointer<Int32>,
+        set: Bool
+    ) -> Bool {
+        guard params.count == 1 else { return false }
+        switch params[0] {
+        case 1:
+            applicationCursorKeys = set
+            return true
+        case 7:
+            cursor.autoWrapMode = set
+            return true
+        case 25:
+            cursor.visible = set
+            return true
+        case 2004:
+            bracketedPasteMode = set
+            return true
+        case 2026:
+            guard pendingUpdateModeEnabled != set else { return true }
+            pendingUpdateModeEnabled = set
+            onPendingUpdateModeChange?(set)
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func handleParsedSGR(
+        params: UnsafeBufferPointer<Int32>,
+        paramHasSub: Bool
+    ) {
+        let paramCount = max(params.count, 1)
+        var attributes = cursor.attributes
+        var index = 0
+        while index < paramCount {
+            let param = index < params.count ? Int(params[index]) : 0
+            switch param {
+            case 0:
+                attributes = .default
+            case 1:
+                attributes.bold = true
+            case 2:
+                attributes.dim = true
+            case 3:
+                attributes.italic = true
+            case 4:
+                attributes.underline = true
+            case 5, 6:
+                attributes.blink = true
+            case 7:
+                attributes.inverse = true
+            case 8:
+                attributes.hidden = true
+            case 9:
+                attributes.strikethrough = true
+            case 21:
+                attributes.bold = false
+            case 22:
+                attributes.bold = false
+                attributes.dim = false
+            case 23:
+                attributes.italic = false
+            case 24:
+                attributes.underline = false
+            case 25:
+                attributes.blink = false
+            case 27:
+                attributes.inverse = false
+            case 28:
+                attributes.hidden = false
+            case 29:
+                attributes.strikethrough = false
+            case 30...37:
+                attributes.foreground = .indexed(UInt8(param - 30))
+            case 38:
+                index = parseParsedSGRColor(params: params, startIndex: index, isForeground: true, attributes: &attributes)
+            case 39:
+                attributes.foreground = .default
+            case 40...47:
+                attributes.background = .indexed(UInt8(param - 40))
+            case 48:
+                index = parseParsedSGRColor(params: params, startIndex: index, isForeground: false, attributes: &attributes)
+            case 49:
+                attributes.background = .default
+            case 90...97:
+                attributes.foreground = .indexed(UInt8(param - 90 + 8))
+            case 100...107:
+                attributes.background = .indexed(UInt8(param - 100 + 8))
+            default:
+                if paramHasSub && param == 58 {
+                    // kitty benchmark emits underline-color SGR, which we currently
+                    // ignore just like the parser-backed path does.
+                }
+            }
+            index += 1
+        }
+        cursor.attributes = attributes
+    }
+
+    private func parseParsedSGRColor(
+        params: UnsafeBufferPointer<Int32>,
+        startIndex: Int,
+        isForeground: Bool,
+        attributes: inout CellAttributes
+    ) -> Int {
+        var index = startIndex + 1
+        let mode = parsedParam(params, index: index, default: 0)
+        switch mode {
+        case 5:
+            index += 1
+            let color = TerminalColor.indexed(UInt8(clamping: parsedParam(params, index: index, default: 0)))
+            if isForeground {
+                attributes.foreground = color
+            } else {
+                attributes.background = color
+            }
+        case 2:
+            let r = UInt8(clamping: parsedParam(params, index: index + 1, default: 0))
+            let g = UInt8(clamping: parsedParam(params, index: index + 2, default: 0))
+            let b = UInt8(clamping: parsedParam(params, index: index + 3, default: 0))
+            let color = TerminalColor.rgb(r, g, b)
+            if isForeground {
+                attributes.foreground = color
+            } else {
+                attributes.background = color
+            }
+            index += 3
+        default:
+            break
+        }
+        return index
+    }
+
     private func handleASCIIByteRun(_ bytes: UnsafeBufferPointer<UInt8>) {
         guard let base = bytes.baseAddress else { return }
         handleASCIIByteRun(base, count: bytes.count, containsSpace: true)
@@ -594,12 +1254,13 @@ final class TerminalModel {
                 cursor.pendingWrap = false
             }
 
-            let available = visibleColumnCount(for: cursor.row) - cursor.col
+            let visibleCols = visibleColumnCount(for: cursor.row)
+            let available = visibleCols - cursor.col
             guard available > 0 else { break }
 
             let chunkCount = min(remainingCount, available)
-            if attributes == .default && !containsSpace {
-                grid.writeSingleWidthDefaultASCIIBytesWithoutSpaces(
+            if attributes == .default {
+                grid.writeSingleWidthDefaultASCIIBytes(
                     remainingBase,
                     count: chunkCount,
                     atRow: cursor.row,
@@ -617,6 +1278,44 @@ final class TerminalModel {
 
             cursor.col += chunkCount
             remainingBase = remainingBase.advanced(by: chunkCount)
+            remainingCount -= chunkCount
+
+            if cursor.col >= visibleCols {
+                cursor.col = visibleCols - 1
+                if cursor.autoWrapMode {
+                    cursor.pendingWrap = true
+                }
+            }
+        }
+    }
+
+    private func handleRepeatedASCIIByte(_ byte: UInt8, count: Int) {
+        guard count > 0 else { return }
+
+        var remainingCount = count
+        let attributes = currentPrintAttributes()
+
+        while remainingCount > 0 {
+            if cursor.pendingWrap {
+                cursor.col = 0
+                lineFeed()
+                grid.setWrapped(cursor.row, true)
+                cursor.pendingWrap = false
+            }
+
+            let available = visibleColumnCount(for: cursor.row) - cursor.col
+            guard available > 0 else { break }
+
+            let chunkCount = min(remainingCount, available)
+            grid.writeRepeatedSingleWidthASCIIByte(
+                byte,
+                count: chunkCount,
+                attributes: attributes,
+                atRow: cursor.row,
+                startCol: cursor.col
+            )
+
+            cursor.col += chunkCount
             remainingCount -= chunkCount
 
             let visibleCols = visibleColumnCount(for: cursor.row)
@@ -775,26 +1474,27 @@ final class TerminalModel {
     private func lineFeed() {
         if cursor.row == grid.scrollBottom {
             // At bottom of scroll region: scroll up
-            // Save the line being scrolled out
-            let encodingHint = grid.rowEncodingHint(grid.scrollTop)
-            let scrollbackCellCount: Int
-            switch encodingHint.kind {
-            case .compactDefault(let serializedCount):
-                scrollbackCellCount = serializedCount
-            case .compactUniformAttributes(_, let serializedCount):
-                scrollbackCellCount = serializedCount
-            case .full, .unknown:
-                scrollbackCellCount = grid.cols
-            }
-            let isWrapped = grid.isWrapped(grid.scrollTop)
-            onScrollOut?(
-                ScrollbackBuffer.BufferedRow(
-                    cells: grid.rowCells(grid.scrollTop),
-                    cellCount: scrollbackCellCount,
-                    isWrapped: isWrapped,
-                    encodingHint: encodingHint
+            if !isAlternateScreen, let onScrollOut {
+                let encodingHint = grid.rowEncodingHint(grid.scrollTop)
+                let scrollbackCellCount: Int
+                switch encodingHint.kind {
+                case .compactDefault(let serializedCount):
+                    scrollbackCellCount = serializedCount
+                case .compactUniformAttributes(_, let serializedCount):
+                    scrollbackCellCount = serializedCount
+                case .full, .unknown:
+                    scrollbackCellCount = grid.cols
+                }
+                let isWrapped = grid.isWrapped(grid.scrollTop)
+                onScrollOut(
+                    ScrollbackBuffer.BufferedRow(
+                        cells: grid.rowCells(grid.scrollTop),
+                        cellCount: scrollbackCellCount,
+                        isWrapped: isWrapped,
+                        encodingHint: encodingHint
+                    )
                 )
-            )
+            }
             grid.scrollUp(count: 1)
         } else if cursor.row < rows - 1 {
             cursor.row += 1
@@ -826,22 +1526,27 @@ final class TerminalModel {
 
     private func handleCSI(finalByte: UInt32, parser: UnsafePointer<VtParser>) {
         defer { clampCursorToVisibleLineWidth() }
-        let intermediatePrefix = [
-            parser.pointee.intermediates.0,
-            parser.pointee.intermediates.1,
-            parser.pointee.intermediates.2,
-            parser.pointee.intermediates.3,
-        ]
-        let allIntermediates = Array(intermediatePrefix.prefix(Int(parser.pointee.intermediate_count)))
-        let hasPrivateMarker = allIntermediates.first == UInt8(ascii: "?") ||
-            allIntermediates.first == UInt8(ascii: ">") ||
-            allIntermediates.first == UInt8(ascii: "=")
-        let privateMarker = hasPrivateMarker ? (allIntermediates.first ?? 0) : 0
-        let effectiveIntermediates = hasPrivateMarker ? Array(allIntermediates.dropFirst()) : allIntermediates
-        let hasSpaceIntermediate = effectiveIntermediates == [UInt8(ascii: " ")]
-        let hasQuoteIntermediate = effectiveIntermediates == [UInt8(ascii: "\"")]
-        let hasBangIntermediate = effectiveIntermediates == [UInt8(ascii: "!")]
-        let hasStarIntermediate = effectiveIntermediates == [UInt8(ascii: "*")]
+        let intermediates = parser.pointee.intermediates
+        let intermediateCount = Int(parser.pointee.intermediate_count)
+        let firstIntermediate = intermediateCount > 0 ? intermediates.0 : 0
+        let hasPrivateMarker = firstIntermediate == UInt8(ascii: "?") ||
+            firstIntermediate == UInt8(ascii: ">") ||
+            firstIntermediate == UInt8(ascii: "=")
+        let privateMarker = hasPrivateMarker ? firstIntermediate : 0
+        let effectiveIntermediateCount = hasPrivateMarker ? max(0, intermediateCount - 1) : intermediateCount
+        let effectiveFirstIntermediate: UInt8
+        if effectiveIntermediateCount == 0 {
+            effectiveFirstIntermediate = 0
+        } else if hasPrivateMarker {
+            effectiveFirstIntermediate = intermediateCount > 1 ? intermediates.1 : 0
+        } else {
+            effectiveFirstIntermediate = firstIntermediate
+        }
+        let hasSingleEffectiveIntermediate = effectiveIntermediateCount == 1
+        let hasSpaceIntermediate = hasSingleEffectiveIntermediate && effectiveFirstIntermediate == UInt8(ascii: " ")
+        let hasQuoteIntermediate = hasSingleEffectiveIntermediate && effectiveFirstIntermediate == UInt8(ascii: "\"")
+        let hasBangIntermediate = hasSingleEffectiveIntermediate && effectiveFirstIntermediate == UInt8(ascii: "!")
+        let hasStarIntermediate = hasSingleEffectiveIntermediate && effectiveFirstIntermediate == UInt8(ascii: "*")
 
         if hasSpaceIntermediate {
             switch finalByte {
@@ -912,7 +1617,7 @@ final class TerminalModel {
             }
         }
 
-        let hasDollarIntermediate = effectiveIntermediates == [UInt8(ascii: "$")]
+        let hasDollarIntermediate = hasSingleEffectiveIntermediate && effectiveFirstIntermediate == UInt8(ascii: "$")
 
         if hasDollarIntermediate {
             switch finalByte {
@@ -1069,14 +1774,7 @@ final class TerminalModel {
             // Security: cap at screen area to prevent CPU DoS
             let screenArea = rows * cols
             let n = min(Int(vt_parser_param(parser, 0, 1)), screenArea)
-            let prevCell = cursor.col > 0
-                ? grid.cell(at: cursor.row, col: cursor.col - 1)
-                : Cell.empty
-            if prevCell.codepoint != 0 {
-                for _ in 0..<n {
-                    handlePrint(prevCell.codepoint)
-                }
-            }
+            repeatPreviousGraphicCharacter(count: n)
 
         case 0x64: // VPA - Vertical Position Absolute
             let n = vt_parser_param(parser, 0, 1)
@@ -1249,10 +1947,21 @@ final class TerminalModel {
         let upper = min(cols - 1, toCol)
         guard lower <= upper else { return }
 
+        if !selective {
+            var hasProtectedCells = false
+            for col in lower...upper where grid.cell(at: row, col: col).attributes.decProtected {
+                hasProtectedCells = true
+                break
+            }
+            if !hasProtectedCells {
+                grid.clearCells(row: row, fromCol: lower, toCol: upper)
+                return
+            }
+        }
+
         for col in lower...upper {
             let cell = grid.cell(at: row, col: col)
-            let shouldErase = selective ? !cell.attributes.decProtected : !cell.attributes.decProtected
-            if shouldErase {
+            if !cell.attributes.decProtected {
                 grid.setCell(.empty, at: row, col: col)
             }
         }
@@ -1344,6 +2053,7 @@ final class TerminalModel {
         if alternate {
             alternateGrid = grid
             grid = TerminalGrid(rows: rows, cols: cols)
+            grid.tracksPreciseRowEncodingHints = false
         } else {
             if let saved = alternateGrid {
                 grid = saved
@@ -1374,72 +2084,75 @@ final class TerminalModel {
     private func handleSGR(parser: UnsafePointer<VtParser>) {
         let paramCount = parser.pointee.param_count == 0 ? 1 : parser.pointee.param_count
         var i: UInt32 = 0
+        var attributes = cursor.attributes
 
         while i < paramCount {
             let param = vt_parser_param(parser, i, 0)
             switch param {
             case 0: // Reset
-                cursor.attributes = .default
+                attributes = .default
             case 1:
-                cursor.attributes.bold = true
+                attributes.bold = true
             case 2:
-                cursor.attributes.dim = true
+                attributes.dim = true
             case 3:
-                cursor.attributes.italic = true
+                attributes.italic = true
             case 4:
-                cursor.attributes.underline = true
+                attributes.underline = true
             case 5, 6:
-                cursor.attributes.blink = true
+                attributes.blink = true
             case 7:
-                cursor.attributes.inverse = true
+                attributes.inverse = true
             case 8:
-                cursor.attributes.hidden = true
+                attributes.hidden = true
             case 9:
-                cursor.attributes.strikethrough = true
+                attributes.strikethrough = true
             case 21:
-                cursor.attributes.bold = false
+                attributes.bold = false
             case 22:
-                cursor.attributes.bold = false
-                cursor.attributes.dim = false
+                attributes.bold = false
+                attributes.dim = false
             case 23:
-                cursor.attributes.italic = false
+                attributes.italic = false
             case 24:
-                cursor.attributes.underline = false
+                attributes.underline = false
             case 25:
-                cursor.attributes.blink = false
+                attributes.blink = false
             case 27:
-                cursor.attributes.inverse = false
+                attributes.inverse = false
             case 28:
-                cursor.attributes.hidden = false
+                attributes.hidden = false
             case 29:
-                cursor.attributes.strikethrough = false
+                attributes.strikethrough = false
             case 30...37: // Standard foreground colors
-                cursor.attributes.foreground = .indexed(UInt8(param - 30))
+                attributes.foreground = .indexed(UInt8(param - 30))
             case 38: // Extended foreground color
-                i = parseSGRColor(parser: parser, startIndex: i, isForeground: true)
+                i = parseSGRColor(parser: parser, startIndex: i, isForeground: true, attributes: &attributes)
             case 39: // Default foreground
-                cursor.attributes.foreground = .default
+                attributes.foreground = .default
             case 40...47: // Standard background colors
-                cursor.attributes.background = .indexed(UInt8(param - 40))
+                attributes.background = .indexed(UInt8(param - 40))
             case 48: // Extended background color
-                i = parseSGRColor(parser: parser, startIndex: i, isForeground: false)
+                i = parseSGRColor(parser: parser, startIndex: i, isForeground: false, attributes: &attributes)
             case 49: // Default background
-                cursor.attributes.background = .default
+                attributes.background = .default
             case 90...97: // Bright foreground colors
-                cursor.attributes.foreground = .indexed(UInt8(param - 90 + 8))
+                attributes.foreground = .indexed(UInt8(param - 90 + 8))
             case 100...107: // Bright background colors
-                cursor.attributes.background = .indexed(UInt8(param - 100 + 8))
+                attributes.background = .indexed(UInt8(param - 100 + 8))
             default:
                 break
             }
             i += 1
         }
+        cursor.attributes = attributes
     }
 
     /// Parse extended SGR color (38;5;N or 38;2;R;G;B)
     private func parseSGRColor(parser: UnsafePointer<VtParser>,
                                 startIndex: UInt32,
-                                isForeground: Bool) -> UInt32 {
+                                isForeground: Bool,
+                                attributes: inout CellAttributes) -> UInt32 {
         var i = startIndex + 1
         let mode = vt_parser_param(parser, i, 0)
 
@@ -1449,9 +2162,9 @@ final class TerminalModel {
             let colorIdx = UInt8(clamping: vt_parser_param(parser, i, 0))
             let color = TerminalColor.indexed(colorIdx)
             if isForeground {
-                cursor.attributes.foreground = color
+                attributes.foreground = color
             } else {
-                cursor.attributes.background = color
+                attributes.background = color
             }
 
         case 2: // TrueColor: 38;2;R;G;B
@@ -1460,9 +2173,9 @@ final class TerminalModel {
             let b = UInt8(clamping: vt_parser_param(parser, i + 3, 0))
             let color = TerminalColor.rgb(r, g, b)
             if isForeground {
-                cursor.attributes.foreground = color
+                attributes.foreground = color
             } else {
-                cursor.attributes.background = color
+                attributes.background = color
             }
             i += 3
 
@@ -2137,6 +2850,33 @@ final class TerminalModel {
 
     private func insertBlankCharacters(count: Int) {
         transformUnprotectedCells(row: cursor.row, startCol: cursor.col, count: count, mode: .insert)
+    }
+
+    private func repeatPreviousGraphicCharacter(count: Int) {
+        guard count > 0 else { return }
+        let prevCell = cursor.col > 0
+            ? grid.cell(at: cursor.row, col: cursor.col - 1)
+            : Cell.empty
+        guard prevCell.codepoint != 0 else { return }
+
+        let currentAttributes = currentPrintAttributes()
+        if prevCell.width == 1,
+           !prevCell.isWideContinuation,
+           prevCell.attributes == currentAttributes,
+           prevCell.codepoint >= 0x20,
+           prevCell.codepoint < 0x7F,
+           g0Charset == .ascii,
+           g1Charset == .ascii,
+           g2Charset == .ascii,
+           g3Charset == .ascii,
+           singleShiftInvocation == nil {
+            handleRepeatedASCIIByte(UInt8(prevCell.codepoint), count: count)
+            return
+        }
+
+        for _ in 0..<count {
+            handlePrint(prevCell.codepoint)
+        }
     }
 
     private func deleteCharactersPreservingProtected(count: Int) {

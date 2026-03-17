@@ -112,6 +112,36 @@ final class TextModelTests: XCTestCase {
         XCTAssertEqual(Array(output.prefix(count)), [0x41])
     }
 
+    func testTerminalTextDecoderHandlesSplitUTF8AcrossChunks() {
+        let decoder = TerminalTextDecoder(encoding: .utf8)
+        var output = [UInt32](repeating: 0, count: 4)
+
+        let firstChunk = Data([0xE6, 0x97])
+        let secondChunk = Data([0xA5, 0xF0, 0x9F, 0x98, 0x80])
+
+        let firstCount = firstChunk.withUnsafeBytes { rawBuffer in
+            decoder.decode(rawBuffer.bindMemory(to: UInt8.self), into: &output)
+        }
+        XCTAssertEqual(firstCount, 0)
+
+        let secondCount = secondChunk.withUnsafeBytes { rawBuffer in
+            decoder.decode(rawBuffer.bindMemory(to: UInt8.self), into: &output)
+        }
+        XCTAssertEqual(Array(output.prefix(secondCount)), [0x65E5, 0x1F600])
+    }
+
+    func testTerminalTextDecoderPreservesRawC1ControlsInUTF8() {
+        let decoder = TerminalTextDecoder(encoding: .utf8)
+        var output = [UInt32](repeating: 0, count: 4)
+        let data = Data([0x9B, 0x41])
+
+        let count = data.withUnsafeBytes { rawBuffer in
+            decoder.decode(rawBuffer.bindMemory(to: UInt8.self), into: &output)
+        }
+
+        XCTAssertEqual(Array(output.prefix(count)), [0x9B, 0x41])
+    }
+
     func testTerminalTextDecoderEmitsReplacementForDanglingLowSurrogate() {
         let decoder = TerminalTextDecoder(encoding: .utf16LittleEndian)
         var output = [UInt32](repeating: 0, count: 4)
@@ -439,6 +469,30 @@ final class TextModelTests: XCTestCase {
         }
         XCTAssertEqual(grid.rowCells(0).map(\.codepoint), Array("12345".utf8).map(UInt32.init))
         XCTAssertEqual(grid.cell(at: 0, col: 6).codepoint, Cell.empty.codepoint)
+    }
+
+    func testTerminalGridSparseDefaultASCIIRowPreservesSpacesInsideSerializedPrefix() {
+        let grid = TerminalGrid(rows: 1, cols: 8)
+        Array("1 3".utf8).withUnsafeBufferPointer { bytes in
+            grid.writeSingleWidthDefaultASCIIBytes(
+                bytes.baseAddress!,
+                count: bytes.count,
+                atRow: 0,
+                startCol: 0
+            )
+        }
+
+        switch grid.rowEncodingHint(0).kind {
+        case .compactDefault(let serializedCount):
+            XCTAssertEqual(serializedCount, 3)
+        default:
+            XCTFail("expected compact default hint for sparse ASCII row with spaces")
+        }
+
+        XCTAssertEqual(grid.cell(at: 0, col: 0).codepoint, UInt32(Character("1").asciiValue!))
+        XCTAssertEqual(grid.cell(at: 0, col: 1).codepoint, Cell.empty.codepoint)
+        XCTAssertEqual(grid.cell(at: 0, col: 2).codepoint, UInt32(Character("3").asciiValue!))
+        XCTAssertEqual(grid.cell(at: 0, col: 5).codepoint, Cell.empty.codepoint)
     }
 
     func testTerminalGridOutOfBoundsAccessIsSafe() {

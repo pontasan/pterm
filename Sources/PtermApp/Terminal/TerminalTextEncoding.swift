@@ -181,9 +181,11 @@ final class TerminalTextDecoder {
 
     private func decodeUTF8(_ input: UnsafeBufferPointer<UInt8>, into output: inout [UInt32]) -> Int {
         var outCount = 0
+        var index = 0
 
-        for byte in input {
+        while index < input.count {
             guard outCount < output.count else { break }
+            let byte = input[index]
 
             // Preserve raw 8-bit C1 controls when they occur at codepoint
             // boundaries. Terminals must recognize these as control functions,
@@ -191,7 +193,65 @@ final class TerminalTextDecoder {
             if utf8Decoder.state == UTF8_ACCEPT, byte >= 0x80, byte <= 0x9F {
                 output[outCount] = UInt32(byte)
                 outCount += 1
+                index += 1
                 continue
+            }
+
+            if utf8Decoder.state == UTF8_ACCEPT {
+                if byte < 0x80 {
+                    output[outCount] = UInt32(byte)
+                    outCount += 1
+                    index += 1
+                    continue
+                }
+
+                if byte >= 0xC2, byte <= 0xDF, index + 1 < input.count {
+                    let b1 = input[index + 1]
+                    if b1 & 0xC0 == 0x80 {
+                        output[outCount] = (UInt32(byte & 0x1F) << 6) | UInt32(b1 & 0x3F)
+                        outCount += 1
+                        index += 2
+                        continue
+                    }
+                }
+
+                if byte >= 0xE0, byte <= 0xEF, index + 2 < input.count {
+                    let b1 = input[index + 1]
+                    let b2 = input[index + 2]
+                    let isLegalSecondByte =
+                        (byte == 0xE0 && (0xA0...0xBF).contains(b1)) ||
+                        (byte == 0xED && (0x80...0x9F).contains(b1)) ||
+                        ((byte != 0xE0 && byte != 0xED) && (b1 & 0xC0 == 0x80))
+                    if isLegalSecondByte, b2 & 0xC0 == 0x80 {
+                        output[outCount] =
+                            (UInt32(byte & 0x0F) << 12) |
+                            (UInt32(b1 & 0x3F) << 6) |
+                            UInt32(b2 & 0x3F)
+                        outCount += 1
+                        index += 3
+                        continue
+                    }
+                }
+
+                if byte >= 0xF0, byte <= 0xF4, index + 3 < input.count {
+                    let b1 = input[index + 1]
+                    let b2 = input[index + 2]
+                    let b3 = input[index + 3]
+                    let isLegalSecondByte =
+                        (byte == 0xF0 && (0x90...0xBF).contains(b1)) ||
+                        (byte == 0xF4 && (0x80...0x8F).contains(b1)) ||
+                        ((byte != 0xF0 && byte != 0xF4) && (b1 & 0xC0 == 0x80))
+                    if isLegalSecondByte, b2 & 0xC0 == 0x80, b3 & 0xC0 == 0x80 {
+                        output[outCount] =
+                            (UInt32(byte & 0x07) << 18) |
+                            (UInt32(b1 & 0x3F) << 12) |
+                            (UInt32(b2 & 0x3F) << 6) |
+                            UInt32(b3 & 0x3F)
+                        outCount += 1
+                        index += 4
+                        continue
+                    }
+                }
             }
 
             let result = utf8_decoder_feed(&utf8Decoder, byte)
@@ -202,6 +262,7 @@ final class TerminalTextDecoder {
                 output[outCount] = UInt32(UTF8_REPLACEMENT_CHAR)
                 outCount += 1
             }
+            index += 1
         }
 
         return outCount

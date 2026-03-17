@@ -208,6 +208,22 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(String(penultimateString.suffix(1)), "*")
     }
 
+    func testGroundFastPathBatchesConsecutiveDoubleWidthCodepoints() {
+        let harness = TerminalModelHarness(rows: 2, cols: 8)
+
+        harness.feed(codepoints: [0x65E5, 0x672C, 0x8A9E, 0x4E2D])
+
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 0).codepoint, 0x65E5)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 1).isWideContinuation)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 2).codepoint, 0x672C)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 3).isWideContinuation)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 4).codepoint, 0x8A9E)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 5).isWideContinuation)
+        XCTAssertEqual(harness.model.grid.cell(at: 0, col: 6).codepoint, 0x4E2D)
+        XCTAssertTrue(harness.model.grid.cell(at: 0, col: 7).isWideContinuation)
+        XCTAssertTrue(harness.model.cursor.pendingWrap)
+    }
+
     func testDisplayLocalInterruptPromptBoundaryMovesToNextLineWhenCurrentLineHasContent() {
         let harness = TerminalModelHarness(rows: 3, cols: 8)
         harness.feed("abc")

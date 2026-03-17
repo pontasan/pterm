@@ -275,6 +275,46 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertTrue(output.contains("done"), "cli output=\(output)")
     }
 
+    func testCLITerminalOutputFilterSuppressesSynchronizedOutputPayloadUntilResume() {
+        let filter = CLITerminalOutputFilter()
+        let firstChunk = Data("before\r\n\u{1B}[?2026hhidden payload".utf8)
+        let secondChunk = Data("\u{1B}[?2026lafter\r\n".utf8)
+
+        let firstOutput = firstChunk.withUnsafeBytes { rawBuffer -> Data in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            return filter.filter(UnsafeBufferPointer(start: bytes.baseAddress, count: bytes.count))
+        }
+        let secondOutput = secondChunk.withUnsafeBytes { rawBuffer -> Data in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            return filter.filter(UnsafeBufferPointer(start: bytes.baseAddress, count: bytes.count))
+        }
+
+        let output = String(decoding: firstOutput + secondOutput, as: UTF8.self)
+        XCTAssertTrue(output.contains("before"), "cli output=\(output)")
+        XCTAssertTrue(output.contains("after"), "cli output=\(output)")
+        XCTAssertFalse(output.contains("hidden payload"), "cli output=\(output)")
+        XCTAssertFalse(output.contains("\u{1B}[?2026h"), "cli output=\(output)")
+        XCTAssertFalse(output.contains("\u{1B}[?2026l"), "cli output=\(output)")
+    }
+
+    func testCLITerminalOutputFilterResumesWhenPendingUpdateDisableSequenceSpansChunks() {
+        let filter = CLITerminalOutputFilter()
+        let firstChunk = Data("\u{1B}[?2026hhidden\u{1B}[?202".utf8)
+        let secondChunk = Data("6lafter".utf8)
+
+        let firstOutput = firstChunk.withUnsafeBytes { rawBuffer -> Data in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            return filter.filter(UnsafeBufferPointer(start: bytes.baseAddress, count: bytes.count))
+        }
+        let secondOutput = secondChunk.withUnsafeBytes { rawBuffer -> Data in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            return filter.filter(UnsafeBufferPointer(start: bytes.baseAddress, count: bytes.count))
+        }
+
+        let output = String(decoding: firstOutput + secondOutput, as: UTF8.self)
+        XCTAssertEqual(output, "after")
+    }
+
     func testPtermDirectoriesOverrideRebindsAllDerivedLocations() throws {
         let originalBase = PtermDirectories.base
         let originalConfig = PtermDirectories.config

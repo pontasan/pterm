@@ -91,4 +91,58 @@ final class VTParserTests: XCTestCase {
         XCTAssertTrue(collector.events.contains { $0.actionRawValue == Int(VT_ACTION_UNHOOK.rawValue) })
         XCTAssertEqual(parser.state, VT_STATE_GROUND)
     }
+
+    func testIgnoredOSCFastPathConsumesPayloadWithoutDecodingEachByte() {
+        let collector = VTCollector()
+        var parser = VtParser()
+        vt_parser_init(&parser, vtTestCallback, Unmanaged.passUnretained(collector).toOpaque())
+        defer { vt_parser_destroy(&parser) }
+
+        let prefix = Array("\u{001B}]6;".utf8)
+        let payload = Array(repeating: UInt8(ascii: "A"), count: 4096)
+        let suffix = Array("\u{001B}\\".utf8)
+
+        let prefixCodepoints = prefix.map(UInt32.init)
+        vt_parser_feed(&parser, prefixCodepoints, prefixCodepoints.count)
+        XCTAssertEqual(parser.state, VT_STATE_OSC_STRING)
+        XCTAssertTrue(parser.osc_ignore_payload)
+
+        let consumed = payload.withUnsafeBufferPointer {
+            vt_parser_consume_ascii_ignored_string_fast_path(&parser, $0.baseAddress, $0.count)
+        }
+        XCTAssertEqual(consumed, payload.count)
+        XCTAssertEqual(parser.state, VT_STATE_OSC_STRING)
+
+        let terminatorConsumed = suffix.withUnsafeBufferPointer {
+            vt_parser_consume_ascii_ignored_string_fast_path(&parser, $0.baseAddress, $0.count)
+        }
+        XCTAssertEqual(terminatorConsumed, suffix.count)
+        XCTAssertEqual(parser.state, VT_STATE_GROUND)
+        XCTAssertTrue(collector.events.contains { $0.actionRawValue == Int(VT_ACTION_OSC_END.rawValue) })
+    }
+
+    func testIgnoredAPCFastPathConsumesPayloadUntilST() {
+        let collector = VTCollector()
+        var parser = VtParser()
+        vt_parser_init(&parser, vtTestCallback, Unmanaged.passUnretained(collector).toOpaque())
+        defer { vt_parser_destroy(&parser) }
+
+        let prefix = Array("\u{001B}_".utf8).map(UInt32.init)
+        vt_parser_feed(&parser, prefix, prefix.count)
+        XCTAssertEqual(parser.state, VT_STATE_SOS_PM_APC_STRING)
+
+        let payload = Array(repeating: UInt8(ascii: "B"), count: 4096)
+        let consumed = payload.withUnsafeBufferPointer {
+            vt_parser_consume_ascii_ignored_string_fast_path(&parser, $0.baseAddress, $0.count)
+        }
+        XCTAssertEqual(consumed, payload.count)
+        XCTAssertEqual(parser.state, VT_STATE_SOS_PM_APC_STRING)
+
+        let suffix = Array("\u{001B}\\".utf8)
+        let suffixConsumed = suffix.withUnsafeBufferPointer {
+            vt_parser_consume_ascii_ignored_string_fast_path(&parser, $0.baseAddress, $0.count)
+        }
+        XCTAssertEqual(suffixConsumed, suffix.count)
+        XCTAssertEqual(parser.state, VT_STATE_GROUND)
+    }
 }

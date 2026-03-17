@@ -21,14 +21,15 @@ enum CharacterWidth {
             return -1
         }
 
-        // Zero-width characters
-        if isZeroWidth(codepoint) {
-            return 0
-        }
-
-        // East Asian Wide / Fullwidth
+        // Most terminal text is either ordinary-width or one of the common
+        // East Asian wide ranges. Check wide first so dense CJK streams do not
+        // pay the much larger zero-width table walk on every codepoint.
         if isWide(codepoint) {
             return 2
+        }
+
+        if isZeroWidth(codepoint) {
+            return 0
         }
 
         return 1

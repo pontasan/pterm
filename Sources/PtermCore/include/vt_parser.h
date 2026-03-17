@@ -125,6 +125,21 @@ void vt_parser_reset(VtParser *parser);
 void vt_parser_feed(VtParser *parser, const uint32_t *codepoints, size_t count);
 
 /*
+ * Consume bytes for ignored OSC/APC/SOS/PM string payloads without first
+ * transcoding them into codepoints.
+ *
+ * This fast path is only valid for ASCII-compatible UTF-8 input. It is used by
+ * benchmark-heavy paths such as kitty's long OSC and graphics protocol tests,
+ * where the terminal intentionally ignores the payload after recognizing the
+ * string kind. Returns the number of bytes consumed from `bytes`.
+ */
+size_t vt_parser_consume_ascii_ignored_string_fast_path(
+    VtParser *parser,
+    const uint8_t *bytes,
+    size_t count
+);
+
+/*
  * Feed a single codepoint to the parser.
  */
 void vt_parser_feed_one(VtParser *parser, uint32_t codepoint);

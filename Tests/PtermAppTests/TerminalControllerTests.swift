@@ -88,6 +88,19 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertEqual(controller.debugSearchScratchCapacity, 0)
     }
 
+    func testDebugProcessPTYOutputMatchesByteWiseProcessingForRepeatedASCIIREP() {
+        let bulk = makeController(rows: 2, cols: 12)
+        let byteWise = makeController(rows: 2, cols: 12)
+        let data = Data([0x41, 0x1B, 0x5B, 0x31, 0x30, 0x62])
+
+        bulk.debugProcessPTYOutputForTesting(data)
+        for byte in data {
+            byteWise.debugProcessPTYOutputForTesting(Data([byte]))
+        }
+
+        XCTAssertEqual(bulk.allText(), byteWise.allText())
+    }
+
     func testInputWithoutNewlineSuppressesOutputActivityIndicator() {
         XCTAssertTrue(TerminalController.shouldSuppressOutputActivity(forInput: Data("abc".utf8)))
         XCTAssertTrue(TerminalController.shouldSuppressOutputActivity(forInput: Data([0x1B, 0x5B, 0x41])))
@@ -749,6 +762,34 @@ final class TerminalControllerTests: XCTestCase {
         }.trimmingCharacters(in: .whitespaces), "Running: Long escape codes")
     }
 
+    func testIgnoredOSCPayloadFastPathStillResumesPendingUpdateMode() {
+        let controller = makeController(rows: 2, cols: 40)
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?2026h".utf8))
+        drainMainQueue(testCase: self)
+        XCTAssertTrue(controller.isRenderingSuppressed)
+
+        let payload = "\u{1B}]6;" + String(repeating: "A", count: 8192) + "\u{1B}\\"
+        controller.debugProcessPTYOutputForTesting(Data(payload.utf8))
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?2026l".utf8))
+        drainMainQueue(testCase: self)
+
+        XCTAssertFalse(controller.isRenderingSuppressed)
+    }
+
+    func testIgnoredAPCPayloadFastPathStillResumesPendingUpdateMode() {
+        let controller = makeController(rows: 2, cols: 40)
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?2026h".utf8))
+        drainMainQueue(testCase: self)
+        XCTAssertTrue(controller.isRenderingSuppressed)
+
+        let payload = "\u{1B}_G" + String(repeating: "B", count: 8192) + "\u{1B}\\"
+        controller.debugProcessPTYOutputForTesting(Data(payload.utf8))
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?2026l".utf8))
+        drainMainQueue(testCase: self)
+
+        XCTAssertFalse(controller.isRenderingSuppressed)
+    }
+
     func testFindMatchesIsCaseInsensitiveAndEmptyQueryReturnsNoMatches() {
         let controller = makeController(rows: 1, cols: 8)
         controller.withModel { model in
@@ -1297,5 +1338,43 @@ final class TerminalControllerTests: XCTestCase {
             byteWise.setScrollOffset(offset)
             XCTAssertEqual(bulk.allText(), byteWise.allText(), "mismatch at scroll offset \(offset)")
         }
+    }
+
+    func testDebugProcessPTYOutputMatchesByteWiseProcessingForKittyBenchmarkCSI() {
+        let bulk = makeController(rows: 24, cols: 80)
+        let byteWise = makeController(rows: 24, cols: 80)
+        let payloadString =
+            "\u{1B}[m\u{1B}[?1h\u{1B}[H"
+            + "\u{1B}[1;2;3;4:3;31m"
+            + "\u{1B}[38:5:24;48:2:125:136:147m"
+            + "a"
+            + "\u{1B}[39m\u{1B}[10`a\u{1B}[100b\u{1B}[?1l"
+            + "\u{1B}[m\u{1B}[10A\u{1B}[3E\u{1B}[2K"
+            + "done\n"
+        let payload = Data(payloadString.utf8)
+
+        bulk.debugProcessPTYOutputForTesting(payload)
+        for byte in payload {
+            byteWise.debugProcessPTYOutputForTesting(Data([byte]))
+        }
+
+        XCTAssertEqual(bulk.allText(), byteWise.allText())
+        let bulkCursor = bulk.withModel { ($0.cursor.row, $0.cursor.col, $0.cursor.pendingWrap) }
+        let byteWiseCursor = byteWise.withModel { ($0.cursor.row, $0.cursor.col, $0.cursor.pendingWrap) }
+        XCTAssertEqual(bulkCursor.0, byteWiseCursor.0)
+        XCTAssertEqual(bulkCursor.1, byteWiseCursor.1)
+        XCTAssertEqual(bulkCursor.2, byteWiseCursor.2)
+    }
+
+    func testAlternateScreenScrollDoesNotAppendScrollback() {
+        let controller = makeController(rows: 3, cols: 6)
+        let payload = Data(("\u{1B}[?1049h" + "1\n2\n3\n4\n5\n").utf8)
+
+        controller.debugProcessPTYOutputForTesting(payload)
+
+        let scrollbackRows = controller.withViewport { _, scrollback, _ in
+            scrollback.rowCount
+        }
+        XCTAssertEqual(scrollbackRows, 0)
     }
 }

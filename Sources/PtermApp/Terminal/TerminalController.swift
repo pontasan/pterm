@@ -410,6 +410,9 @@ final class TerminalController {
         // Wire scrollback: when a line scrolls off the top, store it
         model.onScrollOut = { [weak self] row in
             guard let self = self else { return }
+            if self.model.isAlternateScreen {
+                return
+            }
             if self.isBatchingParserScrollOut {
                 self.pendingParserScrollOutRows.append(row)
                 if self.scrollOffset > 0 {
@@ -700,20 +703,37 @@ final class TerminalController {
             startedRenderingSuppressed = terminalRenderingSuppressed
             beginParserScrollOutBatch()
             defer { endParserScrollOutBatch() }
-            let input = UnsafeBufferPointer(start: ptr, count: count)
-            let remainingInput: UnsafeBufferPointer<UInt8>
-            if canUseDirectASCIIGroundFastPath(input) {
-                let consumed = model.consumeGroundASCIIBytesFastPathPrefix(input)
-                if consumed > 0 {
-                    didMutateDisplay = true
+            var fastPathPointer = ptr
+            var fastPathRemainingCount = count
+
+            while fastPathRemainingCount > 0 {
+                let input = UnsafeBufferPointer(start: fastPathPointer, count: fastPathRemainingCount)
+
+                if canUseDirectASCIIGroundFastPath(input) {
+                    let consumed = model.consumeGroundASCIIBytesFastPathPrefix(input)
+                    if consumed > 0 {
+                        didMutateDisplay = true
+                        fastPathPointer = fastPathPointer.advanced(by: consumed)
+                        fastPathRemainingCount -= consumed
+                        continue
+                    }
                 }
-                remainingInput = UnsafeBufferPointer(
-                    start: ptr.advanced(by: consumed),
-                    count: count - consumed
+
+                let ignoredStringBytes = vt_parser_consume_ascii_ignored_string_fast_path(
+                    &parser,
+                    fastPathPointer,
+                    fastPathRemainingCount
                 )
-            } else {
-                remainingInput = input
+                if ignoredStringBytes > 0 {
+                    fastPathPointer = fastPathPointer.advanced(by: ignoredStringBytes)
+                    fastPathRemainingCount -= ignoredStringBytes
+                    continue
+                }
+
+                break
             }
+
+            let remainingInput = UnsafeBufferPointer(start: fastPathPointer, count: fastPathRemainingCount)
 
             if !remainingInput.isEmpty {
                 ensureCodepointBufferCapacity(requiredCount: remainingInput.count)

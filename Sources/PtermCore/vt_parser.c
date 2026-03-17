@@ -504,6 +504,157 @@ void vt_parser_feed(VtParser *parser, const uint32_t *codepoints, size_t count) 
     }
 }
 
+size_t vt_parser_consume_ascii_ignored_string_fast_path(
+    VtParser *parser,
+    const uint8_t *bytes,
+    size_t count
+) {
+    if (!parser || !bytes || count == 0) {
+        return 0;
+    }
+
+    if (parser->state == VT_STATE_GROUND && count >= 2 && bytes[0] == 0x1B) {
+        if (bytes[1] == ']') {
+            size_t index = 2;
+            uint32_t command = 0;
+            bool has_digits = false;
+
+            while (index < count) {
+                const uint8_t byte = bytes[index];
+                if (byte >= '0' && byte <= '9') {
+                    has_digits = true;
+                    command = command * 10 + (uint32_t)(byte - '0');
+                    index++;
+                    continue;
+                }
+                break;
+            }
+
+            if (!has_digits || index >= count || bytes[index] != ';' ||
+                osc_command_should_capture(command, has_digits)) {
+                return 0;
+            }
+
+            parser_string_clear(parser);
+            parser->state = VT_STATE_OSC_STRING;
+            parser->osc_command = command;
+            parser->osc_command_has_digits = true;
+            parser->osc_saw_separator = true;
+            parser->osc_ignore_payload = true;
+            index++;
+
+            for (; index < count; index++) {
+                const uint8_t byte = bytes[index];
+                if (byte == 0x07) {
+                    emit(parser, VT_ACTION_OSC_END, 0);
+                    parser->state = VT_STATE_GROUND;
+                    return index + 1;
+                }
+                if (byte == 0x1B) {
+                    if (index + 1 >= count) {
+                        return index;
+                    }
+                    if (bytes[index + 1] == '\\') {
+                        emit(parser, VT_ACTION_OSC_END, 0);
+                        parser_clear(parser);
+                        parser->state = VT_STATE_GROUND;
+                        return index + 2;
+                    }
+                    emit(parser, VT_ACTION_OSC_END, 0);
+                    parser_clear(parser);
+                    parser->state = VT_STATE_ESCAPE;
+                    return index + 1;
+                }
+                if (byte >= 0x80) {
+                    return 0;
+                }
+            }
+            return count;
+        }
+
+        if (bytes[1] == 'X' || bytes[1] == '^' || bytes[1] == '_') {
+            parser->state = VT_STATE_SOS_PM_APC_STRING;
+            for (size_t i = 2; i < count; i++) {
+                const uint8_t byte = bytes[i];
+                if (byte == 0x1B) {
+                    if (i + 1 >= count) {
+                        return i;
+                    }
+                    if (bytes[i + 1] == '\\') {
+                        parser_clear(parser);
+                        parser->state = VT_STATE_GROUND;
+                        return i + 2;
+                    }
+                    parser_clear(parser);
+                    parser->state = VT_STATE_ESCAPE;
+                    return i + 1;
+                }
+                if (byte >= 0x80) {
+                    return 0;
+                }
+            }
+            return count;
+        }
+    }
+
+    if (parser->state == VT_STATE_OSC_STRING &&
+        parser->osc_saw_separator &&
+        parser->osc_ignore_payload) {
+        for (size_t i = 0; i < count; i++) {
+            const uint8_t byte = bytes[i];
+            if (byte == 0x07) {
+                emit(parser, VT_ACTION_OSC_END, 0);
+                parser->state = VT_STATE_GROUND;
+                return i + 1;
+            }
+            if (byte == 0x1B) {
+                if (i + 1 >= count) {
+                    return i;
+                }
+                if (bytes[i + 1] == '\\') {
+                    emit(parser, VT_ACTION_OSC_END, 0);
+                    parser_clear(parser);
+                    parser->state = VT_STATE_GROUND;
+                    return i + 2;
+                }
+                emit(parser, VT_ACTION_OSC_END, 0);
+                parser_clear(parser);
+                parser->state = VT_STATE_ESCAPE;
+                return i + 1;
+            }
+            if (byte >= 0x80) {
+                return 0;
+            }
+        }
+        return count;
+    }
+
+    if (parser->state == VT_STATE_SOS_PM_APC_STRING) {
+        for (size_t i = 0; i < count; i++) {
+            const uint8_t byte = bytes[i];
+            if (byte == 0x1B) {
+                if (i + 1 >= count) {
+                    return i;
+                }
+                if (bytes[i + 1] == '\\') {
+                    parser_clear(parser);
+                    parser->state = VT_STATE_GROUND;
+                    return i + 2;
+                }
+                parser_clear(parser);
+                parser->state = VT_STATE_ESCAPE;
+                return i + 1;
+            }
+            if (byte >= 0x80) {
+                return 0;
+            }
+        }
+        return count;
+    }
+
+    return 0;
+}
+
 int32_t vt_parser_param(const VtParser *parser, uint32_t index,
                          int32_t default_val) {
     if (index >= parser->param_count || parser->params[index] <= 0) {
