@@ -3815,5 +3815,11 @@ final class TerminalModel {
         clampCursorToVisibleLineWidth()
     }
 
+    func reconcileCachedDimensionsWithActiveGrid() {
+        let dimensions = grid.readableDimensions()
+        rows = dimensions.rows
+        cols = dimensions.cols
+    }
+
 
 }

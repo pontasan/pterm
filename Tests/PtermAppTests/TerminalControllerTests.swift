@@ -173,6 +173,88 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertEqual(controller.debugSearchScratchCapacity, 0)
     }
 
+    func testRenderSnapshotUsesActiveGridDimensionsWhenCachedModelSizeDrifts() {
+        let controller = makeController(rows: 3, cols: 5)
+
+        controller.withViewport { model, _, _ in
+            _ = model.grid.resize(newRows: 2, newCols: 3, cursorRow: 0, cursorCol: 0)
+            model.grid.setCell(
+                Cell(codepoint: 65, attributes: .default, width: 1, isWideContinuation: false),
+                at: 0,
+                col: 0
+            )
+            model.grid.setCell(
+                Cell(codepoint: 66, attributes: .default, width: 1, isWideContinuation: false),
+                at: 1,
+                col: 1
+            )
+        }
+
+        let snapshot = controller.captureRenderSnapshot()
+
+        XCTAssertEqual(snapshot.rows, 2)
+        XCTAssertEqual(snapshot.cols, 3)
+        XCTAssertEqual(snapshot.visibleRows.count, 2)
+        XCTAssertEqual(snapshot.visibleRows[0].cells.count, 3)
+        XCTAssertEqual(snapshot.visibleRows[1].cells.count, 3)
+        XCTAssertEqual(snapshot.visibleRows[0].cells[0].codepoint, 65)
+        XCTAssertEqual(snapshot.visibleRows[1].cells[1].codepoint, 66)
+        XCTAssertEqual(controller.findMatches(for: "a"), [.init(absoluteRow: 0, startCol: 0, endCol: 0)])
+        XCTAssertEqual(controller.allText(), "A\n B ")
+    }
+
+    func testRenderSnapshotSurvivesMalformedGridRowOrderState() {
+        let controller = makeController(rows: 3, cols: 4)
+
+        controller.withViewport { model, _, _ in
+            model.grid.setCell(
+                Cell(codepoint: 65, attributes: .default, width: 1, isWideContinuation: false),
+                at: 0,
+                col: 0
+            )
+            model.grid.debugCorruptReadableStateForTesting(
+                rowOrder: [99],
+                hasRowPermutation: true
+            )
+        }
+
+        let snapshot = controller.captureRenderSnapshot()
+
+        XCTAssertEqual(snapshot.rows, 1)
+        XCTAssertEqual(snapshot.cols, 4)
+        XCTAssertEqual(snapshot.visibleRows.count, 1)
+        XCTAssertEqual(snapshot.visibleRows[0].cells.count, 4)
+        XCTAssertEqual(snapshot.visibleRows[0].cells[0].codepoint, Cell.empty.codepoint)
+    }
+
+    func testRenderSnapshotClampsToReadableMetadataRowsWhenGridMetadataIsTruncated() {
+        let controller = makeController(rows: 3, cols: 4)
+
+        controller.withViewport { model, _, _ in
+            model.grid.setCell(
+                Cell(codepoint: 65, attributes: .default, width: 1, isWideContinuation: false),
+                at: 0,
+                col: 0
+            )
+            model.grid.setCell(
+                Cell(codepoint: 66, attributes: .default, width: 1, isWideContinuation: false),
+                at: 1,
+                col: 0
+            )
+            model.grid.debugCorruptReadableStateForTesting(
+                physicalSparseCompactDefaultPrefixCounts: [0, 0],
+                rowEncodingHintStatesCount: 2
+            )
+        }
+
+        let snapshot = controller.captureRenderSnapshot()
+
+        XCTAssertEqual(snapshot.rows, 2)
+        XCTAssertEqual(snapshot.visibleRows.count, 2)
+        XCTAssertEqual(snapshot.visibleRows[0].cells[0].codepoint, 65)
+        XCTAssertEqual(snapshot.visibleRows[1].cells[0].codepoint, 66)
+    }
+
     func testStopReleasesControllerScratchImmediately() {
         let controller = makeController(rows: 2, cols: 4)
 

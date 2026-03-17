@@ -8089,6 +8089,37 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(Set(expectedOriginalIDs).isSubset(of: Set(restoredOriginalSplit.controllers.map(\.id))))
     }
 
+    func testNewTerminalFromFocusedSplitLineageKeepsGridInvariantsDuringSplitRender() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let first = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let second = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let third = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+
+        primeGridForSplitTransitionStress(first.model.grid)
+        primeGridForSplitTransitionStress(second.model.grid)
+        primeGridForSplitTransitionStress(third.model.grid)
+
+        let harness = try makeAppHarness(renderer: renderer, manager: manager)
+        let delegate = harness.delegate
+        let hostedContentView = harness.hostedContentView
+
+        delegate.switchToSplit([first, second, third])
+        try assertCurrentSplitRenderPathIsConsistent(in: hostedContentView, manager: manager)
+
+        let initialSplit = try currentSplitContainer(in: hostedContentView)
+        initialSplit.onMaximizeTerminal?(first)
+        delegate.newTerminal(nil)
+
+        try assertCurrentSplitRenderPathIsConsistent(in: hostedContentView, manager: manager)
+
+        let derivedSplit = try currentSplitContainer(in: hostedContentView)
+        derivedSplit.onCommandClickTerminal?(first)
+
+        try assertCurrentSplitRenderPathIsConsistent(in: hostedContentView, manager: manager)
+    }
+
     func testDerivedSplitTerminalRemovalFallsBackToFilteredAncestorInsteadOfOverview() throws {
         let renderer = try makeRendererOrSkip()
         let manager = TerminalManager(rows: 24, cols: 80, config: .default)
@@ -8261,6 +8292,37 @@ final class AppKitComponentTests: XCTestCase {
 
     private func currentFocusedScrollView(in hostedContentView: NSView) throws -> TerminalScrollView {
         try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? TerminalScrollView }.first)
+    }
+
+    private func assertCurrentSplitRenderPathIsConsistent(
+        in hostedContentView: NSView,
+        manager: TerminalManager,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let split = try currentSplitContainer(in: hostedContentView)
+        let splitRenderView = try XCTUnwrap(
+            allSubviews(in: split).compactMap { $0 as? SplitRenderView }.first,
+            file: file,
+            line: line
+        )
+        renderFrame(for: splitRenderView)
+
+        for controller in manager.terminals {
+            let issues = controller.model.grid.debugValidateInternalInvariants()
+            XCTAssertTrue(issues.isEmpty, issues.joined(separator: " | "), file: file, line: line)
+            _ = controller.captureRenderSnapshot()
+        }
+    }
+
+    private func primeGridForSplitTransitionStress(_ grid: TerminalGrid) {
+        grid.setCell(Cell(codepoint: 0x41, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 0)
+        grid.setCell(Cell(codepoint: 0x42, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 1)
+        grid.setCell(Cell(codepoint: 0x43, attributes: .default, width: 1, isWideContinuation: false), at: 1, col: 0)
+        grid.setCell(Cell(codepoint: 0x44, attributes: .default, width: 1, isWideContinuation: false), at: 1, col: 1)
+        grid.scrollUp(count: 1)
+        _ = grid.resize(newRows: 18, newCols: 72, cursorRow: 2, cursorCol: 2)
+        _ = grid.resize(newRows: 24, newCols: 80, cursorRow: 2, cursorCol: 2)
     }
 
     private func makeSharedRenderTexture(renderer: MetalRenderer, width: Int, height: Int) -> MTLTexture? {

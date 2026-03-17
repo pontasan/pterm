@@ -1261,8 +1261,9 @@ final class TerminalController {
 
     func snapshotViewport() -> ViewportSnapshot {
         lock.withReadLock {
-            let rows = model.rows
-            let cols = model.cols
+            let dimensions = visibleGridDimensionsLocked()
+            let rows = dimensions.rows
+            let cols = dimensions.cols
             let scrollbackRowCount = scrollback.rowCount
             let offset = scrollOffset
             let grid = model.grid.snapshot()
@@ -1297,8 +1298,9 @@ final class TerminalController {
 
     func captureRenderSnapshot() -> RenderSnapshot {
         lock.withReadLock {
-            let rows = model.rows
-            let cols = model.cols
+            let dimensions = visibleGridDimensionsLocked()
+            let rows = dimensions.rows
+            let cols = dimensions.cols
             let cursor = model.cursor
             let reverseVideo = model.reverseVideoEnabled
             let offset = scrollOffset
@@ -1325,21 +1327,23 @@ final class TerminalController {
 
     func selectedText(for selection: TerminalSelection) -> String {
         lock.withReadLock {
+            let dimensions = visibleGridDimensionsLocked()
             let rows = visibleRowsLocked()
-            return Self.extractText(selection: selection, rows: rows, cols: model.cols)
+            return Self.extractText(selection: selection, rows: rows, cols: dimensions.cols)
         }
     }
 
     func allText() -> String {
         lock.withReadLock {
-            let totalRows = scrollback.rowCount + model.rows
+            let dimensions = visibleGridDimensionsLocked()
+            let totalRows = scrollback.rowCount + dimensions.rows
             guard totalRows > 0 else { return "" }
 
             return extractionScratchLock.withLock {
                 var result = ""
-                result.reserveCapacity(Self.suggestedAllTextReserveCapacity(totalRows: totalRows, cols: model.cols))
-                textExtractionGridRowBuffer.reserveCapacity(model.cols)
-                textExtractionScrollbackRowBuffer.reserveCapacity(model.cols)
+                result.reserveCapacity(Self.suggestedAllTextReserveCapacity(totalRows: totalRows, cols: dimensions.cols))
+                textExtractionGridRowBuffer.reserveCapacity(dimensions.cols)
+                textExtractionScrollbackRowBuffer.reserveCapacity(dimensions.cols)
 
                 for absoluteRow in 0..<totalRows {
                     let isScrollbackRow = absoluteRow < scrollback.rowCount
@@ -1354,7 +1358,7 @@ final class TerminalController {
                         cells = textExtractionGridRowBuffer
                     }
 
-                    let maxColumn = max(model.cols - 1, 0)
+                    let maxColumn = max(dimensions.cols - 1, 0)
                     if absoluteRow < totalRows - 1 {
                         let nextIsWrapped: Bool
                         if absoluteRow + 1 < scrollback.rowCount {
@@ -1386,11 +1390,12 @@ final class TerminalController {
         guard !needle.isEmpty else { return [] }
 
         return lock.withReadLock {
-            extractionScratchLock.withLock {
+            let dimensions = visibleGridDimensionsLocked()
+            return extractionScratchLock.withLock {
                 var matches: [SearchMatch] = []
                 matches.reserveCapacity(Self.suggestedSearchReserveCapacity(scrollbackRows: scrollback.rowCount))
-                textExtractionScrollbackRowBuffer.reserveCapacity(model.cols)
-                searchColumnBuffer.reserveCapacity(model.cols)
+                textExtractionScrollbackRowBuffer.reserveCapacity(dimensions.cols)
+                searchColumnBuffer.reserveCapacity(dimensions.cols)
                 for row in 0..<scrollback.rowCount {
                     if scrollback.getRow(at: row, into: &textExtractionScrollbackRowBuffer) {
                         Self.appendMatches(
@@ -1403,10 +1408,10 @@ final class TerminalController {
                     }
                 }
 
-                textExtractionGridRowBuffer.reserveCapacity(model.cols)
-                for row in 0..<model.rows {
+                textExtractionGridRowBuffer.reserveCapacity(dimensions.cols)
+                for row in 0..<dimensions.rows {
                     textExtractionGridRowBuffer.removeAll(keepingCapacity: true)
-                    for col in 0..<model.cols {
+                    for col in 0..<dimensions.cols {
                         textExtractionGridRowBuffer.append(model.grid.cell(at: row, col: col))
                     }
                     Self.appendMatches(
@@ -1425,6 +1430,7 @@ final class TerminalController {
 
     func revealSearchMatch(_ match: SearchMatch) -> TerminalSelection {
         let relativeRow = lock.withWriteLock { () -> Int in
+            let dimensions = visibleGridDimensionsLocked()
             let scrollbackCount = scrollback.rowCount
             let visibleTop: Int
             if match.absoluteRow < scrollbackCount {
@@ -1434,7 +1440,7 @@ final class TerminalController {
                 visibleTop = scrollbackCount
                 scrollOffset = 0
             }
-            return max(0, min(model.rows - 1, match.absoluteRow - visibleTop))
+            return max(0, min(dimensions.rows - 1, match.absoluteRow - visibleTop))
         }
 
         return TerminalSelection(
@@ -1523,12 +1529,13 @@ final class TerminalController {
     }
 
     private func visibleRowsLocked() -> [ViewportRow] {
+        let dimensions = visibleGridDimensionsLocked()
         let scrollbackCount = scrollback.rowCount
         let firstAbsolute = scrollOffset > 0 ? max(0, scrollbackCount - scrollOffset) : scrollbackCount
 
         var rows: [ViewportRow] = []
-        rows.reserveCapacity(model.rows)
-        for row in 0..<model.rows {
+        rows.reserveCapacity(dimensions.rows)
+        for row in 0..<dimensions.rows {
             let absoluteRow = firstAbsolute + row
             if absoluteRow < scrollbackCount {
                 rows.append(ViewportRow(
@@ -1540,8 +1547,8 @@ final class TerminalController {
             }
             let gridRow = absoluteRow - scrollbackCount
             var cells: [Cell] = []
-            cells.reserveCapacity(model.cols)
-            for col in 0..<model.cols {
+            cells.reserveCapacity(dimensions.cols)
+            for col in 0..<dimensions.cols {
                 cells.append(model.grid.cell(at: gridRow, col: col))
             }
             rows.append(
@@ -1553,6 +1560,14 @@ final class TerminalController {
             )
         }
         return rows
+    }
+
+    private func visibleGridDimensionsLocked() -> (rows: Int, cols: Int) {
+        let dimensions = model.grid.readableDimensions()
+        if model.rows != dimensions.rows || model.cols != dimensions.cols {
+            model.reconcileCachedDimensionsWithActiveGrid()
+        }
+        return dimensions
     }
 
     private func scheduleMainCallbacks(

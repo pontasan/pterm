@@ -104,10 +104,11 @@ final class TerminalGrid {
 
     /// Get cell at (row, col). Returns empty cell if out of bounds.
     func cell(at row: Int, col: Int) -> Cell {
-        guard row >= 0, row < rows, col >= 0, col < cols else {
+        let dimensions = readableDimensions()
+        guard row >= 0, row < dimensions.rows, col >= 0, col < dimensions.cols,
+              let physicalRow = readablePhysicalRow(for: row, readableRowCount: dimensions.rows) else {
             return Cell.empty
         }
-        let physicalRow = physicalRow(for: row)
         if isPhysicalRowBlank(physicalRow) {
             return .empty
         }
@@ -115,7 +116,11 @@ final class TerminalGrid {
         if sparsePrefixCount > 0, col >= sparsePrefixCount {
             return .empty
         }
-        return cells[cellIndex(row: row, col: col)]
+        let index = physicalRow * dimensions.cols + col
+        guard index >= 0, index < cells.count else {
+            return .empty
+        }
+        return cells[index]
     }
 
     /// Set cell at (row, col). No-op if out of bounds.
@@ -434,13 +439,17 @@ final class TerminalGrid {
 
     /// Check if a row is soft-wrapped.
     func isWrapped(_ row: Int) -> Bool {
-        guard row >= 0, row < rows else { return false }
-        return physicalWrappedFlags[physicalRow(for: row)]
+        let dimensions = readableDimensions()
+        guard row >= 0, row < dimensions.rows,
+              let physicalRow = readablePhysicalRow(for: row, readableRowCount: dimensions.rows) else { return false }
+        return physicalWrappedFlags[physicalRow]
     }
 
     func lineAttribute(at row: Int) -> TerminalLineAttribute {
-        guard row >= 0, row < rows else { return .singleWidth }
-        return physicalLineAttributes[physicalRow(for: row)]
+        let dimensions = readableDimensions()
+        guard row >= 0, row < dimensions.rows,
+              let physicalRow = readablePhysicalRow(for: row, readableRowCount: dimensions.rows) else { return .singleWidth }
+        return physicalLineAttributes[physicalRow]
     }
 
     var hasOnlySingleWidthLines: Bool {
@@ -503,6 +512,8 @@ final class TerminalGrid {
         nonSingleWidthLineCount = 0
         physicalMayContainProtectedCells = Array(repeating: false, count: rows)
         physicalBlankRows = Array(repeating: true, count: rows)
+        physicalSparseCompactDefaultPrefixCounts = Array(repeating: 0, count: rows)
+        debugAssertInternalInvariants()
     }
 
     // MARK: - Scrolling
@@ -537,6 +548,7 @@ final class TerminalGrid {
                 clearPhysicalRow(physicalRow(for: bottom))
             }
             hasRowPermutation = true
+            debugAssertInternalInvariants()
             return
         }
 
@@ -555,6 +567,7 @@ final class TerminalGrid {
                     rowOrderIndex = 0
                 }
             }
+            debugAssertInternalInvariants()
             return
         }
 
@@ -566,6 +579,7 @@ final class TerminalGrid {
         for row in (bottom - count + 1)...bottom {
             clearPhysicalRow(physicalRow(for: row))
         }
+        debugAssertInternalInvariants()
     }
 
     /// Scroll the scroll region down by `count` lines.
@@ -601,6 +615,7 @@ final class TerminalGrid {
                     rowOrderIndex = 0
                 }
             }
+            debugAssertInternalInvariants()
             return
         }
 
@@ -612,6 +627,7 @@ final class TerminalGrid {
         for row in top..<(top + count) {
             clearPhysicalRow(physicalRow(for: row))
         }
+        debugAssertInternalInvariants()
     }
 
     @inline(__always)
@@ -624,6 +640,7 @@ final class TerminalGrid {
         }
         clearPhysicalRow(clearedPhysicalRow)
         hasRowPermutation = true
+        debugAssertInternalInvariants()
     }
 
     /// A row that was trimmed from the grid during resize.
@@ -715,6 +732,7 @@ final class TerminalGrid {
             guard isBlankPaddingRow else { break }
             newCells.removeLast(newCols)
             newWrapped.removeLast()
+            newLineAttributes.removeLast()
             totalRows -= 1
         }
 
@@ -747,6 +765,7 @@ final class TerminalGrid {
         self.rowEncodingHintStates = Array(repeating: .dirty, count: newRows)
         self.rowOrder.removeAll(keepingCapacity: true)
         self.hasRowPermutation = false
+        self.rowOrderHead = 0
         self.setWrappedFlags(newWrapped)
         self.physicalLineAttributes = newLineAttributes
         self.nonSingleWidthLineCount = newLineAttributes.reduce(into: 0) { count, attribute in
@@ -771,6 +790,7 @@ final class TerminalGrid {
 
         let clampedRow = max(0, min(newRows - 1, newCursorRow))
         let clampedCol = max(0, min(newCols - 1, newCursorCol))
+        debugAssertInternalInvariants()
         return ResizeResult(cursorRow: clampedRow, cursorCol: clampedCol, trimmedRows: trimmedRows)
     }
 
@@ -818,6 +838,7 @@ final class TerminalGrid {
         rowEncodingHintStates = Array(repeating: .dirty, count: newRows)
         rowOrder.removeAll(keepingCapacity: true)
         hasRowPermutation = false
+        rowOrderHead = 0
         self.rows = newRows
         setWrappedFlags(wrappedFlags)
         physicalLineAttributes = lineAttributes
@@ -841,6 +862,7 @@ final class TerminalGrid {
         self.scrollTop = 0
         self.scrollBottom = newRows - 1
 
+        debugAssertInternalInvariants()
         return ResizeResult(
             cursorRow: max(0, min(newRows - 1, newCursorRow)),
             cursorCol: cursorCol,
@@ -935,17 +957,20 @@ final class TerminalGrid {
 
     /// Get raw cell data for a row (for ring buffer storage).
     func rowCells(_ row: Int) -> ArraySlice<Cell> {
-        guard row >= 0, row < rows else { return [] }
-        let physicalRow = physicalRow(for: row)
+        let dimensions = readableDimensions()
+        guard row >= 0, row < dimensions.rows,
+              let physicalRow = readablePhysicalRow(for: row, readableRowCount: dimensions.rows) else { return [] }
         if isPhysicalRowBlank(physicalRow) {
             return ArraySlice(emptyRowTemplate)
         }
-        let start = rowBaseOffset(for: row)
+        let start = physicalRow * dimensions.cols
         let sparsePrefixCount = physicalSparseCompactDefaultPrefixCounts[physicalRow]
         if sparsePrefixCount > 0 {
-            return cells[start..<(start + sparsePrefixCount)]
+            let end = min(start + sparsePrefixCount, cells.count)
+            return cells[start..<end]
         }
-        return cells[start..<(start + cols)]
+        let end = min(start + dimensions.cols, cells.count)
+        return cells[start..<end]
     }
 
     /// Return only the cells that scrollback serialization actually needs.
@@ -1086,6 +1111,173 @@ final class TerminalGrid {
         guard hasRowPermutation else { return logicalRow }
         let index = rowOrderHead + logicalRow
         return rowOrder[index < rows ? index : index - rows]
+    }
+
+    @inline(__always)
+    func readableDimensions() -> (rows: Int, cols: Int) {
+        guard cols > 0 else { return (rows: 0, cols: 0) }
+        var readableRows = rows
+        readableRows = min(readableRows, cells.count / cols)
+        readableRows = min(readableRows, rowEncodingHintStates.count)
+        readableRows = min(readableRows, physicalWrappedFlags.count)
+        readableRows = min(readableRows, physicalLineAttributes.count)
+        readableRows = min(readableRows, physicalMayContainProtectedCells.count)
+        readableRows = min(readableRows, physicalBlankRows.count)
+        readableRows = min(readableRows, physicalSparseCompactDefaultPrefixCounts.count)
+        if hasRowPermutation {
+            readableRows = min(readableRows, rowOrder.count)
+        }
+        return (rows: max(0, readableRows), cols: cols)
+    }
+
+    @inline(__always)
+    private func readablePhysicalRow(for logicalRow: Int, readableRowCount: Int) -> Int? {
+        guard logicalRow >= 0, logicalRow < readableRowCount else { return nil }
+        guard hasRowPermutation else { return logicalRow }
+        let index = rowOrderHead + logicalRow
+        let wrappedIndex = index < rowOrder.count ? index : index - rowOrder.count
+        guard wrappedIndex >= 0, wrappedIndex < rowOrder.count else { return nil }
+        let physicalRow = rowOrder[wrappedIndex]
+        guard physicalRow >= 0, physicalRow < readableRowCount else { return nil }
+        return physicalRow
+    }
+
+    func debugCorruptReadableStateForTesting(
+        rowOrder: [Int]? = nil,
+        hasRowPermutation: Bool? = nil,
+        rowOrderHead: Int? = nil,
+        physicalWrappedFlags: [Bool]? = nil,
+        physicalLineAttributes: [TerminalLineAttribute]? = nil,
+        physicalMayContainProtectedCells: [Bool]? = nil,
+        physicalBlankRows: [Bool]? = nil,
+        physicalSparseCompactDefaultPrefixCounts: [Int]? = nil,
+        rowEncodingHintStatesCount: Int? = nil
+    ) {
+        if let rowOrder {
+            self.rowOrder = rowOrder
+        }
+        if let hasRowPermutation {
+            self.hasRowPermutation = hasRowPermutation
+        }
+        if let rowOrderHead {
+            self.rowOrderHead = rowOrderHead
+        }
+        if let physicalWrappedFlags {
+            self.physicalWrappedFlags = physicalWrappedFlags
+        }
+        if let physicalLineAttributes {
+            self.physicalLineAttributes = physicalLineAttributes
+        }
+        if let physicalMayContainProtectedCells {
+            self.physicalMayContainProtectedCells = physicalMayContainProtectedCells
+        }
+        if let physicalBlankRows {
+            self.physicalBlankRows = physicalBlankRows
+        }
+        if let physicalSparseCompactDefaultPrefixCounts {
+            self.physicalSparseCompactDefaultPrefixCounts = physicalSparseCompactDefaultPrefixCounts
+        }
+        if let rowEncodingHintStatesCount {
+            self.rowEncodingHintStates = Array(repeating: .dirty, count: rowEncodingHintStatesCount)
+        }
+    }
+
+    func debugValidateInternalInvariants() -> [String] {
+        var issues: [String] = []
+        if rows < 0 {
+            issues.append("rows is negative: \(rows)")
+        }
+        if cols < 0 {
+            issues.append("cols is negative: \(cols)")
+        }
+        if cols == 0 {
+            if !cells.isEmpty {
+                issues.append("cells is non-empty while cols is zero")
+            }
+        } else if cells.count != rows * cols {
+            issues.append("cells.count (\(cells.count)) != rows * cols (\(rows * cols))")
+        }
+        if emptyRowTemplate.count != cols {
+            issues.append("emptyRowTemplate.count (\(emptyRowTemplate.count)) != cols (\(cols))")
+        }
+        if rowEncodingHintStates.count != rows {
+            issues.append("rowEncodingHintStates.count (\(rowEncodingHintStates.count)) != rows (\(rows))")
+        }
+        if physicalWrappedFlags.count != rows {
+            issues.append("physicalWrappedFlags.count (\(physicalWrappedFlags.count)) != rows (\(rows))")
+        }
+        if physicalLineAttributes.count != rows {
+            issues.append("physicalLineAttributes.count (\(physicalLineAttributes.count)) != rows (\(rows))")
+        }
+        if physicalMayContainProtectedCells.count != rows {
+            issues.append("physicalMayContainProtectedCells.count (\(physicalMayContainProtectedCells.count)) != rows (\(rows))")
+        }
+        if physicalBlankRows.count != rows {
+            issues.append("physicalBlankRows.count (\(physicalBlankRows.count)) != rows (\(rows))")
+        }
+        if physicalSparseCompactDefaultPrefixCounts.count != rows {
+            issues.append("physicalSparseCompactDefaultPrefixCounts.count (\(physicalSparseCompactDefaultPrefixCounts.count)) != rows (\(rows))")
+        }
+        if scrollTop < 0 || scrollTop >= rows, rows > 0 {
+            issues.append("scrollTop (\(scrollTop)) is out of bounds for rows (\(rows))")
+        }
+        if scrollBottom < 0 || scrollBottom >= rows, rows > 0 {
+            issues.append("scrollBottom (\(scrollBottom)) is out of bounds for rows (\(rows))")
+        }
+        if rows > 0, scrollTop > scrollBottom {
+            issues.append("scrollTop (\(scrollTop)) > scrollBottom (\(scrollBottom))")
+        }
+        if hasRowPermutation {
+            if rowOrder.count != rows {
+                issues.append("rowOrder.count (\(rowOrder.count)) != rows (\(rows)) while permutation is active")
+            }
+            if rowOrderHead < 0 || rowOrderHead >= max(rows, 1) {
+                issues.append("rowOrderHead (\(rowOrderHead)) is out of bounds for rows (\(rows))")
+            }
+            if rowOrder.count == rows {
+                var seen = Set<Int>()
+                for physicalRow in rowOrder {
+                    if physicalRow < 0 || physicalRow >= rows {
+                        issues.append("rowOrder contains out-of-bounds physical row \(physicalRow)")
+                        break
+                    }
+                    if !seen.insert(physicalRow).inserted {
+                        issues.append("rowOrder contains duplicate physical row \(physicalRow)")
+                        break
+                    }
+                }
+            }
+        } else if !rowOrder.isEmpty || rowOrderHead != 0 {
+            issues.append("rowOrder state should be empty/reset when permutation is inactive")
+        }
+        for (physicalRow, sparsePrefixCount) in physicalSparseCompactDefaultPrefixCounts.enumerated() {
+            if sparsePrefixCount < 0 || sparsePrefixCount > cols {
+                issues.append("physicalSparseCompactDefaultPrefixCounts[\(physicalRow)] = \(sparsePrefixCount) is outside 0...\(cols)")
+                break
+            }
+        }
+        let expectedNonSingleWidthLineCount = physicalLineAttributes.reduce(into: 0) { count, attribute in
+            if attribute.isDoubleWidth {
+                count += 1
+            }
+        }
+        if nonSingleWidthLineCount != expectedNonSingleWidthLineCount {
+            issues.append("nonSingleWidthLineCount (\(nonSingleWidthLineCount)) != expected count (\(expectedNonSingleWidthLineCount))")
+        }
+        return issues
+    }
+
+    @inline(__always)
+    private func debugAssertInternalInvariants(
+        file: StaticString = #file,
+        line: UInt = #line
+    ) {
+        #if DEBUG
+        let issues = debugValidateInternalInvariants()
+        if !issues.isEmpty {
+            assertionFailure("TerminalGrid invariant failure: \(issues.joined(separator: " | "))", file: file, line: line)
+        }
+        #endif
     }
 
     private func markRowEncodingHintDirty(_ logicalRow: Int) {
