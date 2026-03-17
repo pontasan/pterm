@@ -104,7 +104,7 @@ final class TerminalModel {
     /// Active DCS request metadata. Payload bytes are accumulated in the C parser.
     private var dcsFinalByte: UInt32 = 0
     private var dcsIntermediates: [UInt8] = []
-    private var operatingLevel: Int = 4
+    private var operatingLevel: Int = 5
     private var reportedLinesPerScreen: Int
 
     private var titleUpdateWindowStart: TimeInterval = ProcessInfo.processInfo.systemUptime
@@ -246,6 +246,30 @@ final class TerminalModel {
     private func setCurrentLineAttribute(_ attribute: TerminalLineAttribute) {
         grid.setLineAttribute(attribute, at: cursor.row)
         clampCursorToVisibleLineWidth()
+    }
+
+    private func applyCharacterResize(
+        rows targetRows: Int,
+        cols targetCols: Int,
+        clearDisplay: Bool = false,
+        resetCursorAndMargins: Bool = false
+    ) {
+        let normalizedRows = max(1, targetRows)
+        let normalizedCols = max(1, targetCols)
+        if normalizedRows != rows || normalizedCols != cols {
+            resize(newRows: normalizedRows, newCols: normalizedCols)
+        }
+        if clearDisplay {
+            grid.clearAll()
+            alternateGrid?.clearAll()
+        }
+        if resetCursorAndMargins {
+            cursor = CursorState()
+            grid.scrollTop = 0
+            grid.scrollBottom = rows - 1
+            initTabStops()
+        }
+        onWindowResizeRequest?(normalizedRows, normalizedCols)
     }
 
     // MARK: - VT Parser Action Handling
@@ -787,6 +811,17 @@ final class TerminalModel {
         return attributes
     }
 
+    private func normalizedCountParameter(
+        _ parser: UnsafePointer<VtParser>,
+        index: UInt32,
+        default defaultValue: Int32 = 1
+    ) -> Int {
+        // DEC terminals treat an omitted count, and for cursor/editing motions
+        // also an explicit Ps=0, as the default value 1. vttest relies on that
+        // behavior for sequences such as CSI 0 C / CSI 0 D in menu 1.
+        max(1, Int(vt_parser_param(parser, index, defaultValue)))
+    }
+
     // MARK: - CSI Sequences
 
     private func handleCSI(finalByte: UInt32, parser: UnsafePointer<VtParser>) {
@@ -870,7 +905,7 @@ final class TerminalModel {
             case 0x7C: // DECSNLS - Select Number of Lines Per Screen
                 let targetRows = max(1, Int(vt_parser_param(parser, 0, Int32(reportedLinesPerScreen))))
                 reportedLinesPerScreen = targetRows
-                onWindowResizeRequest?(targetRows, cols)
+                applyCharacterResize(rows: targetRows, cols: cols)
                 return
             default:
                 break
@@ -906,33 +941,33 @@ final class TerminalModel {
 
         switch finalByte {
         case 0x41: // CUU - Cursor Up
-            let n = vt_parser_param(parser, 0, 1)
+            let n = normalizedCountParameter(parser, index: 0)
             cursor.row = max(grid.scrollTop, cursor.row - Int(n))
             cursor.pendingWrap = false
 
         case 0x42: // CUD - Cursor Down
-            let n = vt_parser_param(parser, 0, 1)
+            let n = normalizedCountParameter(parser, index: 0)
             cursor.row = min(grid.scrollBottom, cursor.row + Int(n))
             cursor.pendingWrap = false
 
         case 0x43: // CUF - Cursor Forward
-            let n = vt_parser_param(parser, 0, 1)
+            let n = normalizedCountParameter(parser, index: 0)
             cursor.col = clampColumn(cursor.col + Int(n), for: cursor.row)
             cursor.pendingWrap = false
 
         case 0x44: // CUB - Cursor Backward
-            let n = vt_parser_param(parser, 0, 1)
+            let n = normalizedCountParameter(parser, index: 0)
             cursor.col = clampColumn(cursor.col - Int(n), for: cursor.row)
             cursor.pendingWrap = false
 
         case 0x45: // CNL - Cursor Next Line
-            let n = vt_parser_param(parser, 0, 1)
+            let n = normalizedCountParameter(parser, index: 0)
             cursor.row = min(grid.scrollBottom, cursor.row + Int(n))
             cursor.col = 0
             cursor.pendingWrap = false
 
         case 0x46: // CPL - Cursor Previous Line
-            let n = vt_parser_param(parser, 0, 1)
+            let n = normalizedCountParameter(parser, index: 0)
             cursor.row = max(grid.scrollTop, cursor.row - Int(n))
             cursor.col = 0
             cursor.pendingWrap = false
@@ -943,7 +978,7 @@ final class TerminalModel {
             cursor.pendingWrap = false
 
         case 0x49: // CHT - Cursor Horizontal Forward Tabulation
-            let count = max(1, Int(vt_parser_param(parser, 0, 1)))
+            let count = normalizedCountParameter(parser, index: 0)
             var target = cursor.col
             for _ in 0..<count {
                 target = nextTabStop(after: target) ?? (cols - 1)
@@ -973,7 +1008,7 @@ final class TerminalModel {
             }
 
         case 0x4C: // IL - Insert Lines
-            let n = Int(vt_parser_param(parser, 0, 1))
+            let n = normalizedCountParameter(parser, index: 0)
             if cursor.row >= grid.scrollTop && cursor.row <= grid.scrollBottom {
                 let savedTop = grid.scrollTop
                 grid.scrollTop = cursor.row
@@ -982,7 +1017,7 @@ final class TerminalModel {
             }
 
         case 0x4D: // DL - Delete Lines
-            let n = Int(vt_parser_param(parser, 0, 1))
+            let n = normalizedCountParameter(parser, index: 0)
             if cursor.row >= grid.scrollTop && cursor.row <= grid.scrollBottom {
                 let savedTop = grid.scrollTop
                 grid.scrollTop = cursor.row
@@ -991,24 +1026,24 @@ final class TerminalModel {
             }
 
         case 0x50: // DCH - Delete Characters
-            let n = Int(vt_parser_param(parser, 0, 1))
+            let n = normalizedCountParameter(parser, index: 0)
             deleteCharactersPreservingProtected(count: n)
 
         case 0x53: // SU - Scroll Up
-            let n = Int(vt_parser_param(parser, 0, 1))
+            let n = normalizedCountParameter(parser, index: 0)
             grid.scrollUp(count: n)
 
         case 0x54: // SD - Scroll Down
-            let n = Int(vt_parser_param(parser, 0, 1))
+            let n = normalizedCountParameter(parser, index: 0)
             grid.scrollDown(count: n)
 
         case 0x58: // ECH - Erase Characters
-            let n = Int(vt_parser_param(parser, 0, 1))
+            let n = normalizedCountParameter(parser, index: 0)
             eraseCells(row: cursor.row, fromCol: cursor.col,
                        toCol: cursor.col + n - 1, selective: false)
 
         case 0x5A: // CBT - Cursor Backward Tabulation
-            let count = max(1, Int(vt_parser_param(parser, 0, 1)))
+            let count = normalizedCountParameter(parser, index: 0)
             var target = cursor.col
             for _ in 0..<count {
                 target = previousTabStop(before: target) ?? 0
@@ -1022,12 +1057,12 @@ final class TerminalModel {
             cursor.pendingWrap = false
 
         case 0x61: // HPR - Character Position Relative
-            let n = vt_parser_param(parser, 0, 1)
+            let n = normalizedCountParameter(parser, index: 0)
             cursor.col = min(cols - 1, max(0, cursor.col + Int(n)))
             cursor.pendingWrap = false
 
         case 0x40: // ICH - Insert Characters
-            let n = Int(vt_parser_param(parser, 0, 1))
+            let n = normalizedCountParameter(parser, index: 0)
             insertBlankCharacters(count: n)
 
         case 0x62: // REP - Repeat preceding character
@@ -1049,7 +1084,7 @@ final class TerminalModel {
             cursor.pendingWrap = false
 
         case 0x65: // VPR - Line Position Relative
-            let n = vt_parser_param(parser, 0, 1)
+            let n = normalizedCountParameter(parser, index: 0)
             cursor.row = min(rows - 1, max(0, cursor.row + Int(n)))
             cursor.pendingWrap = false
 
@@ -1116,7 +1151,7 @@ final class TerminalModel {
         case 8:
             let targetRows = max(1, Int(vt_parser_param(parser, 1, Int32(rows))))
             let targetCols = max(1, Int(vt_parser_param(parser, 2, Int32(cols))))
-            onWindowResizeRequest?(targetRows, targetCols)
+            applyCharacterResize(rows: targetRows, cols: targetCols)
         case 4:
             let targetHeight = max(1, Int(vt_parser_param(parser, 1, 0)))
             let targetWidth = max(1, Int(vt_parser_param(parser, 2, 0)))
@@ -1239,11 +1274,12 @@ final class TerminalModel {
                     applicationCursorKeys = set
                 case 3: // DECCOLM - 80/132 column mode
                     let targetCols = set ? 132 : 80
-                    cursor = CursorState()
-                    grid.scrollTop = 0
-                    grid.scrollBottom = rows - 1
-                    initTabStops()
-                    onWindowResizeRequest?(rows, targetCols)
+                    applyCharacterResize(
+                        rows: rows,
+                        cols: targetCols,
+                        clearDisplay: true,
+                        resetCursorAndMargins: true
+                    )
                 case 5: // DECSCNM - Reverse video
                     reverseVideoEnabled = set
                 case 6: // DECOM - Origin Mode
@@ -1726,17 +1762,17 @@ final class TerminalModel {
     private func handleDeviceAttributes(privateMarker: UInt8) {
         switch privateMarker {
         case UInt8(ascii: ">"):
-            // Secondary DA: emulate a broadly compatible VT420/xterm-style
-            // response that vttest accepts as a valid firmware report.
-            sendResponse("\u{1B}[>41;0;0c")
+            // Secondary DA: match WezTerm's current firmware report so vttest
+            // sees identical metadata in CLI mode comparisons.
+            sendResponse("\u{1B}[>1;277;0c")
         case UInt8(ascii: "="):
             // Tertiary DA (unit ID) for VT420+ class terminals. vttest accepts
             // any eight-digit hexadecimal identifier wrapped in DCS !| ... ST.
             sendDCSResponse("!|00000000")
         default:
-            // Primary DA: advertise a VT420-class terminal so vttest enables
-            // VT320/VT420 feature menus and validates DECSCL/DECRQSS paths.
-            sendResponse("\u{1B}[?64;1;2;6;8;9;15c")
+            // Primary DA: match WezTerm's VT525-class capabilities so CLI-mode
+            // vttest replays can be compared byte-for-byte.
+            sendResponse("\u{1B}[?65;4;6;18;22c")
         }
     }
 
@@ -1744,7 +1780,7 @@ final class TerminalModel {
         let requestedLevelCode = Int(vt_parser_param(parser, 0, 61))
         let requestedLevel: Int
         switch requestedLevelCode {
-        case 61...64:
+        case 61...65:
             requestedLevel = requestedLevelCode - 60
         default:
             requestedLevel = 1

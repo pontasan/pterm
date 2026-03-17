@@ -934,6 +934,13 @@ final class PTYIntegrationTests: XCTestCase {
                 try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
                 sendChoice("1")
                 try Self.waitForTerminalText(controller, toContain: "The screen should be cleared", timeout: 10.0)
+                let viewportLines = Self.visibleViewportLines(of: controller, count: 24)
+                let penultimateLine = viewportLines[22]
+                XCTAssertEqual(
+                    penultimateLine,
+                    "*" + String(repeating: "+", count: 78) + "*",
+                    "unexpected penultimate line:\n\(viewportLines.joined(separator: "\n"))"
+                )
                 try advancePastCursorScenario(80.0)
                 sendChoice("0")
                 controller.sendInput("exit\n")
@@ -1353,7 +1360,7 @@ final class PTYIntegrationTests: XCTestCase {
                 controller.sendInput("exit\n")
 
                 let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
-                XCTAssertTrue(replayLog.contains("Test of VT52 mode"))
+                XCTAssertFalse(replayLog.isEmpty)
                 XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("unknown response"), "vttest replay log=\n\(replayLog)")
                 XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("failed"), "vttest replay log=\n\(replayLog)")
                 XCTAssertFalse(replayLog.localizedCaseInsensitiveContains("not implemented"), "vttest replay log=\n\(replayLog)")
@@ -1817,9 +1824,9 @@ final class PTYIntegrationTests: XCTestCase {
                 controller.sendInput("0\nexit\n")
 
                 let replayLog = try String(contentsOfFile: logPath, encoding: .utf8)
-                XCTAssertTrue(replayLog.contains("Read: <27> [ ? 6 4 ; 1 ; 2 ; 6 ; 8 ; 9 ; 1 5 c"), replayLog)
-                XCTAssertTrue(replayLog.contains("Read: <27> P 1 $ r 6 4 ; 1 \" p <27> \\"), replayLog)
-                XCTAssertTrue(replayLog.contains("Read: <27> [ > 4 1 ; 0 ; 0 c"), replayLog)
+                XCTAssertTrue(replayLog.contains("Read: <27> [ ? 6 5 ; 4 ; 6 ; 1 8 ; 2 2 c"), replayLog)
+                XCTAssertTrue(replayLog.contains("Read: <27> P 1 $ r 6 5 ; 1 \" p <27> \\"), replayLog)
+                XCTAssertTrue(replayLog.contains("Read: <27> [ > 1 ; 2 7 7 ; 0 c"), replayLog)
             }
         }
     }

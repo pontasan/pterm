@@ -148,6 +148,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingConfigReload: DispatchWorkItem?
     private var backShortcutMonitor: Any?
     private var commandIdentityModifierMonitor: Any?
+    private var commandIdentityShortcutLocalMonitor: Any?
+    private var commandIdentityShortcutGlobalMonitor: Any?
+    private var commandIdentityHeaderSuppressedUntilCommandRelease = false
     private var titlebarBackButton: NSButton?
 
     private var metricsMonitor: ProcessMetricsMonitor?
@@ -263,7 +266,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isIntegratedViewVisible || terminalBackgroundOpacity < 0.999
     }
 
-    init(launchOptions: LaunchOptions = LaunchOptions(profileRoot: nil, restoreSessionMode: .attempt, immediateAction: nil, directLaunch: nil)) {
+    init(launchOptions: LaunchOptions = LaunchOptions(profileRoot: nil, restoreSessionMode: .attempt, cliMode: false, immediateAction: nil, directLaunch: nil)) {
         self.launchOptions = launchOptions
         super.init()
     }
@@ -620,7 +623,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.handleHighPriorityInterruptShortcut() ?? false
         }
         appWindow.onCommandModifierChange = { [weak self] isHeld in
-            self?.setCommandIdentityHeadersVisible(isHeld)
+            guard let self else { return }
+            if !isHeld {
+                self.commandIdentityHeaderSuppressedUntilCommandRelease = false
+            }
+            self.setCommandIdentityHeadersVisible(self.currentCommandIdentityHeadersVisible())
         }
         window = appWindow
         window.center()
@@ -697,6 +704,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         clipboardCleanupService = cleanupService
         installBackShortcutMonitor()
         installCommandIdentityModifierMonitor()
+        installCommandIdentityShortcutMonitor()
 
         // Setup menu
         setupMenu()
@@ -779,6 +787,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? sessionStore.markCleanShutdown()
         singleInstanceLock.release()
         removeCommandIdentityModifierMonitor()
+        removeCommandIdentityShortcutMonitor()
         return .terminateNow
     }
 
@@ -1470,7 +1479,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         removeCommandIdentityModifierMonitor()
         commandIdentityModifierMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] _ in
             guard let self else { return }
-            self.setCommandIdentityHeadersVisible(self.currentCommandModifierHeld())
+            if !self.currentCommandModifierHeld() {
+                self.commandIdentityHeaderSuppressedUntilCommandRelease = false
+            }
+            self.setCommandIdentityHeadersVisible(self.currentCommandIdentityHeadersVisible())
         }
     }
 
@@ -1479,6 +1491,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSEvent.removeMonitor(commandIdentityModifierMonitor)
             self.commandIdentityModifierMonitor = nil
         }
+    }
+
+    private func installCommandIdentityShortcutMonitor() {
+        removeCommandIdentityShortcutMonitor()
+        commandIdentityShortcutLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.handleCommandIdentityShortcutMonitor(event)
+            return event
+        }
+        commandIdentityShortcutGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.handleCommandIdentityShortcutMonitor(event)
+        }
+    }
+
+    private func removeCommandIdentityShortcutMonitor() {
+        if let commandIdentityShortcutLocalMonitor {
+            NSEvent.removeMonitor(commandIdentityShortcutLocalMonitor)
+            self.commandIdentityShortcutLocalMonitor = nil
+        }
+        if let commandIdentityShortcutGlobalMonitor {
+            NSEvent.removeMonitor(commandIdentityShortcutGlobalMonitor)
+            self.commandIdentityShortcutGlobalMonitor = nil
+        }
+    }
+
+    private func handleCommandIdentityShortcutMonitor(_ event: NSEvent) {
+        guard event.modifierFlags.contains(.command),
+              event.modifierFlags.contains(.shift),
+              event.charactersIgnoringModifiers == "4" else {
+            return
+        }
+        commandIdentityHeaderSuppressedUntilCommandRelease = true
+        setCommandIdentityHeadersVisible(false)
     }
 
     private func installTitlebarBackButton() {
@@ -2566,9 +2610,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CGEventSource.flagsState(.combinedSessionState).contains(.maskCommand)
     }
 
+    private func currentCommandIdentityHeadersVisible() -> Bool {
+        currentCommandModifierHeld() && !commandIdentityHeaderSuppressedUntilCommandRelease
+    }
+
     private func setCommandIdentityHeadersVisible(_ visible: Bool) {
-        terminalView?.setCommandModifierActive(visible)
-        splitContainerView?.setCommandModifierActive(visible)
+        let commandHeld = currentCommandModifierHeld()
+        terminalView?.setCommandModifierActive(commandHeld)
+        terminalView?.setCommandIdentityHeaderVisible(visible)
+        splitContainerView?.setCommandModifierActive(commandHeld)
+        splitContainerView?.setIdentityHeaderVisible(visible)
     }
 
     private func refreshStatusBarCommandHints() {

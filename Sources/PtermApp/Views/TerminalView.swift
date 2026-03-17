@@ -136,6 +136,19 @@ final class TerminalView: MTKView, NSTextInputClient {
             requestDisplayUpdate()
         }
     }
+    private var commandIdentityHeaderVisible = false {
+        didSet {
+            guard commandIdentityHeaderVisible != oldValue else { return }
+            requestDisplayUpdate()
+        }
+    }
+    private var suppressCommandIdentityHeaderUntilCommandRelease = false {
+        didSet {
+            guard suppressCommandIdentityHeaderUntilCommandRelease != oldValue else { return }
+            syncSplitContainerCommandIdentityHeaderVisibility()
+            requestDisplayUpdate()
+        }
+    }
 
     /// Current text selection (nil = no selection)
     private(set) var selection: TerminalSelection? {
@@ -721,7 +734,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     private func commandIdentityHeaderConfig() -> MetalRenderer.HeaderOverlayConfig? {
-        guard commandModifierActive,
+        guard commandIdentityHeaderVisible && !suppressCommandIdentityHeaderUntilCommandRelease,
               let controller = terminalController else {
             return nil
         }
@@ -744,12 +757,31 @@ final class TerminalView: MTKView, NSTextInputClient {
         commandModifierActive = active
     }
 
+    func setCommandIdentityHeaderVisible(_ visible: Bool) {
+        commandIdentityHeaderVisible = visible
+    }
+
     func debugSetCommandModifierActive(_ active: Bool) {
         setCommandModifierActive(active)
+        setCommandIdentityHeaderVisible(active)
     }
 
     func debugCommandIdentityHeaderText() -> String? {
         commandIdentityHeaderConfig()?.text
+    }
+
+    private func shouldSuppressCommandIdentityHeader(for event: NSEvent) -> Bool {
+        event.modifierFlags.contains(.command) &&
+        event.modifierFlags.contains(.shift) &&
+        event.charactersIgnoringModifiers == "4"
+    }
+
+    private func syncSplitContainerCommandIdentityHeaderVisibility() {
+        guard renderingSuppressed,
+              let splitContainer = enclosingScrollView?.superview as? SplitTerminalContainerView else {
+            return
+        }
+        splitContainer.setIdentityHeaderVisible(commandIdentityHeaderVisible && !suppressCommandIdentityHeaderUntilCommandRelease)
     }
 
     // MARK: - Grid Position from Mouse
@@ -777,6 +809,9 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     override func keyDown(with event: NSEvent) {
         hideImagePreview()
+        if shouldSuppressCommandIdentityHeader(for: event) {
+            suppressCommandIdentityHeaderUntilCommandRelease = true
+        }
         if shortcutConfiguration.matches(.backToIntegrated, event: event) {
             onBackToIntegrated?()
             return
@@ -815,10 +850,14 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     override func flagsChanged(with event: NSEvent) {
         let commandHeld = event.modifierFlags.contains(.command)
+        if !commandHeld {
+            suppressCommandIdentityHeaderUntilCommandRelease = false
+        }
         commandModifierActive = commandHeld
         if renderingSuppressed,
            let splitContainer = enclosingScrollView?.superview as? SplitTerminalContainerView {
             splitContainer.setCommandModifierActive(commandHeld)
+            splitContainer.setIdentityHeaderVisible(commandIdentityHeaderVisible && !suppressCommandIdentityHeaderUntilCommandRelease)
         }
         updateLinkHover(with: event)
     }

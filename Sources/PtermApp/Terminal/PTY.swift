@@ -17,6 +17,10 @@ enum PTYError: Error {
 /// Thread safety: All access to masterFD and isRunning is protected by fdLock
 /// to prevent data races between the GCD read source and stop()/write() calls.
 final class PTY {
+    private enum ControlCharacter {
+        static let endOfTransmission: UInt8 = 0x04
+    }
+
     private enum ReadBufferPolicy {
         static let minimumCapacity = 4096
         static let preferredCapacity = 65536
@@ -62,6 +66,7 @@ final class PTY {
     /// Dispatch source for reading PTY output
     private var readSource: DispatchSourceRead?
     private var writeSource: DispatchSourceWrite?
+    private var childTerminationStatus: Int32?
 
     /// Signals that the child process has fully exited and been reaped.
     private let exitSemaphore = DispatchSemaphore(value: 0)
@@ -80,6 +85,20 @@ final class PTY {
 
     /// Callback invoked when the child process exits
     var onExit: (() -> Void)?
+
+    var normalizedExitCode: Int32 {
+        exitStateLock.lock()
+        let status = childTerminationStatus
+        exitStateLock.unlock()
+        guard let status else { return EXIT_FAILURE }
+        if Self.didExitNormally(status) {
+            return Self.exitStatus(status)
+        }
+        if Self.wasTerminatedBySignal(status) {
+            return 128 + Self.terminationSignal(status)
+        }
+        return EXIT_FAILURE
+    }
 
     private let exitStateLock = NSLock()
     private var childExitObserved = false
@@ -124,6 +143,7 @@ final class PTY {
                termEnv: String = "xterm-256color",
                initialDirectory: String? = nil,
                shellLaunchOrder: [String] = ShellLaunchConfiguration.default.launchOrder,
+               slaveTerminalAttributes: termios? = nil,
                executablePath: String? = nil,
                arguments: [String] = []) throws {
         // Validate TERM value: only allow alphanumeric and hyphens
@@ -165,7 +185,14 @@ final class PTY {
         }
 
         var amaster: Int32 = -1
-        let pid = forkpty(&amaster, nil, nil, &winSize)
+        let pid: pid_t
+        if var slaveAttributes = slaveTerminalAttributes {
+            pid = withUnsafeMutablePointer(to: &slaveAttributes) { attributesPointer in
+                forkpty(&amaster, nil, attributesPointer, &winSize)
+            }
+        } else {
+            pid = forkpty(&amaster, nil, nil, &winSize)
+        }
 
         if pid < 0 {
             throw PTYError.forkptyFailed(String(cString: strerror(errno)))
@@ -282,6 +309,16 @@ final class PTY {
         }
     }
 
+    /// Wait indefinitely for the child process to exit without forcing termination.
+    func waitForExit() {
+        fdLock.lock()
+        let pid = childPID
+        fdLock.unlock()
+
+        guard pid > 0 else { return }
+        exitSemaphore.wait()
+    }
+
     /// Write data to the PTY (user input).
     func write(_ data: Data) {
         enqueueWrite(data, highPriority: false)
@@ -308,6 +345,10 @@ final class PTY {
 
         guard fd >= 0 else { return }
         enqueueWrite(Data([byte]), highPriority: true)
+    }
+
+    func sendEndOfTransmission() {
+        writeControlCharacter(ControlCharacter.endOfTransmission)
     }
 
     /// Returns the current foreground process group leader PID for this PTY.
@@ -467,7 +508,19 @@ final class PTY {
                 continue
             }
 
-            if bytesRead == 0 || (bytesRead < 0 && errno != EAGAIN && errno != EINTR) {
+            if bytesRead == 0 {
+                fdLock.lock()
+                _isRunning = false
+                fdLock.unlock()
+                releaseReadBuffer()
+                if aggregatedCount > 0 {
+                    emitOutput(buffer: aggregatedReadBuffer, count: aggregatedCount)
+                }
+                markReadChannelClosedAndNotifyIfReady()
+                return
+            }
+
+            if bytesRead < 0 && errno != EAGAIN && errno != EINTR {
                 fdLock.lock()
                 _isRunning = false
                 fdLock.unlock()
@@ -551,6 +604,9 @@ final class PTY {
             let pid = self.childPID
             guard pid > 0 else { return }
             waitpid(pid, &status, 0)
+            self.exitStateLock.lock()
+            self.childTerminationStatus = status
+            self.exitStateLock.unlock()
             self.fdLock.lock()
             self._isRunning = false
             self.childPID = 0
@@ -565,6 +621,7 @@ final class PTY {
         childExitObserved = false
         readChannelClosed = false
         exitNotified = false
+        childTerminationStatus = nil
         exitStateLock.unlock()
     }
 
@@ -724,5 +781,26 @@ final class PTY {
         fdLock.lock()
         defer { fdLock.unlock() }
         return masterFD
+    }
+
+    private static func waitStatusCode(_ status: Int32) -> Int32 {
+        status & 0x7f
+    }
+
+    private static func didExitNormally(_ status: Int32) -> Bool {
+        waitStatusCode(status) == 0
+    }
+
+    private static func wasTerminatedBySignal(_ status: Int32) -> Bool {
+        let code = waitStatusCode(status)
+        return code != 0 && code != 0x7f
+    }
+
+    private static func exitStatus(_ status: Int32) -> Int32 {
+        (status >> 8) & 0xff
+    }
+
+    private static func terminationSignal(_ status: Int32) -> Int32 {
+        waitStatusCode(status)
     }
 }

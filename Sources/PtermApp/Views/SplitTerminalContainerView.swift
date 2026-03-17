@@ -16,6 +16,7 @@ final class SplitTerminalContainerView: NSView {
     private var activeOutputTerminalIDs: Set<UUID> = []
     private(set) var selectedTerminalIDs: Set<UUID> = []
     private var commandModifierActive = false
+    private var identityHeaderVisible = false
     private var stagedSelectionModeActive = false
     private var scrollViews: [TerminalScrollView] = []
     /// Single MTKView overlay that renders all terminal cells.
@@ -131,7 +132,7 @@ final class SplitTerminalContainerView: NSView {
     }
 
     private func headerOverlayConfig(for controller: TerminalController) -> MetalRenderer.HeaderOverlayConfig? {
-        guard commandModifierActive else { return nil }
+        guard identityHeaderVisible else { return nil }
         let workspace = controller.sessionSnapshot.workspaceName.trimmingCharacters(in: .whitespacesAndNewlines)
         let title = controller.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let identity = workspace.isEmpty ? title : "\(workspace) - \(title)"
@@ -312,6 +313,12 @@ final class SplitTerminalContainerView: NSView {
         }
         guard commandModifierActive != active else { return }
         commandModifierActive = active
+        requestRender()
+    }
+
+    func setIdentityHeaderVisible(_ visible: Bool) {
+        guard identityHeaderVisible != visible else { return }
+        identityHeaderVisible = visible
         requestRender()
     }
 

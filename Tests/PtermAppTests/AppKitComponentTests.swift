@@ -9613,6 +9613,54 @@ private extension AppKitComponentTests {
         XCTAssertEqual(view.debugCommandIdentityHeaderText(), "Workgroup - aws")
     }
 
+    func testTerminalViewSuppressesCommandIdentityHeaderDuringCommandShift4UntilCommandRelease() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/header",
+            customTitle: "aws",
+            workspaceName: "Workgroup"
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 240), renderer: renderer)
+        view.terminalController = controller
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 240))
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+
+        let commandShiftFlags = try XCTUnwrap(makeFlagsEvent(window: window, modifiers: [.command, .shift]))
+        view.flagsChanged(with: commandShiftFlags)
+        XCTAssertEqual(view.debugCommandIdentityHeaderText(), "Workgroup - aws")
+
+        let screenshotEvent = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command, .shift],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: "$",
+            charactersIgnoringModifiers: "4",
+            isARepeat: false,
+            keyCode: 21
+        ))
+        view.keyDown(with: screenshotEvent)
+        XCTAssertNil(view.debugCommandIdentityHeaderText())
+
+        let shiftOnlyFlags = try XCTUnwrap(makeFlagsEvent(window: window, modifiers: [.shift]))
+        view.flagsChanged(with: shiftOnlyFlags)
+        XCTAssertNil(view.debugCommandIdentityHeaderText())
+
+        view.flagsChanged(with: commandShiftFlags)
+        XCTAssertEqual(view.debugCommandIdentityHeaderText(), "Workgroup - aws")
+    }
+
     func testSplitTerminalContainerCommandIdentityHeaderUsesWorkspaceAndTitle() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(
@@ -9636,6 +9684,7 @@ private extension AppKitComponentTests {
 
         XCTAssertNil(container.debugIdentityHeaderText(for: controller))
         container.setCommandModifierActive(true)
+        container.setIdentityHeaderVisible(true)
         XCTAssertEqual(container.debugIdentityHeaderText(for: controller), "Ops - wk")
     }
 }

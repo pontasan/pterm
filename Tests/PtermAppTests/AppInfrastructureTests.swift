@@ -46,6 +46,7 @@ final class AppInfrastructureTests: XCTestCase {
 
         XCTAssertEqual(options.restoreSessionMode, .attempt)
         XCTAssertNil(options.profileRoot)
+        XCTAssertFalse(options.cliMode)
         XCTAssertNil(options.immediateAction)
     }
 
@@ -79,6 +80,19 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertEqual(options.immediateAction, .version)
     }
 
+    func testLaunchOptionsParsesCLIModeFlag() throws {
+        let options = try LaunchOptions.parse(arguments: ["--cli"])
+
+        XCTAssertTrue(options.cliMode)
+        XCTAssertNil(options.directLaunch)
+    }
+
+    func testLaunchOptionsRejectsDuplicateCLIModeFlag() {
+        XCTAssertThrowsError(try LaunchOptions.parse(arguments: ["--cli", "--cli"])) { error in
+            XCTAssertEqual(error as? LaunchOptionsError, .duplicateCLIModeOption)
+        }
+    }
+
     func testLaunchOptionsParsesDirectCommandEqualsForm() throws {
         let options = try LaunchOptions.parse(arguments: ["--command=/opt/homebrew/bin/vttest"])
 
@@ -87,6 +101,21 @@ final class AppInfrastructureTests: XCTestCase {
             DirectLaunchOptions(
                 executablePath: "/opt/homebrew/bin/vttest",
                 arguments: []
+            )
+        )
+    }
+
+    func testLaunchOptionsParsesCLIPassthroughCommandAfterDoubleDash() throws {
+        let options = try LaunchOptions.parse(
+            arguments: ["--cli", "--", "/usr/bin/env", "printenv", "TERM"]
+        )
+
+        XCTAssertTrue(options.cliMode)
+        XCTAssertEqual(
+            options.directLaunch,
+            DirectLaunchOptions(
+                executablePath: "/usr/bin/env",
+                arguments: ["printenv", "TERM"]
             )
         )
     }
@@ -176,6 +205,7 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertTrue(help.contains("--version"))
         XCTAssertTrue(help.contains("--user-data-dir"))
         XCTAssertTrue(help.contains("--restore-session"))
+        XCTAssertTrue(help.contains("--cli"))
         XCTAssertTrue(help.contains("--command"))
         XCTAssertTrue(help.contains("attempt"))
         XCTAssertTrue(help.contains("force"))
@@ -188,6 +218,61 @@ final class AppInfrastructureTests: XCTestCase {
         let version = PtermCommandLine.versionText(bundle: bundle)
 
         XCTAssertFalse(version.isEmpty)
+    }
+
+    func testCLIModePropagatesPipeEOFToForegroundProgram() throws {
+        let process = Process()
+        process.executableURL = builtPtermExecutableURL()
+        process.arguments = ["--cli", "--", "/bin/cat"]
+
+        let inputPipe = Pipe()
+        let outputPipe = Pipe()
+        process.standardInput = inputPipe
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+
+        let exitExpectation = expectation(description: "cli-cat-exit")
+        process.terminationHandler = { _ in
+            exitExpectation.fulfill()
+        }
+
+        try process.run()
+        inputPipe.fileHandleForWriting.write(Data("abc\n".utf8))
+        try inputPipe.fileHandleForWriting.close()
+
+        wait(for: [exitExpectation], timeout: 5.0)
+
+        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(decoding: outputData, as: UTF8.self)
+        XCTAssertEqual(process.terminationStatus, 0, "cli output=\(output)")
+        XCTAssertTrue(output.contains("abc"), "cli output=\(output)")
+    }
+
+    func testCLIModeDoesNotKillForegroundProcessAfterShutdownGracePeriod() throws {
+        let process = Process()
+        process.executableURL = builtPtermExecutableURL()
+        process.arguments = ["--cli", "--", "/bin/sh", "-lc", "sleep 1; printf done"]
+
+        let inputPipe = Pipe()
+        let outputPipe = Pipe()
+        process.standardInput = inputPipe
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+
+        let exitExpectation = expectation(description: "cli-sleep-exit")
+        process.terminationHandler = { _ in
+            exitExpectation.fulfill()
+        }
+
+        try process.run()
+        try inputPipe.fileHandleForWriting.close()
+
+        wait(for: [exitExpectation], timeout: 5.0)
+
+        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(decoding: outputData, as: UTF8.self)
+        XCTAssertEqual(process.terminationStatus, 0, "cli output=\(output)")
+        XCTAssertTrue(output.contains("done"), "cli output=\(output)")
     }
 
     func testPtermDirectoriesOverrideRebindsAllDerivedLocations() throws {
@@ -2125,6 +2210,17 @@ final class AppInfrastructureTests: XCTestCase {
         pty.debugPrimeReadBufferCapacity(128)
         XCTAssertEqual(pty.debugReadBufferCapacity, 4096)
     }
+}
+
+private func builtPtermExecutableURL(filePath: StaticString = #filePath) -> URL {
+    let sourceFileURL = URL(fileURLWithPath: "\(filePath)")
+    return sourceFileURL
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent(".build", isDirectory: true)
+        .appendingPathComponent("debug", isDirectory: true)
+        .appendingPathComponent("PtermApp", isDirectory: false)
 }
 
 private func encryptedNotePayloadForTest(plaintext: Data, key: Data) throws -> Data {

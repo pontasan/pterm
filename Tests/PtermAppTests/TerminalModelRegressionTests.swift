@@ -76,6 +76,138 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(bellCount, 3)
     }
 
+    func testCursorRelativeMovementTreatsExplicitZeroParameterAsOne() {
+        let harness = TerminalModelHarness(rows: 4, cols: 8)
+
+        harness.feed("\u{1B}[2;4H")
+        harness.feed("\u{1B}[0C")
+        XCTAssertEqual(harness.model.cursor.col, 4)
+
+        harness.feed("\u{1B}[0D")
+        XCTAssertEqual(harness.model.cursor.col, 3)
+
+        harness.feed("\u{1B}[0B")
+        XCTAssertEqual(harness.model.cursor.row, 2)
+
+        harness.feed("\u{1B}[0A")
+        XCTAssertEqual(harness.model.cursor.row, 1)
+    }
+
+    func testVttestCursorMovementsBoxLeavesPenultimateRowAligned() {
+        let harness = TerminalModelHarness(rows: 24, cols: 80)
+
+        func csi(_ params: String, _ final: String) -> String { "\u{1B}[\(params)\(final)" }
+        func esc(_ suffix: String) -> String { "\u{1B}\(suffix)" }
+        func cup(_ row: Int, _ col: Int) -> String { csi("\(row);\(col)", "H") }
+        func hvp(_ row: Int, _ col: Int) -> String { csi("\(row);\(col)", "f") }
+        func cuu(_ count: Int) -> String { csi("\(count)", "A") }
+        func cud(_ count: Int) -> String { csi("\(count)", "B") }
+        func cuf(_ count: Int) -> String { csi("\(count)", "C") }
+        func cub(_ count: Int) -> String { csi("\(count)", "D") }
+        func ed(_ mode: Int) -> String { csi("\(mode)", "J") }
+        func el(_ mode: Int) -> String { csi("\(mode)", "K") }
+
+        let width = 80
+        let maxLines = 24
+        let innerL = 10
+        let innerR = 71
+
+        harness.feed(esc("#8"))
+        harness.feed(cup(9, innerL))
+        harness.feed(ed(1))
+        harness.feed(cup(18, 60))
+        harness.feed(ed(0))
+        harness.feed(el(1))
+        harness.feed(cup(9, innerR))
+        harness.feed(el(0))
+
+        for row in 10...16 {
+            harness.feed(cup(row, innerL))
+            harness.feed(el(1))
+            harness.feed(cup(row, innerR))
+            harness.feed(el(0))
+        }
+
+        for col in 1...width {
+            harness.feed(hvp(maxLines, col))
+            harness.feed("*")
+            harness.feed(hvp(1, col))
+            harness.feed("*")
+        }
+
+        harness.feed(cup(2, 2))
+        for _ in 2...maxLines - 1 {
+            harness.feed("+")
+            harness.feed(cub(1))
+            harness.feed(esc("D"))
+        }
+
+        harness.feed(cup(maxLines - 1, width - 1))
+        for _ in stride(from: maxLines - 1, through: 2, by: -1) {
+            harness.feed("+")
+            harness.feed(cub(1))
+            harness.feed(esc("M"))
+        }
+
+        harness.feed(cup(2, 1))
+        for row in 2...maxLines - 1 {
+            harness.feed("*")
+            harness.feed(cup(row, width))
+            harness.feed("*")
+            harness.feed(cub(10))
+            if row < 10 {
+                harness.feed(esc("E"))
+            } else {
+                harness.feed("\n")
+            }
+        }
+
+        harness.feed(cup(2, 10))
+        harness.feed(cub(42))
+        harness.feed(cuf(2))
+        for _ in 3...width - 2 {
+            harness.feed("+")
+            harness.feed(cuf(0))
+            harness.feed(cub(2))
+            harness.feed(cuf(1))
+        }
+
+        harness.feed(cup(maxLines - 1, innerR - 1))
+        harness.feed(cuf(42))
+        harness.feed(cub(2))
+        for _ in stride(from: width - 2, through: 3, by: -1) {
+            harness.feed("+")
+            harness.feed(cub(1))
+            harness.feed(cuf(1))
+            harness.feed(cub(0))
+            harness.feed(codepoints: [0x08])
+        }
+
+        harness.feed(cup(1, 1))
+        harness.feed(cuu(10))
+        harness.feed(cuu(1))
+        harness.feed(cuu(0))
+        harness.feed(cup(maxLines, width))
+        harness.feed(cud(10))
+        harness.feed(cud(1))
+        harness.feed(cud(0))
+
+        let penultimateRow = harness.model.grid.rowCells(maxLines - 2).map { cell -> Character in
+            if cell.isWideContinuation { return " " }
+            guard let scalar = UnicodeScalar(cell.codepoint) else { return "?" }
+            return Character(scalar)
+        }
+        let penultimateString = String(penultimateRow)
+
+        XCTAssertFalse(harness.model.grid.isWrapped(maxLines - 2))
+        XCTAssertEqual(String(penultimateString.prefix(2)), " +")
+        XCTAssertEqual(
+            String(penultimateString.dropFirst(2).prefix(width - 3)),
+            String(repeating: "+", count: width - 3)
+        )
+        XCTAssertEqual(String(penultimateString.suffix(1)), "*")
+    }
+
     func testDisplayLocalInterruptPromptBoundaryMovesToNextLineWhenCurrentLineHasContent() {
         let harness = TerminalModelHarness(rows: 3, cols: 8)
         harness.feed("abc")
@@ -472,7 +604,7 @@ final class TerminalModelRegressionTests: XCTestCase {
 
         harness.feed("\u{1B}[c")
 
-        XCTAssertEqual(responses, ["\u{1B}[?64;1;2;6;8;9;15c"])
+        XCTAssertEqual(responses, ["\u{1B}[?65;4;6;18;22c"])
     }
 
     func testTerminalModelSecondaryDeviceAttributesEmitFirmwareStyleResponse() {
@@ -482,7 +614,7 @@ final class TerminalModelRegressionTests: XCTestCase {
 
         harness.feed("\u{1B}[>c")
 
-        XCTAssertEqual(responses, ["\u{1B}[>41;0;0c"])
+        XCTAssertEqual(responses, ["\u{1B}[>1;277;0c"])
     }
 
     func testTerminalModelRequestTerminalParametersReturnsValidReportsForZeroAndOne() {
@@ -603,6 +735,8 @@ final class TerminalModelRegressionTests: XCTestCase {
 
         XCTAssertEqual(characterResize?.0, 24)
         XCTAssertEqual(characterResize?.1, 80)
+        XCTAssertEqual(harness.model.rows, 24)
+        XCTAssertEqual(harness.model.cols, 80)
         XCTAssertEqual(pixelResize?.0, 800)
         XCTAssertEqual(pixelResize?.1, 600)
     }
@@ -1528,6 +1662,8 @@ final class TerminalModelRegressionTests: XCTestCase {
 
         XCTAssertEqual(characterResize?.0, 48)
         XCTAssertEqual(characterResize?.1, 80)
+        XCTAssertEqual(harness.model.rows, 48)
+        XCTAssertEqual(harness.model.cols, 80)
         XCTAssertEqual(responses.count, 1)
         XCTAssertEqual(String(data: responses[0], encoding: .isoLatin1), "\u{1B}P1$r48*|\u{1B}\\")
     }
@@ -1796,6 +1932,7 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(resizeRequests.map(\.1), [132, 80])
         XCTAssertFalse(harness.model.reverseVideoEnabled)
         XCTAssertFalse(harness.model.applicationKeypadMode)
+        XCTAssertEqual(harness.model.cols, 80)
         XCTAssertEqual(harness.model.cursor.row, 0)
         XCTAssertEqual(harness.model.cursor.col, 0)
     }

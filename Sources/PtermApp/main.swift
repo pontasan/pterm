@@ -25,6 +25,19 @@ if let immediateAction = launchOptions.immediateAction {
     exit(EXIT_SUCCESS)
 }
 
+if launchOptions.cliMode {
+    PtermDirectories.ensureDirectories()
+    let config = PtermConfigStore.load()
+    let session = CLILaunchSession(launchOptions: launchOptions, config: config)
+    do {
+        try session.run()
+        fatalError("CLI session returned unexpectedly.")
+    } catch {
+        FileHandle.standardError.write(Data("Failed to start CLI session: \(error)\n".utf8))
+        exit(EXIT_FAILURE)
+    }
+}
+
 let app = NSApplication.shared
 if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
    let icon = NSImage(contentsOf: iconURL) {

@@ -5,6 +5,7 @@ enum LaunchOptionsError: Error, LocalizedError, Equatable {
     case duplicateProfileRootOption
     case emptyProfileRootPath
     case invalidRestoreSessionMode(String)
+    case duplicateCLIModeOption
     case duplicateCommandOption
     case emptyCommandPath
 
@@ -18,6 +19,8 @@ enum LaunchOptionsError: Error, LocalizedError, Equatable {
             return "Profile root path must not be empty."
         case .invalidRestoreSessionMode(let value):
             return "Invalid value for --restore-session: \(value). Expected one of: attempt, force, never."
+        case .duplicateCLIModeOption:
+            return "CLI mode was specified more than once."
         case .duplicateCommandOption:
             return "Command was specified more than once."
         case .emptyCommandPath:
@@ -45,6 +48,7 @@ struct DirectLaunchOptions: Equatable {
 struct LaunchOptions: Equatable {
     let profileRoot: URL?
     let restoreSessionMode: RestoreSessionMode
+    let cliMode: Bool
     let immediateAction: LaunchImmediateAction?
     let directLaunch: DirectLaunchOptions?
 
@@ -54,6 +58,7 @@ struct LaunchOptions: Equatable {
         var index = 0
         var profileRoot: URL?
         var restoreSessionMode: RestoreSessionMode = .attempt
+        var cliMode = false
         var immediateAction: LaunchImmediateAction?
         var directLaunch: DirectLaunchOptions?
 
@@ -101,6 +106,11 @@ struct LaunchOptions: Equatable {
                     executablePath: executablePath,
                     arguments: directLaunchArguments
                 )
+            } else if argument == "--cli" {
+                if cliMode {
+                    throw LaunchOptionsError.duplicateCLIModeOption
+                }
+                cliMode = true
             } else if argument == "--help" || argument == "-h" {
                 immediateAction = .help
             } else if argument == "--version" || argument == "-v" {
@@ -110,6 +120,18 @@ struct LaunchOptions: Equatable {
             } else if argument == "--command" {
                 throw LaunchOptionsError.missingValue(argument)
             } else if argument == "--" {
+                if cliMode {
+                    let remainingArguments = Array(arguments.dropFirst(index + 1))
+                    if let command = remainingArguments.first {
+                        if directLaunch != nil {
+                            throw LaunchOptionsError.duplicateCommandOption
+                        }
+                        directLaunch = DirectLaunchOptions(
+                            executablePath: try resolveCommandPath(command),
+                            arguments: Array(remainingArguments.dropFirst())
+                        )
+                    }
+                }
                 break
             }
             index += 1
@@ -118,6 +140,7 @@ struct LaunchOptions: Equatable {
         return LaunchOptions(
             profileRoot: profileRoot,
             restoreSessionMode: restoreSessionMode,
+            cliMode: cliMode,
             immediateAction: immediateAction,
             directLaunch: directLaunch
         )
@@ -209,7 +232,10 @@ enum PtermCommandLine {
             ?? "pterm"
 
         return """
-        Usage: \(executable) [options]
+        Usage:
+          \(executable) [options]
+          \(executable) --cli [options]
+          \(executable) --cli -- <command> [arguments...]
 
         Options:
           --help, -h
@@ -229,6 +255,16 @@ enum PtermCommandLine {
                 attempt  Try restoring. If the previous exit was unclean, ask for confirmation.
                 force    Restore without confirmation, even after an unclean exit.
                 never    Do not restore any previous session.
+
+          --cli
+              Run without opening the GUI window.
+              Start a single terminal session and bridge the parent process stdin/stdout/stderr
+              to that session. Without a command, pterm launches the configured login shell
+              in the current working directory.
+              Examples:
+                \(executable) --cli
+                \(executable) --cli -- /bin/zsh
+                \(executable) --cli -- tail -F /var/log/system.log
 
           --command <path>
           --command=<path>
