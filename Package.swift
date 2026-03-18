@@ -15,7 +15,7 @@ let package = Package(
             publicHeadersPath: "include",
             cSettings: [
                 .headerSearchPath("include"),
-                .unsafeFlags(["-Wall", "-Wextra", "-Werror", "-O2"], .when(configuration: .release)),
+                .unsafeFlags(["-Wall", "-Wextra", "-Werror", "-O3"], .when(configuration: .release)),
                 .unsafeFlags(["-Wall", "-Wextra", "-Werror", "-g"], .when(configuration: .debug))
             ]
         ),
