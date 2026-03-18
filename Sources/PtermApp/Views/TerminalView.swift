@@ -823,13 +823,20 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     private func scaledOutputFPS(baseFPS: Double) -> Int {
         let adjusted = baseFPS * outputFrameThrottlingMode.redrawCadenceCoefficient
-        let capped = min(adjusted, Double(outputFrameThrottlingMode.preferredOutputFPSCap))
+        let capped = min(adjusted, Double(displayAwareOutputFPSCap()))
         return max(1, Int(capped.rounded()))
     }
 
     private func scaledOutputPulseInterval(baseInterval: TimeInterval) -> TimeInterval {
-        let floorInterval = 1.0 / Double(max(outputFrameThrottlingMode.preferredOutputFPSCap, 1))
+        let floorInterval = 1.0 / Double(max(displayAwareOutputFPSCap(), 1))
         return max(floorInterval, baseInterval / outputFrameThrottlingMode.redrawCadenceCoefficient)
+    }
+
+    private func displayAwareOutputFPSCap() -> Int {
+        let configuredCap = max(outputFrameThrottlingMode.preferredOutputFPSCap, 1)
+        let screenCap = window?.screen?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? 0
+        guard screenCap > 0 else { return configuredCap }
+        return min(configuredCap, screenCap)
     }
 
     private func scheduleScrollerSyncIfNeeded() {
@@ -2306,6 +2313,7 @@ extension TerminalView: MTKViewDelegate {
         guard !renderingSuppressed,
               let renderer = renderer,
               let controller = terminalController else { return }
+        RenderFPSMonitor.shared.recordFrame()
         lastDisplaySubmissionTime = CACurrentMediaTime()
         deferredDisplayUpdateWorkItem?.cancel()
         deferredDisplayUpdateWorkItem = nil

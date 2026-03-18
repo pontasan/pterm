@@ -173,6 +173,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var titlebarBackButton: NSButton?
 
     private var metricsMonitor: ProcessMetricsMonitor?
+    private var fpsRefreshTimer: Timer?
     /// Tracks last output time per terminal for active-output indicator.
     private var lastOutputTimes: [UUID: Date] = [:]
     private var knownTerminalIDs: Set<UUID> = []
@@ -676,7 +677,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusBarView.onOpenNote = { [weak self] in
             self?.editAppNote()
         }
+        statusBarView.setFPSVisible(config.textInteraction.showFPSInStatusBar)
         contentHostView().addSubview(statusBarView)
+        updateFPSRefreshTimer()
 
         // Create terminal manager with initial grid size
         let pad = renderer.gridPadding * 2
@@ -1295,6 +1298,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         statusBarView.updateCpuUsage(percent: metrics.cpuPercent)
         statusBarView.updateMemoryUsage(bytes: metrics.memoryBytes)
+        statusBarView.updateFPS(config.textInteraction.showFPSInStatusBar ? RenderFPSMonitor.shared.currentFPS() : nil)
+    }
+
+    private func updateFPSRefreshTimer() {
+        fpsRefreshTimer?.invalidate()
+        fpsRefreshTimer = nil
+        guard config.textInteraction.showFPSInStatusBar else {
+            statusBarView?.updateFPS(nil)
+            return
+        }
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.statusBarView?.updateFPS(RenderFPSMonitor.shared.currentFPS())
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        fpsRefreshTimer = timer
     }
 
     private var currentPresentation: TerminalListPresentation {
@@ -1658,6 +1677,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         splitContainerView?.typewriterSoundEnabled = config.textInteraction.typewriterSoundEnabled
         integratedView?.shortcutConfiguration = config.shortcuts
         integratedView?.outputFrameThrottlingMode = config.textInteraction.outputFrameThrottlingMode
+        statusBarView?.setFPSVisible(config.textInteraction.showFPSInStatusBar)
+        updateFPSRefreshTimer()
+        refreshStatusBarMetrics()
 
         if config.terminalAppearance != previousConfig.terminalAppearance {
             renderer.updateTerminalAppearance(config.terminalAppearance)

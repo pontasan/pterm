@@ -126,7 +126,10 @@ final class SplitRenderView: MTKView {
         outputPulseTimer?.invalidate()
         outputPulseTimer = nil
         guard hasActiveOutput else { return }
-        let floorInterval = 1.0 / Double(max(outputFrameThrottlingMode.preferredOutputFPSCap, 1))
+        let configuredCap = max(outputFrameThrottlingMode.preferredOutputFPSCap, 1)
+        let screenCap = window?.screen?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? 0
+        let effectiveCap = screenCap > 0 ? min(configuredCap, screenCap) : configuredCap
+        let floorInterval = 1.0 / Double(max(effectiveCap, 1))
         let interval = max(floorInterval, 0.25 / outputFrameThrottlingMode.redrawCadenceCoefficient)
         let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.requestRender()
@@ -396,6 +399,7 @@ extension SplitRenderView: MTKViewDelegate {
               let commandBuffer = renderer.commandQueue.makeCommandBuffer() else {
             return
         }
+        RenderFPSMonitor.shared.recordFrame()
 
         renderPassDescriptor.colorAttachments[0].loadAction = .clear
         renderPassDescriptor.colorAttachments[0].clearColor = renderer.terminalClearColor

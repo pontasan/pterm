@@ -70,6 +70,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var encodingPopup: NSPopUpButton?
     private var outputConfirmedInputAnimationCheck: NSButton?
     private var outputFrameThrottlingPopup: NSPopUpButton?
+    private var showFPSInStatusBarCheck: NSButton?
     private var typewriterSoundCheck: NSButton?
     private var scrollPersistenceCheck: NSButton?
     private var mcpServerEnabledCheck: NSButton?
@@ -188,7 +189,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
         resetSection("session", removing: ["scroll_buffer_persistence"])
         resetSection("shells", removing: ["launch_order"])
-        resetSection("text_interaction", removing: ["output_confirmed_input_animation", "output_frame_throttling_mode", "output_frame_throttling_enabled", "typewriter_sound_enabled"])
+        resetSection("text_interaction", removing: ["output_confirmed_input_animation", "output_frame_throttling_mode", "output_frame_throttling_enabled", "show_fps_in_status_bar", "typewriter_sound_enabled"])
         resetSection("appearance", removing: [
             "terminal_foreground_color",
             "terminal_background_color",
@@ -388,6 +389,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         addView(
             makeDescriptionLabel(
                 "Aggressive visibly batches heavy output, Balanced keeps throughput-friendly coalescing, and Continuous favors smoother scrolling.",
+                width: width
+            ),
+            28
+        )
+        addSpacing(12)
+
+        let showFPSInStatusBar = (textInteraction?["show_fps_in_status_bar"] as? Bool) ?? TextInteractionConfiguration.default.showFPSInStatusBar
+        let showFPSCheckbox = makeCheckbox(
+            "Show FPS in status bar",
+            checked: showFPSInStatusBar
+        )
+        showFPSCheckbox.target = self
+        showFPSCheckbox.action = #selector(showFPSInStatusBarChanged(_:))
+        showFPSInStatusBarCheck = showFPSCheckbox
+        addView(showFPSCheckbox, 22)
+        addSpacing(2)
+        addView(
+            makeDescriptionLabel(
+                "Display the current app render FPS in the bottom-right status bar for visual verification.",
                 width: width
             ),
             28
@@ -747,6 +767,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         var textInteraction = (configData["text_interaction"] as? [String: Any]) ?? [:]
         textInteraction.removeValue(forKey: "output_frame_throttling_enabled")
         textInteraction["output_frame_throttling_mode"] = map[sender.titleOfSelectedItem ?? "Balanced"] ?? OutputFrameThrottlingMode.balanced.configuredValue
+        configData["text_interaction"] = textInteraction
+        commitConfigChange()
+    }
+
+    @objc private func showFPSInStatusBarChanged(_ sender: NSButton) {
+        var textInteraction = (configData["text_interaction"] as? [String: Any]) ?? [:]
+        textInteraction["show_fps_in_status_bar"] = (sender.state == .on)
         configData["text_interaction"] = textInteraction
         commitConfigChange()
     }

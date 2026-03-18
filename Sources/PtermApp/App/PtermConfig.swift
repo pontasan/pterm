@@ -101,11 +101,13 @@ struct ShellLaunchConfiguration: Equatable {
 struct TextInteractionConfiguration: Equatable {
     let outputConfirmedInputAnimation: Bool
     let outputFrameThrottlingMode: OutputFrameThrottlingMode
+    let showFPSInStatusBar: Bool
     let typewriterSoundEnabled: Bool
 
     static let `default` = TextInteractionConfiguration(
         outputConfirmedInputAnimation: true,
         outputFrameThrottlingMode: .continuous,
+        showFPSInStatusBar: false,
         typewriterSoundEnabled: true
     )
 }
@@ -323,6 +325,7 @@ enum PtermConfigStore {
                     }
                     return defaults.textInteraction.outputFrameThrottlingMode
                 }(),
+                showFPSInStatusBar: boolValue(textInteraction?["show_fps_in_status_bar"]) ?? defaults.textInteraction.showFPSInStatusBar,
                 typewriterSoundEnabled: boolValue(textInteraction?["typewriter_sound_enabled"]) ?? defaults.textInteraction.typewriterSoundEnabled
             ),
             fontName: stringValue(font?["name"]) ?? stringValue(root["font_name"]),

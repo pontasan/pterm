@@ -88,6 +88,18 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(labels.contains("CPU: --.-% | MEM: -- MB"))
     }
 
+    func testStatusBarViewCanShowFPSInMetricsArea() {
+        let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 500, height: 24))
+        view.setFPSVisible(true)
+        view.updateCpuUsage(percent: 12.4)
+        view.updateMemoryUsage(bytes: 512 * 1024 * 1024)
+        view.updateFPS(99.8)
+        view.layoutSubtreeIfNeeded()
+
+        let labels = allSubviews(in: view).compactMap { $0 as? NSTextField }.map(\.stringValue)
+        XCTAssertTrue(labels.contains("CPU: 12.4% | MEM: 512MB | FPS: 99.8"))
+    }
+
     func testStatusBarOverviewHintCanBeShown() {
         let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
 
@@ -442,6 +454,26 @@ final class AppKitComponentTests: XCTestCase {
 
             let loaded = PtermConfigStore.load(from: configURL)
             XCTAssertEqual(loaded.textInteraction.outputFrameThrottlingMode, .aggressive)
+        }
+    }
+
+    func testSettingsWindowFPSStatusBarOptionDefaultsOffAndPersists() throws {
+        try withTemporaryPtermConfig { configURL in
+            let controller = SettingsWindowController(configURL: configURL)
+
+            let checkbox = try XCTUnwrap(
+                allSubviews(in: controller.window?.contentView)
+                    .compactMap { $0 as? NSButton }
+                    .first(where: { $0.title == "Show FPS in status bar" })
+            )
+
+            XCTAssertEqual(checkbox.state, .off)
+
+            checkbox.state = .on
+            _ = checkbox.target?.perform(checkbox.action, with: checkbox)
+
+            let loaded = PtermConfigStore.load(from: configURL)
+            XCTAssertTrue(loaded.textInteraction.showFPSInStatusBar)
         }
     }
 

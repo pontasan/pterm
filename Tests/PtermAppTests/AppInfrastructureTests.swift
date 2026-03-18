@@ -1414,13 +1414,15 @@ final class AppInfrastructureTests: XCTestCase {
         let loaded = PtermConfigStore.load(from: URL(fileURLWithPath: "/nonexistent/config.json"))
 
         XCTAssertEqual(loaded.textInteraction.outputFrameThrottlingMode, .continuous)
+        XCTAssertFalse(loaded.textInteraction.showFPSInStatusBar)
     }
 
     func testPtermConfigStoreLoadsOutputFrameThrottlingSetting() throws {
         try withTemporaryPtermConfig { configURL in
             let json: [String: Any] = [
                 "text_interaction": [
-                    "output_frame_throttling_mode": "continuous"
+                    "output_frame_throttling_mode": "continuous",
+                    "show_fps_in_status_bar": true
                 ]
             ]
             let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
@@ -1428,6 +1430,7 @@ final class AppInfrastructureTests: XCTestCase {
 
             let loaded = PtermConfigStore.load(from: configURL)
             XCTAssertEqual(loaded.textInteraction.outputFrameThrottlingMode, .continuous)
+            XCTAssertTrue(loaded.textInteraction.showFPSInStatusBar)
         }
     }
 

@@ -7,11 +7,13 @@ final class StatusBarView: NSView {
     }
 
     private let metricsLabel = NSTextField(labelWithString: "CPU: --.-% | MEM: -- MB")
-    private let metricsTemplateLabel = NSTextField(labelWithString: "CPU: 999.9% | MEM: 99999MB")
+    private let metricsTemplateLabel = NSTextField(labelWithString: "")
     private let overviewHintLabel = NSTextField(labelWithString: "Cmd+A: Show all terminals")
     private let overviewHintSeparatorLabel = NSTextField(labelWithString: "|")
     private var currentCpu: Double = 0
     private var currentMemBytes: UInt64 = 0
+    private var currentFPS: Double?
+    private var showsFPSInStatusBar = false
     private var metricsLabelWidth: CGFloat = 0
     private let backButton: NSButton
     private let separatorLabel: NSTextField
@@ -57,8 +59,7 @@ final class StatusBarView: NSView {
         metricsLabel.alignment = .right
         addSubview(metricsLabel)
         metricsTemplateLabel.font = font
-        metricsTemplateLabel.sizeToFit()
-        metricsLabelWidth = ceil(metricsTemplateLabel.frame.width)
+        refreshMetricsTemplateWidth()
 
         backButton.bezelStyle = .recessed
         backButton.isBordered = false
@@ -212,9 +213,39 @@ final class StatusBarView: NSView {
         refreshMetricsLabel()
     }
 
+    func updateFPS(_ fps: Double?) {
+        currentFPS = fps
+        refreshMetricsLabel()
+    }
+
+    func setFPSVisible(_ visible: Bool) {
+        guard showsFPSInStatusBar != visible else { return }
+        showsFPSInStatusBar = visible
+        if !visible {
+            currentFPS = nil
+        }
+        refreshMetricsTemplateWidth()
+        refreshMetricsLabel()
+        needsLayout = true
+    }
+
+    private func refreshMetricsTemplateWidth() {
+        metricsTemplateLabel.stringValue = showsFPSInStatusBar
+            ? "CPU: 999.9% | MEM: 99999MB | FPS: 999.9"
+            : "CPU: 999.9% | MEM: 99999MB"
+        metricsTemplateLabel.sizeToFit()
+        metricsLabelWidth = ceil(metricsTemplateLabel.frame.width)
+    }
+
     private func refreshMetricsLabel() {
         let megabytes = Double(currentMemBytes) / (1024 * 1024)
-        let formatted = String(format: "CPU: %.1f%% | MEM: %.0fMB", currentCpu, megabytes)
+        let formatted: String
+        if showsFPSInStatusBar {
+            let fpsText = currentFPS.map { String(format: "%.1f", $0) } ?? "--.-"
+            formatted = String(format: "CPU: %.1f%% | MEM: %.0fMB | FPS: %@", currentCpu, megabytes, fpsText)
+        } else {
+            formatted = String(format: "CPU: %.1f%% | MEM: %.0fMB", currentCpu, megabytes)
+        }
         guard metricsLabel.stringValue != formatted else { return }
         metricsLabel.stringValue = formatted
     }

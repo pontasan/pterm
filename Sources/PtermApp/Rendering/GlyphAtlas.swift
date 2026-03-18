@@ -9,6 +9,26 @@ import Metal
 /// a Metal texture atlas. Handles Retina (HiDPI) rendering and font fallback
 /// for CJK characters (delegated to Core Text's font cascade).
 final class GlyphAtlas {
+    private static let accessGenerationRefreshStride: UInt64 = 1024
+    private static let recentAccessRingCapacity = 8192
+    private static let emptyGraphemeCacheKey = Cell.GraphemeCacheKey(
+        count: 0,
+        scalar0: 0,
+        scalar1: 0,
+        scalar2: 0,
+        scalar3: 0,
+        scalar4: 0,
+        scalar5: 0,
+        scalar6: 0,
+        scalar7: 0
+    )
+    private static func makeRecentCodepointAccessRing() -> ContiguousArray<UInt32> {
+        ContiguousArray(repeating: 0, count: recentAccessRingCapacity)
+    }
+    private static func makeRecentClusterAccessRing() -> ContiguousArray<Cell.GraphemeCacheKey> {
+        ContiguousArray(repeating: emptyGraphemeCacheKey, count: recentAccessRingCapacity)
+    }
+
     /// Metal texture containing rasterized glyphs
     private(set) var texture: MTLTexture?
     private(set) var colorTexture: MTLTexture?
@@ -35,8 +55,20 @@ final class GlyphAtlas {
     private var resolvedBMPFontCache: ContiguousArray<CTFont?> = ContiguousArray(repeating: nil, count: 0x10000)
     private var resolvedBMPGlyphCache: ContiguousArray<CGGlyph> = ContiguousArray(repeating: 0, count: 0x10000)
     private var resolvedBMPFontKnown: ContiguousArray<Bool> = ContiguousArray(repeating: false, count: 0x10000)
+    private var resolvedBMPPageFallbackFonts: ContiguousArray<CTFont?> = ContiguousArray(repeating: nil, count: 0x100)
+    private var resolvedBMPPageFallbackKnown: ContiguousArray<Bool> = ContiguousArray(repeating: false, count: 0x100)
+    private var fallbackFonts: [CTFont] = []
     private var accessGeneration: UInt64 = 0
     private(set) var atlasRevision: UInt64 = 0
+    private var recentCodepointAccesses: ContiguousArray<UInt32> = GlyphAtlas.makeRecentCodepointAccessRing()
+    private var recentCodepointAccessCount: Int = 0
+    private var recentCodepointAccessWriteIndex: Int = 0
+    private var recentClusterAccesses: ContiguousArray<Cell.GraphemeCacheKey> = GlyphAtlas.makeRecentClusterAccessRing()
+    private var recentClusterAccessCount: Int = 0
+    private var recentClusterAccessWriteIndex: Int = 0
+    private var recentColorClusterAccesses: ContiguousArray<Cell.GraphemeCacheKey> = GlyphAtlas.makeRecentClusterAccessRing()
+    private var recentColorClusterAccessCount: Int = 0
+    private var recentColorClusterAccessWriteIndex: Int = 0
 
     /// Font reference
     private var ctFont: CTFont
@@ -116,6 +148,7 @@ final class GlyphAtlas {
         self.ctFont = defaultFont
         self.fontName = CTFontCopyPostScriptName(self.ctFont) as String
         calculateCellMetrics()
+        rebuildFallbackFontCascade()
         if prerasterizeASCII {
             rebuildAtlas()
         }
@@ -189,15 +222,20 @@ final class GlyphAtlas {
     /// Get glyph info for a codepoint, rasterizing if not cached.
     func glyphInfo(for codepoint: UInt32) -> GlyphInfo? {
         accessGeneration &+= 1
+        recordRecentCodepointAccess(codepoint)
         if codepoint < 128, var cached = asciiGlyphCache[Int(codepoint)] {
-            cached.lastAccessGeneration = accessGeneration
+            refreshAccessGenerationIfNeeded(&cached)
             asciiGlyphCache[Int(codepoint)] = cached
-            glyphCache[codepoint] = cached
+            if cached.lastAccessGeneration == accessGeneration {
+                glyphCache[codepoint] = cached
+            }
             return cached
         }
         if var cached = glyphCache[codepoint] {
-            cached.lastAccessGeneration = accessGeneration
-            glyphCache[codepoint] = cached
+            refreshAccessGenerationIfNeeded(&cached)
+            if cached.lastAccessGeneration == accessGeneration {
+                glyphCache[codepoint] = cached
+            }
             return cached
         }
         return rasterizeGlyph(codepoint: codepoint, allowAtlasGrowth: true)
@@ -208,9 +246,12 @@ final class GlyphAtlas {
         if key.count == 1 {
             return glyphInfo(for: key.scalar0)
         }
+        recordRecentClusterAccess(key)
         if var cached = clusterGlyphCache[key] {
-            cached.lastAccessGeneration = accessGeneration
-            clusterGlyphCache[key] = cached
+            refreshAccessGenerationIfNeeded(&cached)
+            if cached.lastAccessGeneration == accessGeneration {
+                clusterGlyphCache[key] = cached
+            }
             return cached
         }
         let text = key.renderedString()
@@ -220,14 +261,93 @@ final class GlyphAtlas {
 
     func colorGlyphInfo(for key: Cell.GraphemeCacheKey) -> GlyphInfo? {
         accessGeneration &+= 1
+        recordRecentColorClusterAccess(key)
         if var cached = colorClusterGlyphCache[key] {
-            cached.lastAccessGeneration = accessGeneration
-            colorClusterGlyphCache[key] = cached
+            refreshAccessGenerationIfNeeded(&cached)
+            if cached.lastAccessGeneration == accessGeneration {
+                colorClusterGlyphCache[key] = cached
+            }
             return cached
         }
         let text = key.renderedString()
         guard !text.isEmpty else { return nil }
         return rasterizeColorGlyph(text: text, cacheKey: key, allowAtlasGrowth: true)
+    }
+
+    @inline(__always)
+    private func refreshAccessGenerationIfNeeded(_ glyph: inout GlyphInfo) {
+        if accessGeneration &- glyph.lastAccessGeneration >= Self.accessGenerationRefreshStride {
+            glyph.lastAccessGeneration = accessGeneration
+        }
+    }
+
+    @inline(__always)
+    private func recordRecentCodepointAccess(_ codepoint: UInt32) {
+        recentCodepointAccesses[recentCodepointAccessWriteIndex] = codepoint
+        recentCodepointAccessWriteIndex = (recentCodepointAccessWriteIndex + 1) % Self.recentAccessRingCapacity
+        if recentCodepointAccessCount < Self.recentAccessRingCapacity {
+            recentCodepointAccessCount += 1
+        }
+    }
+
+    @inline(__always)
+    private func recordRecentClusterAccess(_ key: Cell.GraphemeCacheKey) {
+        recentClusterAccesses[recentClusterAccessWriteIndex] = key
+        recentClusterAccessWriteIndex = (recentClusterAccessWriteIndex + 1) % Self.recentAccessRingCapacity
+        if recentClusterAccessCount < Self.recentAccessRingCapacity {
+            recentClusterAccessCount += 1
+        }
+    }
+
+    @inline(__always)
+    private func recordRecentColorClusterAccess(_ key: Cell.GraphemeCacheKey) {
+        recentColorClusterAccesses[recentColorClusterAccessWriteIndex] = key
+        recentColorClusterAccessWriteIndex = (recentColorClusterAccessWriteIndex + 1) % Self.recentAccessRingCapacity
+        if recentColorClusterAccessCount < Self.recentAccessRingCapacity {
+            recentColorClusterAccessCount += 1
+        }
+    }
+
+    private func recentCodepointAccessSet(limit: UInt64) -> Set<UInt32> {
+        guard recentCodepointAccessCount > 0 else { return [] }
+        let tailCount = min(Int(limit), recentCodepointAccessCount)
+        guard tailCount > 0 else { return [] }
+        var retained = Set<UInt32>()
+        retained.reserveCapacity(tailCount)
+        var index = (recentCodepointAccessWriteIndex - tailCount + Self.recentAccessRingCapacity) % Self.recentAccessRingCapacity
+        for _ in 0..<tailCount {
+            retained.insert(recentCodepointAccesses[index])
+            index = (index + 1) % Self.recentAccessRingCapacity
+        }
+        return retained
+    }
+
+    private func recentClusterAccessSet(limit: UInt64) -> Set<Cell.GraphemeCacheKey> {
+        guard recentClusterAccessCount > 0 else { return [] }
+        let tailCount = min(Int(limit), recentClusterAccessCount)
+        guard tailCount > 0 else { return [] }
+        var retained = Set<Cell.GraphemeCacheKey>()
+        retained.reserveCapacity(tailCount)
+        var index = (recentClusterAccessWriteIndex - tailCount + Self.recentAccessRingCapacity) % Self.recentAccessRingCapacity
+        for _ in 0..<tailCount {
+            retained.insert(recentClusterAccesses[index])
+            index = (index + 1) % Self.recentAccessRingCapacity
+        }
+        return retained
+    }
+
+    private func recentColorClusterAccessSet(limit: UInt64) -> Set<Cell.GraphemeCacheKey> {
+        guard recentColorClusterAccessCount > 0 else { return [] }
+        let tailCount = min(Int(limit), recentColorClusterAccessCount)
+        guard tailCount > 0 else { return [] }
+        var retained = Set<Cell.GraphemeCacheKey>()
+        retained.reserveCapacity(tailCount)
+        var index = (recentColorClusterAccessWriteIndex - tailCount + Self.recentAccessRingCapacity) % Self.recentAccessRingCapacity
+        for _ in 0..<tailCount {
+            retained.insert(recentColorClusterAccesses[index])
+            index = (index + 1) % Self.recentAccessRingCapacity
+        }
+        return retained
     }
 
     /// Rasterize a single glyph and add it to the atlas.
@@ -401,8 +521,29 @@ final class GlyphAtlas {
             resolvedBMPFontCache[index] = nil
             return nil
         }
-        let string = String(Character(scalar)) as CFString
-        let fallbackFont = CTFontCreateForString(ctFont, string, CFRangeMake(0, 1))
+        let pageIndex = index >> 8
+        let fallbackFont: CTFont
+        if resolvedBMPPageFallbackKnown[pageIndex],
+           let cachedPageFallback = resolvedBMPPageFallbackFonts[pageIndex] {
+            fallbackFont = cachedPageFallback
+        } else {
+            var resolvedPageFallback: CTFont?
+            for candidateFont in fallbackFonts {
+                glyph = 0
+                if CTFontGetGlyphsForCharacters(candidateFont, &characters, &glyph, 1), glyph != 0 {
+                    resolvedPageFallback = candidateFont
+                    break
+                }
+            }
+            if let resolvedPageFallback {
+                fallbackFont = resolvedPageFallback
+            } else {
+                let string = String(Character(scalar)) as CFString
+                fallbackFont = CTFontCreateForString(ctFont, string, CFRangeMake(0, 1))
+            }
+            resolvedBMPPageFallbackFonts[pageIndex] = fallbackFont
+            resolvedBMPPageFallbackKnown[pageIndex] = true
+        }
 
         glyph = 0
         if CTFontGetGlyphsForCharacters(fallbackFont, &characters, &glyph, 1), glyph != 0 {
@@ -410,6 +551,20 @@ final class GlyphAtlas {
             resolvedBMPGlyphCache[index] = glyph
             resolvedBMPFontKnown[index] = true
             return (fallbackFont, glyph)
+        }
+
+        let string = String(Character(scalar)) as CFString
+        let preciseFallbackFont = CTFontCreateForString(ctFont, string, CFRangeMake(0, 1))
+        if preciseFallbackFont !== fallbackFont {
+            glyph = 0
+            if CTFontGetGlyphsForCharacters(preciseFallbackFont, &characters, &glyph, 1), glyph != 0 {
+                resolvedBMPPageFallbackFonts[pageIndex] = preciseFallbackFont
+                resolvedBMPPageFallbackKnown[pageIndex] = true
+                resolvedBMPFontCache[index] = preciseFallbackFont
+                resolvedBMPGlyphCache[index] = glyph
+                resolvedBMPFontKnown[index] = true
+                return (preciseFallbackFont, glyph)
+            }
         }
 
         resolvedBMPFontKnown[index] = true
@@ -659,6 +814,39 @@ final class GlyphAtlas {
         rebuildAtlas()
     }
 
+    private func rebuildFallbackFontCascade() {
+        let descriptors = (CTFontCopyDefaultCascadeListForLanguages(ctFont, nil) as? [CTFontDescriptor]) ?? []
+        var seenPostScriptNames = Set<String>()
+        seenPostScriptNames.insert(CTFontCopyPostScriptName(ctFont) as String)
+        fallbackFonts.removeAll(keepingCapacity: true)
+        fallbackFonts.reserveCapacity(descriptors.count + 8)
+
+        let preferredFallbackNames = [
+            "PingFangSC-Regular",
+            "PingFangTC-Regular",
+            "PingFangHK-Regular",
+            "HiraginoSans-W3",
+            "HiraginoSans-W6",
+            "AppleColorEmoji"
+        ]
+        for fontName in preferredFallbackNames {
+            guard let font = NSFont(name: fontName, size: fontSize) else { continue }
+            let ctFont = font as CTFont
+            let postScriptName = CTFontCopyPostScriptName(ctFont) as String
+            if seenPostScriptNames.insert(postScriptName).inserted {
+                fallbackFonts.append(ctFont)
+            }
+        }
+
+        for descriptor in descriptors {
+            let font = CTFontCreateWithFontDescriptor(descriptor, fontSize, nil)
+            let postScriptName = CTFontCopyPostScriptName(font) as String
+            if seenPostScriptNames.insert(postScriptName).inserted {
+                fallbackFonts.append(font)
+            }
+        }
+    }
+
     func resetToMinimum() {
         glyphCache.removeAll()
         asciiGlyphCache = ContiguousArray(repeating: nil, count: 128)
@@ -667,6 +855,18 @@ final class GlyphAtlas {
         resolvedBMPFontCache = ContiguousArray(repeating: nil, count: 0x10000)
         resolvedBMPGlyphCache = ContiguousArray(repeating: 0, count: 0x10000)
         resolvedBMPFontKnown = ContiguousArray(repeating: false, count: 0x10000)
+        resolvedBMPPageFallbackFonts = ContiguousArray(repeating: nil, count: 0x100)
+        resolvedBMPPageFallbackKnown = ContiguousArray(repeating: false, count: 0x100)
+        fallbackFonts.removeAll(keepingCapacity: true)
+        recentCodepointAccesses = GlyphAtlas.makeRecentCodepointAccessRing()
+        recentCodepointAccessCount = 0
+        recentCodepointAccessWriteIndex = 0
+        recentClusterAccesses = GlyphAtlas.makeRecentClusterAccessRing()
+        recentClusterAccessCount = 0
+        recentClusterAccessWriteIndex = 0
+        recentColorClusterAccesses = GlyphAtlas.makeRecentClusterAccessRing()
+        recentColorClusterAccessCount = 0
+        recentColorClusterAccessWriteIndex = 0
         packX = 0
         packY = 0
         rowHeight = 0
@@ -675,6 +875,7 @@ final class GlyphAtlas {
         colorRowHeight = 0
         atlasDimension = initialAtlasDimension
         calculateCellMetrics()
+        rebuildFallbackFontCascade()
         texture = nil
         colorTexture = nil
         atlasRevision &+= 1
@@ -691,23 +892,29 @@ final class GlyphAtlas {
         }
 
         let currentGeneration = accessGeneration
+        let recentCodepoints = recentCodepointAccessSet(limit: maximumInactiveGenerations)
+        let recentClusters = recentClusterAccessSet(limit: maximumInactiveGenerations)
+        let recentColorClusters = recentColorClusterAccessSet(limit: maximumInactiveGenerations)
         let retained = glyphCache.compactMap { entry -> UInt32? in
             let (codepoint, info) = entry
-            guard currentGeneration &- info.lastAccessGeneration <= maximumInactiveGenerations else {
+            guard recentCodepoints.contains(codepoint) ||
+                    currentGeneration &- info.lastAccessGeneration <= maximumInactiveGenerations else {
                 return nil
             }
             return codepoint
         }
         let retainedClusters = clusterGlyphCache.compactMap { entry -> Cell.GraphemeCacheKey? in
             let (text, info) = entry
-            guard currentGeneration &- info.lastAccessGeneration <= maximumInactiveGenerations else {
+            guard recentClusters.contains(text) ||
+                    currentGeneration &- info.lastAccessGeneration <= maximumInactiveGenerations else {
                 return nil
             }
             return text
         }
         let retainedColorClusters = colorClusterGlyphCache.compactMap { entry -> Cell.GraphemeCacheKey? in
             let (text, info) = entry
-            guard currentGeneration &- info.lastAccessGeneration <= maximumInactiveGenerations else {
+            guard recentColorClusters.contains(text) ||
+                    currentGeneration &- info.lastAccessGeneration <= maximumInactiveGenerations else {
                 return nil
             }
             return text
@@ -759,6 +966,18 @@ final class GlyphAtlas {
         resolvedBMPFontCache = ContiguousArray(repeating: nil, count: 0x10000)
         resolvedBMPGlyphCache = ContiguousArray(repeating: 0, count: 0x10000)
         resolvedBMPFontKnown = ContiguousArray(repeating: false, count: 0x10000)
+        resolvedBMPPageFallbackFonts = ContiguousArray(repeating: nil, count: 0x100)
+        resolvedBMPPageFallbackKnown = ContiguousArray(repeating: false, count: 0x100)
+        rebuildFallbackFontCascade()
+        recentCodepointAccesses = GlyphAtlas.makeRecentCodepointAccessRing()
+        recentCodepointAccessCount = 0
+        recentCodepointAccessWriteIndex = 0
+        recentClusterAccesses = GlyphAtlas.makeRecentClusterAccessRing()
+        recentClusterAccessCount = 0
+        recentClusterAccessWriteIndex = 0
+        recentColorClusterAccesses = GlyphAtlas.makeRecentClusterAccessRing()
+        recentColorClusterAccessCount = 0
+        recentColorClusterAccessWriteIndex = 0
         packX = 0
         packY = 0
         rowHeight = 0

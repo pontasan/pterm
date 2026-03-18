@@ -294,7 +294,7 @@ final class PastedImageRegistry {
 
         PtermDirectories.ensureDirectories()
         let destination = PtermDirectories.files.appendingPathComponent(
-            "kitty-image-\(index)-\(UUID().uuidString).\(format.blobPathExtension)"
+            "kitty-image-\(index)-\(UUID().uuidString).\(format.pathExtension)"
         )
         try AtomicFileWriter.write(persistedData, to: destination, permissions: 0o600)
         let cgImage = Self.cgImage(from: persistedData, format: .png, pixelWidth: pixelWidth, pixelHeight: pixelHeight)
