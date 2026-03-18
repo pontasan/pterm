@@ -323,7 +323,11 @@ final class TerminalView: MTKView, NSTextInputClient {
             rgbaBytes[index] = bgraBytes[index + 2]
             rgbaBytes[index + 1] = bgraBytes[index + 1]
             rgbaBytes[index + 2] = bgraBytes[index]
-            rgbaBytes[index + 3] = bgraBytes[index + 3]
+            // The render target is visually composited over the terminal's black
+            // background in the app. Flatten the exported debug image the same way
+            // so screenshot parity compares the actual visible result instead of
+            // alpha-channel implementation details.
+            rgbaBytes[index + 3] = 0xFF
             index += 4
         }
 
