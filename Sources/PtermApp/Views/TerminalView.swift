@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ImageIO
 import MetalKit
 import QuartzCore
 
@@ -286,6 +287,66 @@ final class TerminalView: MTKView, NSTextInputClient {
             transientTextOverlays: committedTextPreviews,
             suppressCursorBlink: suppressCursorBlink
         )
+    }
+
+    func debugRenderedPNGDataForTesting() -> Data? {
+        guard let renderer else { return nil }
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        let expectedSize = expectedDrawableSize(for: scale)
+        let pixelWidth = max(Int(expectedSize.width.rounded(.up)), 1)
+        let pixelHeight = max(Int(expectedSize.height.rounded(.up)), 1)
+
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: MetalRenderer.renderTargetPixelFormat,
+            width: pixelWidth,
+            height: pixelHeight,
+            mipmapped: false
+        )
+        descriptor.storageMode = .shared
+        descriptor.usage = [.renderTarget, .shaderRead]
+        guard let texture = renderer.device.makeTexture(descriptor: descriptor) else { return nil }
+
+        debugRenderFrameToTextureForTesting(texture)
+
+        let bytesPerRow = pixelWidth * 4
+        var bgraBytes = [UInt8](repeating: 0, count: bytesPerRow * pixelHeight)
+        texture.getBytes(
+            &bgraBytes,
+            bytesPerRow: bytesPerRow,
+            from: MTLRegionMake2D(0, 0, pixelWidth, pixelHeight),
+            mipmapLevel: 0
+        )
+
+        var rgbaBytes = bgraBytes
+        var index = 0
+        while index < bgraBytes.count {
+            rgbaBytes[index] = bgraBytes[index + 2]
+            rgbaBytes[index + 1] = bgraBytes[index + 1]
+            rgbaBytes[index + 2] = bgraBytes[index]
+            rgbaBytes[index + 3] = bgraBytes[index + 3]
+            index += 4
+        }
+
+        let data = Data(rgbaBytes)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let image = CGImage(
+                width: pixelWidth,
+                height: pixelHeight,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: bytesPerRow,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ) else {
+            return nil
+        }
+
+        let bitmap = NSBitmapImageRep(cgImage: image)
+        return bitmap.representation(using: .png, properties: [:])
     }
 
     @discardableResult

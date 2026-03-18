@@ -47,12 +47,12 @@ final class KeyboardHandler {
                let scalar = chars.unicodeScalars.first {
                 let code = scalar.value
                 if code == 0x63 { // c
-                    controller.performInterrupt()
+                    controller.sendInput(String(UnicodeScalar(0x03)!))
                     playInputFeedbackIfEnabled()
                     return true
                 }
                 if code == 0x5A || code == 0x7A { // z
-                    controller.performInterrupt(controlCharacter: 0x1A)
+                    controller.sendInput(String(UnicodeScalar(0x1A)!))
                     playInputFeedbackIfEnabled()
                     return true
                 }
@@ -76,7 +76,7 @@ final class KeyboardHandler {
                 }
                 // Ctrl+\ = 0x1C
                 if code == 0x5C {
-                    controller.performInterrupt(controlCharacter: 0x1C)
+                    controller.sendInput(String(UnicodeScalar(0x1C)!))
                     playInputFeedbackIfEnabled()
                     return true
                 }
@@ -238,6 +238,8 @@ final class KeyboardHandler {
             return .input("\u{1B}[Z")
         case "backspace":
             return .input(String(UnicodeScalar(0x7F)!))
+        case "insert":
+            return .input("\u{1B}[2~")
         case "delete":
             return .input("\u{1B}[3~")
         case "up":
@@ -278,16 +280,62 @@ final class KeyboardHandler {
         case "f18": return .input("\u{1B}[32~")
         case "f19": return .input("\u{1B}[33~")
         case "f20": return .input("\u{1B}[34~")
+        case "keypad_pf1", "kp_pf1":
+            return .input("\u{1B}OP")
+        case "keypad_pf2", "kp_pf2":
+            return .input("\u{1B}OQ")
+        case "keypad_pf3", "kp_pf3":
+            return .input("\u{1B}OR")
+        case "keypad_pf4", "kp_pf4":
+            return .input("\u{1B}OS")
+        case "keypad_0", "kp_0":
+            return .input(namedKeypadSequence(numeric: "0", application: "\u{1B}Op", controller: controller))
+        case "keypad_1", "kp_1":
+            return .input(namedKeypadSequence(numeric: "1", application: "\u{1B}Oq", controller: controller))
+        case "keypad_2", "kp_2":
+            return .input(namedKeypadSequence(numeric: "2", application: "\u{1B}Or", controller: controller))
+        case "keypad_3", "kp_3":
+            return .input(namedKeypadSequence(numeric: "3", application: "\u{1B}Os", controller: controller))
+        case "keypad_4", "kp_4":
+            return .input(namedKeypadSequence(numeric: "4", application: "\u{1B}Ot", controller: controller))
+        case "keypad_5", "kp_5":
+            return .input(namedKeypadSequence(numeric: "5", application: "\u{1B}Ou", controller: controller))
+        case "keypad_6", "kp_6":
+            return .input(namedKeypadSequence(numeric: "6", application: "\u{1B}Ov", controller: controller))
+        case "keypad_7", "kp_7":
+            return .input(namedKeypadSequence(numeric: "7", application: "\u{1B}Ow", controller: controller))
+        case "keypad_8", "kp_8":
+            return .input(namedKeypadSequence(numeric: "8", application: "\u{1B}Ox", controller: controller))
+        case "keypad_9", "kp_9":
+            return .input(namedKeypadSequence(numeric: "9", application: "\u{1B}Oy", controller: controller))
+        case "keypad_plus", "kp_plus":
+            return .input(namedKeypadSequence(numeric: "+", application: "\u{1B}Ok", controller: controller))
+        case "keypad_multiply", "kp_multiply":
+            return .input(namedKeypadSequence(numeric: "*", application: "\u{1B}Oj", controller: controller))
+        case "keypad_divide", "kp_divide":
+            return .input(namedKeypadSequence(numeric: "/", application: "\u{1B}Oo", controller: controller))
+        case "keypad_minus", "kp_minus":
+            return .input(namedKeypadSequence(numeric: "-", application: "\u{1B}Om", controller: controller))
+        case "keypad_decimal", "kp_decimal":
+            return .input(namedKeypadSequence(numeric: ".", application: "\u{1B}On", controller: controller))
+        case "keypad_enter", "kp_enter":
+            return .input(namedKeypadSequence(numeric: "\r", application: "\u{1B}OM", controller: controller))
         case "ctrl_c", "control_c":
-            return .interrupt(0x03)
+            return .input(String(UnicodeScalar(0x03)!))
         case "ctrl_z", "control_z":
-            return .interrupt(0x1A)
+            return .input(String(UnicodeScalar(0x1A)!))
         case "ctrl_backslash", "control_backslash":
-            return .interrupt(0x1C)
+            return .input(String(UnicodeScalar(0x1C)!))
+        case "ctrl_space", "control_space", "ctrl_at", "control_at":
+            return .input(String(UnicodeScalar(0x00)!))
         case "ctrl_left_bracket", "control_left_bracket":
             return .input("\u{1B}")
         case "ctrl_right_bracket", "control_right_bracket":
             return .input(String(UnicodeScalar(0x1D)!))
+        case "ctrl_caret", "control_caret", "ctrl_tilde", "control_tilde", "ctrl_backtick", "control_backtick":
+            return .input(String(UnicodeScalar(0x1E)!))
+        case "ctrl_underscore", "control_underscore", "ctrl_question_mark", "control_question_mark":
+            return .input(String(UnicodeScalar(0x1F)!))
         default:
             if let controlAction = mcpControlCharacterAction(for: key) {
                 return controlAction
@@ -300,6 +348,11 @@ final class KeyboardHandler {
         let appCursor = controller.withModel { $0.applicationCursorKeys }
         let prefix = appCursor ? "\u{1B}O" : "\u{1B}["
         return "\(prefix)\(letter)"
+    }
+
+    private static func namedKeypadSequence(numeric: String, application: String, controller: TerminalController) -> String {
+        let appKeypad = controller.withModel { $0.applicationKeypadMode }
+        return appKeypad ? application : numeric
     }
 
     private static func mcpControlCharacterAction(for key: String) -> MCPKeyAction? {

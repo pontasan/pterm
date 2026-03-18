@@ -3470,10 +3470,6 @@ final class PTYIntegrationTests: XCTestCase {
     }
 
     private static func findExecutable(named name: String) -> String? {
-        // TODO: Re-enable the vttest-based integration coverage after we restore a fast, dedicated lane for these replay-heavy scenarios.
-        if name == "vttest" {
-            return nil
-        }
         let searchPaths = [
             "/opt/homebrew/bin",
             "/usr/local/bin",

@@ -3582,7 +3582,8 @@ extension AppDelegate: MCPToolProvider {
                 inputSchema: [
                     "type": "object",
                     "properties": [
-                        "terminal_id": ["type": "string"]
+                        "terminal_id": ["type": "string"],
+                        "include_render_png_path": ["type": "boolean"]
                     ],
                     "required": ["terminal_id"]
                 ]
@@ -3769,7 +3770,10 @@ extension AppDelegate: MCPToolProvider {
             ]
         case "capture_terminal":
             let controller = try mcpTerminal(from: arguments)
-            payload = mcpTerminalDetailsPayload(for: controller)
+            payload = mcpTerminalDetailsPayload(
+                for: controller,
+                includeRenderPNGPath: (arguments["include_render_png_path"] as? Bool) == true
+            )
         case "wait_for_terminal":
             let condition = try MCPTerminalWaitCondition(arguments: arguments)
             payload = try waitForTerminal(condition)
@@ -3924,17 +3928,95 @@ extension AppDelegate: MCPToolProvider {
         ]
     }
 
-    private func mcpTerminalDetailsPayload(for controller: TerminalController) -> [String: Any] {
-        [
+    private func mcpTerminalDetailsPayload(
+        for controller: TerminalController,
+        includeRenderPNGPath: Bool = false
+    ) -> [String: Any] {
+        let snapshot = controller.captureRenderSnapshot()
+        var payload: [String: Any] = [
             "terminal": mcpTerminalPayload(for: controller),
             "all_text": controller.allText(),
-            "visible_text": mcpVisibleText(for: controller),
-            "visible_text_raw": mcpVisibleText(for: controller, trimWhitespace: false)
+            "rows": snapshot.rows,
+            "cols": snapshot.cols,
+            "visible_text": Self.mcpVisibleText(from: snapshot, trimWhitespace: true),
+            "visible_text_raw": Self.mcpVisibleText(from: snapshot, trimWhitespace: false),
+            "visible_text_ansi": Self.mcpVisibleTextANSI(from: snapshot, trimWhitespace: true),
+            "visible_text_ansi_raw": Self.mcpVisibleTextANSI(from: snapshot, trimWhitespace: false)
         ]
+        if let viewportGeometry = mcpViewportGeometryPayload(for: controller) {
+            payload["viewport_geometry"] = viewportGeometry
+        }
+        if includeRenderPNGPath,
+           let renderPNGPath = mcpRenderedTerminalImagePath(for: controller) {
+            payload["render_png_path"] = renderPNGPath
+        }
+        return payload
     }
 
-    private func mcpVisibleText(for controller: TerminalController, trimWhitespace: Bool = true) -> String {
-        Self.mcpVisibleText(from: controller.captureRenderSnapshot(), trimWhitespace: trimWhitespace)
+    private func mcpRenderedTerminalImagePath(for controller: TerminalController) -> String? {
+        guard let target = activeTerminalInteractionTarget(),
+              target.controller.id == controller.id,
+              let pngData = target.view.debugRenderedPNGDataForTesting() else {
+            return nil
+        }
+
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("pterm-mcp-captures", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let fileURL = directory.appendingPathComponent("\(controller.id.uuidString)-render.png")
+            try pngData.write(to: fileURL, options: .atomic)
+            return fileURL.path
+        } catch {
+            return nil
+        }
+    }
+
+    private func mcpViewportGeometryPayload(for controller: TerminalController) -> [String: Any]? {
+        guard let target = activeTerminalInteractionTarget(),
+              target.controller.id == controller.id,
+              let window = target.view.window,
+              let screen = window.screen else {
+            return nil
+        }
+
+        let visibleRect = target.view.visibleRect
+        guard !visibleRect.isEmpty else { return nil }
+
+        let rectInWindow = target.view.convert(visibleRect, to: nil)
+        let contentFrameInWindow = window.contentView?.frame ?? .zero
+        let rectInWindowTopLeft = CGRect(
+            x: contentFrameInWindow.minX + rectInWindow.minX,
+            y: window.frame.height - (contentFrameInWindow.minY + rectInWindow.maxY),
+            width: rectInWindow.width,
+            height: rectInWindow.height
+        ).integral
+        let rectInScreen = window.convertToScreen(rectInWindow)
+        let cgRect = CGRect(
+            x: rectInScreen.minX,
+            y: screen.frame.maxY - rectInScreen.maxY,
+            width: rectInScreen.width,
+            height: rectInScreen.height
+        ).integral
+
+        guard cgRect.width > 0, cgRect.height > 0 else { return nil }
+
+        return [
+            "window_number": Int(window.windowNumber),
+            "scale_factor": window.backingScaleFactor,
+            "viewport_rect_in_window_cg": [
+                "x": rectInWindowTopLeft.origin.x,
+                "y": rectInWindowTopLeft.origin.y,
+                "width": rectInWindowTopLeft.width,
+                "height": rectInWindowTopLeft.height
+            ],
+            "screen_rect_cg": [
+                "x": cgRect.origin.x,
+                "y": cgRect.origin.y,
+                "width": cgRect.width,
+                "height": cgRect.height
+            ]
+        ]
     }
 
     static func mcpVisibleText(
@@ -3942,20 +4024,162 @@ extension AppDelegate: MCPToolProvider {
         trimWhitespace: Bool
     ) -> String {
         snapshot.visibleRows
-            .map { row in
-                let text = String(row.cells.compactMap { cell in
-                    guard cell.codepoint != 0,
-                          let scalar = UnicodeScalar(cell.codepoint) else {
-                        return Character(" ")
-                    }
-                    return Character(scalar)
-                })
-                if trimWhitespace {
-                    return text.trimmingCharacters(in: .whitespaces)
-                }
-                return text
-            }
+            .map { mcpVisibleRowText(from: $0, trimWhitespace: trimWhitespace) }
             .joined(separator: "\n")
+    }
+
+    static func mcpVisibleTextANSI(
+        from snapshot: TerminalController.RenderSnapshot,
+        trimWhitespace: Bool
+    ) -> String {
+        snapshot.visibleRows
+            .map { mcpVisibleRowTextANSI(from: $0, trimWhitespace: trimWhitespace) }
+            .joined(separator: "\n")
+    }
+
+    private static func mcpVisibleRowText(
+        from row: TerminalController.RenderRowSnapshot,
+        trimWhitespace: Bool
+    ) -> String {
+        let bounds = mcpVisibleRowBounds(in: row.cells, trimWhitespace: trimWhitespace)
+        guard bounds.lowerBound < bounds.upperBound else { return "" }
+
+        var output = ""
+        output.reserveCapacity(bounds.count)
+        for cell in row.cells[bounds] {
+            guard let rendered = mcpRenderedVisibleText(for: cell) else { continue }
+            output.append(rendered)
+        }
+        return output
+    }
+
+    private static func mcpVisibleRowTextANSI(
+        from row: TerminalController.RenderRowSnapshot,
+        trimWhitespace: Bool
+    ) -> String {
+        let bounds = mcpVisibleRowBounds(in: row.cells, trimWhitespace: trimWhitespace)
+        guard bounds.lowerBound < bounds.upperBound else { return "" }
+
+        var output = ""
+        var currentAttributes = CellAttributes.default
+        var needsReset = false
+
+        for cell in row.cells[bounds] {
+            guard let rendered = mcpRenderedVisibleText(for: cell) else { continue }
+            let attributes = cell.attributes
+            if attributes != currentAttributes {
+                output.append(mcpANSITransition(from: currentAttributes, to: attributes))
+                currentAttributes = attributes
+                needsReset = attributes != .default
+            }
+            output.append(rendered)
+        }
+
+        if needsReset {
+            output.append("\u{001B}[m")
+        }
+        return output
+    }
+
+    private static func mcpVisibleRowBounds(in cells: [Cell], trimWhitespace: Bool) -> Range<Int> {
+        guard trimWhitespace else { return cells.startIndex..<cells.endIndex }
+
+        var lowerBound = cells.startIndex
+        while lowerBound < cells.endIndex, mcpCellIsTrimmedWhitespace(cells[lowerBound]) {
+            lowerBound += 1
+        }
+
+        var upperBound = cells.endIndex
+        while upperBound > lowerBound, mcpCellIsTrimmedWhitespace(cells[upperBound - 1]) {
+            upperBound -= 1
+        }
+        return lowerBound..<upperBound
+    }
+
+    private static func mcpCellIsTrimmedWhitespace(_ cell: Cell) -> Bool {
+        guard let rendered = mcpRenderedVisibleText(for: cell) else { return true }
+        return rendered == " "
+    }
+
+    private static func mcpRenderedVisibleText(for cell: Cell) -> String? {
+        guard !cell.isWideContinuation, !cell.hasInlineImage else { return nil }
+        let rendered = cell.renderedString()
+        return rendered.isEmpty ? " " : rendered
+    }
+
+    private static func mcpANSITransition(from _: CellAttributes, to target: CellAttributes) -> String {
+        if target == .default {
+            return "\u{001B}[m"
+        }
+
+        var params: [String] = ["0"]
+        if target.bold { params.append("1") }
+        if target.dim { params.append("2") }
+        if target.italic { params.append("3") }
+        if target.underline {
+            switch target.underlineStyle {
+            case .single:
+                params.append("4")
+            case .double:
+                params.append("4:2")
+            case .curly:
+                params.append("4:3")
+            case .dotted:
+                params.append("4:4")
+            case .dashed:
+                params.append("4:5")
+            }
+        }
+        if target.blink { params.append("5") }
+        if target.inverse { params.append("7") }
+        if target.hidden { params.append("8") }
+        if target.strikethrough { params.append("9") }
+        params.append(contentsOf: mcpANSIColorParameters(for: target.foreground, role: .foreground))
+        params.append(contentsOf: mcpANSIColorParameters(for: target.background, role: .background))
+        params.append(contentsOf: mcpANSIColorParameters(for: target.underlineColor, role: .underline))
+        return "\u{001B}[\(params.joined(separator: ";"))m"
+    }
+
+    private enum MCPANSIColorRole {
+        case foreground
+        case background
+        case underline
+    }
+
+    private static func mcpANSIColorParameters(for color: TerminalColor, role: MCPANSIColorRole) -> [String] {
+        switch color {
+        case .default:
+            switch role {
+            case .foreground:
+                return ["39"]
+            case .background:
+                return ["49"]
+            case .underline:
+                return ["59"]
+            }
+        case .indexed(let index):
+            switch role {
+            case .foreground:
+                if index < 8 { return ["\(30 + index)"] }
+                if index < 16 { return ["\(90 + (index - 8))"] }
+                return ["38", "5", "\(index)"]
+            case .background:
+                if index < 8 { return ["\(40 + index)"] }
+                if index < 16 { return ["\(100 + (index - 8))"] }
+                return ["48", "5", "\(index)"]
+            case .underline:
+                return ["58", "5", "\(index)"]
+            }
+        case .rgb(let r, let g, let b):
+            switch role {
+            case .foreground:
+                return ["38", "2", "\(r)", "\(g)", "\(b)"]
+            case .background:
+                return ["48", "2", "\(r)", "\(g)", "\(b)"]
+            case .underline:
+                return ["58", "2", "\(r)", "\(g)", "\(b)"]
+            }
+        }
     }
 
     private func mcpObservation(for controller: TerminalController) -> MCPTerminalObservation {

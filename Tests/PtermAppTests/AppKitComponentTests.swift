@@ -3385,11 +3385,40 @@ final class AppKitComponentTests: XCTestCase {
         )
         XCTAssertEqual(
             KeyboardHandler.mcpKeyAction(named: "ctrl_c", controller: controller),
-            .interrupt(0x03)
+            .input(String(UnicodeScalar(0x03)!))
         )
         XCTAssertEqual(
             KeyboardHandler.mcpKeyAction(named: "ctrl_d", controller: controller),
             .input(String(UnicodeScalar(0x04)!))
+        )
+        XCTAssertEqual(
+            KeyboardHandler.mcpKeyAction(named: "ctrl_space", controller: controller),
+            .input(String(UnicodeScalar(0x00)!))
+        )
+        XCTAssertEqual(
+            KeyboardHandler.mcpKeyAction(named: "ctrl_caret", controller: controller),
+            .input(String(UnicodeScalar(0x1E)!))
+        )
+        XCTAssertEqual(
+            KeyboardHandler.mcpKeyAction(named: "ctrl_underscore", controller: controller),
+            .input(String(UnicodeScalar(0x1F)!))
+        )
+        XCTAssertEqual(
+            KeyboardHandler.mcpKeyAction(named: "insert", controller: controller),
+            .input("\u{1B}[2~")
+        )
+        XCTAssertEqual(
+            KeyboardHandler.mcpKeyAction(named: "keypad_1", controller: controller),
+            .input("1")
+        )
+        controller.withModel { $0.applicationKeypadMode = true }
+        XCTAssertEqual(
+            KeyboardHandler.mcpKeyAction(named: "keypad_1", controller: controller),
+            .input("\u{1B}Oq")
+        )
+        XCTAssertEqual(
+            KeyboardHandler.mcpKeyAction(named: "keypad_enter", controller: controller),
+            .input("\u{1B}OM")
         )
     }
 

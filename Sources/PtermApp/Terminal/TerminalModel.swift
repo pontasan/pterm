@@ -2944,10 +2944,17 @@ final class TerminalModel {
             break
 
         case 0x72: // DECSTBM - Set Top and Bottom Margins
-            let top = Int(vt_parser_param(parser, 0, 1)) - 1
-            let bottom = Int(vt_parser_param(parser, 1, Int32(rows))) - 1
-            grid.scrollTop = max(0, min(top, rows - 1))
-            grid.scrollBottom = max(grid.scrollTop, min(bottom, rows - 1))
+            let requestedTop = Int(vt_parser_param(parser, 0, 1))
+            let requestedBottom = Int(vt_parser_param(parser, 1, Int32(rows)))
+            let top = max(1, min(requestedTop, rows))
+            let bottom = max(1, min(requestedBottom, rows))
+            if bottom - top < 1 {
+                grid.scrollTop = 0
+                grid.scrollBottom = rows - 1
+            } else {
+                grid.scrollTop = top - 1
+                grid.scrollBottom = bottom - 1
+            }
             cursor.row = cursor.originMode ? grid.scrollTop : 0
             cursor.col = 0
             cursor.pendingWrap = false

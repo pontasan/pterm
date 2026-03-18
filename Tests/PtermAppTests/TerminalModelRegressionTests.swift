@@ -2131,4 +2131,40 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(harness.model.cursor.row, 0)
         XCTAssertEqual(harness.model.cursor.col, 0)
     }
+
+    func testDECSTBMInvalidMarginsResetToNoScrollRegion() {
+        let harness = TerminalModelHarness(rows: 24, cols: 80)
+
+        harness.feed("\u{1B}[20;10r")
+        XCTAssertEqual(harness.model.grid.scrollTop, 0)
+        XCTAssertEqual(harness.model.grid.scrollBottom, 23)
+
+        harness.feed("\u{1B}[0;1r")
+        XCTAssertEqual(harness.model.grid.scrollTop, 0)
+        XCTAssertEqual(harness.model.grid.scrollBottom, 23)
+
+        harness.feed("\u{1B}[0;0r")
+        XCTAssertEqual(harness.model.grid.scrollTop, 0)
+        XCTAssertEqual(harness.model.grid.scrollBottom, 23)
+    }
+
+    func testVttestKnownBugSInvalidScrollRegionKeepsTwentiethLineVisible() {
+        let harness = TerminalModelHarness(rows: 24, cols: 80)
+
+        harness.feed("\u{1B}[20;10r")
+        for index in 1...20 {
+            harness.feed("This is 20 lines of text (line \(index)), no scroll region.\n")
+        }
+
+        let visibleLines = (0..<24).map { row in
+            String(harness.model.grid.rowCells(row).compactMap { cell -> Character? in
+                guard !cell.isWideContinuation else { return nil }
+                guard cell.codepoint != 0, let scalar = UnicodeScalar(cell.codepoint) else { return nil }
+                return Character(scalar)
+            }).trimmingCharacters(in: .whitespaces)
+        }
+
+        let visibleText = visibleLines.joined(separator: "\n")
+        XCTAssertTrue(visibleText.contains("line 20"), visibleText)
+    }
 }

@@ -2460,6 +2460,51 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertEqual(trimmed.components(separatedBy: "\n").first, "hi")
     }
 
+    func testMCPVisibleTextUsesRenderedGraphemeClusters() {
+        let controller = TerminalController(
+            rows: 2,
+            cols: 8,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 32,
+            scrollbackMaxCapacity: 32,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+
+        controller.debugProcessPTYOutputForTesting(Data("👩‍💻 e\u{301}\n".utf8))
+
+        let snapshot = controller.captureRenderSnapshot()
+        let raw = AppDelegate.mcpVisibleText(from: snapshot, trimWhitespace: false)
+
+        XCTAssertTrue(raw.contains("👩‍💻"))
+        XCTAssertTrue(raw.contains("e\u{301}"))
+    }
+
+    func testMCPVisibleTextANSIRawPreservesWhitespaceAndStyle() {
+        let controller = TerminalController(
+            rows: 2,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 32,
+            scrollbackMaxCapacity: 32,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+
+        controller.debugProcessPTYOutputForTesting(Data(" \u{001B}[1;31mA\u{001B}[0m \n".utf8))
+
+        let snapshot = controller.captureRenderSnapshot()
+        let ansiRaw = AppDelegate.mcpVisibleTextANSI(from: snapshot, trimWhitespace: false)
+        let ansiTrimmed = AppDelegate.mcpVisibleTextANSI(from: snapshot, trimWhitespace: true)
+
+        XCTAssertTrue(ansiRaw.hasPrefix(" "))
+        XCTAssertTrue(ansiRaw.contains("\u{001B}[0;1;31;49;59mA"))
+        XCTAssertTrue(ansiRaw.contains("\u{001B}[m"))
+        XCTAssertTrue(ansiTrimmed.hasPrefix("\u{001B}[0;1;31;49;59mA"))
+    }
+
     func testMCPTerminalWaitConditionMatchesForegroundRevisionAndIdleState() throws {
         let terminalID = UUID()
         let observation = AppDelegate.MCPTerminalObservation(
