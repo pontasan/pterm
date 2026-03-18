@@ -355,6 +355,14 @@ final class IntegratedView: MTKView, NSDraggingSource {
     var debugHasOutputContentRedrawTimer: Bool { outputContentRedrawTimer != nil }
 
     var shortcutConfiguration: ShortcutConfiguration = .default
+    var outputFrameThrottlingMode: OutputFrameThrottlingMode = TextInteractionConfiguration.default.outputFrameThrottlingMode {
+        didSet {
+            guard outputFrameThrottlingMode != oldValue else { return }
+            let isDragging = dragAutoScrollTimer != nil || dragInsertionIndicator != nil || dragWorkspaceIndicator != nil
+            updateOutputPulseTimer(isDragging: isDragging)
+            requestOverviewOutputDisplay()
+        }
+    }
     var explicitWorkspaceNames: [String] = [] {
         didSet {
             invalidateLayoutCache()
@@ -1194,8 +1202,9 @@ final class IntegratedView: MTKView, NSDraggingSource {
         metalLayer.pixelFormat = MetalRenderer.renderTargetPixelFormat
         metalLayer.isOpaque = false
         if #available(macOS 10.13.2, *) {
-            metalLayer.maximumDrawableCount = 2
+            metalLayer.maximumDrawableCount = 3
         }
+        metalLayer.displaySyncEnabled = false
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -2810,7 +2819,9 @@ extension IntegratedView: MTKViewDelegate {
             return
         }
         guard outputPulseTimer == nil else { return }
-        let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+        let floorInterval = 1.0 / Double(max(outputFrameThrottlingMode.preferredOutputFPSCap, 1))
+        let interval = max(floorInterval, 0.25 / outputFrameThrottlingMode.redrawCadenceCoefficient)
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.requestOverviewOutputDisplay()
         }
         RunLoop.main.add(timer, forMode: .common)

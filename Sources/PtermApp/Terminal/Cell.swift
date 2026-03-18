@@ -19,6 +19,66 @@ enum TerminalLineAttribute: Equatable {
 /// A single cell in the terminal grid.
 /// Each cell holds one character (codepoint), its visual attributes, and display width.
 struct Cell {
+    struct GraphemeCacheKey: Hashable {
+        var count: UInt8
+        var scalar0: UInt32
+        var scalar1: UInt32
+        var scalar2: UInt32
+        var scalar3: UInt32
+        var scalar4: UInt32
+        var scalar5: UInt32
+        var scalar6: UInt32
+        var scalar7: UInt32
+
+        init(
+            count: UInt8,
+            scalar0: UInt32,
+            scalar1: UInt32,
+            scalar2: UInt32,
+            scalar3: UInt32,
+            scalar4: UInt32,
+            scalar5: UInt32,
+            scalar6: UInt32,
+            scalar7: UInt32
+        ) {
+            self.count = count
+            self.scalar0 = scalar0
+            self.scalar1 = scalar1
+            self.scalar2 = scalar2
+            self.scalar3 = scalar3
+            self.scalar4 = scalar4
+            self.scalar5 = scalar5
+            self.scalar6 = scalar6
+            self.scalar7 = scalar7
+        }
+
+        func renderedString() -> String {
+            let scalars: [UInt32] = switch count {
+            case 1: [scalar0]
+            case 2: [scalar0, scalar1]
+            case 3: [scalar0, scalar1, scalar2]
+            case 4: [scalar0, scalar1, scalar2, scalar3]
+            case 5: [scalar0, scalar1, scalar2, scalar3, scalar4]
+            case 6: [scalar0, scalar1, scalar2, scalar3, scalar4, scalar5]
+            case 7: [scalar0, scalar1, scalar2, scalar3, scalar4, scalar5, scalar6]
+            default: [scalar0, scalar1, scalar2, scalar3, scalar4, scalar5, scalar6, scalar7]
+            }
+            return TerminalTextEncoding.string(from: scalars) ?? ""
+        }
+
+        static func isOrdered(_ lhs: GraphemeCacheKey, _ rhs: GraphemeCacheKey) -> Bool {
+            if lhs.count != rhs.count { return lhs.count < rhs.count }
+            if lhs.scalar0 != rhs.scalar0 { return lhs.scalar0 < rhs.scalar0 }
+            if lhs.scalar1 != rhs.scalar1 { return lhs.scalar1 < rhs.scalar1 }
+            if lhs.scalar2 != rhs.scalar2 { return lhs.scalar2 < rhs.scalar2 }
+            if lhs.scalar3 != rhs.scalar3 { return lhs.scalar3 < rhs.scalar3 }
+            if lhs.scalar4 != rhs.scalar4 { return lhs.scalar4 < rhs.scalar4 }
+            if lhs.scalar5 != rhs.scalar5 { return lhs.scalar5 < rhs.scalar5 }
+            if lhs.scalar6 != rhs.scalar6 { return lhs.scalar6 < rhs.scalar6 }
+            return lhs.scalar7 < rhs.scalar7
+        }
+    }
+
     /// Unicode codepoint. 0 means empty cell.
     var codepoint: UInt32
 
@@ -135,11 +195,64 @@ struct Cell {
         return scalars
     }
 
+    @inline(__always)
+    func graphemeScalarCount() -> Int {
+        1 + Int(graphemeTailCount)
+    }
+
+    @inline(__always)
+    func onlyScalarMatches(_ predicate: (UInt32) -> Bool) -> Bool {
+        guard graphemeTailCount == 0 else { return false }
+        return predicate(codepoint)
+    }
+
+    @inline(__always)
+    func containsGraphemeScalar(_ scalar: UInt32) -> Bool {
+        if codepoint == scalar { return true }
+        if graphemeTailCount >= 1, graphemeTail0 == scalar { return true }
+        if graphemeTailCount >= 2, graphemeTail1 == scalar { return true }
+        if graphemeTailCount >= 3, graphemeTail2 == scalar { return true }
+        if graphemeTailCount >= 4, graphemeTail3 == scalar { return true }
+        if graphemeTailCount >= 5, graphemeTail4 == scalar { return true }
+        if graphemeTailCount >= 6, graphemeTail5 == scalar { return true }
+        if graphemeTailCount >= 7, graphemeTail6 == scalar { return true }
+        return false
+    }
+
+    @inline(__always)
+    func containsGraphemeScalar(where predicate: (UInt32) -> Bool) -> Bool {
+        if predicate(codepoint) { return true }
+        if graphemeTailCount >= 1, predicate(graphemeTail0) { return true }
+        if graphemeTailCount >= 2, predicate(graphemeTail1) { return true }
+        if graphemeTailCount >= 3, predicate(graphemeTail2) { return true }
+        if graphemeTailCount >= 4, predicate(graphemeTail3) { return true }
+        if graphemeTailCount >= 5, predicate(graphemeTail4) { return true }
+        if graphemeTailCount >= 6, predicate(graphemeTail5) { return true }
+        if graphemeTailCount >= 7, predicate(graphemeTail6) { return true }
+        return false
+    }
+
     func renderedString() -> String {
         if hasInlineImage {
             return ""
         }
         return TerminalTextEncoding.string(from: graphemeScalars()) ?? ""
+    }
+
+    @inline(__always)
+    func graphemeCacheKey() -> GraphemeCacheKey? {
+        guard !hasInlineImage else { return nil }
+        return GraphemeCacheKey(
+            count: graphemeTailCount &+ 1,
+            scalar0: codepoint,
+            scalar1: graphemeTail0,
+            scalar2: graphemeTail1,
+            scalar3: graphemeTail2,
+            scalar4: graphemeTail3,
+            scalar5: graphemeTail4,
+            scalar6: graphemeTail5,
+            scalar7: graphemeTail6
+        )
     }
 
     func lastGraphemeScalar() -> UInt32 {
@@ -152,6 +265,83 @@ struct Cell {
         case 5: return graphemeTail4
         case 6: return graphemeTail5
         default: return graphemeTail6
+        }
+    }
+
+    @inline(__always)
+    func mayUseColorEmojiPresentation() -> Bool {
+        guard !hasInlineImage, codepoint > 0x20 else { return false }
+        if !hasGraphemeTail {
+            guard Cell.scalarMayHaveDefaultEmojiPresentation(codepoint),
+                  let scalar = UnicodeScalar(codepoint) else { return false }
+            return scalar.properties.isEmojiPresentation
+        }
+
+        if Cell.scalarRequiresColorEmojiConsideration(codepoint) { return true }
+        if graphemeTailCount >= 1, Cell.scalarRequiresColorEmojiConsideration(graphemeTail0) { return true }
+        if graphemeTailCount >= 2, Cell.scalarRequiresColorEmojiConsideration(graphemeTail1) { return true }
+        if graphemeTailCount >= 3, Cell.scalarRequiresColorEmojiConsideration(graphemeTail2) { return true }
+        if graphemeTailCount >= 4, Cell.scalarRequiresColorEmojiConsideration(graphemeTail3) { return true }
+        if graphemeTailCount >= 5, Cell.scalarRequiresColorEmojiConsideration(graphemeTail4) { return true }
+        if graphemeTailCount >= 6, Cell.scalarRequiresColorEmojiConsideration(graphemeTail5) { return true }
+        if graphemeTailCount >= 7, Cell.scalarRequiresColorEmojiConsideration(graphemeTail6) { return true }
+        return false
+    }
+
+    @inline(__always)
+    private static func scalarRequiresColorEmojiConsideration(_ scalarValue: UInt32) -> Bool {
+        if scalarValue == 0x200D || scalarValue == 0xFE0F || scalarValue == 0x20E3 {
+            return true
+        }
+        if (0x1F1E6...0x1F1FF).contains(scalarValue) || (0x1F3FB...0x1F3FF).contains(scalarValue) {
+            return true
+        }
+        guard scalarMayHaveDefaultEmojiPresentation(scalarValue),
+              let scalar = UnicodeScalar(scalarValue) else { return false }
+        return scalar.properties.isEmojiPresentation
+    }
+
+    @inline(__always)
+    private static func scalarMayHaveDefaultEmojiPresentation(_ scalarValue: UInt32) -> Bool {
+        if scalarValue >= 0x1F000 {
+            return true
+        }
+        switch scalarValue {
+        case 0x231A...0x231B,
+             0x23E9...0x23EC,
+             0x23F0, 0x23F3,
+             0x24C2,
+             0x25FD...0x25FE,
+             0x2614...0x2615,
+             0x2648...0x2653,
+             0x267F,
+             0x2693,
+             0x26A1,
+             0x26AA...0x26AB,
+             0x26BD...0x26BE,
+             0x26C4...0x26C5,
+             0x26CE,
+             0x26D4,
+             0x26EA,
+             0x26F2...0x26F5,
+             0x26FA,
+             0x26FD,
+             0x2705,
+             0x270A...0x270B,
+             0x2728,
+             0x274C,
+             0x274E,
+             0x2753...0x2755,
+             0x2757,
+             0x2795...0x2797,
+             0x27B0,
+             0x27BF,
+             0x2B1B...0x2B1C,
+             0x2B50,
+             0x2B55:
+            return true
+        default:
+            return false
         }
     }
 }
@@ -168,17 +358,20 @@ enum UnderlineStyle: UInt8, Equatable {
 struct CellAttributes: Equatable {
     var foreground: TerminalColor
     var background: TerminalColor
-    var bold: Bool
-    var italic: Bool
-    var underline: Bool
-    var strikethrough: Bool
-    var inverse: Bool
-    var hidden: Bool
-    var dim: Bool
-    var blink: Bool
-    var decProtected: Bool = false
-    var underlineStyle: UnderlineStyle = .single
     var underlineColor: TerminalColor = .default
+    private var packedFlags: UInt16
+
+    private static let boldBit: UInt16 = 1 << 0
+    private static let italicBit: UInt16 = 1 << 1
+    private static let underlineBit: UInt16 = 1 << 2
+    private static let strikethroughBit: UInt16 = 1 << 3
+    private static let inverseBit: UInt16 = 1 << 4
+    private static let hiddenBit: UInt16 = 1 << 5
+    private static let dimBit: UInt16 = 1 << 6
+    private static let blinkBit: UInt16 = 1 << 7
+    private static let decProtectedBit: UInt16 = 1 << 8
+    private static let underlineStyleShift: UInt16 = 9
+    private static let underlineStyleMask: UInt16 = 0b111 << underlineStyleShift
 
     init(
         foreground: TerminalColor,
@@ -197,17 +390,90 @@ struct CellAttributes: Equatable {
     ) {
         self.foreground = foreground
         self.background = background
-        self.bold = bold
-        self.italic = italic
-        self.underline = underline
-        self.strikethrough = strikethrough
-        self.inverse = inverse
-        self.hidden = hidden
-        self.dim = dim
-        self.blink = blink
-        self.decProtected = decProtected
-        self.underlineStyle = underlineStyle
         self.underlineColor = underlineColor
+        var flags: UInt16 = 0
+        if bold { flags |= Self.boldBit }
+        if italic { flags |= Self.italicBit }
+        if underline { flags |= Self.underlineBit }
+        if strikethrough { flags |= Self.strikethroughBit }
+        if inverse { flags |= Self.inverseBit }
+        if hidden { flags |= Self.hiddenBit }
+        if dim { flags |= Self.dimBit }
+        if blink { flags |= Self.blinkBit }
+        if decProtected { flags |= Self.decProtectedBit }
+        flags |= UInt16(underlineStyle.rawValue) << Self.underlineStyleShift
+        self.packedFlags = flags
+    }
+
+    var bold: Bool {
+        get { (packedFlags & Self.boldBit) != 0 }
+        set { setFlag(Self.boldBit, enabled: newValue) }
+    }
+
+    var italic: Bool {
+        get { (packedFlags & Self.italicBit) != 0 }
+        set { setFlag(Self.italicBit, enabled: newValue) }
+    }
+
+    var underline: Bool {
+        get { (packedFlags & Self.underlineBit) != 0 }
+        set { setFlag(Self.underlineBit, enabled: newValue) }
+    }
+
+    var strikethrough: Bool {
+        get { (packedFlags & Self.strikethroughBit) != 0 }
+        set { setFlag(Self.strikethroughBit, enabled: newValue) }
+    }
+
+    var inverse: Bool {
+        get { (packedFlags & Self.inverseBit) != 0 }
+        set { setFlag(Self.inverseBit, enabled: newValue) }
+    }
+
+    var hidden: Bool {
+        get { (packedFlags & Self.hiddenBit) != 0 }
+        set { setFlag(Self.hiddenBit, enabled: newValue) }
+    }
+
+    var dim: Bool {
+        get { (packedFlags & Self.dimBit) != 0 }
+        set { setFlag(Self.dimBit, enabled: newValue) }
+    }
+
+    var blink: Bool {
+        get { (packedFlags & Self.blinkBit) != 0 }
+        set { setFlag(Self.blinkBit, enabled: newValue) }
+    }
+
+    var decProtected: Bool {
+        get { (packedFlags & Self.decProtectedBit) != 0 }
+        set { setFlag(Self.decProtectedBit, enabled: newValue) }
+    }
+
+    var underlineStyle: UnderlineStyle {
+        get {
+            let rawValue = UInt8((packedFlags & Self.underlineStyleMask) >> Self.underlineStyleShift)
+            return UnderlineStyle(rawValue: rawValue) ?? .single
+        }
+        set {
+            packedFlags &= ~Self.underlineStyleMask
+            packedFlags |= UInt16(newValue.rawValue) << Self.underlineStyleShift
+        }
+    }
+
+    private mutating func setFlag(_ bit: UInt16, enabled: Bool) {
+        if enabled {
+            packedFlags |= bit
+        } else {
+            packedFlags &= ~bit
+        }
+    }
+
+    static func == (lhs: CellAttributes, rhs: CellAttributes) -> Bool {
+        lhs.foreground == rhs.foreground &&
+        lhs.background == rhs.background &&
+        lhs.underlineColor == rhs.underlineColor &&
+        lhs.packedFlags == rhs.packedFlags
     }
 
     static let `default` = CellAttributes(

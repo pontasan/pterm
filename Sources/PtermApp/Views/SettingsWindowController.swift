@@ -69,6 +69,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var launchShellsValues: [String] = []
     private var encodingPopup: NSPopUpButton?
     private var outputConfirmedInputAnimationCheck: NSButton?
+    private var outputFrameThrottlingPopup: NSPopUpButton?
     private var typewriterSoundCheck: NSButton?
     private var scrollPersistenceCheck: NSButton?
     private var mcpServerEnabledCheck: NSButton?
@@ -187,7 +188,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
         resetSection("session", removing: ["scroll_buffer_persistence"])
         resetSection("shells", removing: ["launch_order"])
-        resetSection("text_interaction", removing: ["output_confirmed_input_animation", "typewriter_sound_enabled"])
+        resetSection("text_interaction", removing: ["output_confirmed_input_animation", "output_frame_throttling_mode", "output_frame_throttling_enabled", "typewriter_sound_enabled"])
         resetSection("appearance", removing: [
             "terminal_foreground_color",
             "terminal_background_color",
@@ -363,6 +364,30 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         addView(
             makeDescriptionLabel(
                 "When enabled, input and delete animations start only after matching PTY output confirms the visible result.",
+                width: width
+            ),
+            28
+        )
+        addSpacing(12)
+
+        let throttlingDisplayValues = ["Aggressive", "Balanced", "Continuous"]
+        let throttlingConfigValues = ["aggressive", "balanced", "continuous"]
+        let configuredThrottlingMode = ((textInteraction?["output_frame_throttling_mode"] as? String).flatMap(OutputFrameThrottlingMode.init(configuredValue:)))
+            ?? (((textInteraction?["output_frame_throttling_enabled"] as? Bool) == false) ? .continuous : TextInteractionConfiguration.default.outputFrameThrottlingMode)
+        let throttlingIndex = throttlingConfigValues.firstIndex(of: configuredThrottlingMode.configuredValue) ?? 1
+        let (throttlingRow, throttlingPopup) = makePopupRow(
+            label: "Heavy Output Redraw:",
+            values: throttlingDisplayValues,
+            current: throttlingDisplayValues[throttlingIndex],
+            width: width
+        )
+        throttlingPopup.target = self
+        throttlingPopup.action = #selector(outputFrameThrottlingModeChanged(_:))
+        outputFrameThrottlingPopup = throttlingPopup
+        addView(throttlingRow, 28)
+        addView(
+            makeDescriptionLabel(
+                "Aggressive visibly batches heavy output, Balanced keeps throughput-friendly coalescing, and Continuous favors smoother scrolling.",
                 width: width
             ),
             28
@@ -709,6 +734,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     @objc private func outputConfirmedInputAnimationChanged(_ sender: NSButton) {
         var textInteraction = (configData["text_interaction"] as? [String: Any]) ?? [:]
         textInteraction["output_confirmed_input_animation"] = (sender.state == .on)
+        configData["text_interaction"] = textInteraction
+        commitConfigChange()
+    }
+
+    @objc private func outputFrameThrottlingModeChanged(_ sender: NSPopUpButton) {
+        let map = [
+            "Aggressive": OutputFrameThrottlingMode.aggressive.configuredValue,
+            "Balanced": OutputFrameThrottlingMode.balanced.configuredValue,
+            "Continuous": OutputFrameThrottlingMode.continuous.configuredValue
+        ]
+        var textInteraction = (configData["text_interaction"] as? [String: Any]) ?? [:]
+        textInteraction.removeValue(forKey: "output_frame_throttling_enabled")
+        textInteraction["output_frame_throttling_mode"] = map[sender.titleOfSelectedItem ?? "Balanced"] ?? OutputFrameThrottlingMode.balanced.configuredValue
         configData["text_interaction"] = textInteraction
         commitConfigChange()
     }

@@ -62,6 +62,7 @@ final class TypewriterSoundPlayer: NSObject, TypewriterKeyClicking, AVAudioPlaye
     private let soundURLs: [URL]
     private var variants: [SoundVariant] = []
     private var lastPlayedIndex: Int?
+    private var isEnabled = false
     var debugSoundFileCount: Int { soundURLs.count }
     var debugLoadedPlayerCount: Int { variants.reduce(0) { $0 + $1.players.count } }
 
@@ -80,9 +81,8 @@ final class TypewriterSoundPlayer: NSObject, TypewriterKeyClicking, AVAudioPlaye
     func configure(enabled: Bool) {
         dispatchPrecondition(condition: .onQueue(.main))
 
-        if enabled {
-            preloadIfNeeded()
-        } else {
+        isEnabled = enabled
+        if !enabled {
             unload()
         }
     }
@@ -110,6 +110,8 @@ final class TypewriterSoundPlayer: NSObject, TypewriterKeyClicking, AVAudioPlaye
 
     func playKeystroke() {
         dispatchPrecondition(condition: .onQueue(.main))
+        guard isEnabled else { return }
+        preloadIfNeeded()
         guard !variants.isEmpty else {
             assertionFailure("Typewriter keystroke audio was requested before preload")
             return

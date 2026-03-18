@@ -9,6 +9,13 @@ import QuartzCore
 /// for scrollback navigation, and delegates rendering to the MetalRenderer.
 /// Wrapped inside a TerminalScrollView for native macOS scrollbar behavior.
 final class TerminalView: MTKView, NSTextInputClient {
+    private struct PendingScrollSyncState {
+        let scrollbackRowCount: Int
+        let viewRows: Int
+        let scrollOffset: Int
+        let cellHeight: CGFloat
+    }
+
     private enum PreviewPolicy {
         static let maxCommittedTextPreviewCount = 30
         static let pendingIntentTimeout: CFTimeInterval = 0.60
@@ -83,6 +90,13 @@ final class TerminalView: MTKView, NSTextInputClient {
             keyboardHandler = nil
         }
     }
+    var outputFrameThrottlingMode: OutputFrameThrottlingMode = TextInteractionConfiguration.default.outputFrameThrottlingMode {
+        didSet {
+            guard outputFrameThrottlingMode != oldValue else { return }
+            requestDisplayUpdate()
+            updateOutputPulseTimer()
+        }
+    }
 
     /// Callback when user requests to go back to integrated view
     var onBackToIntegrated: (() -> Void)?
@@ -96,7 +110,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         didSet { toolTip = cmdClickTooltip }
     }
     /// Resolves terminal `[Image #x]` placeholders to locally stored pasted images.
-    var imagePreviewURLProvider: ((Int) -> URL?)?
+    var imagePreviewURLProvider: ((UUID, Int) -> URL?)?
 
     /// When true, rendering is demand-driven (only on model changes) instead of 60fps continuous.
     /// Used in split view to avoid overwhelming GPU with many independent display links.
@@ -185,7 +199,6 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var recentCommittedInsertions: [RecentCommittedInsertion] = []
     private var pendingCommittedTextIntents: [CommittedTextAnimationIntent] = []
     private var pendingTextInputHandled = false
-    private var scrollerSyncPending = true
     private var viewIsOpaque = false
     private var debugSuppressInterpretKeyEvents = false
 
@@ -196,6 +209,11 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var imagePreviewView: NSImageView?
     private var inlineImageLayers: [Int: CALayer] = [:]
     private var lastDrawnRenderContentVersion: UInt64 = 0
+    private var displayUpdateScheduled = false
+    private var scrollerSyncScheduled = false
+    private var pendingScrollSyncState: PendingScrollSyncState?
+    private var deferredDisplayUpdateWorkItem: DispatchWorkItem?
+    private var lastDisplaySubmissionTime: CFTimeInterval = 0
 
     var hasActiveImagePreviewWindow: Bool { imagePreviewWindow != nil }
     var debugInlineImageLayerCount: Int { inlineImageLayers.count }
@@ -208,6 +226,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     var debugHasKeyboardHandler: Bool { keyboardHandler != nil }
     var debugHasMarkedTextStorage: Bool { markedTextStorage != nil }
     var debugHasOutputPulseTimer: Bool { outputPulseTimer != nil }
+    var debugEffectiveDisplayUpdateFPSForTesting: Int { effectiveDisplayUpdateFPS() }
     var debugHasCommittedTextPreview: Bool { !activeCommittedTextPreviewOverlays().isEmpty }
     var debugCommittedTextPreviewCount: Int { committedTextPreviews.count }
     var debugPendingCommittedTextIntentCount: Int { pendingCommittedTextIntents.count }
@@ -393,8 +412,9 @@ final class TerminalView: MTKView, NSTextInputClient {
         metalLayer.pixelFormat = MetalRenderer.renderTargetPixelFormat
         metalLayer.isOpaque = viewIsOpaque
         if #available(macOS 10.13.2, *) {
-            metalLayer.maximumDrawableCount = 2
+            metalLayer.maximumDrawableCount = 3
         }
+        metalLayer.displaySyncEnabled = false
     }
 
     private func expectedDrawableSize(for scale: CGFloat) -> CGSize {
@@ -474,9 +494,12 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     private func scheduleIdleBufferRelease() {
         guard demandDrivenRendering, !renderingSuppressed else { return }
-        idleBufferReleaseTimer?.invalidate()
+        guard !isOutputActive else { return }
+        guard idleBufferReleaseTimer == nil else { return }
         let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
-            self?.releaseIdleReusableBuffersNow()
+            guard let self else { return }
+            self.idleBufferReleaseTimer = nil
+            self.releaseIdleReusableBuffersNow()
         }
         RunLoop.main.add(timer, forMode: .common)
         idleBufferReleaseTimer = timer
@@ -484,7 +507,8 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     private func releaseIdleReusableBuffersNow() {
         guard demandDrivenRendering, !renderingSuppressed else { return }
-        if window?.isKeyWindow == true, window?.firstResponder === self {
+        let isTransientTerminal = terminalController?.isTransient == true
+        if isOutputActive || (!isTransientTerminal && window?.isKeyWindow == true && window?.firstResponder === self) {
             scheduleIdleBufferRelease()
             return
         }
@@ -579,13 +603,11 @@ final class TerminalView: MTKView, NSTextInputClient {
             self?.resolvePendingCommittedTextIntentsIfNeeded()
             self?.requestDisplayUpdate()
             self?.updateMarkedTextOverlay()
-            self?.scrollerSyncPending = true
         }
         controller.onRenderingSuppressedChange = { [weak self] suppressed in
             self?.renderingSuppressed = suppressed
         }
         controller.notifyFocusChanged(window?.isKeyWindow == true)
-        scrollerSyncPending = true
         updateTerminalSize(notificationMode: .immediateOnly)
         updateCursorBlinkTimer()
         updateOutputPulseTimer()
@@ -684,6 +706,24 @@ final class TerminalView: MTKView, NSTextInputClient {
         inlineImageLayers.removeAll(keepingCapacity: false)
     }
 
+    func pruneInlineImageResources(ownerID: UUID, retaining liveIndices: Set<Int>) {
+        guard terminalController?.id == ownerID else { return }
+
+        if let hoveredImagePlaceholder,
+           hoveredImagePlaceholder.ownerID == ownerID,
+           !liveIndices.contains(hoveredImagePlaceholder.index) {
+            hideImagePreview()
+        }
+
+        let staleIndices = inlineImageLayers.keys.filter { !liveIndices.contains($0) }
+        guard !staleIndices.isEmpty else { return }
+        for index in staleIndices {
+            guard let layer = inlineImageLayers[index] else { continue }
+            layer.removeFromSuperlayer()
+            inlineImageLayers.removeValue(forKey: index)
+        }
+    }
+
     private func updateInlineImageLayers(with snapshot: TerminalController.RenderSnapshot) {
         guard imagePreviewURLProvider != nil,
               let renderer,
@@ -700,9 +740,9 @@ final class TerminalView: MTKView, NSTextInputClient {
 
         var activeIndices = Set<Int>()
         for placement in placements {
-            guard let registeredImage = PastedImageRegistry.shared.registeredImage(forPlaceholderIndex: placement.index),
-                  let image = TerminalInlineImageSupport.image(for: registeredImage.url),
-                  let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            guard let ownerID = placement.ownerID,
+                  let registeredImage = PastedImageRegistry.shared.registeredImage(ownerID: ownerID, forPlaceholderIndex: placement.index),
+                  let cgImage = TerminalInlineImageSupport.cgImage(for: registeredImage) else {
                 continue
             }
 
@@ -745,8 +785,68 @@ final class TerminalView: MTKView, NSTextInputClient {
             splitContainer.requestRender()
             return
         }
-        ensureDrawableStorageAllocatedIfNeeded()
-        setNeedsDisplay(bounds)
+        guard !displayUpdateScheduled else { return }
+        let now = CACurrentMediaTime()
+        let targetFPS = max(effectiveDisplayUpdateFPS(), 1)
+        let minimumInterval = 1.0 / Double(targetFPS)
+        let targetTime = max(now, lastDisplaySubmissionTime + minimumInterval)
+        displayUpdateScheduled = true
+
+        let scheduleDisplay = { [weak self] in
+            guard let self else { return }
+            self.ensureDrawableStorageAllocatedIfNeeded()
+            self.setNeedsDisplay(self.bounds)
+        }
+
+        if targetTime <= now + 0.0005 {
+            deferredDisplayUpdateWorkItem?.cancel()
+            deferredDisplayUpdateWorkItem = nil
+            scheduleDisplay()
+            return
+        }
+
+        let workItem = DispatchWorkItem(block: scheduleDisplay)
+        deferredDisplayUpdateWorkItem?.cancel()
+        deferredDisplayUpdateWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + (targetTime - now), execute: workItem)
+    }
+
+    private func effectiveDisplayUpdateFPS() -> Int {
+        guard isOutputActive,
+              pendingCommittedTextIntents.isEmpty,
+              !hasMarkedText() else {
+            return preferredFramesPerSecond
+        }
+        let baseFPS = terminalController?.isTransient == true ? 2.0 : 15.0
+        return scaledOutputFPS(baseFPS: baseFPS)
+    }
+
+    private func scaledOutputFPS(baseFPS: Double) -> Int {
+        let adjusted = baseFPS * outputFrameThrottlingMode.redrawCadenceCoefficient
+        let capped = min(adjusted, Double(outputFrameThrottlingMode.preferredOutputFPSCap))
+        return max(1, Int(capped.rounded()))
+    }
+
+    private func scaledOutputPulseInterval(baseInterval: TimeInterval) -> TimeInterval {
+        let floorInterval = 1.0 / Double(max(outputFrameThrottlingMode.preferredOutputFPSCap, 1))
+        return max(floorInterval, baseInterval / outputFrameThrottlingMode.redrawCadenceCoefficient)
+    }
+
+    private func scheduleScrollerSyncIfNeeded() {
+        guard pendingScrollSyncState != nil, !scrollerSyncScheduled else { return }
+        scrollerSyncScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.scrollerSyncScheduled = false
+            guard let state = self.pendingScrollSyncState else { return }
+            self.pendingScrollSyncState = nil
+            (self.enclosingScrollView as? TerminalScrollView)?.syncScroller(
+                scrollbackRowCount: state.scrollbackRowCount,
+                viewRows: state.viewRows,
+                scrollOffset: state.scrollOffset,
+                cellHeight: state.cellHeight
+            )
+        }
     }
 
     override func setNeedsDisplay(_ invalidRect: NSRect) {
@@ -777,6 +877,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         cursorBlinkTimer = nil
         guard demandDrivenRendering,
               !renderingSuppressed,
+              !isOutputActive,
               window?.isKeyWindow == true,
               let controller = terminalController else {
             return
@@ -796,7 +897,8 @@ final class TerminalView: MTKView, NSTextInputClient {
               isOutputActive else {
             return
         }
-        let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+        let interval = scaledOutputPulseInterval(baseInterval: 0.25)
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.requestDisplayUpdate()
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -962,7 +1064,8 @@ final class TerminalView: MTKView, NSTextInputClient {
         guard let controller = terminalController,
               let position = gridPosition(from: event),
               let placeholder = controller.detectedImagePlaceholder(at: position),
-              let imageURL = imagePreviewURLProvider?(placeholder.index) else {
+              let ownerID = placeholder.ownerID,
+              let imageURL = imagePreviewURLProvider?(ownerID, placeholder.index) else {
             hoveredImagePlaceholder = nil
             hideImagePreview()
             return
@@ -2203,9 +2306,13 @@ extension TerminalView: MTKViewDelegate {
         guard !renderingSuppressed,
               let renderer = renderer,
               let controller = terminalController else { return }
+        lastDisplaySubmissionTime = CACurrentMediaTime()
+        deferredDisplayUpdateWorkItem?.cancel()
+        deferredDisplayUpdateWorkItem = nil
 
         let currentVersion = controller.currentRenderContentVersion
         if controller.isInInterruptCatchUpMode && currentVersion == lastDrawnRenderContentVersion {
+            displayUpdateScheduled = false
             return
         }
 
@@ -2220,7 +2327,11 @@ extension TerminalView: MTKViewDelegate {
         let suppressCursorBlink = !committedTextPreviews.isEmpty || !pendingCommittedTextIntents.isEmpty || hasMarkedText()
         // Capture the exact visible frame under the controller read lock, then
         // release the lock before vertex building and Metal submission.
-        let snapshot = controller.captureRenderSnapshot()
+        guard let snapshot = controller.captureRenderSnapshotIfAvailable() else {
+            displayUpdateScheduled = false
+            requestDisplayUpdate()
+            return
+        }
         renderer.render(
             snapshot: snapshot,
             selection: selection,
@@ -2232,13 +2343,19 @@ extension TerminalView: MTKViewDelegate {
             suppressCursorBlink: suppressCursorBlink,
             in: view
         )
-        updateInlineImageLayers(with: snapshot)
-        lastDrawnRenderContentVersion = currentVersion
+        pendingScrollSyncState = PendingScrollSyncState(
+            scrollbackRowCount: snapshot.scrollbackRowCount,
+            viewRows: snapshot.rows,
+            scrollOffset: snapshot.scrollOffset,
+            cellHeight: renderer.glyphAtlas.cellHeight
+        )
+        scheduleScrollerSyncIfNeeded()
+        lastDrawnRenderContentVersion = snapshot.contentVersion
         scheduleIdleBufferRelease()
-
-        if scrollerSyncPending {
-            (enclosingScrollView as? TerminalScrollView)?.syncScroller()
-            scrollerSyncPending = false
+        displayUpdateScheduled = false
+        if !isOutputActive,
+           controller.currentRenderContentVersion != snapshot.contentVersion {
+            requestDisplayUpdate()
         }
     }
 }
@@ -2597,6 +2714,60 @@ final class TerminalScrollView: NSScrollView {
         // scroll positioning (which differs by sub-line pixel amounts).
         let currentY = self.contentView.bounds.origin.y
         if abs(currentY - targetY) > cellH {
+            self.contentView.setBoundsOrigin(NSPoint(x: 0, y: targetY))
+            self.reflectScrolledClipView(self.contentView)
+        }
+
+        pinTerminalViewToViewport()
+        lastScrollSyncSignature = signature
+    }
+
+    func syncScroller(snapshot: TerminalController.RenderSnapshot, cellHeight: CGFloat) {
+        syncScroller(
+            scrollbackRowCount: snapshot.scrollbackRowCount,
+            viewRows: snapshot.rows,
+            scrollOffset: snapshot.scrollOffset,
+            cellHeight: cellHeight
+        )
+    }
+
+    func syncScroller(scrollbackRowCount sbCount: Int, viewRows: Int, scrollOffset: Int, cellHeight: CGFloat) {
+        guard cellHeight > 0 else { return }
+
+        let totalRows = sbCount + viewRows
+        let viewportHeight = bounds.height
+        let documentHeight = max(viewportHeight, CGFloat(totalRows) * cellHeight)
+        let signature = ScrollSyncSignature(
+            scrollbackRowCount: sbCount,
+            viewRows: viewRows,
+            scrollOffset: scrollOffset,
+            viewportSize: bounds.size,
+            cellHeight: cellHeight
+        )
+        let targetFrame = NSRect(origin: contentView.bounds.origin, size: contentView.bounds.size)
+        if lastScrollSyncSignature == signature, terminalView.frame == targetFrame {
+            return
+        }
+
+        isSyncing = true
+        defer { isSyncing = false }
+
+        let docView = self.documentView!
+        if abs(docView.frame.height - documentHeight) > 1 {
+            docView.frame = NSRect(x: 0, y: 0, width: self.bounds.width, height: documentHeight)
+            self.reflectScrolledClipView(self.contentView)
+        }
+
+        let maxY = documentHeight - viewportHeight
+        let targetY: CGFloat
+        if sbCount > 0 {
+            targetY = maxY * CGFloat(sbCount - scrollOffset) / CGFloat(sbCount)
+        } else {
+            targetY = maxY
+        }
+
+        let currentY = self.contentView.bounds.origin.y
+        if abs(currentY - targetY) > cellHeight {
             self.contentView.setBoundsOrigin(NSPoint(x: 0, y: targetY))
             self.reflectScrolledClipView(self.contentView)
         }

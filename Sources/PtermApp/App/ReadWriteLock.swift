@@ -23,6 +23,19 @@ final class ReadWriteLock {
         return try body()
     }
 
+    func tryWithReadLock<T>(_ body: () throws -> T) rethrows -> T? {
+        let result = pthread_rwlock_tryrdlock(&rawLock)
+        if result == EBUSY {
+            return nil
+        }
+        precondition(result == 0, "pthread_rwlock_tryrdlock failed: \(result)")
+        defer {
+            let unlockResult = pthread_rwlock_unlock(&rawLock)
+            precondition(unlockResult == 0, "pthread_rwlock_unlock failed: \(unlockResult)")
+        }
+        return try body()
+    }
+
     func withWriteLock<T>(_ body: () throws -> T) rethrows -> T {
         let result = pthread_rwlock_wrlock(&rawLock)
         precondition(result == 0, "pthread_rwlock_wrlock failed: \(result)")

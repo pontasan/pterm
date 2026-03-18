@@ -1052,7 +1052,7 @@ final class TerminalModelRegressionTests: XCTestCase {
             captured = (index, data, format, width, height, columns, rows)
         }
 
-        harness.model.handleKittyGraphicsAPCPayload("Gi=7,a=T,f=100,t=d,s=2,v=1,c=4,r=3;\(payload)")
+        harness.model.handleKittyGraphicsAPCPayloadString("Gi=7,a=T,f=100,t=d,s=2,v=1,c=4,r=3;\(payload)")
 
         XCTAssertEqual(captured?.index, 7)
         XCTAssertEqual(captured?.data, expectedPayload)
@@ -1068,6 +1068,75 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(anchor.imageRows, 3)
         XCTAssertEqual(anchor.imageOriginColOffset, 0)
         XCTAssertEqual(anchor.imageOriginRowOffset, 0)
+    }
+
+    func testTerminalModelKittyGraphicsPayloadAccumulatesChunkedDirectTransfer() {
+        let harness = TerminalModelHarness()
+        let expectedPayload = Data([0x89, 0x50, 0x4E, 0x47, 0xAA, 0xBB, 0xCC, 0xDD])
+        let encoded = expectedPayload.base64EncodedString()
+        let splitIndex = encoded.index(encoded.startIndex, offsetBy: encoded.count / 2)
+        let firstHalf = String(encoded[..<splitIndex])
+        let secondHalf = String(encoded[splitIndex...])
+        var captures: [(Int, Data)] = []
+        harness.model.onKittyImagePayload = { index, data, _, _, _, _, _ in
+            captures.append((index, data))
+        }
+
+        harness.model.handleKittyGraphicsAPCPayloadString("Gi=9,a=T,f=100,t=d,m=1;\(firstHalf)")
+        XCTAssertTrue(captures.isEmpty)
+
+        harness.model.handleKittyGraphicsAPCPayloadString("Gi=9,a=T,f=100,t=d,m=0;\(secondHalf)")
+        XCTAssertEqual(captures.count, 1)
+        XCTAssertEqual(captures.first?.0, 9)
+        XCTAssertEqual(captures.first?.1, expectedPayload)
+    }
+
+    func testTerminalModelKittyGraphicsPayloadLoadsFileTransfer() throws {
+        let harness = TerminalModelHarness()
+        let expectedPayload = Data([0x89, 0x50, 0x4E, 0x47, 0x11, 0x22, 0x33, 0x44])
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pterm-kitty-graphics-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("sample.png")
+        try expectedPayload.write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let encodedPath = Data(fileURL.path.utf8).base64EncodedString()
+        var captured: (index: Int, data: Data, format: TerminalImagePayloadFormat)?
+        harness.model.onKittyImagePayload = { index, data, format, _, _, _, _ in
+            captured = (index, data, format)
+        }
+
+        harness.model.handleKittyGraphicsAPCPayloadString("Gi=5,a=T,f=100,t=f;\(encodedPath)")
+
+        XCTAssertEqual(captured?.index, 5)
+        XCTAssertEqual(captured?.data, expectedPayload)
+        XCTAssertEqual(captured?.format, .png)
+    }
+
+    func testTerminalModelKittyGraphicsDeferredJobUsesSpoolFileAndCleansItUp() throws {
+        let harness = TerminalModelHarness()
+        let expectedPayload = Data([0x89, 0x50, 0x4E, 0x47, 0x55, 0x66, 0x77, 0x88])
+        let command = "Gi=12,a=T,f=100,t=d;\(expectedPayload.base64EncodedString())"
+        let commandBytes = Array(command.utf8)
+        var captured: Data?
+        harness.model.onKittyImagePayload = { _, data, _, _, _, _, _ in
+            captured = data
+        }
+
+        let job = commandBytes.withUnsafeBufferPointer { buffer in
+            harness.model.handleKittyGraphicsAPCPayload(buffer)
+        }
+
+        guard let job else {
+            XCTFail("expected deferred kitty image job")
+            return
+        }
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: job.encodedPayloadFileURL.path))
+        harness.model.executeDeferredKittyImagePayload(job)
+        XCTAssertEqual(captured, expectedPayload)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: job.encodedPayloadFileURL.path))
     }
 
     func testTerminalModelSaveRestoreCursorRoundTripsPositionAndAttributes() {

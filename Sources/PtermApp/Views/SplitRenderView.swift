@@ -11,6 +11,10 @@ import MetalKit
 /// Event handling (keyboard, mouse, IME) remains on the individual TerminalViews
 /// underneath. This view passes all hit-test events through (hitTest returns nil).
 final class SplitRenderView: MTKView {
+    private struct InlineImageLayerID {
+        let ownerID: UUID
+        let index: Int
+    }
     /// Reference to a terminal cell in the split grid.
     /// Holds a weak reference to TerminalView so live state (selection, border) is read each frame.
     struct CellRef {
@@ -31,10 +35,18 @@ final class SplitRenderView: MTKView {
             requestRender()
         }
     }
+    var outputFrameThrottlingMode: OutputFrameThrottlingMode = TextInteractionConfiguration.default.outputFrameThrottlingMode {
+        didSet {
+            guard outputFrameThrottlingMode != oldValue else { return }
+            updateOutputPulseTimer()
+            requestRender()
+        }
+    }
     private var viewIsOpaque = false
     private var idleBufferReleaseTimer: Timer?
     private var outputPulseTimer: Timer?
     private var inlineImageLayers: [String: CALayer] = [:]
+    private var inlineImageLayerIDs: [String: InlineImageLayerID] = [:]
 
     var debugHasOutputPulseTimer: Bool { outputPulseTimer != nil }
     var debugInlineImageLayerCount: Int { inlineImageLayers.count }
@@ -114,7 +126,9 @@ final class SplitRenderView: MTKView {
         outputPulseTimer?.invalidate()
         outputPulseTimer = nil
         guard hasActiveOutput else { return }
-        let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+        let floorInterval = 1.0 / Double(max(outputFrameThrottlingMode.preferredOutputFPSCap, 1))
+        let interval = max(floorInterval, 0.25 / outputFrameThrottlingMode.redrawCadenceCoefficient)
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.requestRender()
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -139,6 +153,20 @@ final class SplitRenderView: MTKView {
     private func clearInlineImageLayers() {
         inlineImageLayers.values.forEach { $0.removeFromSuperlayer() }
         inlineImageLayers.removeAll(keepingCapacity: false)
+        inlineImageLayerIDs.removeAll(keepingCapacity: false)
+    }
+
+    func pruneInlineImageResources(ownerID: UUID, retaining liveIndices: Set<Int>) {
+        let staleKeys = inlineImageLayerIDs.compactMap { key, layerID -> String? in
+            guard layerID.ownerID == ownerID, !liveIndices.contains(layerID.index) else { return nil }
+            return key
+        }
+        guard !staleKeys.isEmpty else { return }
+        for key in staleKeys {
+            inlineImageLayers[key]?.removeFromSuperlayer()
+            inlineImageLayers.removeValue(forKey: key)
+            inlineImageLayerIDs.removeValue(forKey: key)
+        }
     }
 
     private func updateInlineImageLayers(using snapshots: [(cellRect: NSRect, snapshot: TerminalController.RenderSnapshot)]) {
@@ -150,13 +178,13 @@ final class SplitRenderView: MTKView {
         var activeKeys = Set<String>()
         for item in snapshots {
             for placement in TerminalInlineImageSupport.detectPlacements(in: item.snapshot) {
-                guard let registeredImage = PastedImageRegistry.shared.registeredImage(forPlaceholderIndex: placement.index),
-                      let image = TerminalInlineImageSupport.image(for: registeredImage.url),
-                      let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                guard let ownerID = placement.ownerID,
+                      let registeredImage = PastedImageRegistry.shared.registeredImage(ownerID: ownerID, forPlaceholderIndex: placement.index),
+                      let cgImage = TerminalInlineImageSupport.cgImage(for: registeredImage) else {
                     continue
                 }
 
-                let key = "\(ObjectIdentifier(hostLayer).hashValue)-\(placement.index)-\(Int(item.cellRect.origin.x))-\(Int(item.cellRect.origin.y))"
+                let key = "\(ObjectIdentifier(hostLayer).hashValue)-\(ownerID.uuidString)-\(placement.index)-\(Int(item.cellRect.origin.x))-\(Int(item.cellRect.origin.y))"
                 activeKeys.insert(key)
                 let frame = TerminalInlineImageSupport.frame(
                     for: placement,
@@ -175,6 +203,7 @@ final class SplitRenderView: MTKView {
                     layer.backgroundColor = NSColor.black.cgColor
                     hostLayer.addSublayer(layer)
                     inlineImageLayers[key] = layer
+                    inlineImageLayerIDs[key] = InlineImageLayerID(ownerID: ownerID, index: placement.index)
                     return layer
                 }()
                 imageLayer.frame = frame
@@ -188,6 +217,7 @@ final class SplitRenderView: MTKView {
             guard let layer = inlineImageLayers[key] else { continue }
             layer.removeFromSuperlayer()
             inlineImageLayers.removeValue(forKey: key)
+            inlineImageLayerIDs.removeValue(forKey: key)
         }
     }
 
@@ -344,8 +374,9 @@ final class SplitRenderView: MTKView {
         metalLayer.pixelFormat = MetalRenderer.renderTargetPixelFormat
         metalLayer.isOpaque = viewIsOpaque
         if #available(macOS 10.13.2, *) {
-            metalLayer.maximumDrawableCount = 2
+            metalLayer.maximumDrawableCount = 3
         }
+        metalLayer.displaySyncEnabled = false
     }
 }
 
@@ -379,8 +410,6 @@ extension SplitRenderView: MTKViewDelegate {
         let sf = Float(renderer.glyphAtlas.scaleFactor)
 
         let viewHeight = bounds.height
-        var renderedSnapshots: [(cellRect: NSRect, snapshot: TerminalController.RenderSnapshot)] = []
-        renderedSnapshots.reserveCapacity(cellRefs.count)
 
         for ref in cellRefs {
             // Read live state from TerminalView each frame
@@ -404,7 +433,6 @@ extension SplitRenderView: MTKViewDelegate {
             // The snapshot must be captured before rendering so split terminals
             // all read coherent controller state without holding locks in Metal work.
             let snapshot = ref.controller.captureRenderSnapshot()
-            renderedSnapshots.append((cellRect: ref.frame, snapshot: snapshot))
             renderer.renderSplitCell(
                 snapshot: snapshot,
                 selection: selection,
@@ -423,7 +451,6 @@ extension SplitRenderView: MTKViewDelegate {
         encoder.endEncoding()
         commandBuffer.present(drawable)
         commandBuffer.commit()
-        updateInlineImageLayers(using: renderedSnapshots)
         scheduleIdleBufferRelease()
     }
 }

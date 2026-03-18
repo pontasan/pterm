@@ -100,12 +100,48 @@ struct ShellLaunchConfiguration: Equatable {
 
 struct TextInteractionConfiguration: Equatable {
     let outputConfirmedInputAnimation: Bool
+    let outputFrameThrottlingMode: OutputFrameThrottlingMode
     let typewriterSoundEnabled: Bool
 
     static let `default` = TextInteractionConfiguration(
         outputConfirmedInputAnimation: true,
+        outputFrameThrottlingMode: .continuous,
         typewriterSoundEnabled: true
     )
+}
+
+enum OutputFrameThrottlingMode: String, Equatable {
+    case aggressive
+    case balanced
+    case continuous
+
+    init?(configuredValue: String) {
+        self.init(rawValue: configuredValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
+    var configuredValue: String { rawValue }
+
+    var redrawCadenceCoefficient: Double {
+        switch self {
+        case .aggressive:
+            return 0.5
+        case .balanced:
+            return 1.0
+        case .continuous:
+            return 50.0
+        }
+    }
+
+    var preferredOutputFPSCap: Int {
+        switch self {
+        case .aggressive:
+            return 30
+        case .balanced:
+            return 60
+        case .continuous:
+            return 100
+        }
+    }
 }
 
 struct MCPServerConfiguration: Equatable {
@@ -277,6 +313,16 @@ enum PtermConfigStore {
             ),
             textInteraction: TextInteractionConfiguration(
                 outputConfirmedInputAnimation: boolValue(textInteraction?["output_confirmed_input_animation"]) ?? defaults.textInteraction.outputConfirmedInputAnimation,
+                outputFrameThrottlingMode: {
+                    if let string = stringValue(textInteraction?["output_frame_throttling_mode"]),
+                       let mode = OutputFrameThrottlingMode(configuredValue: string) {
+                        return mode
+                    }
+                    if let legacyEnabled = boolValue(textInteraction?["output_frame_throttling_enabled"]) {
+                        return legacyEnabled ? .balanced : .continuous
+                    }
+                    return defaults.textInteraction.outputFrameThrottlingMode
+                }(),
                 typewriterSoundEnabled: boolValue(textInteraction?["typewriter_sound_enabled"]) ?? defaults.textInteraction.typewriterSoundEnabled
             ),
             fontName: stringValue(font?["name"]) ?? stringValue(root["font_name"]),

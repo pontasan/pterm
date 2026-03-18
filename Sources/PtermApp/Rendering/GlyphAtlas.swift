@@ -29,8 +29,12 @@ final class GlyphAtlas {
     /// Glyph metrics cache. Last-access tracking lives inside GlyphInfo so the
     /// atlas does not pay for a second dictionary keyed by the same codepoints.
     private(set) var glyphCache: [UInt32: GlyphInfo] = [:]
-    private(set) var clusterGlyphCache: [String: GlyphInfo] = [:]
-    private(set) var colorClusterGlyphCache: [String: GlyphInfo] = [:]
+    private var asciiGlyphCache: ContiguousArray<GlyphInfo?> = ContiguousArray(repeating: nil, count: 128)
+    private(set) var clusterGlyphCache: [Cell.GraphemeCacheKey: GlyphInfo] = [:]
+    private(set) var colorClusterGlyphCache: [Cell.GraphemeCacheKey: GlyphInfo] = [:]
+    private var resolvedBMPFontCache: ContiguousArray<CTFont?> = ContiguousArray(repeating: nil, count: 0x10000)
+    private var resolvedBMPGlyphCache: ContiguousArray<CGGlyph> = ContiguousArray(repeating: 0, count: 0x10000)
+    private var resolvedBMPFontKnown: ContiguousArray<Bool> = ContiguousArray(repeating: false, count: 0x10000)
     private var accessGeneration: UInt64 = 0
     private(set) var atlasRevision: UInt64 = 0
 
@@ -111,7 +115,6 @@ final class GlyphAtlas {
         let defaultFont = Self.makeTerminalFont(size: fontSize)
         self.ctFont = defaultFont
         self.fontName = CTFontCopyPostScriptName(self.ctFont) as String
-
         calculateCellMetrics()
         if prerasterizeASCII {
             rebuildAtlas()
@@ -186,6 +189,12 @@ final class GlyphAtlas {
     /// Get glyph info for a codepoint, rasterizing if not cached.
     func glyphInfo(for codepoint: UInt32) -> GlyphInfo? {
         accessGeneration &+= 1
+        if codepoint < 128, var cached = asciiGlyphCache[Int(codepoint)] {
+            cached.lastAccessGeneration = accessGeneration
+            asciiGlyphCache[Int(codepoint)] = cached
+            glyphCache[codepoint] = cached
+            return cached
+        }
         if var cached = glyphCache[codepoint] {
             cached.lastAccessGeneration = accessGeneration
             glyphCache[codepoint] = cached
@@ -194,29 +203,31 @@ final class GlyphAtlas {
         return rasterizeGlyph(codepoint: codepoint, allowAtlasGrowth: true)
     }
 
-    func glyphInfo(for text: String) -> GlyphInfo? {
-        guard !text.isEmpty else { return nil }
-        if text.unicodeScalars.count == 1, let scalar = text.unicodeScalars.first {
-            return glyphInfo(for: scalar.value)
-        }
+    func glyphInfo(for key: Cell.GraphemeCacheKey) -> GlyphInfo? {
         accessGeneration &+= 1
-        if var cached = clusterGlyphCache[text] {
+        if key.count == 1 {
+            return glyphInfo(for: key.scalar0)
+        }
+        if var cached = clusterGlyphCache[key] {
             cached.lastAccessGeneration = accessGeneration
-            clusterGlyphCache[text] = cached
+            clusterGlyphCache[key] = cached
             return cached
         }
-        return rasterizeGlyph(text: text, cacheKey: text, allowAtlasGrowth: true)
+        let text = key.renderedString()
+        guard !text.isEmpty else { return nil }
+        return rasterizeGlyph(text: text, cacheKey: key, allowAtlasGrowth: true)
     }
 
-    func colorGlyphInfo(for text: String) -> GlyphInfo? {
-        guard !text.isEmpty else { return nil }
+    func colorGlyphInfo(for key: Cell.GraphemeCacheKey) -> GlyphInfo? {
         accessGeneration &+= 1
-        if var cached = colorClusterGlyphCache[text] {
+        if var cached = colorClusterGlyphCache[key] {
             cached.lastAccessGeneration = accessGeneration
-            colorClusterGlyphCache[text] = cached
+            colorClusterGlyphCache[key] = cached
             return cached
         }
-        return rasterizeColorGlyph(text: text, cacheKey: text, allowAtlasGrowth: true)
+        let text = key.renderedString()
+        guard !text.isEmpty else { return nil }
+        return rasterizeColorGlyph(text: text, cacheKey: key, allowAtlasGrowth: true)
     }
 
     /// Rasterize a single glyph and add it to the atlas.
@@ -224,20 +235,15 @@ final class GlyphAtlas {
     private func rasterizeGlyph(codepoint: UInt32, allowAtlasGrowth: Bool) -> GlyphInfo? {
         guard let scalar = Unicode.Scalar(codepoint) else { return nil }
 
-        // Get glyph from Core Text (handles font fallback for CJK automatically)
-        let string = String(Character(scalar)) as CFString
-        let attrString = CFAttributedStringCreate(
-            nil, string,
-            [kCTFontAttributeName: ctFont] as CFDictionary
-        )!
-        let line = CTLineCreateWithAttributedString(attrString)
-        let runs = CTLineGetGlyphRuns(line) as! [CTRun]
-
-        guard let run = runs.first else { return nil }
-        let runFont = (CTRunGetAttributes(run) as NSDictionary)[kCTFontAttributeName as String] as! CTFont
-
-        var glyph: CGGlyph = 0
-        CTRunGetGlyphs(run, CFRangeMake(0, 1), &glyph)
+        let run: (font: CTFont, glyph: CGGlyph)?
+        if codepoint <= 0xFFFF {
+            run = resolvedBMPFontAndGlyph(for: codepoint)
+        } else {
+            run = resolvedRunFontAndGlyph(for: scalar)
+        }
+        guard let run else { return nil }
+        let runFont = run.font
+        var glyph = run.glyph
 
         // Get glyph bounding box
         var boundingRect = CGRect.zero
@@ -284,89 +290,82 @@ final class GlyphAtlas {
         }
 
         // Rasterize glyph to bitmap
-        let colorSpace = CGColorSpace(name: CGColorSpace.linearGray) ?? CGColorSpaceCreateDeviceGray()
-        guard let context = CGContext(
-            data: nil,
-            width: pixelW,
-            height: pixelH,
-            bitsPerComponent: 8,
-            bytesPerRow: pixelW,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.none.rawValue
-        ) else { return nil }
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        var bitmap = ContiguousArray<UInt8>(repeating: 0, count: pixelW * pixelH)
+        let metrics = bitmap.withUnsafeMutableBytes { rawBytes -> (renderPixelWidth: Int, renderPixelHeight: Int, displayPadding: Float, cellOffsetX: Float, baselineOffset: Float)? in
+            guard let baseAddress = rawBytes.baseAddress,
+                  let context = CGContext(
+                    data: baseAddress,
+                    width: pixelW,
+                    height: pixelH,
+                    bitsPerComponent: 8,
+                    bytesPerRow: pixelW,
+                    space: colorSpace,
+                    bitmapInfo: CGImageAlphaInfo.none.rawValue
+                  ) else {
+                return nil
+            }
 
-        // Terminal glyphs need stable grayscale coverage, especially when composited
-        // over translucent backgrounds on lower-DPI displays. Disable font smoothing
-        // and subpixel positioning so the atlas stores predictable monochrome coverage
-        // rather than display-specific LCD assumptions.
-        context.setAllowsAntialiasing(true)
-        context.setShouldAntialias(true)
-        context.setAllowsFontSmoothing(false)
-        context.setShouldSmoothFonts(false)
-        context.setAllowsFontSubpixelPositioning(false)
-        context.setShouldSubpixelPositionFonts(false)
-        context.setAllowsFontSubpixelQuantization(false)
-        context.setShouldSubpixelQuantizeFonts(false)
-        context.scaleBy(x: scale, y: scale)
-        context.setFillColor(gray: 0, alpha: 1)
-        context.fill(CGRect(x: 0, y: 0, width: CGFloat(pixelW) / scale,
-                           height: CGFloat(pixelH) / scale))
+            // Terminal glyphs need stable grayscale coverage, especially when composited
+            // over translucent backgrounds on lower-DPI displays. Disable font smoothing
+            // and subpixel positioning so the atlas stores predictable monochrome coverage
+            // rather than display-specific LCD assumptions.
+            context.setAllowsAntialiasing(true)
+            context.setShouldAntialias(true)
+            context.setAllowsFontSmoothing(false)
+            context.setShouldSmoothFonts(false)
+            context.setAllowsFontSubpixelPositioning(false)
+            context.setShouldSubpixelPositionFonts(false)
+            context.setAllowsFontSubpixelQuantization(false)
+            context.setShouldSubpixelQuantizeFonts(false)
+            context.scaleBy(x: scale, y: scale)
 
-        // Draw glyph
-        context.setFillColor(gray: 1, alpha: 1)
-        let padding = CGFloat(paddingPixels) / scale
-        let drawX = -boundingRect.origin.x + padding
-        // Snap the baseline to an integer pixel boundary within the bitmap.
-        // Without this, different glyphs have non-integer baseline offsets in
-        // the bitmap, causing ±1px visual misalignment with nearest-neighbor sampling.
-        // Use the font's shared baseline within a fixed-height cell bitmap.
-        // This avoids glyph-specific top/bottom boxes leaking into terminal row
-        // placement, which is what causes letters like "m", "d", and "t" to
-        // drift relative to each other on 1x displays.
-        let drawY = ceil((baseline * scale) + CGFloat(paddingPixels)) / scale
+            // Draw glyph into a zeroed grayscale bitmap to avoid an extra CoreGraphics fill pass.
+            context.setFillColor(gray: 1, alpha: 1)
+            let padding = CGFloat(paddingPixels) / scale
+            let drawX = -boundingRect.origin.x + padding
+            let drawY = ceil((baseline * scale) + CGFloat(paddingPixels)) / scale
 
-        var position = CGPoint(x: drawX, y: drawY)
-        CTFontDrawGlyphs(runFont, &glyph, &position, 1, context)
+            var position = CGPoint(x: drawX, y: drawY)
+            CTFontDrawGlyphs(runFont, &glyph, &position, 1, context)
 
-        // Upload to atlas texture
-        guard let data = context.data else { return nil }
-        ensureAtlasTexture()
-        let region = MTLRegionMake2D(packX, packY, pixelW, pixelH)
-        texture?.replace(region: region, mipmapLevel: 0,
-                        withBytes: data, bytesPerRow: pixelW)
+            ensureAtlasTexture()
+            let region = MTLRegionMake2D(packX, packY, pixelW, pixelH)
+            texture?.replace(region: region, mipmapLevel: 0, withBytes: baseAddress, bytesPerRow: pixelW)
 
-        // Keep display metrics derived from the actual oversampled bitmap so the
-        // top/baseline relationship survives the downscale exactly.
-        let renderPixelWidth = max(1, Int(round(CGFloat(pixelW) * displayScale / scale)))
-        let renderPixelHeight = max(1, Int(round(CGFloat(pixelH) * displayScale / scale)))
-        let displayPadding = Float((CGFloat(paddingPixels) * displayScale) / scale)
-        let cellOffsetX = Float(
-            (((cellWidth - advance.width) * 0.5) + boundingRect.origin.x) * displayScale
-        )
-        // The baseline offset now comes from the shared cell baseline, not a
-        // glyph-specific bounding box. That keeps every ASCII glyph aligned to
-        // the same terminal row baseline across displays.
-        let baselineOffset = min(
-            Float(renderPixelHeight),
-            max(0, ((Float(pixelH) / Float(scale)) - Float(drawY)) * Float(displayScale))
-        )
+            let renderPixelWidth = max(1, Int(round(CGFloat(pixelW) * displayScale / scale)))
+            let renderPixelHeight = max(1, Int(round(CGFloat(pixelH) * displayScale / scale)))
+            let displayPadding = Float((CGFloat(paddingPixels) * displayScale) / scale)
+            let cellOffsetX = Float(
+                (((cellWidth - advance.width) * 0.5) + boundingRect.origin.x) * displayScale
+            )
+            let baselineOffset = min(
+                Float(renderPixelHeight),
+                max(0, ((Float(pixelH) / Float(scale)) - Float(drawY)) * Float(displayScale))
+            )
+            return (renderPixelWidth, renderPixelHeight, displayPadding, cellOffsetX, baselineOffset)
+        }
+        guard let metrics else { return nil }
 
         let info = GlyphInfo(
             textureX: Float(packX) / Float(atlasPixelW),
             textureY: Float(packY) / Float(atlasPixelH),
             textureW: Float(pixelW) / Float(atlasPixelW),
             textureH: Float(pixelH) / Float(atlasPixelH),
-            cellOffsetX: cellOffsetX,
-            bitmapPadding: displayPadding,
+            cellOffsetX: metrics.cellOffsetX,
+            bitmapPadding: metrics.displayPadding,
             bearingX: Float(boundingRect.origin.x),
-            baselineOffset: baselineOffset,
-            pixelWidth: renderPixelWidth,
-            pixelHeight: renderPixelHeight,
+            baselineOffset: metrics.baselineOffset,
+            pixelWidth: metrics.renderPixelWidth,
+            pixelHeight: metrics.renderPixelHeight,
             advance: Float(advance.width),
             lastAccessGeneration: accessGeneration
         )
 
         glyphCache[codepoint] = info
+        if codepoint < 128 {
+            asciiGlyphCache[Int(codepoint)] = info
+        }
 
         // Advance pack position
         packX += pixelW + 1
@@ -375,8 +374,69 @@ final class GlyphAtlas {
         return info
     }
 
+    private func resolvedBMPFontAndGlyph(for codepoint: UInt32) -> (font: CTFont, glyph: CGGlyph)? {
+        let index = Int(codepoint)
+
+        if resolvedBMPFontKnown[index] {
+            guard let font = resolvedBMPFontCache[index] else { return nil }
+            let glyph = resolvedBMPGlyphCache[index]
+            guard glyph != 0 else {
+                return nil
+            }
+            return (font, glyph)
+        }
+
+        let character = UniChar(codepoint)
+        var characters = [character]
+        var glyph: CGGlyph = 0
+        if CTFontGetGlyphsForCharacters(ctFont, &characters, &glyph, 1), glyph != 0 {
+            resolvedBMPFontCache[index] = ctFont
+            resolvedBMPGlyphCache[index] = glyph
+            resolvedBMPFontKnown[index] = true
+            return (ctFont, glyph)
+        }
+
+        guard let scalar = Unicode.Scalar(codepoint) else {
+            resolvedBMPFontKnown[index] = true
+            resolvedBMPFontCache[index] = nil
+            return nil
+        }
+        let string = String(Character(scalar)) as CFString
+        let fallbackFont = CTFontCreateForString(ctFont, string, CFRangeMake(0, 1))
+
+        glyph = 0
+        if CTFontGetGlyphsForCharacters(fallbackFont, &characters, &glyph, 1), glyph != 0 {
+            resolvedBMPFontCache[index] = fallbackFont
+            resolvedBMPGlyphCache[index] = glyph
+            resolvedBMPFontKnown[index] = true
+            return (fallbackFont, glyph)
+        }
+
+        resolvedBMPFontKnown[index] = true
+        resolvedBMPFontCache[index] = nil
+        resolvedBMPGlyphCache[index] = 0
+        return nil
+    }
+
+    private func resolvedRunFontAndGlyph(for scalar: Unicode.Scalar) -> (font: CTFont, glyph: CGGlyph)? {
+        let string = String(Character(scalar)) as CFString
+        let attrString = CFAttributedStringCreate(
+            nil,
+            string,
+            [kCTFontAttributeName: ctFont] as CFDictionary
+        )!
+        let line = CTLineCreateWithAttributedString(attrString)
+        let runs = CTLineGetGlyphRuns(line) as! [CTRun]
+        guard let run = runs.first else { return nil }
+        let runFont = (CTRunGetAttributes(run) as NSDictionary)[kCTFontAttributeName as String] as! CTFont
+        var glyph: CGGlyph = 0
+        CTRunGetGlyphs(run, CFRangeMake(0, 1), &glyph)
+        guard glyph != 0 else { return nil }
+        return (runFont, glyph)
+    }
+
     @discardableResult
-    private func rasterizeGlyph(text: String, cacheKey: String, allowAtlasGrowth: Bool) -> GlyphInfo? {
+    private func rasterizeGlyph(text: String, cacheKey: Cell.GraphemeCacheKey, allowAtlasGrowth: Bool) -> GlyphInfo? {
         let attrString = CFAttributedStringCreate(
             nil,
             text as CFString,
@@ -409,61 +469,66 @@ final class GlyphAtlas {
             return clusterGlyphCache[cacheKey]
         }
 
-        let colorSpace = CGColorSpace(name: CGColorSpace.linearGray) ?? CGColorSpaceCreateDeviceGray()
-        guard let context = CGContext(
-            data: nil,
-            width: pixelW,
-            height: pixelH,
-            bitsPerComponent: 8,
-            bytesPerRow: pixelW,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.none.rawValue
-        ) else { return nil }
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        var bitmap = ContiguousArray<UInt8>(repeating: 0, count: pixelW * pixelH)
+        let metrics = bitmap.withUnsafeMutableBytes { rawBytes -> (renderPixelWidth: Int, renderPixelHeight: Int, displayPadding: Float, cellOffsetX: Float, baselineOffset: Float)? in
+            guard let baseAddress = rawBytes.baseAddress,
+                  let context = CGContext(
+                    data: baseAddress,
+                    width: pixelW,
+                    height: pixelH,
+                    bitsPerComponent: 8,
+                    bytesPerRow: pixelW,
+                    space: colorSpace,
+                    bitmapInfo: CGImageAlphaInfo.none.rawValue
+                  ) else {
+                return nil
+            }
 
-        context.setAllowsAntialiasing(true)
-        context.setShouldAntialias(true)
-        context.setAllowsFontSmoothing(false)
-        context.setShouldSmoothFonts(false)
-        context.setAllowsFontSubpixelPositioning(false)
-        context.setShouldSubpixelPositionFonts(false)
-        context.setAllowsFontSubpixelQuantization(false)
-        context.setShouldSubpixelQuantizeFonts(false)
-        context.scaleBy(x: scale, y: scale)
-        context.setFillColor(gray: 0, alpha: 1)
-        context.fill(CGRect(x: 0, y: 0, width: CGFloat(pixelW) / scale, height: CGFloat(pixelH) / scale))
-        context.setFillColor(gray: 1, alpha: 1)
+            context.setAllowsAntialiasing(true)
+            context.setShouldAntialias(true)
+            context.setAllowsFontSmoothing(false)
+            context.setShouldSmoothFonts(false)
+            context.setAllowsFontSubpixelPositioning(false)
+            context.setShouldSubpixelPositionFonts(false)
+            context.setAllowsFontSubpixelQuantization(false)
+            context.setShouldSubpixelQuantizeFonts(false)
+            context.scaleBy(x: scale, y: scale)
+            context.setFillColor(gray: 1, alpha: 1)
 
-        let padding = CGFloat(paddingPixels) / scale
-        let drawY = ceil((baseline * scale) + CGFloat(paddingPixels)) / scale
-        context.textPosition = CGPoint(x: padding, y: drawY)
-        CTLineDraw(line, context)
+            let padding = CGFloat(paddingPixels) / scale
+            let drawY = ceil((baseline * scale) + CGFloat(paddingPixels)) / scale
+            context.textPosition = CGPoint(x: padding, y: drawY)
+            CTLineDraw(line, context)
 
-        guard let data = context.data else { return nil }
-        ensureAtlasTexture()
-        let region = MTLRegionMake2D(packX, packY, pixelW, pixelH)
-        texture?.replace(region: region, mipmapLevel: 0, withBytes: data, bytesPerRow: pixelW)
+            ensureAtlasTexture()
+            let region = MTLRegionMake2D(packX, packY, pixelW, pixelH)
+            texture?.replace(region: region, mipmapLevel: 0, withBytes: baseAddress, bytesPerRow: pixelW)
 
-        let renderPixelWidth = max(1, Int(round(CGFloat(pixelW) * displayScale / scale)))
-        let renderPixelHeight = max(1, Int(round(CGFloat(pixelH) * displayScale / scale)))
-        let displayPadding = Float((CGFloat(paddingPixels) * displayScale) / scale)
-        let cellOffsetX = Float(
-            (((cellWidth - advance) * 0.5) + drawingBounds.origin.x) * displayScale
-        )
-        let baselineOffset = min(
-            Float(renderPixelHeight),
-            max(0, ((Float(pixelH) / Float(scale)) - Float(drawY)) * Float(displayScale))
-        )
+            let renderPixelWidth = max(1, Int(round(CGFloat(pixelW) * displayScale / scale)))
+            let renderPixelHeight = max(1, Int(round(CGFloat(pixelH) * displayScale / scale)))
+            let displayPadding = Float((CGFloat(paddingPixels) * displayScale) / scale)
+            let cellOffsetX = Float(
+                (((cellWidth - advance) * 0.5) + drawingBounds.origin.x) * displayScale
+            )
+            let baselineOffset = min(
+                Float(renderPixelHeight),
+                max(0, ((Float(pixelH) / Float(scale)) - Float(drawY)) * Float(displayScale))
+            )
+            return (renderPixelWidth, renderPixelHeight, displayPadding, cellOffsetX, baselineOffset)
+        }
+        guard let metrics else { return nil }
         let info = GlyphInfo(
             textureX: Float(packX) / Float(atlasPixelW),
             textureY: Float(packY) / Float(atlasPixelH),
             textureW: Float(pixelW) / Float(atlasPixelW),
             textureH: Float(pixelH) / Float(atlasPixelH),
-            cellOffsetX: cellOffsetX,
-            bitmapPadding: displayPadding,
+            cellOffsetX: metrics.cellOffsetX,
+            bitmapPadding: metrics.displayPadding,
             bearingX: Float(drawingBounds.origin.x),
-            baselineOffset: baselineOffset,
-            pixelWidth: renderPixelWidth,
-            pixelHeight: renderPixelHeight,
+            baselineOffset: metrics.baselineOffset,
+            pixelWidth: metrics.renderPixelWidth,
+            pixelHeight: metrics.renderPixelHeight,
             advance: Float(advance),
             lastAccessGeneration: accessGeneration
         )
@@ -474,7 +539,7 @@ final class GlyphAtlas {
     }
 
     @discardableResult
-    private func rasterizeColorGlyph(text: String, cacheKey: String, allowAtlasGrowth: Bool) -> GlyphInfo? {
+    private func rasterizeColorGlyph(text: String, cacheKey: Cell.GraphemeCacheKey, allowAtlasGrowth: Bool) -> GlyphInfo? {
         let attrString = CFAttributedStringCreate(
             nil,
             text as CFString,
@@ -508,15 +573,15 @@ final class GlyphAtlas {
         }
 
         guard let context = CGContext(
-            data: nil,
-            width: pixelW,
-            height: pixelH,
-            bitsPerComponent: 8,
-            bytesPerRow: pixelW * 4,
-            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue |
-                CGBitmapInfo.byteOrder32Little.rawValue
-        ) else { return nil }
+                data: nil,
+                width: pixelW,
+                height: pixelH,
+                bitsPerComponent: 8,
+                bytesPerRow: pixelW * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue |
+                    CGBitmapInfo.byteOrder32Little.rawValue
+            ) else { return nil }
 
         context.clear(CGRect(x: 0, y: 0, width: pixelW, height: pixelH))
         context.scaleBy(x: scale, y: scale)
@@ -582,7 +647,6 @@ final class GlyphAtlas {
         self.ctFont = font
         self.fontName = CTFontCopyPostScriptName(font) as String
         self.fontSize = size
-
         rebuildAtlas()
     }
 
@@ -597,8 +661,12 @@ final class GlyphAtlas {
 
     func resetToMinimum() {
         glyphCache.removeAll()
+        asciiGlyphCache = ContiguousArray(repeating: nil, count: 128)
         clusterGlyphCache.removeAll()
         colorClusterGlyphCache.removeAll()
+        resolvedBMPFontCache = ContiguousArray(repeating: nil, count: 0x10000)
+        resolvedBMPGlyphCache = ContiguousArray(repeating: 0, count: 0x10000)
+        resolvedBMPFontKnown = ContiguousArray(repeating: false, count: 0x10000)
         packX = 0
         packY = 0
         rowHeight = 0
@@ -630,14 +698,14 @@ final class GlyphAtlas {
             }
             return codepoint
         }
-        let retainedClusters = clusterGlyphCache.compactMap { entry -> String? in
+        let retainedClusters = clusterGlyphCache.compactMap { entry -> Cell.GraphemeCacheKey? in
             let (text, info) = entry
             guard currentGeneration &- info.lastAccessGeneration <= maximumInactiveGenerations else {
                 return nil
             }
             return text
         }
-        let retainedColorClusters = colorClusterGlyphCache.compactMap { entry -> String? in
+        let retainedColorClusters = colorClusterGlyphCache.compactMap { entry -> Cell.GraphemeCacheKey? in
             let (text, info) = entry
             guard currentGeneration &- info.lastAccessGeneration <= maximumInactiveGenerations else {
                 return nil
@@ -677,16 +745,20 @@ final class GlyphAtlas {
 
     private func rebuildAtlasRetaining(
         _ required: Set<UInt32>,
-        retainedClusters: Set<String>,
-        retainedColorClusters: Set<String>,
+        retainedClusters: Set<Cell.GraphemeCacheKey>,
+        retainedColorClusters: Set<Cell.GraphemeCacheKey>,
         resetToInitialSize: Bool
     ) {
         if resetToInitialSize {
             atlasDimension = initialAtlasDimension
         }
         glyphCache.removeAll()
+        asciiGlyphCache = ContiguousArray(repeating: nil, count: 128)
         clusterGlyphCache.removeAll()
         colorClusterGlyphCache.removeAll()
+        resolvedBMPFontCache = ContiguousArray(repeating: nil, count: 0x10000)
+        resolvedBMPGlyphCache = ContiguousArray(repeating: 0, count: 0x10000)
+        resolvedBMPFontKnown = ContiguousArray(repeating: false, count: 0x10000)
         packX = 0
         packY = 0
         rowHeight = 0
@@ -701,11 +773,13 @@ final class GlyphAtlas {
         for codepoint in required.sorted() {
             _ = rasterizeGlyph(codepoint: codepoint, allowAtlasGrowth: true)
         }
-        for text in retainedClusters.sorted() {
-            _ = rasterizeGlyph(text: text, cacheKey: text, allowAtlasGrowth: true)
+        for key in retainedClusters.sorted(by: Cell.GraphemeCacheKey.isOrdered) {
+            let text = key.renderedString()
+            _ = rasterizeGlyph(text: text, cacheKey: key, allowAtlasGrowth: true)
         }
-        for text in retainedColorClusters.sorted() {
-            _ = rasterizeColorGlyph(text: text, cacheKey: text, allowAtlasGrowth: true)
+        for key in retainedColorClusters.sorted(by: Cell.GraphemeCacheKey.isOrdered) {
+            let text = key.renderedString()
+            _ = rasterizeColorGlyph(text: text, cacheKey: key, allowAtlasGrowth: true)
         }
         syncTextureToGPU(texture)
         syncTextureToGPU(colorTexture)
@@ -715,11 +789,11 @@ final class GlyphAtlas {
         Set(glyphCache.keys)
     }
 
-    private func currentClusterGlyphSet() -> Set<String> {
+    private func currentClusterGlyphSet() -> Set<Cell.GraphemeCacheKey> {
         Set(clusterGlyphCache.keys)
     }
 
-    private func currentColorClusterGlyphSet() -> Set<String> {
+    private func currentColorClusterGlyphSet() -> Set<Cell.GraphemeCacheKey> {
         Set(colorClusterGlyphCache.keys)
     }
 
@@ -749,16 +823,16 @@ final class GlyphAtlas {
         return true
     }
 
-    private func growAtlasAndRepack(addingColorCluster text: String) -> Bool {
+    private func growAtlasAndRepack(addingColorCluster key: Cell.GraphemeCacheKey) -> Bool {
         guard atlasDimension < maxAtlasDimension else { return false }
         atlasDimension = nextAtlasDimension(after: atlasDimension)
         rebuildAtlasRetaining(
             currentGlyphSet().union(prerasterizedASCIISet()),
             retainedClusters: currentClusterGlyphSet(),
-            retainedColorClusters: currentColorClusterGlyphSet().union([text]),
+            retainedColorClusters: currentColorClusterGlyphSet().union([key]),
             resetToInitialSize: false
         )
-        return colorClusterGlyphCache[text] != nil
+        return colorClusterGlyphCache[key] != nil
     }
 
     private static func makeTerminalFont(name: String? = nil, size: CGFloat) -> CTFont {

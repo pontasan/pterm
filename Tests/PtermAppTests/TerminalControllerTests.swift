@@ -5,6 +5,10 @@ import PtermCore
 
 @MainActor
 final class TerminalControllerTests: XCTestCase {
+    private final class PurgedURLRecorder {
+        var urls: [URL] = []
+    }
+
     private func initialRowIndexCapacity(for initialCapacity: Int) -> Int {
         let targetRowBytes = 128
         let computed = (initialCapacity + (targetRowBytes - 1)) / targetRowBytes
@@ -66,6 +70,39 @@ final class TerminalControllerTests: XCTestCase {
             scrollbackPersistencePath: scrollbackPersistencePath,
             currentDirectoryProvider: currentDirectoryProvider
         )
+    }
+
+    private func installInlineImagePurgeObserver(
+        on controller: TerminalController,
+        registry: PastedImageRegistry,
+        recorder: PurgedURLRecorder
+    )  {
+        controller.onInlineImageReachabilityChange = { ownerID, liveIndices in
+            let purged = registry.purgeUnreferencedImages(
+                ownerID: ownerID,
+                retainingPlaceholderIndices: liveIndices
+            )
+            recorder.urls.append(contentsOf: purged)
+        }
+    }
+
+    @discardableResult
+    private func registerPersistedInlineImage(
+        registry: PastedImageRegistry,
+        ownerID: UUID,
+        index: Int
+    ) throws -> URL {
+        let pngBytes = Data([
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52
+        ])
+        try registry.registerTransient(
+            imageData: pngBytes,
+            format: .png,
+            placeholderIndex: index,
+            ownerID: ownerID
+        )
+        return try XCTUnwrap(registry.url(ownerID: ownerID, forPlaceholderIndex: index))
     }
 
     func testTerminalControllerStartsWithoutDecodeBufferAllocation() {
@@ -1520,7 +1557,7 @@ final class TerminalControllerTests: XCTestCase {
 
             var resolvedURL: URL?
             for _ in 0..<50 {
-                if let url = PastedImageRegistry.shared.url(forPlaceholderIndex: 3) {
+                if let url = PastedImageRegistry.shared.url(ownerID: controller.id, forPlaceholderIndex: 3) {
                     resolvedURL = url
                     break
                 }
@@ -1532,6 +1569,182 @@ final class TerminalControllerTests: XCTestCase {
             XCTAssertEqual(try Data(contentsOf: url), pngBytes)
             XCTAssertFalse(controller.allText().contains("[Image #3]"))
             XCTAssertEqual(controller.detectedImagePlaceholder(at: .init(row: 0, col: 0))?.index, 3)
+        }
+    }
+
+    func testInlineImageReachabilityReconciliationRetainsOnlyGridAndScrollbackReferences() {
+        let controller = makeController(rows: 4, cols: 6)
+        var reported: [(UUID, Set<Int>)] = []
+        controller.onInlineImageReachabilityChange = { ownerID, liveIndices in
+            reported.append((ownerID, liveIndices))
+        }
+
+        controller.model.grid.setCell(.inlineImage(id: 1, columns: 1, rows: 1, originColOffset: 0, originRowOffset: 0), at: 0, col: 0)
+        controller.debugAppendScrollbackRowForTesting(
+            ArraySlice([.inlineImage(id: 2, columns: 1, rows: 1, originColOffset: 0, originRowOffset: 0)]),
+            isWrapped: false
+        )
+        _ = controller.debugCompactScrollbackNow()
+        XCTAssertEqual(controller.withViewport { _, scrollback, _ in scrollback.rowCount }, 1)
+        XCTAssertEqual(controller.withViewport { _, scrollback, _ in scrollback.getRow(at: 0)?.first?.imageID }, 2)
+
+        controller.debugReconcileInlineImageReachabilityForTesting()
+        XCTAssertEqual(reported.last?.0, controller.id)
+        XCTAssertEqual(reported.last?.1, Set([1, 2]))
+
+        controller.clearScrollback()
+        XCTAssertEqual(reported.last?.1, Set([1]))
+
+        controller.model.grid.setCell(.empty, at: 0, col: 0)
+        controller.debugReconcileInlineImageReachabilityForTesting()
+        XCTAssertEqual(reported.last?.1, Set<Int>())
+    }
+
+    func testDisplayMutationThatOverwritesVisibleInlineImageSchedulesReachabilityReconciliation() {
+        let controller = makeController(rows: 4, cols: 12)
+        var reported: [Set<Int>] = []
+        controller.onInlineImageReachabilityChange = { _, liveIndices in
+            reported.append(liveIndices)
+        }
+
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}_Gi=41,a=T,t=d,c=1,r=1;\u{1B}\\".utf8))
+        drainMainQueue(testCase: self)
+        XCTAssertEqual(reported.last, Set([41]))
+
+        controller.debugProcessPTYOutputForTesting(Data("\rX".utf8))
+        drainMainQueue(testCase: self)
+        XCTAssertEqual(reported.last, Set<Int>())
+    }
+
+    func testProcessExitPurgesUnreferencedInlineImages() throws {
+        try withTemporaryPtermConfig { _ in
+            let registry = PastedImageRegistry.shared
+            registry.reset()
+            defer { registry.reset() }
+
+            let controller = makeController(rows: 4, cols: 6)
+            let recorder = PurgedURLRecorder()
+            installInlineImagePurgeObserver(on: controller, registry: registry, recorder: recorder)
+
+            let persistedURL = try registerPersistedInlineImage(
+                registry: registry,
+                ownerID: controller.id,
+                index: 11
+            )
+            XCTAssertTrue(FileManager.default.fileExists(atPath: persistedURL.path))
+
+            controller.debugSimulateProcessExitForTesting()
+
+            XCTAssertEqual(Set(recorder.urls), Set([persistedURL]))
+            XCTAssertNil(registry.registeredImage(ownerID: controller.id, forPlaceholderIndex: 11))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: persistedURL.path))
+        }
+    }
+
+    func testExplicitClearScrollbackPurgesScrollbackOnlyInlineImages() throws {
+        try withTemporaryPtermConfig { _ in
+            let registry = PastedImageRegistry.shared
+            registry.reset()
+            defer { registry.reset() }
+
+            let controller = makeController(rows: 4, cols: 6)
+            let recorder = PurgedURLRecorder()
+            installInlineImagePurgeObserver(on: controller, registry: registry, recorder: recorder)
+
+            controller.debugAppendScrollbackRowForTesting(
+                ArraySlice([.inlineImage(id: 21, columns: 1, rows: 1, originColOffset: 0, originRowOffset: 0)]),
+                isWrapped: false
+            )
+            let persistedURL = try registerPersistedInlineImage(
+                registry: registry,
+                ownerID: controller.id,
+                index: 21
+            )
+            XCTAssertTrue(FileManager.default.fileExists(atPath: persistedURL.path))
+
+            controller.clearScrollback()
+
+            XCTAssertEqual(Set(recorder.urls), Set([persistedURL]))
+            XCTAssertNil(registry.registeredImage(ownerID: controller.id, forPlaceholderIndex: 21))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: persistedURL.path))
+        }
+    }
+
+    func testParserRequestedScrollbackClearPurgesScrollbackOnlyInlineImages() throws {
+        try withTemporaryPtermConfig { _ in
+            let registry = PastedImageRegistry.shared
+            registry.reset()
+            defer { registry.reset() }
+
+            let controller = makeController(rows: 4, cols: 6)
+            let recorder = PurgedURLRecorder()
+            installInlineImagePurgeObserver(on: controller, registry: registry, recorder: recorder)
+
+            controller.debugAppendScrollbackRowForTesting(
+                ArraySlice([.inlineImage(id: 22, columns: 1, rows: 1, originColOffset: 0, originRowOffset: 0)]),
+                isWrapped: false
+            )
+            let persistedURL = try registerPersistedInlineImage(
+                registry: registry,
+                ownerID: controller.id,
+                index: 22
+            )
+            XCTAssertTrue(FileManager.default.fileExists(atPath: persistedURL.path))
+
+            controller.debugProcessPTYOutputForTesting(Data("\u{1B}[3J".utf8))
+
+            XCTAssertEqual(Set(recorder.urls), Set([persistedURL]))
+            XCTAssertNil(registry.registeredImage(ownerID: controller.id, forPlaceholderIndex: 22))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: persistedURL.path))
+        }
+    }
+
+    func testScrollbackCompactionPurgesImagesEvictedByBoundedScrollback() throws {
+        try withTemporaryPtermConfig { _ in
+            let registry = PastedImageRegistry.shared
+            registry.reset()
+            defer { registry.reset() }
+
+            let controller = makeController(
+                rows: 4,
+                cols: 6,
+                scrollbackInitialCapacity: 128,
+                scrollbackMaxCapacity: 128
+            )
+            let recorder = PurgedURLRecorder()
+            installInlineImagePurgeObserver(on: controller, registry: registry, recorder: recorder)
+
+            controller.debugAppendScrollbackRowForTesting(
+                ArraySlice([.inlineImage(id: 23, columns: 1, rows: 1, originColOffset: 0, originRowOffset: 0)]),
+                isWrapped: false
+            )
+            let persistedURL = try registerPersistedInlineImage(
+                registry: registry,
+                ownerID: controller.id,
+                index: 23
+            )
+
+            for _ in 0..<32 {
+                controller.debugAppendScrollbackRowForTesting(
+                    ArraySlice([
+                        Cell(
+                            codepoint: 65,
+                            attributes: .default,
+                            width: 1,
+                            isWideContinuation: false
+                        )
+                    ]),
+                    isWrapped: false
+                )
+            }
+
+            XCTAssertEqual(controller.withViewport { _, scrollback, _ in scrollback.liveInlineImageIDs() }, Set<Int>())
+
+            _ = controller.debugCompactScrollbackNow()
+
+            XCTAssertEqual(Set(recorder.urls), Set([persistedURL]))
+            XCTAssertNil(registry.registeredImage(ownerID: controller.id, forPlaceholderIndex: 23))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: persistedURL.path))
         }
     }
 

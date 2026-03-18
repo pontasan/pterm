@@ -14,9 +14,17 @@ import Dispatch
 /// lock for the entire decode+parse operation, while rendering and search
 /// paths take shared read locks.
 final class TerminalController {
-    private static let kittyImagePersistenceQueue = DispatchQueue(
-        label: "com.tranworks.pterm.kitty-image-persistence",
-        qos: .utility
+    private static let kittyImageProcessingConcurrency = min(
+        max(ProcessInfo.processInfo.activeProcessorCount / 2, 2),
+        8
+    )
+    private static let kittyImageProcessingQueue = DispatchQueue(
+        label: "com.tranworks.pterm.kitty-image-processing",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+    private static let kittyImageProcessingSemaphore = DispatchSemaphore(
+        value: kittyImageProcessingConcurrency
     )
 
     private struct ViewportRow {
@@ -33,6 +41,7 @@ final class TerminalController {
     }
 
     struct DetectedImagePlaceholder: Equatable {
+        let ownerID: UUID?
         let index: Int
         let originalText: String
         let startCol: Int
@@ -85,12 +94,17 @@ final class TerminalController {
     /// - non-visible scrollback/grid rows, because the renderer should not read
     ///   data it cannot draw for the current frame
     struct RenderSnapshot {
+        let contentVersion: UInt64
         let rows: Int
         let cols: Int
         let cursor: CursorState
         let reverseVideo: Bool
         let scrollOffset: Int
+        let scrollbackRowCount: Int
         let firstVisibleAbsoluteRow: Int
+        let ownerID: UUID
+        let hasInlineImages: Bool
+        let inlineImagePlacements: [TerminalInlineImagePlacement]
         let visibleRows: [RenderRowSnapshot]
     }
 
@@ -163,20 +177,26 @@ final class TerminalController {
     /// Callback when title changes
     var onTitleChange: ((String) -> Void)?
     var onStateChange: (() -> Void)?
+    var onInlineImageReachabilityChange: ((UUID, Set<Int>) -> Void)?
 
     /// Coalesces bursty PTY-driven callbacks onto a single main-queue hop.
     private let callbackLock = NSLock()
+    private let renderSnapshotCacheLock = NSLock()
     private let extractionScratchLock = NSLock()
     private let interruptDrainLock = NSLock()
     private var mainCallbacksScheduled = false
     private var pendingNeedsDisplay = false
     private var pendingOutputActivity = false
     private var pendingStateChange = false
+    private var inlineImageReachabilityReconcileScheduled = false
+    private var lastKnownInlineImageReachabilityWasNonEmpty = false
     private var terminalRenderingSuppressed = false
     private var pendingRenderingSuppressedChanges: [Bool] = []
     private var interruptDiscardingOutput = false
     private var pendingInterruptDrainCompletion: DispatchWorkItem?
     private var renderContentVersion: UInt64 = 0
+    private var cachedRenderSnapshot: RenderSnapshot?
+    private var cachedRenderSnapshotVersion: UInt64 = 0
     private var lastOutputDate: Date?
     private var outputActivitySuppressedUntilUptime: TimeInterval = 0
     private let scrollbackCompactionLock = NSLock()
@@ -191,6 +211,11 @@ final class TerminalController {
     private var pendingParserScrollOffsetDelta = 0
     private var pendingGroundBytes: [UInt8] = []
     private var pendingKittyGraphicsBytes: [UInt8] = []
+    private var pendingKittyGraphicsSearchStart = 0
+    private struct KittyGraphicsConsumeResult {
+        let consumed: Int
+        let deferredJob: TerminalModel.DeferredKittyImagePayloadJob?
+    }
 
     /// Decode buffer for UTF-8 -> codepoints.
     /// Starts empty and grows on demand so idle terminals do not pay a
@@ -416,18 +441,23 @@ final class TerminalController {
         }
 
         model.onKittyImagePayload = { [weak self] index, data, format, pixelWidth, pixelHeight, columns, rows in
-            Self.kittyImagePersistenceQueue.async {
-                _ = try? PastedImageRegistry.shared.register(
-                    imageData: data,
-                    format: format,
-                    placeholderIndex: index,
-                    pixelWidth: pixelWidth,
-                    pixelHeight: pixelHeight,
-                    columns: columns,
-                    rows: rows
-                )
-                DispatchQueue.main.async {
-                    self?.onNeedsDisplay?()
+            Self.kittyImageProcessingSemaphore.wait()
+            Self.kittyImageProcessingQueue.async {
+                defer { Self.kittyImageProcessingSemaphore.signal() }
+                autoreleasepool {
+                    guard let self else { return }
+                    try? PastedImageRegistry.shared.registerTransient(
+                        imageData: data,
+                        format: format,
+                        placeholderIndex: index,
+                        ownerID: self.id,
+                        pixelWidth: pixelWidth,
+                        pixelHeight: pixelHeight,
+                        columns: columns,
+                        rows: rows
+                    )
+                    self.scheduleInlineImageReachabilityReconcile(force: true)
+                    self.scheduleMainCallbacks(needsDisplay: true)
                 }
             }
         }
@@ -454,6 +484,54 @@ final class TerminalController {
         }
     }
 
+    private func liveInlineImagePlaceholderIndicesLocked() -> Set<Int> {
+        var ids = model.grid.liveInlineImageIDs()
+        ids.formUnion(scrollback.liveInlineImageIDs())
+        return ids
+    }
+
+    private func reconcileInlineImageReachability() {
+        let liveIndices = lock.withReadLock {
+            liveInlineImagePlaceholderIndicesLocked()
+        }
+        callbackLock.withLock {
+            lastKnownInlineImageReachabilityWasNonEmpty = !liveIndices.isEmpty
+        }
+        onInlineImageReachabilityChange?(id, liveIndices)
+    }
+
+    private func scheduleInlineImageReachabilityReconcile(force: Bool = false) {
+        if force {
+            reconcileInlineImageReachability()
+            return
+        }
+
+        let gridCurrentlyContainsInlineImages: Bool = {
+            return lock.withReadLock {
+                !model.grid.liveInlineImageIDs().isEmpty
+            }
+        }()
+        let shouldSchedule = callbackLock.withLock { () -> Bool in
+            if !force && !lastKnownInlineImageReachabilityWasNonEmpty && !gridCurrentlyContainsInlineImages {
+                return false
+            }
+            if inlineImageReachabilityReconcileScheduled {
+                return false
+            }
+            inlineImageReachabilityReconcileScheduled = true
+            return true
+        }
+        guard shouldSchedule else { return }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.callbackLock.withLock {
+                self.inlineImageReachabilityReconcileScheduled = false
+            }
+            self.reconcileInlineImageReachability()
+        }
+    }
+
     // MARK: - Start / Stop
 
     func start() throws {
@@ -463,6 +541,7 @@ final class TerminalController {
 
         pty.onExit = { [weak self] in
             self?.auditLogger?.flush()
+            self?.reconcileInlineImageReachability()
             self?.onExit?()
         }
 
@@ -531,6 +610,7 @@ final class TerminalController {
             scrollback.clear()
             scrollOffset = 0
         }
+        reconcileInlineImageReachability()
         scheduleMainCallbacks(needsDisplay: true, stateChange: true)
     }
 
@@ -722,6 +802,7 @@ final class TerminalController {
         var renderingSuppressedChanges: [Bool] = []
         var startedRenderingSuppressed = false
         var shouldScheduleScrollbackCompaction = true
+        var deferredKittyImageJobs: [TerminalModel.DeferredKittyImagePayloadJob] = []
         let ptr = data.baseAddress!
         let count = data.count
 
@@ -748,10 +829,14 @@ final class TerminalController {
                 while fastPathRemainingCount > 0 {
                     let input = UnsafeBufferPointer(start: fastPathPointer, count: fastPathRemainingCount)
 
-                    if let consumed = self.consumeKittyGraphicsPayloadPrefix(input), consumed > 0 {
+                    if let kittyGraphics = self.consumeKittyGraphicsPayloadPrefix(input),
+                       kittyGraphics.consumed > 0 {
+                        if let deferredJob = kittyGraphics.deferredJob {
+                            deferredKittyImageJobs.append(deferredJob)
+                        }
                         didMutateDisplay = true
-                        fastPathPointer = fastPathPointer.advanced(by: consumed)
-                        fastPathRemainingCount -= consumed
+                        fastPathPointer = fastPathPointer.advanced(by: kittyGraphics.consumed)
+                        fastPathRemainingCount -= kittyGraphics.consumed
                         continue
                     }
 
@@ -842,6 +927,17 @@ final class TerminalController {
             renderingSuppressedChanges = pendingRenderingSuppressedChanges
             pendingRenderingSuppressedChanges.removeAll(keepingCapacity: true)
             shouldScheduleScrollbackCompaction = !model.isAlternateScreen || scrollback.rowCount > 0
+                if didMutateDisplay {
+                    renderSnapshotCacheLock.withLock {
+                        cachedRenderSnapshotVersion = 0
+                    }
+                }
+        }
+
+        if !deferredKittyImageJobs.isEmpty {
+            for job in deferredKittyImageJobs {
+                model.executeDeferredKittyImagePayload(job)
+            }
         }
 
         if !renderingSuppressedChanges.isEmpty {
@@ -889,6 +985,10 @@ final class TerminalController {
                 scheduleScrollbackCompaction()
             }
             return
+        }
+
+        if didMutateDisplay || clearedScrollback {
+            scheduleInlineImageReachabilityReconcile(force: clearedScrollback)
         }
 
         let now = ProcessInfo.processInfo.systemUptime
@@ -1075,7 +1175,7 @@ final class TerminalController {
         return true
     }
 
-    private func consumeKittyGraphicsPayloadPrefix(_ bytes: UnsafeBufferPointer<UInt8>) -> Int? {
+    private func consumeKittyGraphicsPayloadPrefix(_ bytes: UnsafeBufferPointer<UInt8>) -> KittyGraphicsConsumeResult? {
         guard textEncoding == .utf8,
               parser.state == VT_STATE_GROUND
         else {
@@ -1087,7 +1187,8 @@ final class TerminalController {
                bytes[0] == 0x1B,
                bytes[1] == UInt8(ascii: "_") {
                 pendingKittyGraphicsBytes.append(contentsOf: bytes)
-                return bytes.count
+                pendingKittyGraphicsSearchStart = max(pendingKittyGraphicsBytes.count - 1, 0)
+                return KittyGraphicsConsumeResult(consumed: bytes.count, deferredJob: nil)
             }
             guard bytes.count >= 3,
                   bytes[0] == 0x1B,
@@ -1101,31 +1202,42 @@ final class TerminalController {
         if pendingKittyGraphicsBytes.isEmpty {
             if let terminatorOffset = asciiSTTerminatorOffset(in: bytes) {
                 let payloadBytes = UnsafeBufferPointer(start: bytes.baseAddress!.advanced(by: 2), count: terminatorOffset - 2)
-                if let payload = String(bytes: payloadBytes, encoding: .isoLatin1) {
-                    model.handleKittyGraphicsAPCPayload(payload)
-                }
-                return terminatorOffset + 2
+                let deferredJob = model.handleKittyGraphicsAPCPayload(payloadBytes)
+                return KittyGraphicsConsumeResult(consumed: terminatorOffset + 2, deferredJob: deferredJob)
             }
             pendingKittyGraphicsBytes.append(contentsOf: bytes)
-            return bytes.count
+            pendingKittyGraphicsSearchStart = max(pendingKittyGraphicsBytes.count - 1, 0)
+            return KittyGraphicsConsumeResult(consumed: bytes.count, deferredJob: nil)
         }
 
         let existingCount = pendingKittyGraphicsBytes.count
         pendingKittyGraphicsBytes.append(contentsOf: bytes)
-        if let terminatorOffset = asciiSTTerminatorOffset(in: pendingKittyGraphicsBytes) {
+        let searchStart = max(0, min(pendingKittyGraphicsSearchStart, max(pendingKittyGraphicsBytes.count - 1, 0)))
+        if let relativeTerminatorOffset = pendingKittyGraphicsBytes.withUnsafeBufferPointer({ buffer -> Int? in
+            guard searchStart < buffer.count else { return nil }
+            let slice = UnsafeBufferPointer(
+                start: buffer.baseAddress!.advanced(by: searchStart),
+                count: buffer.count - searchStart
+            )
+            return asciiSTTerminatorOffset(in: slice)
+        }) {
+            let terminatorOffset = searchStart + relativeTerminatorOffset
             let payloadStart = 2
             let payloadCount = terminatorOffset - payloadStart
+            var deferredJob: TerminalModel.DeferredKittyImagePayloadJob?
             if payloadCount > 0 {
                 let payloadSlice = pendingKittyGraphicsBytes[payloadStart..<(payloadStart + payloadCount)]
-                if let payload = String(bytes: payloadSlice, encoding: .isoLatin1) {
-                    model.handleKittyGraphicsAPCPayload(payload)
+                payloadSlice.withUnsafeBufferPointer { buffer in
+                    deferredJob = model.handleKittyGraphicsAPCPayload(buffer)
                 }
             }
             let consumedFromPendingChunk = max(0, min(bytes.count, terminatorOffset + 2 - existingCount))
             pendingKittyGraphicsBytes.removeAll(keepingCapacity: true)
-            return consumedFromPendingChunk
+            pendingKittyGraphicsSearchStart = 0
+            return KittyGraphicsConsumeResult(consumed: consumedFromPendingChunk, deferredJob: deferredJob)
         }
-        return bytes.count
+        pendingKittyGraphicsSearchStart = max(pendingKittyGraphicsBytes.count - 1, 0)
+        return KittyGraphicsConsumeResult(consumed: bytes.count, deferredJob: nil)
     }
 
     private func asciiSTTerminatorOffset(in bytes: UnsafeBufferPointer<UInt8>) -> Int? {
@@ -1393,36 +1505,107 @@ final class TerminalController {
     }
 
     func captureRenderSnapshot() -> RenderSnapshot {
-        lock.withReadLock {
-            let dimensions = visibleGridDimensionsLocked()
-            let rows = dimensions.rows
-            let cols = dimensions.cols
-            let cursor = model.cursor
-            let reverseVideo = model.reverseVideoEnabled
-            let offset = scrollOffset
-            let visibleRows = visibleRowsLocked()
-            let firstVisibleAbsoluteRow = offset > 0
-                ? max(0, scrollback.rowCount - offset)
-                : scrollback.rowCount
+        let expectedVersion = currentRenderContentVersion
+        if let cached = renderSnapshotCacheLock.withLock({
+            cachedRenderSnapshotVersion == expectedVersion ? cachedRenderSnapshot : nil
+        }) {
+            return cached
+        }
+        let snapshot = lock.withReadLock {
+            buildRenderSnapshotLocked()
+        }
+        renderSnapshotCacheLock.withLock {
+            cachedRenderSnapshot = snapshot
+            cachedRenderSnapshotVersion = snapshot.contentVersion
+        }
+        return snapshot
+    }
 
-            let renderRows = visibleRows.map { row in
-                RenderRowSnapshot(
-                    cells: row.cells,
-                    lineAttribute: row.lineAttribute,
-                    isWrapped: row.isWrapped
+    private func buildRenderSnapshotLocked() -> RenderSnapshot {
+        let dimensions = visibleGridDimensionsLocked()
+        let rows = dimensions.rows
+        let cols = dimensions.cols
+        let cursor = model.cursor
+        let reverseVideo = model.reverseVideoEnabled
+        let offset = scrollOffset
+        let scrollbackCount = scrollback.rowCount
+        let firstVisibleAbsoluteRow = offset > 0
+            ? max(0, scrollbackCount - offset)
+            : scrollbackCount
+
+        var renderRows: [RenderRowSnapshot] = []
+        renderRows.reserveCapacity(rows)
+        var scrollbackRowBuffer: [Cell] = []
+        scrollbackRowBuffer.reserveCapacity(cols)
+        for row in 0..<rows {
+            let absoluteRow = firstVisibleAbsoluteRow + row
+            if absoluteRow < scrollbackCount {
+                scrollbackRowBuffer.removeAll(keepingCapacity: true)
+                _ = scrollback.getRow(at: absoluteRow, into: &scrollbackRowBuffer)
+                renderRows.append(
+                    RenderRowSnapshot(
+                        cells: scrollbackRowBuffer,
+                        lineAttribute: .singleWidth,
+                        isWrapped: scrollback.isRowWrapped(at: absoluteRow)
+                    )
                 )
+                continue
             }
 
-            return RenderSnapshot(
-                rows: rows,
-                cols: cols,
-                cursor: cursor,
-                reverseVideo: reverseVideo,
-                scrollOffset: offset,
-                firstVisibleAbsoluteRow: firstVisibleAbsoluteRow,
-                visibleRows: renderRows
+            let gridRow = absoluteRow - scrollbackCount
+            let compactCells = Array(model.grid.rowCells(gridRow))
+            let cells = compactCells.isEmpty ? Array(repeating: .empty, count: cols) : compactCells
+            renderRows.append(
+                RenderRowSnapshot(
+                    cells: cells,
+                    lineAttribute: model.grid.lineAttribute(at: gridRow),
+                    isWrapped: model.grid.isWrapped(gridRow)
+                )
             )
         }
+        let hasInlineImages = renderRows.contains { row in
+            row.cells.contains { $0.hasInlineImage }
+        }
+        let inlineImagePlacements = hasInlineImages
+            ? TerminalInlineImageSupport.detectPlacements(in: renderRows, ownerID: id)
+            : []
+
+        let contentVersion = currentRenderContentVersion
+        return RenderSnapshot(
+            contentVersion: contentVersion,
+            rows: rows,
+            cols: cols,
+            cursor: cursor,
+            reverseVideo: reverseVideo,
+            scrollOffset: offset,
+            scrollbackRowCount: scrollbackCount,
+            firstVisibleAbsoluteRow: firstVisibleAbsoluteRow,
+            ownerID: id,
+            hasInlineImages: hasInlineImages,
+            inlineImagePlacements: inlineImagePlacements,
+            visibleRows: renderRows
+        )
+    }
+
+    func captureRenderSnapshotIfAvailable() -> RenderSnapshot? {
+        let expectedVersion = currentRenderContentVersion
+        let cachedState = renderSnapshotCacheLock.withLock {
+            (cachedRenderSnapshot, cachedRenderSnapshotVersion)
+        }
+        if let cached = cachedState.0, cachedState.1 == expectedVersion {
+            return cached
+        }
+        let snapshot = lock.tryWithReadLock {
+            buildRenderSnapshotLocked()
+        }
+        if let snapshot {
+            renderSnapshotCacheLock.withLock {
+                cachedRenderSnapshot = snapshot
+                cachedRenderSnapshotVersion = snapshot.contentVersion
+            }
+            return snapshot
+        }
+        return cachedState.0
     }
 
     func selectedText(for selection: TerminalSelection) -> String {
@@ -1596,9 +1779,10 @@ final class TerminalController {
                     isWrapped: row.isWrapped
                 )
             }
-            for placement in TerminalInlineImageSupport.detectPlacements(in: visibleRows)
+            for placement in TerminalInlineImageSupport.detectPlacements(in: visibleRows, ownerID: id)
             where placement.row == position.row && position.col >= placement.startCol && position.col <= placement.endCol {
                 return DetectedImagePlaceholder(
+                    ownerID: placement.ownerID,
                     index: placement.index,
                     originalText: placement.originalText,
                     startCol: placement.startCol,
@@ -1784,12 +1968,14 @@ final class TerminalController {
 
     @discardableResult
     private func performIdleScrollbackCompaction() -> Bool {
-        return lock.withWriteLock {
+        let didCompact = lock.withWriteLock {
             let didCompact = scrollback.compactIfUnderutilized()
             shrinkIdleCodepointBufferIfNeeded()
             shrinkIdleExtractionScratchIfNeeded()
             return didCompact
         }
+        reconcileInlineImageReachability()
+        return didCompact
     }
 
     private func handleScrollbackCompactionTimerFired() {
@@ -1842,6 +2028,16 @@ final class TerminalController {
         lock.withWriteLock {
             scrollback.appendRow(cells, isWrapped: isWrapped, encodingHint: encodingHint)
         }
+    }
+
+    func debugReconcileInlineImageReachabilityForTesting() {
+        reconcileInlineImageReachability()
+    }
+
+    func debugSimulateProcessExitForTesting() {
+        auditLogger?.flush()
+        reconcileInlineImageReachability()
+        onExit?()
     }
 
     func debugProcessPTYOutputForTesting(_ data: Data, recordAudit: Bool = false) {

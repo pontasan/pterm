@@ -139,6 +139,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var config: PtermConfig = .default
 
+    private struct ConfigFileSignature: Equatable {
+        let exists: Bool
+        let fileSize: UInt64
+        let modificationDate: Date?
+
+        static func capture(at url: URL) -> ConfigFileSignature {
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+                return ConfigFileSignature(exists: false, fileSize: 0, modificationDate: nil)
+            }
+            let sizeNumber = attributes[.size] as? NSNumber
+            return ConfigFileSignature(
+                exists: true,
+                fileSize: sizeNumber?.uint64Value ?? 0,
+                modificationDate: attributes[.modificationDate] as? Date
+            )
+        }
+    }
+
     private var statusBarView: StatusBarView!
     private var windowBackgroundGlassView: NSView?
     private var windowRootContentView: NSView!
@@ -146,6 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowPresentationHostView: NSView!
     private var configWatchSource: DispatchSourceFileSystemObject?
     private var pendingConfigReload: DispatchWorkItem?
+    private var lastLoadedConfigSignature = ConfigFileSignature.capture(at: PtermDirectories.config)
     private var backShortcutMonitor: Any?
     private var commandIdentityModifierMonitor: Any?
     private var commandIdentityShortcutLocalMonitor: Any?
@@ -156,6 +175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var metricsMonitor: ProcessMetricsMonitor?
     /// Tracks last output time per terminal for active-output indicator.
     private var lastOutputTimes: [UUID: Date] = [:]
+    private var knownTerminalIDs: Set<UUID> = []
     private var outputIdleTimer: Timer?
     private var activeOutputTerminalIDs: Set<UUID> = []
     private var visibleOutputIndicatorSuppressedUntilByTerminalID: [UUID: Date] = [:]
@@ -585,6 +605,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Ensure ~/.pterm/ directories exist
         PtermDirectories.ensureDirectories()
         config = PtermConfigStore.load()
+        lastLoadedConfigSignature = ConfigFileSignature.capture(at: PtermDirectories.config)
         TypewriterSoundPlayer.shared.configure(enabled: config.textInteraction.typewriterSoundEnabled)
         startConfigWatcher()
 
@@ -640,7 +661,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         configureWindowAppearance()
 
-        let restoredSession = loadRestorableSession()
+        let directLaunchOnlyStartup = launchOptions.directLaunch != nil
+        let restoredSession = directLaunchOnlyStartup ? nil : loadRestorableSession()
         applyInitialFontConfiguration(restoredSession)
         if let restoredSession {
             window.setFrame(restoredSession.windowFrame.rect, display: false)
@@ -670,25 +692,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.handleTerminalListChanged()
         }
 
-        let bootstrappedConfiguredWorkspaces: Bool
-        if restoredSession == nil {
-            bootstrappedConfiguredWorkspaces = bootstrapConfiguredWorkspaces()
+        if directLaunchOnlyStartup {
+            performDirectLaunchIfRequested()
         } else {
-            bootstrappedConfiguredWorkspaces = false
+            let bootstrappedConfiguredWorkspaces: Bool
+            if restoredSession == nil {
+                bootstrappedConfiguredWorkspaces = bootstrapConfiguredWorkspaces()
+            } else {
+                bootstrappedConfiguredWorkspaces = false
+            }
+            switch Self.initialLaunchDisposition(
+                restoredSession: restoredSession,
+                bootstrappedConfiguredWorkspaces: bootstrappedConfiguredWorkspaces
+            ) {
+            case .restoreSession(let restoredSession):
+                restoreSession(restoredSession)
+            case .showIntegrated:
+                switchToIntegrated()
+            case .createInitialTerminalAndShowIntegrated:
+                _ = addInitialWorkspaceTerminal()
+                switchToIntegrated()
+            }
         }
-        switch Self.initialLaunchDisposition(
-            restoredSession: restoredSession,
-            bootstrappedConfiguredWorkspaces: bootstrappedConfiguredWorkspaces
-        ) {
-        case .restoreSession(let restoredSession):
-            restoreSession(restoredSession)
-        case .showIntegrated:
-            switchToIntegrated()
-        case .createInitialTerminalAndShowIntegrated:
-            _ = addInitialWorkspaceTerminal()
-            switchToIntegrated()
-        }
-        performDirectLaunchIfRequested()
 
         // Show window
         NSApp.setActivationPolicy(.regular)
@@ -849,6 +874,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let remainingTerminalIDs = Set(manager.terminals.map(\.id))
+        let removedTerminalIDs = knownTerminalIDs.subtracting(remainingTerminalIDs)
+        for removedID in removedTerminalIDs {
+            purgeInlineImageResources(ownerID: removedID, retaining: [], removingOwner: true)
+        }
+        knownTerminalIDs = remainingTerminalIDs
         lastOutputTimes = lastOutputTimes.filter { remainingTerminalIDs.contains($0.key) }
         terminalsEverIdle = terminalsEverIdle.intersection(remainingTerminalIDs)
         activeOutputTerminalIDs = activeOutputTerminalIDs.intersection(remainingTerminalIDs)
@@ -935,6 +965,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         requestSessionPersist()
     }
 
+    private func purgeInlineImageResources(ownerID: UUID, retaining liveIndices: Set<Int>, removingOwner: Bool = false) {
+        let evictedURLs = pastedImageRegistry.purgeUnreferencedImages(
+            ownerID: ownerID,
+            retainingPlaceholderIndices: liveIndices
+        )
+        TerminalInlineImageSupport.evictCachedImages(for: evictedURLs)
+        renderer.releaseInlineImageTextures(ownerID: ownerID, retaining: liveIndices)
+        terminalView?.pruneInlineImageResources(ownerID: ownerID, retaining: liveIndices)
+        splitContainerView?.pruneInlineImageResources(ownerID: ownerID, retaining: liveIndices)
+        if removingOwner {
+            pastedImageRegistry.removeImages(ownerID: ownerID)
+            renderer.releaseInlineImageTextures(ownerID: ownerID)
+            terminalView?.pruneInlineImageResources(ownerID: ownerID, retaining: [])
+            splitContainerView?.pruneInlineImageResources(ownerID: ownerID, retaining: [])
+        }
+    }
+
     // MARK: - View Switching
 
     private func switchToFocused(_ controller: TerminalController) {
@@ -949,9 +996,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sv.autoresizingMask = [.width, .height]
         sv.shortcutConfiguration = config.shortcuts
         sv.terminalView.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
+        sv.terminalView.outputFrameThrottlingMode = config.textInteraction.outputFrameThrottlingMode
         sv.terminalView.typewriterSoundEnabled = config.textInteraction.typewriterSoundEnabled
-        sv.terminalView.imagePreviewURLProvider = { [weak self] index in
-            self?.pastedImageRegistry.url(forPlaceholderIndex: index)
+        sv.terminalView.imagePreviewURLProvider = { [weak self] ownerID, index in
+            self?.pastedImageRegistry.url(ownerID: ownerID, forPlaceholderIndex: index)
         }
         sv.terminalView.onBackToIntegrated = { [weak self] in
             self?.switchToIntegrated()
@@ -1037,9 +1085,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         splitView.autoresizingMask = [.width, .height]
         splitView.shortcutConfiguration = config.shortcuts
         splitView.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
+        splitView.outputFrameThrottlingMode = config.textInteraction.outputFrameThrottlingMode
         splitView.typewriterSoundEnabled = config.textInteraction.typewriterSoundEnabled
-        splitView.imagePreviewURLProvider = { [weak self] index in
-            self?.pastedImageRegistry.url(forPlaceholderIndex: index)
+        splitView.imagePreviewURLProvider = { [weak self] ownerID, index in
+            self?.pastedImageRegistry.url(ownerID: ownerID, forPlaceholderIndex: index)
         }
         splitView.onActiveControllerChange = { [weak self] controller in
             self?.applyRendererSettings(for: controller)
@@ -1181,6 +1230,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let iv = IntegratedView(frame: frame, renderer: renderer, manager: manager)
         iv.autoresizingMask = [.width, .height]
         iv.shortcutConfiguration = config.shortcuts
+        iv.outputFrameThrottlingMode = config.textInteraction.outputFrameThrottlingMode
         iv.onSelectTerminal = { [weak self] controller in
             self?.switchToFocused(controller)
         }
@@ -1443,6 +1493,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         source.setEventHandler { [weak self] in
+            guard FileManager.default.fileExists(atPath: PtermDirectories.config.path) else {
+                return
+            }
             self?.scheduleConfigReload()
         }
         source.setCancelHandler {
@@ -1581,41 +1634,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.15, execute: work)
     }
 
-    private func reloadConfigurationFromDisk() {
-        config = PtermConfigStore.load()
+    private func reloadConfigurationFromDisk(force: Bool = false) {
+        let signature = ConfigFileSignature.capture(at: PtermDirectories.config)
+        if !force, signature == lastLoadedConfigSignature {
+            return
+        }
+        lastLoadedConfigSignature = signature
+
+        let previousConfig = config
+        let loadedConfig = PtermConfigStore.load()
+        config = loadedConfig
         TypewriterSoundPlayer.shared.configure(enabled: config.textInteraction.typewriterSoundEnabled)
         configureMCPServer()
         manager.updateConfiguration(config)
         setupMenu()
         terminalView?.shortcutConfiguration = config.shortcuts
         terminalView?.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
+        terminalView?.outputFrameThrottlingMode = config.textInteraction.outputFrameThrottlingMode
         terminalView?.typewriterSoundEnabled = config.textInteraction.typewriterSoundEnabled
         splitContainerView?.shortcutConfiguration = config.shortcuts
         splitContainerView?.outputConfirmedInputAnimationsEnabled = config.textInteraction.outputConfirmedInputAnimation
+        splitContainerView?.outputFrameThrottlingMode = config.textInteraction.outputFrameThrottlingMode
         splitContainerView?.typewriterSoundEnabled = config.textInteraction.typewriterSoundEnabled
         integratedView?.shortcutConfiguration = config.shortcuts
-        renderer.updateTerminalAppearance(config.terminalAppearance)
+        integratedView?.outputFrameThrottlingMode = config.textInteraction.outputFrameThrottlingMode
 
-        let fontName = config.fontName ?? renderer.glyphAtlas.fontName
-        let fontSize = CGFloat(config.fontSize ?? Double(renderer.glyphAtlas.fontSize))
+        if config.terminalAppearance != previousConfig.terminalAppearance {
+            renderer.updateTerminalAppearance(config.terminalAppearance)
+            applyAppearanceSettingsToVisibleViews()
+            integratedView?.setNeedsDisplay(integratedView?.bounds ?? .zero)
+        }
 
-        // Apply the new font to the renderer and propagate to all terminals.
-        // Without synchronizeControllerFontSettings(), per-terminal persisted
-        // font settings would override the global config on the next view switch.
-        let currentRows = manager.fullRows
-        let currentCols = manager.fullCols
-        renderer.updateFont(name: fontName, size: fontSize)
-        synchronizeControllerFontSettings()
-        resizeWindowForFontChange(rows: currentRows, cols: currentCols)
+        let currentFontName = renderer.glyphAtlas.fontName
+        let currentFontSize = renderer.glyphAtlas.fontSize
+        let fontName = config.fontName ?? currentFontName
+        let fontSize = CGFloat(config.fontSize ?? Double(currentFontSize))
+        if fontName != currentFontName || fontSize != currentFontSize {
+            // Apply the new font to the renderer and propagate to all terminals.
+            // Without synchronizeControllerFontSettings(), per-terminal persisted
+            // font settings would override the global config on the next view switch.
+            let currentRows = manager.fullRows
+            let currentCols = manager.fullCols
+            renderer.updateFont(name: fontName, size: fontSize)
+            synchronizeControllerFontSettings()
+            resizeWindowForFontChange(rows: currentRows, cols: currentCols)
 
-        terminalView?.fontSizeDidChange()
-        terminalView?.updateMarkedTextOverlayPublic()
-        splitContainerView?.fontSizeDidChange()
-        splitContainerView?.updateMarkedTextForFontChange()
-        applyAppearanceSettingsToVisibleViews()
-        integratedView?.setNeedsDisplay(integratedView?.bounds ?? .zero)
+            terminalView?.fontSizeDidChange()
+            terminalView?.updateMarkedTextOverlayPublic()
+            splitContainerView?.fontSizeDidChange()
+            splitContainerView?.updateMarkedTextForFontChange()
+        }
+
         synchronizeWindowLayout(shouldPersistSession: false)
-
         updateWindowTitle()
     }
 
@@ -1936,6 +2006,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onStateChange = { [weak self] in
             DispatchQueue.main.async {
                 self?.requestSessionPersist()
+            }
+        }
+        controller.onInlineImageReachabilityChange = { [weak self] ownerID, liveIndices in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.purgeInlineImageResources(ownerID: ownerID, retaining: liveIndices)
             }
         }
         controller.onOutputActivity = { [weak self, weak controller] in

@@ -42,13 +42,21 @@ final class SplitTerminalContainerView: NSView {
             }
         }
     }
+    var outputFrameThrottlingMode: OutputFrameThrottlingMode = TextInteractionConfiguration.default.outputFrameThrottlingMode {
+        didSet {
+            scrollViews.forEach {
+                $0.terminalView.outputFrameThrottlingMode = outputFrameThrottlingMode
+            }
+            splitRenderView?.outputFrameThrottlingMode = outputFrameThrottlingMode
+        }
+    }
 
     var onBackToIntegrated: (() -> Void)?
     var onActiveControllerChange: ((TerminalController) -> Void)?
     var onMaximizeTerminal: ((TerminalController) -> Void)?
     var onCommandClickTerminal: ((TerminalController) -> Void)?
     var onCommitSelectedControllers: (([TerminalController]) -> Void)?
-    var imagePreviewURLProvider: ((Int) -> URL?)? {
+    var imagePreviewURLProvider: ((UUID, Int) -> URL?)? {
         didSet {
             scrollViews.forEach { $0.terminalView.imagePreviewURLProvider = imagePreviewURLProvider }
         }
@@ -183,6 +191,7 @@ final class SplitTerminalContainerView: NSView {
             let scrollView = scrollViews[index]
             scrollView.terminalView.shortcutConfiguration = shortcutConfiguration
             scrollView.terminalView.outputConfirmedInputAnimationsEnabled = outputConfirmedInputAnimationsEnabled
+            scrollView.terminalView.outputFrameThrottlingMode = outputFrameThrottlingMode
             scrollView.terminalView.typewriterSoundEnabled = typewriterSoundEnabled
             scrollView.terminalView.imagePreviewURLProvider = imagePreviewURLProvider
             scrollView.terminalView.terminalController = controller
@@ -228,6 +237,7 @@ final class SplitTerminalContainerView: NSView {
         }
         addSubview(overlay)
         splitRenderView = overlay
+        splitRenderView?.outputFrameThrottlingMode = outputFrameThrottlingMode
         splitRenderView?.hasActiveOutput = !activeOutputTerminalIDs.isEmpty
         syncRenderCells()
         applyAppearanceSettings()
@@ -349,6 +359,13 @@ final class SplitTerminalContainerView: NSView {
             scrollView.terminalView.compactForMemoryPressureNow()
         }
         splitRenderView?.compactForMemoryPressureNow()
+    }
+
+    func pruneInlineImageResources(ownerID: UUID, retaining liveIndices: Set<Int>) {
+        for scrollView in scrollViews {
+            scrollView.terminalView.pruneInlineImageResources(ownerID: ownerID, retaining: liveIndices)
+        }
+        splitRenderView?.pruneInlineImageResources(ownerID: ownerID, retaining: liveIndices)
     }
 
     func syncScaleFactorIfNeeded() {

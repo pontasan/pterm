@@ -69,10 +69,11 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(player.debugLoadedPlayerCount, 0)
 
         player.configure(enabled: true)
-        let loadedCount = player.debugLoadedPlayerCount
-        XCTAssertGreaterThan(loadedCount, 0)
+        XCTAssertEqual(player.debugLoadedPlayerCount, 0)
 
         player.playKeystroke()
+        let loadedCount = player.debugLoadedPlayerCount
+        XCTAssertGreaterThan(loadedCount, 0)
         XCTAssertEqual(player.debugLoadedPlayerCount, loadedCount)
 
         player.configure(enabled: false)
@@ -421,6 +422,26 @@ final class AppKitComponentTests: XCTestCase {
 
             let loaded = PtermConfigStore.load(from: configURL)
             XCTAssertFalse(loaded.textInteraction.typewriterSoundEnabled)
+        }
+    }
+
+    func testSettingsWindowOutputFrameThrottlingModeDefaultsToContinuousAndPersists() throws {
+        try withTemporaryPtermConfig { configURL in
+            let controller = SettingsWindowController(configURL: configURL)
+
+            let popup = try XCTUnwrap(
+                allSubviews(in: controller.window?.contentView)
+                    .compactMap { $0 as? NSPopUpButton }
+                    .first(where: { $0.itemTitles == ["Aggressive", "Balanced", "Continuous"] })
+            )
+
+            XCTAssertEqual(popup.titleOfSelectedItem, "Continuous")
+
+            popup.selectItem(withTitle: "Aggressive")
+            _ = popup.target?.perform(popup.action, with: popup)
+
+            let loaded = PtermConfigStore.load(from: configURL)
+            XCTAssertEqual(loaded.textInteraction.outputFrameThrottlingMode, .aggressive)
         }
     }
 
@@ -830,7 +851,7 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(metalLayer.pixelFormat, .bgra8Unorm_srgb)
         XCTAssertEqual(metalLayer.colorspace?.name as String?, CGColorSpace.sRGB as String)
         if #available(macOS 10.13.2, *) {
-            XCTAssertEqual(metalLayer.maximumDrawableCount, 2)
+            XCTAssertEqual(metalLayer.maximumDrawableCount, 3)
         }
     }
 
@@ -921,11 +942,13 @@ final class AppKitComponentTests: XCTestCase {
         let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 200), renderer: renderer)
         let imageURL = try writeTemporaryPNGImage(size: NSSize(width: 1, height: 1))
         PastedImageRegistry.shared.reset()
-        PastedImageRegistry.shared.register(url: imageURL, forPlaceholderIndex: 1)
+        PastedImageRegistry.shared.register(url: imageURL, ownerID: controller.id, forPlaceholderIndex: 1)
         defer { PastedImageRegistry.shared.reset() }
 
         view.terminalController = controller
-        view.imagePreviewURLProvider = { PastedImageRegistry.shared.url(forPlaceholderIndex: $0) }
+        view.imagePreviewURLProvider = { ownerID, index in
+            PastedImageRegistry.shared.url(ownerID: ownerID, forPlaceholderIndex: index)
+        }
         controller.debugProcessPTYOutputForTesting(Data("\u{1B}_Gi=1,a=T,t=d,c=1,r=1;\u{1B}\\".utf8))
         view.debugRefreshInlineImagesForTesting()
 
@@ -958,12 +981,15 @@ final class AppKitComponentTests: XCTestCase {
                 imageData: try makePNGImageData(size: NSSize(width: 2, height: 2)),
                 format: .png,
                 placeholderIndex: 3,
+                ownerID: controller.id,
                 columns: 4,
                 rows: 2
             )
 
             view.terminalController = controller
-            view.imagePreviewURLProvider = { PastedImageRegistry.shared.url(forPlaceholderIndex: $0) }
+            view.imagePreviewURLProvider = { ownerID, index in
+                PastedImageRegistry.shared.url(ownerID: ownerID, forPlaceholderIndex: index)
+            }
             controller.debugProcessPTYOutputForTesting(Data("\u{1B}_Gi=3,a=T,t=d,c=4,r=2;\u{1B}\\".utf8))
             view.debugRefreshInlineImagesForTesting()
         }
@@ -971,6 +997,73 @@ final class AppKitComponentTests: XCTestCase {
         let frame = try XCTUnwrap(view.debugInlineImageLayerFrames().first)
         XCTAssertEqual(frame.width, renderer.glyphAtlas.cellWidth * 4, accuracy: 1.0)
         XCTAssertEqual(frame.height, renderer.glyphAtlas.cellHeight * 2, accuracy: 1.0)
+    }
+
+    func testTerminalViewPrunesInlineImageLayersForUnreferencedOwnerImages() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 20,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/inline-image-prune-terminal-view"
+        )
+        defer { controller.stop(waitForExit: true) }
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 200), renderer: renderer)
+        let imageURL = try writeTemporaryPNGImage(size: NSSize(width: 1, height: 1))
+        PastedImageRegistry.shared.reset()
+        defer { PastedImageRegistry.shared.reset() }
+        PastedImageRegistry.shared.register(url: imageURL, ownerID: controller.id, forPlaceholderIndex: 1)
+
+        view.terminalController = controller
+        view.imagePreviewURLProvider = { ownerID, index in
+            PastedImageRegistry.shared.url(ownerID: ownerID, forPlaceholderIndex: index)
+        }
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}_Gi=1,a=T,t=d,c=1,r=1;\u{1B}\\".utf8))
+        view.debugRefreshInlineImagesForTesting()
+        XCTAssertEqual(view.debugInlineImageLayerCount, 1)
+
+        view.pruneInlineImageResources(ownerID: controller.id, retaining: [])
+        XCTAssertEqual(view.debugInlineImageLayerCount, 0)
+    }
+
+    func testRendererBuildsInlineImageDrawCommandsForKittyImageCells() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 24,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/inline-image-metal"
+        )
+        defer { controller.stop(waitForExit: true) }
+        defer { PastedImageRegistry.shared.reset() }
+
+        try withTemporaryPtermConfig { _ in
+            PastedImageRegistry.shared.reset()
+            _ = try PastedImageRegistry.shared.register(
+                imageData: try makePNGImageData(size: NSSize(width: 2, height: 2)),
+                format: .png,
+                placeholderIndex: 4,
+                columns: 3,
+                rows: 2
+            )
+
+            controller.debugProcessPTYOutputForTesting(Data("\u{1B}_Gi=4,a=T,t=d,c=3,r=2;\u{1B}\\".utf8))
+            let snapshot = controller.captureRenderSnapshot()
+            let vertexData = renderer.debugBuildVertexDataForTesting(snapshot: snapshot)
+
+            XCTAssertEqual(vertexData.inlineImageDraws.count, 1)
+            XCTAssertEqual(vertexData.inlineImageDraws.first?.index, 4)
+        }
     }
 
     func testRendererSuppressesKittyImagePlaceholderGlyphsWhenInlineImageIsPresent() throws {
@@ -1063,9 +1156,11 @@ final class AppKitComponentTests: XCTestCase {
         ]
         let imageURL = try writeTemporaryPNGImage(size: NSSize(width: 1, height: 1))
         PastedImageRegistry.shared.reset()
-        PastedImageRegistry.shared.register(url: imageURL, forPlaceholderIndex: 2)
+        PastedImageRegistry.shared.register(url: imageURL, ownerID: controller.id, forPlaceholderIndex: 2)
         defer { PastedImageRegistry.shared.reset() }
-        terminalView.imagePreviewURLProvider = { PastedImageRegistry.shared.url(forPlaceholderIndex: $0) }
+        terminalView.imagePreviewURLProvider = { ownerID, index in
+            PastedImageRegistry.shared.url(ownerID: ownerID, forPlaceholderIndex: index)
+        }
         controller.debugProcessPTYOutputForTesting(Data("\u{1B}_Gi=2,a=T,t=d,c=1,r=1;\u{1B}\\".utf8))
 
         splitView.debugRefreshInlineImagesForTesting()
@@ -1074,6 +1169,46 @@ final class AppKitComponentTests: XCTestCase {
         let frame = try XCTUnwrap(splitView.debugInlineImageLayerFrames().first)
         XCTAssertGreaterThan(frame.minX, 0)
         XCTAssertGreaterThan(frame.minY, 0)
+    }
+
+    func testSplitRenderViewPrunesInlineImageLayersForUnreferencedOwnerImages() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 20,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/inline-image-prune-split-view"
+        )
+        defer { controller.stop(waitForExit: true) }
+        let terminalView = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        terminalView.terminalController = controller
+        let splitView = SplitRenderView(frame: NSRect(x: 0, y: 0, width: 400, height: 240), renderer: renderer)
+        splitView.cellRefs = [
+            SplitRenderView.CellRef(
+                terminalView: terminalView,
+                controller: controller,
+                frame: NSRect(x: 20, y: 30, width: 320, height: 160)
+            )
+        ]
+        let imageURL = try writeTemporaryPNGImage(size: NSSize(width: 1, height: 1))
+        PastedImageRegistry.shared.reset()
+        defer { PastedImageRegistry.shared.reset() }
+        PastedImageRegistry.shared.register(url: imageURL, ownerID: controller.id, forPlaceholderIndex: 2)
+        terminalView.imagePreviewURLProvider = { ownerID, index in
+            PastedImageRegistry.shared.url(ownerID: ownerID, forPlaceholderIndex: index)
+        }
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}_Gi=2,a=T,t=d,c=1,r=1;\u{1B}\\".utf8))
+
+        splitView.debugRefreshInlineImagesForTesting()
+        XCTAssertEqual(splitView.debugInlineImageLayerCount, 1)
+
+        splitView.pruneInlineImageResources(ownerID: controller.id, retaining: [])
+        XCTAssertEqual(splitView.debugInlineImageLayerCount, 0)
     }
 
     func testIntegratedViewUsesSRGBRenderTargetConfiguration() throws {
@@ -1088,7 +1223,7 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(metalLayer.pixelFormat, .bgra8Unorm_srgb)
         XCTAssertEqual(metalLayer.colorspace?.name as String?, CGColorSpace.sRGB as String)
         if #available(macOS 10.13.2, *) {
-            XCTAssertEqual(metalLayer.maximumDrawableCount, 2)
+            XCTAssertEqual(metalLayer.maximumDrawableCount, 3)
         }
     }
 
@@ -1496,7 +1631,11 @@ final class AppKitComponentTests: XCTestCase {
 
         XCTAssertEqual(vertexData.glyphVertices.count, 0)
         XCTAssertEqual(vertexData.colorGlyphVertices.count, 72)
-        XCTAssertNotNil(renderer.glyphAtlas.colorGlyphInfo(for: "\u{1F600}"))
+        XCTAssertNotNil(
+            renderer.glyphAtlas.colorGlyphInfo(
+                for: Cell(codepoint: 0x1F600, attributes: .default, width: 2, isWideContinuation: false).graphemeCacheKey()!
+            )
+        )
     }
 
     func testRendererProducesNonMonochromePixelsForEmoji() throws {
@@ -2425,7 +2564,7 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(metalLayer.pixelFormat, .bgra8Unorm_srgb)
         XCTAssertEqual(metalLayer.colorspace?.name as String?, CGColorSpace.sRGB as String)
         if #available(macOS 10.13.2, *) {
-            XCTAssertEqual(metalLayer.maximumDrawableCount, 2)
+            XCTAssertEqual(metalLayer.maximumDrawableCount, 3)
         }
     }
 
@@ -2448,6 +2587,35 @@ final class AppKitComponentTests: XCTestCase {
 
         view.isOutputActive = false
         XCTAssertFalse(view.debugHasOutputPulseTimer)
+    }
+
+    func testTerminalViewOutputFrameThrottlingModesControlEffectiveFPS() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            isTransient: true
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+        view.preferredFramesPerSecond = 60
+        view.isOutputActive = true
+
+        view.outputFrameThrottlingMode = .aggressive
+        XCTAssertEqual(view.debugEffectiveDisplayUpdateFPSForTesting, 1)
+
+        view.outputFrameThrottlingMode = .balanced
+        XCTAssertEqual(view.debugEffectiveDisplayUpdateFPSForTesting, 2)
+
+        view.outputFrameThrottlingMode = .continuous
+
+        XCTAssertEqual(view.debugEffectiveDisplayUpdateFPSForTesting, 100)
     }
 
     func testSplitRenderViewOutputPulseTimerTracksActiveOutputState() throws {
@@ -4464,6 +4632,46 @@ final class AppKitComponentTests: XCTestCase {
         view.debugReleaseIdleBuffersNow()
 
         XCTAssertNotNil(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
+    }
+
+    func testTerminalViewIdlePurgeReleasesBuffersForFocusedTransientTerminalOnceOutputStops() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let controller = TerminalController(
+            rows: 6,
+            cols: 24,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/focused-transient-terminal",
+            isTransient: true
+        )
+        controller.withModel { model in
+            for (column, scalar) in "transient idle".unicodeScalars.enumerated() {
+                model.grid.setCell(Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: column)
+            }
+        }
+
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 200), renderer: renderer)
+        view.terminalController = controller
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        window.makeKeyAndOrderFront(nil)
+        drainMainQueue(testCase: self)
+        window.makeFirstResponder(view)
+        drainMainQueue(testCase: self)
+        renderFrame(for: view)
+
+        XCTAssertTrue(renderer.hasTerminalBuffers(for: view))
+        XCTAssertGreaterThan(renderer.terminalScrollbackScratchRowCapacity(for: view), 0)
+        view.debugReleaseIdleBuffersNow()
+
+        XCTAssertFalse(renderer.hasTerminalBuffers(for: view))
+        XCTAssertEqual(renderer.terminalScrollbackScratchRowCapacity(for: view), 0)
+        XCTAssertEqual(view.drawableSize, .zero)
     }
 
     func testTerminalViewInactiveReleaseDropsDrawableAndBuffersImmediately() throws {
@@ -8546,6 +8754,50 @@ final class AppKitComponentTests: XCTestCase {
         }
         DispatchQueue.main.async(execute: pollIntegratedState)
         wait(for: [integratedExpectation], timeout: 3.0)
+    }
+
+    func testTerminalRemovalPurgesAllOwnerScopedInlineImages() throws {
+        try withTemporaryPtermConfig { _ in
+            let registry = PastedImageRegistry.shared
+            registry.reset()
+            defer { registry.reset() }
+
+            let renderer = try makeRendererOrSkip()
+            let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+            defer { manager.stopAll(waitForExit: true) }
+            let controller = try manager.addTerminal(
+                initialDirectory: NSTemporaryDirectory(),
+                workspaceName: "Alpha",
+                fontName: "Menlo",
+                fontSize: 13
+            )
+
+            let harness = try makeAppHarness(renderer: renderer, manager: manager)
+            _ = harness.delegate
+            manager.onListChanged?()
+            drainMainQueue(testCase: self)
+
+            let pngBytes = Data([
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+                0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52
+            ])
+            try registry.registerTransient(
+                imageData: pngBytes,
+                format: .png,
+                placeholderIndex: 31,
+                ownerID: controller.id
+            )
+            let persistedURL = try XCTUnwrap(
+                registry.url(ownerID: controller.id, forPlaceholderIndex: 31)
+            )
+            XCTAssertTrue(FileManager.default.fileExists(atPath: persistedURL.path))
+
+            manager.removeTerminal(controller)
+            drainMainQueue(testCase: self)
+
+            XCTAssertNil(registry.registeredImage(ownerID: controller.id, forPlaceholderIndex: 31))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: persistedURL.path))
+        }
     }
 
     func testSplitLineageScenarioMatrixPreservesReturnTargetsAcrossWorkspaces() throws {

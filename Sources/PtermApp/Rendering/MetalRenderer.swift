@@ -50,21 +50,13 @@ final class MetalRenderer {
         glyph.cellOffsetX + ((spanWidth - singleCellWidth) * 0.5)
     }
 
-    private static func imagePlaceholderColumns(for rows: [TerminalController.RenderRowSnapshot]) -> [IndexSet] {
-        TerminalInlineImageSupport.hiddenPlaceholderColumns(in: rows)
+    private static func shouldAttemptColorEmoji(for cell: Cell) -> Bool {
+        cell.mayUseColorEmojiPresentation()
     }
 
-    private static func shouldAttemptColorEmoji(for cell: Cell) -> Bool {
-        guard cell.codepoint > 0x20 else { return false }
-        let scalars = cell.renderedString().unicodeScalars
-        return scalars.contains { scalar in
-            scalar.properties.isEmojiPresentation ||
-            scalar.value == 0x200D ||
-            scalar.value == 0xFE0F ||
-            scalar.value == 0x20E3 ||
-            (0x1F1E6...0x1F1FF).contains(scalar.value) ||
-            (0x1F3FB...0x1F3FF).contains(scalar.value)
-        }
+    @inline(__always)
+    private static func couldBeRenderedAsBlockElement(_ codepoint: UInt32) -> Bool {
+        codepoint >= 0x2580 && codepoint <= 0x259F
     }
 
     struct TerminalAppearance {
@@ -79,9 +71,16 @@ final class MetalRenderer {
 
     /// Result of building vertex data for a single frame.
     final class VertexData {
+        struct InlineImageDraw {
+            let ownerID: UUID
+            let index: Int
+            let vertices: [Float]
+        }
+
         var bgVertices: [Float] = []
         var glyphVertices: [Float] = []
         var colorGlyphVertices: [Float] = []
+        var inlineImageDraws: [InlineImageDraw] = []
         var cursorVertices: [Float] = []
         var overlayVertices: [Float] = []
 
@@ -89,6 +88,7 @@ final class MetalRenderer {
             bgVertices.removeAll(keepingCapacity: keepingCapacity)
             glyphVertices.removeAll(keepingCapacity: keepingCapacity)
             colorGlyphVertices.removeAll(keepingCapacity: keepingCapacity)
+            inlineImageDraws.removeAll(keepingCapacity: keepingCapacity)
             cursorVertices.removeAll(keepingCapacity: keepingCapacity)
             overlayVertices.removeAll(keepingCapacity: keepingCapacity)
         }
@@ -136,6 +136,27 @@ final class MetalRenderer {
     /// Public accessor for sampler (used by IntegratedView)
     var samplerState: MTLSamplerState? { sampler }
     var thumbnailSamplerState: MTLSamplerState? { thumbnailSampler }
+    private let textureLoader: MTKTextureLoader
+    private struct InlineImageTextureKey: Hashable {
+        let ownerID: UUID
+        let index: Int
+    }
+    private struct InlineImageTextureEntry {
+        let generation: UUID
+        let texture: MTLTexture
+    }
+    private var inlineImageTextures: [InlineImageTextureKey: InlineImageTextureEntry] = [:]
+
+    @inline(__always)
+    private static func rowsContainInlineImages<S: Sequence>(_ rows: S) -> Bool
+    where S.Element == TerminalController.RenderRowSnapshot {
+        for row in rows {
+            if row.cells.contains(where: \.hasInlineImage) {
+                return true
+            }
+        }
+        return false
+    }
 
     /// Per-view buffer set to avoid conflicts when multiple MTKViews share this renderer.
     final class ViewBufferSet {
@@ -413,9 +434,18 @@ final class MetalRenderer {
             return nil
         }
         self.commandQueue = queue
+        self.textureLoader = MTKTextureLoader(device: device)
 
-        self.glyphAtlas = GlyphAtlas(device: device, fontSize: MetalRenderer.defaultFontSize,
-                                      scaleFactor: scaleFactor)
+        let initialAtlasDimension = device.hasUnifiedMemory ? 2048 : 256
+        let maxAtlasDimension = device.hasUnifiedMemory ? 4096 : 2048
+        self.glyphAtlas = GlyphAtlas(
+            device: device,
+            fontSize: MetalRenderer.defaultFontSize,
+            scaleFactor: scaleFactor,
+            initialAtlasDimension: initialAtlasDimension,
+            maxAtlasDimension: maxAtlasDimension,
+            prerasterizeASCII: true
+        )
 
         setupSampler()
     }
@@ -452,6 +482,18 @@ final class MetalRenderer {
         glyphAtlas.compactRetainingRecentlyUsedGlyphs(
             maximumInactiveGenerations: maximumInactiveGenerations
         )
+    }
+
+    func releaseInlineImageTextures(ownerID: UUID) {
+        inlineImageTextures.keys
+            .filter { $0.ownerID == ownerID }
+            .forEach { inlineImageTextures.removeValue(forKey: $0) }
+    }
+
+    func releaseInlineImageTextures(ownerID: UUID, retaining liveIndices: Set<Int>) {
+        inlineImageTextures.keys
+            .filter { $0.ownerID == ownerID && !liveIndices.contains($0.index) }
+            .forEach { inlineImageTextures.removeValue(forKey: $0) }
     }
 
     var terminalClearColor: MTLClearColor {
@@ -684,6 +726,146 @@ final class MetalRenderer {
         encoder.setFragmentTexture(atlas, index: 0)
         encoder.setFragmentSamplerState(glyphSamplerForCurrentOutput(), index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count / floatsPerVertex)
+    }
+
+    private func texture(
+        for registeredImage: PastedImageRegistry.RegisteredImage,
+        ownerID: UUID,
+        index: Int
+    ) -> MTLTexture? {
+        let key = InlineImageTextureKey(ownerID: ownerID, index: index)
+        if let cached = inlineImageTextures[key], cached.generation == registeredImage.generation {
+            return cached.texture
+        }
+        if let texture = rawTexture(for: registeredImage) {
+            inlineImageTextures[key] = InlineImageTextureEntry(
+                generation: registeredImage.generation,
+                texture: texture
+            )
+            return texture
+        }
+        if let imageData = registeredImage.rawPixelData,
+           let imageFormat = registeredImage.rawPixelFormat,
+           imageFormat == .png || imageFormat == .jpeg || imageFormat == .gif || imageFormat == .webp {
+            let options: [MTKTextureLoader.Option: Any] = [
+                .SRGB: true,
+                .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue)
+            ]
+            if let texture = try? textureLoader.newTexture(data: imageData, options: options) {
+                inlineImageTextures[key] = InlineImageTextureEntry(
+                    generation: registeredImage.generation,
+                    texture: texture
+                )
+                return texture
+            }
+        }
+        guard let cgImage = TerminalInlineImageSupport.cgImage(for: registeredImage) else {
+            inlineImageTextures.removeValue(forKey: key)
+            return nil
+        }
+        let options: [MTKTextureLoader.Option: Any] = [
+            .SRGB: true,
+            .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue)
+        ]
+        guard let texture = try? textureLoader.newTexture(cgImage: cgImage, options: options) else {
+            return nil
+        }
+        inlineImageTextures[key] = InlineImageTextureEntry(
+            generation: registeredImage.generation,
+            texture: texture
+        )
+        return texture
+    }
+
+    private func rawTexture(for registeredImage: PastedImageRegistry.RegisteredImage) -> MTLTexture? {
+        guard let rawPixelFormat = registeredImage.rawPixelFormat,
+              let pixelWidth = registeredImage.pixelWidth,
+              let pixelHeight = registeredImage.pixelHeight,
+              pixelWidth > 0,
+              pixelHeight > 0 else {
+            return nil
+        }
+        let rawPixelData = registeredImage.rawPixelData ?? PastedImageRegistry.mappedBlobData(for: registeredImage)
+        guard let rawPixelData else { return nil }
+
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm_srgb,
+            width: pixelWidth,
+            height: pixelHeight,
+            mipmapped: false
+        )
+        descriptor.usage = [.shaderRead]
+        descriptor.storageMode = .shared
+        guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
+
+        let region = MTLRegionMake2D(0, 0, pixelWidth, pixelHeight)
+        switch rawPixelFormat {
+        case .rawRGBA:
+            rawPixelData.withUnsafeBytes { rawBuffer in
+                guard let base = rawBuffer.baseAddress else { return }
+                texture.replace(
+                    region: region,
+                    mipmapLevel: 0,
+                    withBytes: base,
+                    bytesPerRow: pixelWidth * 4
+                )
+            }
+        case .rawRGB:
+            var rgba = Data(count: pixelWidth * pixelHeight * 4)
+            rgba.withUnsafeMutableBytes { destinationBuffer in
+                rawPixelData.withUnsafeBytes { sourceBuffer in
+                    guard let src = sourceBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                          let dst = destinationBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                        return
+                    }
+                    var sourceIndex = 0
+                    var destinationIndex = 0
+                    while sourceIndex < rawPixelData.count {
+                        dst[destinationIndex] = src[sourceIndex]
+                        dst[destinationIndex + 1] = src[sourceIndex + 1]
+                        dst[destinationIndex + 2] = src[sourceIndex + 2]
+                        dst[destinationIndex + 3] = 0xFF
+                        sourceIndex += 3
+                        destinationIndex += 4
+                    }
+                }
+            }
+            rgba.withUnsafeBytes { rawBuffer in
+                guard let base = rawBuffer.baseAddress else { return }
+                texture.replace(
+                    region: region,
+                    mipmapLevel: 0,
+                    withBytes: base,
+                    bytesPerRow: pixelWidth * 4
+                )
+            }
+        default:
+            return nil
+        }
+
+        return texture
+    }
+
+    private func drawInlineImageDraws(
+        _ imageDraws: [VertexData.InlineImageDraw],
+        encoder: MTLRenderCommandEncoder,
+        uniforms: inout MetalUniforms
+    ) {
+        guard !imageDraws.isEmpty,
+              let pipeline = texturePipeline else { return }
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.size, index: 1)
+        encoder.setFragmentSamplerState(thumbnailSampler ?? sampler, index: 0)
+        for imageDraw in imageDraws {
+            guard let registeredImage = PastedImageRegistry.shared.registeredImage(ownerID: imageDraw.ownerID, forPlaceholderIndex: imageDraw.index),
+                  let texture = texture(for: registeredImage, ownerID: imageDraw.ownerID, index: imageDraw.index),
+                  let buffer = makeTemporaryBuffer(vertices: imageDraw.vertices) else {
+                continue
+            }
+            encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+            encoder.setFragmentTexture(texture, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: imageDraw.vertices.count / floatsPerVertex)
+        }
     }
 
     /// Build vertex data from terminal model and render.
@@ -927,6 +1109,11 @@ final class MetalRenderer {
             uniforms: &uniforms,
             buffer: updateVertexBuffer(&bs.colorGlyphBuffer, vertices: vd.colorGlyphVertices)
         )
+        drawInlineImageDraws(
+            vd.inlineImageDraws,
+            encoder: encoder,
+            uniforms: &uniforms
+        )
 
         if !vd.cursorVertices.isEmpty, let pipeline = cursorPipeline,
            let buf = updateVertexBuffer(&bs.cursorBuffer, vertices: vd.cursorVertices) {
@@ -1009,8 +1196,6 @@ final class MetalRenderer {
                                   bufferSet: ViewBufferSet) -> VertexData {
         let vd = bufferSet.terminalVertexScratch
         vd.reset()
-        var cachedGlyphs: [UInt32: GlyphAtlas.GlyphInfo] = [:]
-        var missingGlyphs: Set<UInt32> = []
 
         let cellW = Float(glyphAtlas.cellWidth) * scaleFactor
         let cellH = Float(glyphAtlas.cellHeight) * scaleFactor
@@ -1048,6 +1233,8 @@ final class MetalRenderer {
         }
 
         let firstAbsolute = scrollOffset > 0 ? max(0, sbCount - scrollOffset) : sbCount
+        var cachedGlyphs: [UInt32: GlyphAtlas.GlyphInfo] = [:]
+        var missingGlyphs: Set<UInt32> = []
 
         @inline(__always)
         func glyphInfo(for codepoint: UInt32) -> GlyphAtlas.GlyphInfo? {
@@ -1068,7 +1255,8 @@ final class MetalRenderer {
         @inline(__always)
         func glyphInfoForCell(_ cell: Cell) -> GlyphAtlas.GlyphInfo? {
             if cell.hasGraphemeTail {
-                return glyphAtlas.glyphInfo(for: cell.renderedString())
+                guard let key = cell.graphemeCacheKey() else { return nil }
+                return glyphAtlas.glyphInfo(for: key)
             }
             return glyphInfo(for: cell.codepoint)
         }
@@ -1084,37 +1272,171 @@ final class MetalRenderer {
                 )
             }
         }
+        let hasSelection = selection != nil
+        let hasTransientTextOverlays = !transientTextOverlays.isEmpty
+        let hasLinkUnderline = linkUnderline != nil
+        let canUseCommonTextCellFastPath = !hasSelection && !hasTransientTextOverlays && !hasLinkUnderline && !model.reverseVideoEnabled
+        let defaultForeground = terminalAppearance.defaultForeground
 
-        var visibleRowsForPlaceholderDetection: [TerminalController.RenderRowSnapshot] = []
-        visibleRowsForPlaceholderDetection.reserveCapacity(viewRows)
-        for row in 0..<viewRows {
-            let absoluteRow = firstAbsolute + row
-            let isScrollbackRow = absoluteRow < sbCount
-            if isScrollbackRow, bufferSet.terminalScrollbackRowHasData[row] {
-                visibleRowsForPlaceholderDetection.append(
-                    TerminalController.RenderRowSnapshot(
-                        cells: bufferSet.terminalScrollbackRowsScratch[row],
-                        lineAttribute: .singleWidth,
-                        isWrapped: scrollback.isRowWrapped(at: absoluteRow)
-                    )
-                )
-            } else {
-                let gridRow = absoluteRow - sbCount
-                var cells: [Cell] = []
-                cells.reserveCapacity(viewCols)
-                for col in 0..<viewCols {
-                    cells.append(model.grid.cell(at: gridRow, col: col))
+        @inline(__always)
+        func appendCommonDefaultRowGlyphs(
+            cells: [Cell],
+            row: Int
+        ) -> Bool {
+            guard !cells.isEmpty else { return true }
+            let y = padY + Float(row) * cellH
+
+            for (col, cell) in cells.enumerated() {
+                if cell.hasInlineImage {
+                    continue
                 }
-                visibleRowsForPlaceholderDetection.append(
-                    TerminalController.RenderRowSnapshot(
-                        cells: cells,
-                        lineAttribute: model.grid.lineAttribute(at: gridRow),
-                        isWrapped: model.grid.isWrapped(gridRow)
+                if cell.isWideContinuation {
+                    continue
+                }
+                if cell.attributes != .default {
+                    return false
+                }
+                if cell.codepoint <= 0x20 {
+                    continue
+                }
+
+                let x = padX + Float(col) * cellW
+                let w = cellW * Float(max(1, cell.width))
+                let h = cellH
+
+                if Self.couldBeRenderedAsBlockElement(cell.codepoint) && renderBlockElementIfNeeded(
+                    codepoint: cell.codepoint,
+                    x: x, y: y, w: w, h: h,
+                    color: defaultForeground,
+                    vertices: &vd.overlayVertices
+                ) {
+                    continue
+                }
+
+                let colorGlyph: GlyphAtlas.GlyphInfo?
+                if Self.shouldAttemptColorEmoji(for: cell) {
+                    colorGlyph = cell.graphemeCacheKey().flatMap { glyphAtlas.colorGlyphInfo(for: $0) }
+                } else {
+                    colorGlyph = nil
+                }
+                guard let glyph = colorGlyph ?? glyphInfoForCell(cell), glyph.pixelWidth > 0 else {
+                    continue
+                }
+
+                let rawGlyphX: Float
+                if cell.width == 1 {
+                    rawGlyphX = x + glyph.cellOffsetX
+                } else {
+                    rawGlyphX = x + Self.wideGlyphOffsetX(
+                        glyph,
+                        spanWidth: w,
+                        singleCellWidth: cellW
                     )
-                )
+                }
+                let baselineScreenY = y + cellH - Float(glyphAtlas.baseline) * scaleFactor
+                let rawGlyphY = baselineScreenY - glyph.baselineOffset
+                let shouldSnapGlyphPosition = !glyphAtlas.usesOversampledRasterizationForCurrentDisplay
+                let glyphX = shouldSnapGlyphPosition ? Self.snapToPixel(rawGlyphX) : rawGlyphX
+                let glyphY = shouldSnapGlyphPosition ? Self.snapToPixel(rawGlyphY) : rawGlyphY
+                let glyphW = Float(glyph.pixelWidth)
+                let glyphH = Float(glyph.pixelHeight)
+
+                if colorGlyph != nil {
+                    addQuad(to: &vd.colorGlyphVertices,
+                            x: glyphX, y: glyphY, w: glyphW, h: glyphH,
+                            tx: glyph.textureX, ty: glyph.textureY,
+                            tw: glyph.textureW, th: glyph.textureH,
+                            fg: (1, 1, 1, 1),
+                            bg: (0, 0, 0, 0))
+                } else {
+                    addQuad(to: &vd.glyphVertices,
+                            x: glyphX, y: glyphY, w: glyphW, h: glyphH,
+                            tx: glyph.textureX, ty: glyph.textureY,
+                            tw: glyph.textureW, th: glyph.textureH,
+                            fg: (defaultForeground.r, defaultForeground.g, defaultForeground.b, 1),
+                            bg: (0, 0, 0, 0))
+                }
+            }
+
+            return true
+        }
+
+        var hasVisibleInlineImages = false
+        for row in 0..<viewRows where !hasVisibleInlineImages {
+            if bufferSet.terminalScrollbackRowHasData[row],
+               bufferSet.terminalScrollbackRowsScratch[row].contains(where: \.hasInlineImage) {
+                hasVisibleInlineImages = true
+                break
+            }
+
+            let absoluteRow = firstAbsolute + row
+            guard absoluteRow >= sbCount else { continue }
+            let gridRow = absoluteRow - sbCount
+            for col in 0..<viewCols {
+                if model.grid.cell(at: gridRow, col: col).hasInlineImage {
+                    hasVisibleInlineImages = true
+                    break
+                }
             }
         }
-        let hiddenPlaceholderColumns = Self.imagePlaceholderColumns(for: visibleRowsForPlaceholderDetection)
+
+        if hasVisibleInlineImages {
+            var visibleRowsForImagePlacement: [TerminalController.RenderRowSnapshot] = []
+            visibleRowsForImagePlacement.reserveCapacity(viewRows)
+            for row in 0..<viewRows {
+                let absoluteRow = firstAbsolute + row
+                let isScrollbackRow = absoluteRow < sbCount
+                if isScrollbackRow, bufferSet.terminalScrollbackRowHasData[row] {
+                    visibleRowsForImagePlacement.append(
+                        TerminalController.RenderRowSnapshot(
+                            cells: bufferSet.terminalScrollbackRowsScratch[row],
+                            lineAttribute: .singleWidth,
+                            isWrapped: scrollback.isRowWrapped(at: absoluteRow)
+                        )
+                    )
+                } else {
+                    let gridRow = absoluteRow - sbCount
+                    var cells: [Cell] = []
+                    cells.reserveCapacity(viewCols)
+                    for col in 0..<viewCols {
+                        cells.append(model.grid.cell(at: gridRow, col: col))
+                    }
+                    visibleRowsForImagePlacement.append(
+                        TerminalController.RenderRowSnapshot(
+                            cells: cells,
+                            lineAttribute: model.grid.lineAttribute(at: gridRow),
+                            isWrapped: model.grid.isWrapped(gridRow)
+                        )
+                    )
+                }
+            }
+
+            let imagePlacements = TerminalInlineImageSupport.detectPlacements(in: visibleRowsForImagePlacement)
+            vd.inlineImageDraws.reserveCapacity(imagePlacements.count)
+            for placement in imagePlacements {
+                let x = padX + Float(placement.startCol) * cellW
+                let y = padY + Float(placement.row) * cellH
+                let w = Float(placement.endCol - placement.startCol + 1) * cellW
+                let h = Float(max(placement.rowSpan, 1)) * cellH
+                var vertices: [Float] = []
+                vertices.reserveCapacity(floatsPerQuad)
+                addQuad(
+                    to: &vertices,
+                    x: x,
+                    y: y,
+                    w: w,
+                    h: h,
+                    tx: 0,
+                    ty: 0,
+                    tw: 1,
+                    th: 1,
+                    fg: (1, 1, 1, 1),
+                    bg: (0, 0, 0, 0)
+                )
+                guard let ownerID = placement.ownerID else { continue }
+                vd.inlineImageDraws.append(.init(ownerID: ownerID, index: placement.index, vertices: vertices))
+            }
+        }
 
         for row in 0..<viewRows {
             let absoluteRow = firstAbsolute + row
@@ -1125,9 +1447,10 @@ final class MetalRenderer {
             let gridRow = isScrollbackRow ? -1 : absoluteRow - sbCount
 
             let rowMatches = bufferSet.terminalSearchMatchesScratch[row]
+            let rowHasMatches = !rowMatches.isEmpty
             var currentMatchIndex = 0
             let selectedColumnRange: ClosedRange<Int>? = {
-                guard let selection else { return nil }
+                guard hasSelection, let selection else { return nil }
                 let start = selection.start
                 let end = selection.end
                 switch selection.mode {
@@ -1149,15 +1472,19 @@ final class MetalRenderer {
                 }
             }()
 
+            let commonFastPathCells = scrollbackRow ?? Array(model.grid.rowCells(gridRow))
+            if canUseCommonTextCellFastPath && !rowHasMatches &&
+                appendCommonDefaultRowGlyphs(cells: commonFastPathCells, row: row) {
+                continue
+            }
+
             for col in 0..<viewCols {
-                let transientTextOverlayCoversCell = transientTextOverlays.contains {
+                let transientTextOverlayCoversCell = hasTransientTextOverlays && transientTextOverlays.contains {
                     $0.masksGridGlyphs &&
                     row == $0.row &&
                     col >= $0.col &&
                     col < ($0.col + $0.columnWidth)
                 }
-                let suppressPlaceholderGlyph = hiddenPlaceholderColumns[row].contains(col)
-
                 let cell: Cell
                 if let sbRow = scrollbackRow {
                     cell = col < sbRow.count ? sbRow[col] : .empty
@@ -1165,6 +1492,9 @@ final class MetalRenderer {
                     cell = model.grid.cell(at: gridRow, col: col)
                 }
 
+                if cell.hasInlineImage {
+                    continue
+                }
                 // Skip continuation cells of wide characters
                 if cell.isWideContinuation { continue }
 
@@ -1177,17 +1507,19 @@ final class MetalRenderer {
                 var fgColor: (r: Float, g: Float, b: Float)
                 var bgColor: (r: Float, g: Float, b: Float, a: Float)
 
-                let isSelected = selectedColumnRange?.contains(col) ?? false
+                let isSelected = hasSelection && (selectedColumnRange?.contains(col) ?? false)
                 let usesDefaultBackground = cell.attributes.background.isDefaultColor
 
                 var searchMatchType: Int = 0 // 0=none, 1=match, 2=current match
-                while currentMatchIndex < rowMatches.count && col > rowMatches[currentMatchIndex].end {
-                    currentMatchIndex += 1
-                }
-                if currentMatchIndex < rowMatches.count {
-                    let match = rowMatches[currentMatchIndex]
-                    if col >= match.start && col <= match.end {
-                        searchMatchType = match.isCurrent ? 2 : 1
+                if rowHasMatches {
+                    while currentMatchIndex < rowMatches.count && col > rowMatches[currentMatchIndex].end {
+                        currentMatchIndex += 1
+                    }
+                    if currentMatchIndex < rowMatches.count {
+                        let match = rowMatches[currentMatchIndex]
+                        if col >= match.start && col <= match.end {
+                            searchMatchType = match.isCurrent ? 2 : 1
+                        }
                     }
                 }
 
@@ -1232,9 +1564,9 @@ final class MetalRenderer {
                 }
 
                 // Block/quadrant elements render more faithfully as geometry.
-                if transientTextOverlayCoversCell || suppressPlaceholderGlyph {
+                if transientTextOverlayCoversCell {
                     // Keep the layout/background space, but defer visible glyphs to the transient overlay.
-                } else if renderBlockElementIfNeeded(
+                } else if Self.couldBeRenderedAsBlockElement(cell.codepoint) && renderBlockElementIfNeeded(
                     codepoint: cell.codepoint,
                     x: x, y: y, w: w, h: h,
                     color: fgColor,
@@ -1242,10 +1574,12 @@ final class MetalRenderer {
                 ) {
                     // no-op
                 } else if cell.codepoint > 0x20 { // Skip spaces
-                    let renderedText = cell.renderedString()
-                    let colorGlyph = Self.shouldAttemptColorEmoji(for: cell)
-                        ? glyphAtlas.colorGlyphInfo(for: renderedText)
-                        : nil
+                    let colorGlyph: GlyphAtlas.GlyphInfo?
+                    if Self.shouldAttemptColorEmoji(for: cell) {
+                        colorGlyph = cell.graphemeCacheKey().flatMap { glyphAtlas.colorGlyphInfo(for: $0) }
+                    } else {
+                        colorGlyph = nil
+                    }
                     let glyph = colorGlyph ?? glyphInfoForCell(cell)
                     guard let glyph, glyph.pixelWidth > 0 else {
                         continue
@@ -1429,7 +1763,8 @@ final class MetalRenderer {
         @inline(__always)
         func glyphInfoForCell(_ cell: Cell) -> GlyphAtlas.GlyphInfo? {
             if cell.hasGraphemeTail {
-                return glyphAtlas.glyphInfo(for: cell.renderedString())
+                guard let key = cell.graphemeCacheKey() else { return nil }
+                return glyphAtlas.glyphInfo(for: key)
             }
             return glyphInfo(for: cell.codepoint)
         }
@@ -1444,7 +1779,144 @@ final class MetalRenderer {
                 )
             }
         }
-        let hiddenPlaceholderColumns = Self.imagePlaceholderColumns(for: snapshot.visibleRows)
+        let hasSelection = selection != nil
+        let hasTransientTextOverlays = !transientTextOverlays.isEmpty
+        let hasLinkUnderline = linkUnderline != nil
+        let canUseCommonTextCellFastPath = !hasSelection && !hasTransientTextOverlays && !hasLinkUnderline && !snapshot.reverseVideo
+        let defaultForeground = terminalAppearance.defaultForeground
+
+        @inline(__always)
+        func appendCommonDefaultRowGlyphs(
+            rowSnapshot: TerminalController.RenderRowSnapshot,
+            row: Int
+        ) -> Bool {
+            let cells = rowSnapshot.cells
+            guard !cells.isEmpty else { return true }
+
+            let lineAttribute = rowSnapshot.lineAttribute
+            let lineColumnWidth = lineAttribute.isDoubleWidth ? cellW * 2.0 : cellW
+            let lineHeightScale: Float = {
+                switch lineAttribute {
+                case .doubleHeightTop, .doubleHeightBottom:
+                    return 2.0
+                case .singleWidth, .doubleWidth:
+                    return 1.0
+                }
+            }()
+            let y = padY + Float(row) * cellH
+
+            for (col, cell) in cells.enumerated() {
+                if cell.hasInlineImage {
+                    continue
+                }
+                if cell.isWideContinuation {
+                    continue
+                }
+                if cell.attributes != .default {
+                    return false
+                }
+                if cell.codepoint <= 0x20 {
+                    continue
+                }
+
+                let x = padX + Float(col) * lineColumnWidth
+                let w = lineColumnWidth * Float(max(1, cell.width))
+                let h = cellH
+
+                if Self.couldBeRenderedAsBlockElement(cell.codepoint) && renderBlockElementIfNeeded(
+                    codepoint: cell.codepoint,
+                    x: x, y: y, w: w, h: h,
+                    color: defaultForeground,
+                    vertices: &vd.overlayVertices
+                ) {
+                    continue
+                }
+
+                let colorGlyph: GlyphAtlas.GlyphInfo?
+                if Self.shouldAttemptColorEmoji(for: cell) {
+                    colorGlyph = cell.graphemeCacheKey().flatMap { glyphAtlas.colorGlyphInfo(for: $0) }
+                } else {
+                    colorGlyph = nil
+                }
+                guard let glyph = colorGlyph ?? glyphInfoForCell(cell), glyph.pixelWidth > 0 else {
+                    continue
+                }
+
+                let rawGlyphX: Float
+                if cell.width == 1 {
+                    rawGlyphX = x + glyph.cellOffsetX
+                } else {
+                    rawGlyphX = x + Self.wideGlyphOffsetX(
+                        glyph,
+                        spanWidth: w,
+                        singleCellWidth: cellW
+                    )
+                }
+                let baselineScreenY = y + cellH - Float(glyphAtlas.baseline) * scaleFactor
+                let rawGlyphY = baselineScreenY - glyph.baselineOffset
+                let shouldSnapGlyphPosition = !glyphAtlas.usesOversampledRasterizationForCurrentDisplay
+                let glyphX = shouldSnapGlyphPosition ? Self.snapToPixel(rawGlyphX) : rawGlyphX
+                let glyphY = shouldSnapGlyphPosition ? Self.snapToPixel(rawGlyphY) : rawGlyphY
+                let glyphW = Float(glyph.pixelWidth)
+                let glyphH = Float(glyph.pixelHeight) * lineHeightScale
+                let (textureY, textureH): (Float, Float) = {
+                    switch lineAttribute {
+                    case .doubleHeightTop:
+                        return (glyph.textureY, glyph.textureH * 0.5)
+                    case .doubleHeightBottom:
+                        return (glyph.textureY + glyph.textureH * 0.5, glyph.textureH * 0.5)
+                    case .singleWidth, .doubleWidth:
+                        return (glyph.textureY, glyph.textureH)
+                    }
+                }()
+
+                if colorGlyph != nil {
+                    addQuad(to: &vd.colorGlyphVertices,
+                            x: glyphX, y: glyphY, w: glyphW, h: glyphH,
+                            tx: glyph.textureX, ty: textureY,
+                            tw: glyph.textureW, th: textureH,
+                            fg: (1, 1, 1, 1),
+                            bg: (0, 0, 0, 0))
+                } else {
+                    addQuad(to: &vd.glyphVertices,
+                            x: glyphX, y: glyphY, w: glyphW, h: glyphH,
+                            tx: glyph.textureX, ty: textureY,
+                            tw: glyph.textureW, th: textureH,
+                            fg: (defaultForeground.r, defaultForeground.g, defaultForeground.b, 1),
+                            bg: (0, 0, 0, 0))
+                }
+            }
+
+            return true
+        }
+
+        if snapshot.hasInlineImages {
+            let imagePlacements = snapshot.inlineImagePlacements
+            vd.inlineImageDraws.reserveCapacity(imagePlacements.count)
+            for placement in imagePlacements {
+                let x = padX + Float(placement.startCol) * cellW
+                let y = padY + Float(placement.row) * cellH
+                let w = Float(placement.endCol - placement.startCol + 1) * cellW
+                let h = Float(max(placement.rowSpan, 1)) * cellH
+                var vertices: [Float] = []
+                vertices.reserveCapacity(floatsPerQuad)
+                addQuad(
+                    to: &vertices,
+                    x: x,
+                    y: y,
+                    w: w,
+                    h: h,
+                    tx: 0,
+                    ty: 0,
+                    tw: 1,
+                    th: 1,
+                    fg: (1, 1, 1, 1),
+                    bg: (0, 0, 0, 0)
+                )
+                guard let ownerID = placement.ownerID else { continue }
+                vd.inlineImageDraws.append(.init(ownerID: ownerID, index: placement.index, vertices: vertices))
+            }
+        }
 
         for row in 0..<viewRows {
             let rowSnapshot = snapshot.visibleRows[row]
@@ -1459,9 +1931,10 @@ final class MetalRenderer {
                 }
             }()
             let rowMatches = bufferSet.terminalSearchMatchesScratch[row]
+            let rowHasMatches = !rowMatches.isEmpty
             var currentMatchIndex = 0
             let selectedColumnRange: ClosedRange<Int>? = {
-                guard let selection else { return nil }
+                guard hasSelection, let selection else { return nil }
                 let start = selection.start
                 let end = selection.end
                 switch selection.mode {
@@ -1483,17 +1956,23 @@ final class MetalRenderer {
                 }
             }()
 
+            if canUseCommonTextCellFastPath && !rowHasMatches &&
+                appendCommonDefaultRowGlyphs(rowSnapshot: rowSnapshot, row: row) {
+                continue
+            }
+
             for col in 0..<viewCols {
-                let transientTextOverlayCoversCell = transientTextOverlays.contains {
+                let transientTextOverlayCoversCell = hasTransientTextOverlays && transientTextOverlays.contains {
                     $0.masksGridGlyphs &&
                     row == $0.row &&
                     col >= $0.col &&
                     col < ($0.col + $0.columnWidth)
                 }
-                let suppressPlaceholderGlyph = hiddenPlaceholderColumns[row].contains(col)
-
                 let cell = col < rowSnapshot.cells.count ? rowSnapshot.cells[col] : .empty
 
+                if cell.hasInlineImage {
+                    continue
+                }
                 if cell.isWideContinuation { continue }
 
                 let x = padX + Float(col) * lineColumnWidth
@@ -1501,20 +1980,92 @@ final class MetalRenderer {
                 let w = lineColumnWidth * Float(max(1, cell.width))
                 let h = cellH
 
+                if canUseCommonTextCellFastPath && !rowHasMatches && cell.attributes == .default {
+                    if cell.codepoint <= 0x20 {
+                        continue
+                    }
+                    if Self.couldBeRenderedAsBlockElement(cell.codepoint) && renderBlockElementIfNeeded(
+                        codepoint: cell.codepoint,
+                        x: x, y: y, w: w, h: h,
+                        color: defaultForeground,
+                        vertices: &vd.overlayVertices
+                    ) {
+                        continue
+                    }
+
+                    let colorGlyph: GlyphAtlas.GlyphInfo?
+                    if Self.shouldAttemptColorEmoji(for: cell) {
+                        colorGlyph = cell.graphemeCacheKey().flatMap { glyphAtlas.colorGlyphInfo(for: $0) }
+                    } else {
+                        colorGlyph = nil
+                    }
+                    let glyph = colorGlyph ?? glyphInfoForCell(cell)
+                    guard let glyph, glyph.pixelWidth > 0 else {
+                        continue
+                    }
+
+                    let rawGlyphX: Float
+                    if cell.width == 1 {
+                        rawGlyphX = x + glyph.cellOffsetX
+                    } else {
+                        rawGlyphX = x + Self.wideGlyphOffsetX(
+                            glyph,
+                            spanWidth: w,
+                            singleCellWidth: cellW
+                        )
+                    }
+                    let baselineScreenY = y + cellH - Float(glyphAtlas.baseline) * scaleFactor
+                    let rawGlyphY = baselineScreenY - glyph.baselineOffset
+                    let shouldSnapGlyphPosition = !glyphAtlas.usesOversampledRasterizationForCurrentDisplay
+                    let glyphX = shouldSnapGlyphPosition ? Self.snapToPixel(rawGlyphX) : rawGlyphX
+                    let glyphY = shouldSnapGlyphPosition ? Self.snapToPixel(rawGlyphY) : rawGlyphY
+                    let glyphW = Float(glyph.pixelWidth)
+                    let glyphH = Float(glyph.pixelHeight) * lineHeightScale
+                    let (textureY, textureH): (Float, Float) = {
+                        switch lineAttribute {
+                        case .doubleHeightTop:
+                            return (glyph.textureY, glyph.textureH * 0.5)
+                        case .doubleHeightBottom:
+                            return (glyph.textureY + glyph.textureH * 0.5, glyph.textureH * 0.5)
+                        case .singleWidth, .doubleWidth:
+                            return (glyph.textureY, glyph.textureH)
+                        }
+                    }()
+
+                    if colorGlyph != nil {
+                        addQuad(to: &vd.colorGlyphVertices,
+                                x: glyphX, y: glyphY, w: glyphW, h: glyphH,
+                                tx: glyph.textureX, ty: textureY,
+                                tw: glyph.textureW, th: textureH,
+                                fg: (1, 1, 1, 1),
+                                bg: (0, 0, 0, 0))
+                    } else {
+                        addQuad(to: &vd.glyphVertices,
+                                x: glyphX, y: glyphY, w: glyphW, h: glyphH,
+                                tx: glyph.textureX, ty: textureY,
+                                tw: glyph.textureW, th: textureH,
+                                fg: (defaultForeground.r, defaultForeground.g, defaultForeground.b, 1),
+                                bg: (0, 0, 0, 0))
+                    }
+                    continue
+                }
+
                 var fgColor: (r: Float, g: Float, b: Float)
                 var bgColor: (r: Float, g: Float, b: Float, a: Float)
 
-                let isSelected = selectedColumnRange?.contains(col) ?? false
+                let isSelected = hasSelection && (selectedColumnRange?.contains(col) ?? false)
                 let usesDefaultBackground = cell.attributes.background.isDefaultColor
 
                 var searchMatchType: Int = 0
-                while currentMatchIndex < rowMatches.count && col > rowMatches[currentMatchIndex].end {
-                    currentMatchIndex += 1
-                }
-                if currentMatchIndex < rowMatches.count {
-                    let match = rowMatches[currentMatchIndex]
-                    if col >= match.start && col <= match.end {
-                        searchMatchType = match.isCurrent ? 2 : 1
+                if rowHasMatches {
+                    while currentMatchIndex < rowMatches.count && col > rowMatches[currentMatchIndex].end {
+                        currentMatchIndex += 1
+                    }
+                    if currentMatchIndex < rowMatches.count {
+                        let match = rowMatches[currentMatchIndex]
+                        if col >= match.start && col <= match.end {
+                            searchMatchType = match.isCurrent ? 2 : 1
+                        }
                     }
                 }
 
@@ -1553,9 +2104,9 @@ final class MetalRenderer {
                             bg: (bgColor.r, bgColor.g, bgColor.b, bgColor.a))
                 }
 
-                if transientTextOverlayCoversCell || suppressPlaceholderGlyph {
+                if transientTextOverlayCoversCell {
                     // Keep the layout/background space, but defer visible glyphs to the transient overlay.
-                } else if renderBlockElementIfNeeded(
+                } else if Self.couldBeRenderedAsBlockElement(cell.codepoint) && renderBlockElementIfNeeded(
                     codepoint: cell.codepoint,
                     x: x, y: y, w: w, h: h,
                     color: fgColor,
@@ -1563,10 +2114,12 @@ final class MetalRenderer {
                 ) {
                     // no-op
                 } else if cell.codepoint > 0x20 {
-                    let renderedText = cell.renderedString()
-                    let colorGlyph = Self.shouldAttemptColorEmoji(for: cell)
-                        ? glyphAtlas.colorGlyphInfo(for: renderedText)
-                        : nil
+                    let colorGlyph: GlyphAtlas.GlyphInfo?
+                    if Self.shouldAttemptColorEmoji(for: cell) {
+                        colorGlyph = cell.graphemeCacheKey().flatMap { glyphAtlas.colorGlyphInfo(for: $0) }
+                    } else {
+                        colorGlyph = nil
+                    }
                     let glyph = colorGlyph ?? glyphInfoForCell(cell)
                     guard let glyph, glyph.pixelWidth > 0 else {
                         continue
@@ -2605,7 +3158,8 @@ final class MetalRenderer {
         @inline(__always)
         func glyphInfoForCell(_ cell: Cell) -> GlyphAtlas.GlyphInfo? {
             if cell.hasGraphemeTail {
-                return glyphAtlas.glyphInfo(for: cell.renderedString())
+                guard let key = cell.graphemeCacheKey() else { return nil }
+                return glyphAtlas.glyphInfo(for: key)
             }
             return glyphInfo(for: cell.codepoint)
         }
@@ -2661,10 +3215,12 @@ final class MetalRenderer {
 
                 // Glyph
                 if cell.codepoint > 0x20 {
-                    let renderedText = cell.renderedString()
-                    let colorGlyph = Self.shouldAttemptColorEmoji(for: cell)
-                        ? glyphAtlas.colorGlyphInfo(for: renderedText)
-                        : nil
+                    let colorGlyph: GlyphAtlas.GlyphInfo?
+                    if Self.shouldAttemptColorEmoji(for: cell) {
+                        colorGlyph = cell.graphemeCacheKey().flatMap { glyphAtlas.colorGlyphInfo(for: $0) }
+                    } else {
+                        colorGlyph = nil
+                    }
                     let glyph = colorGlyph ?? glyphInfoForCell(cell)
                     guard let glyph, glyph.pixelWidth > 0 else {
                         continue
@@ -2928,6 +3484,11 @@ final class MetalRenderer {
             encoder: encoder,
             uniforms: &uniforms,
             buffer: makeTemporaryBuffer(vertices: vd.colorGlyphVertices)
+        )
+        drawInlineImageDraws(
+            vd.inlineImageDraws,
+            encoder: encoder,
+            uniforms: &uniforms
         )
 
         if !vd.cursorVertices.isEmpty, let pipeline = cursorPipeline {

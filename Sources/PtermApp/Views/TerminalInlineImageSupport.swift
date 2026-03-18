@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 
 struct TerminalInlineImagePlacement: Equatable {
+    let ownerID: UUID?
     let index: Int
     let row: Int
     let startCol: Int
@@ -13,11 +14,17 @@ struct TerminalInlineImagePlacement: Equatable {
 enum TerminalInlineImageSupport {
     private static let imageCache = NSCache<NSURL, NSImage>()
 
-    static func detectPlacements(in snapshot: TerminalController.RenderSnapshot) -> [TerminalInlineImagePlacement] {
-        detectPlacements(in: snapshot.visibleRows)
+    static func evictCachedImages(for urls: some Sequence<URL>) {
+        for url in urls {
+            imageCache.removeObject(forKey: url as NSURL)
+        }
     }
 
-    static func detectPlacements(in rows: [TerminalController.RenderRowSnapshot]) -> [TerminalInlineImagePlacement] {
+    static func detectPlacements(in snapshot: TerminalController.RenderSnapshot) -> [TerminalInlineImagePlacement] {
+        snapshot.inlineImagePlacements
+    }
+
+    static func detectPlacements(in rows: [TerminalController.RenderRowSnapshot], ownerID: UUID? = nil) -> [TerminalInlineImagePlacement] {
         var placements: [TerminalInlineImagePlacement] = []
         placements.reserveCapacity(4)
         var seenAnchors = Set<String>()
@@ -34,6 +41,7 @@ enum TerminalInlineImageSupport {
                 let rowSpan = max(Int(cell.imageRows), 1)
                 placements.append(
                     TerminalInlineImagePlacement(
+                        ownerID: ownerID,
                         index: Int(cell.imageID),
                         row: anchorRow,
                         startCol: anchorCol,
@@ -59,7 +67,49 @@ enum TerminalInlineImageSupport {
         )
     }
 
-    static func image(for url: URL) -> NSImage? {
+    static func cgImage(for registeredImage: PastedImageRegistry.RegisteredImage) -> CGImage? {
+        if let cgImage = registeredImage.cgImage {
+            return cgImage
+        }
+        if let blobData = PastedImageRegistry.mappedBlobData(for: registeredImage),
+           let rawPixelFormat = registeredImage.rawPixelFormat,
+           let cgImage = PastedImageRegistry.cgImage(
+                from: blobData,
+                format: rawPixelFormat,
+                pixelWidth: registeredImage.pixelWidth,
+                pixelHeight: registeredImage.pixelHeight
+           ) {
+            return cgImage
+        }
+        if let rawPixelData = registeredImage.rawPixelData,
+           let rawPixelFormat = registeredImage.rawPixelFormat,
+           let cgImage = PastedImageRegistry.cgImage(
+                from: rawPixelData,
+                format: rawPixelFormat,
+                pixelWidth: registeredImage.pixelWidth,
+                pixelHeight: registeredImage.pixelHeight
+           ) {
+            return cgImage
+        }
+        if let rawPixelData = registeredImage.rawPixelData,
+           let rawPixelFormat = registeredImage.rawPixelFormat,
+           let pixelWidth = registeredImage.pixelWidth,
+           let pixelHeight = registeredImage.pixelHeight {
+            return PastedImageRegistry.cgImageFromRawPixelData(
+                rawPixelData,
+                format: rawPixelFormat,
+                width: pixelWidth,
+                height: pixelHeight
+            )
+        }
+        guard let url = registeredImage.url,
+              let image = image(for: url) else {
+            return nil
+        }
+        return image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+    }
+
+    private static func image(for url: URL) -> NSImage? {
         let key = url as NSURL
         if let cached = imageCache.object(forKey: key) {
             return cached

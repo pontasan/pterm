@@ -503,6 +503,20 @@ final class ScrollbackBuffer {
         releaseSerializationBuffer()
     }
 
+    func liveInlineImageIDs() -> Set<Int> {
+        var ids = Set<Int>()
+        ids.reserveCapacity(8)
+        var rowBuffer: [Cell] = []
+        rowBuffer.reserveCapacity(256)
+        for rowIndex in 0..<rowCount {
+            guard getRow(at: rowIndex, into: &rowBuffer) else { continue }
+            for cell in rowBuffer where cell.hasInlineImage {
+                ids.insert(Int(cell.imageID))
+            }
+        }
+        return ids
+    }
+
     @discardableResult
     func compactIfUnderutilized() -> Bool {
         guard let rb = ringBuffer else { return false }
@@ -765,7 +779,7 @@ final class ScrollbackBuffer {
                 canUseCompactDefault = false
             }
 
-            if canUseCompactUniform && cell.attributes != sharedAttributes {
+            if canUseCompactUniform && !isCompactUniformAttributeCell(cell, sharedAttributes: sharedAttributes) {
                 canUseCompactUniform = false
             }
 
@@ -978,6 +992,12 @@ final class ScrollbackBuffer {
         cell.attributes == sharedAttributes &&
         cell.width == Cell.empty.width &&
         !cell.isWideContinuation &&
+        !cell.hasInlineImage &&
+        !cell.hasGraphemeTail
+    }
+
+    private static func isCompactUniformAttributeCell(_ cell: Cell, sharedAttributes: CellAttributes) -> Bool {
+        cell.attributes == sharedAttributes &&
         !cell.hasInlineImage &&
         !cell.hasGraphemeTail
     }

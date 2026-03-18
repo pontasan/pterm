@@ -1,3 +1,5 @@
+import Compression
+import Darwin
 import Foundation
 import PtermCore
 
@@ -7,6 +9,54 @@ import PtermCore
 /// to update the terminal display. This is the bridge between the C VT parser
 /// and the Swift rendering layer.
 final class TerminalModel {
+    @_silgen_name("shm_open")
+    private static func posixShmOpen(_ name: UnsafePointer<CChar>, _ oflag: Int32, _ mode: mode_t) -> Int32
+
+    private struct KittyImageChunkAccumulator {
+        let startRow: Int
+        let startCol: Int
+        let transmission: UInt8
+        let compression: UInt8?
+        let pixelWidth: Int?
+        let pixelHeight: Int?
+        let columnSpan: Int
+        let rowSpan: Int
+        let format: TerminalImagePayloadFormat?
+        let byteOffset: Int
+        let byteCount: Int?
+        let encodedPayloadFileURL: URL
+    }
+
+    private struct KittyGraphicsControl {
+        var action: UInt8 = UInt8(ascii: "t")
+        var transmission: UInt8 = UInt8(ascii: "d")
+        var compression: UInt8?
+        var hasMoreChunks = false
+        var byteOffset = 0
+        var byteCount: Int?
+        var imageIndex: Int?
+        var columnSpan = 1
+        var rowSpan = 1
+        var pixelWidth: Int?
+        var pixelHeight: Int?
+        var formatCode: Int?
+        var encodedPayloadStart = 0
+    }
+
+    struct DeferredKittyImagePayloadJob {
+        let imageIndex: Int
+        let encodedPayloadFileURL: URL
+        let transmission: UInt8
+        let compression: UInt8?
+        let format: TerminalImagePayloadFormat?
+        let pixelWidth: Int?
+        let pixelHeight: Int?
+        let columnSpan: Int
+        let rowSpan: Int
+        let byteOffset: Int
+        let byteCount: Int?
+    }
+
     private enum DesignatedCharacterSet {
         case ascii
         case british
@@ -134,7 +184,15 @@ final class TerminalModel {
     private var insertModeEnabled = false
     private var protectedAreaModeEnabled = false
     private var nextKittyImagePlaceholderIndex = 1
+    private var kittyImageChunkAccumulators: [Int: KittyImageChunkAccumulator] = [:]
+    private var previousPrintableEndsWithZWJ = false
     private static let answerbackMessage = "pterm"
+    private static let kittyImageEncodedPayloadDirectory: URL = {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pterm-kitty-image-payloads", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }()
 
     init(rows: Int, cols: Int) {
         self.rows = rows
@@ -142,6 +200,12 @@ final class TerminalModel {
         self.reportedLinesPerScreen = rows
         self.grid = TerminalGrid(rows: rows, cols: cols)
         initTabStops()
+    }
+
+    deinit {
+        for accumulator in kittyImageChunkAccumulators.values {
+            try? FileManager.default.removeItem(at: accumulator.encodedPayloadFileURL)
+        }
     }
 
     // MARK: - Tab Stops
@@ -553,14 +617,17 @@ final class TerminalModel {
     }
 
     private func graphemeDisplayWidth(for cell: Cell) -> Int {
-        let scalars = cell.graphemeScalars()
-        if scalars.contains(0x200D) || scalars.contains(0x20E3) || scalars.contains(where: isEmojiModifier) {
+        if cell.containsGraphemeScalar(0x200D)
+            || cell.containsGraphemeScalar(0x20E3)
+            || cell.containsGraphemeScalar(where: isEmojiModifier) {
             return 2
         }
-        if scalars.count == 2 && isRegionalIndicator(scalars[0]) && isRegionalIndicator(scalars[1]) {
+        if cell.graphemeScalarCount() == 2
+            && isRegionalIndicator(cell.codepoint)
+            && isRegionalIndicator(cell.lastGraphemeScalar()) {
             return 2
         }
-        if scalars.contains(0xFE0F) {
+        if cell.containsGraphemeScalar(0xFE0F) {
             return 2
         }
         return max(Int(cell.width), CharacterWidth.width(of: cell.codepoint), 1)
@@ -594,8 +661,7 @@ final class TerminalModel {
         } else if isEmojiModifier(codepoint) {
             shouldAppend = CharacterWidth.width(of: cell.codepoint) == 2 || cell.hasGraphemeTail
         } else if isRegionalIndicator(codepoint) {
-            let scalars = cell.graphemeScalars()
-            shouldAppend = scalars.count == 1 && isRegionalIndicator(scalars[0])
+            shouldAppend = cell.onlyScalarMatches(isRegionalIndicator)
         } else if lastScalar == 0x200D {
             shouldAppend = true
         } else {
@@ -631,6 +697,13 @@ final class TerminalModel {
         return true
     }
 
+    @inline(__always)
+    private func shouldAttemptAppendToPreviousGraphemeCluster(_ codepoint: UInt32, width: Int) -> Bool {
+        if width == 0 { return true }
+        if isEmojiModifier(codepoint) || isRegionalIndicator(codepoint) { return true }
+        return previousPrintableEndsWithZWJ
+    }
+
     @discardableResult
     func consumeGroundASCIIBytesFastPathPrefix(_ bytes: UnsafeBufferPointer<UInt8>) -> Int {
         guard !bytes.isEmpty else { return 0 }
@@ -638,6 +711,17 @@ final class TerminalModel {
 
         var index = 0
         while index < bytes.count {
+            if canUseDefaultSingleWidthASCIITextFastPath {
+                let fastPathConsumed = consumeGroundTextASCIIBytesDefaultSingleWidthFastPathPrefix(
+                    baseAddress.advanced(by: index),
+                    count: bytes.count - index
+                )
+                if fastPathConsumed > 0 {
+                    index += fastPathConsumed
+                    continue
+                }
+            }
+
             let textRunCount = Int(
                 vt_parser_scan_text_ascii_prefix(
                     baseAddress.advanced(by: index),
@@ -732,9 +816,19 @@ final class TerminalModel {
         _ bytes: UnsafePointer<UInt8>,
         count: Int
     ) {
+        _ = consumeGroundTextASCIIBytesDefaultSingleWidthFastPathPrefix(bytes, count: count)
+    }
+
+    @discardableResult
+    @inline(__always)
+    private func consumeGroundTextASCIIBytesDefaultSingleWidthFastPathPrefix(
+        _ bytes: UnsafePointer<UInt8>,
+        count: Int
+    ) -> Int {
         var pointer = bytes
         var remainingCount = count
         let visibleCols = cols
+        let originalCount = count
 
         while remainingCount > 0 {
             let printableCount = Int(
@@ -756,7 +850,7 @@ final class TerminalModel {
                     }
 
                     let available = visibleCols - cursor.col
-                    guard available > 0 else { return }
+                    guard available > 0 else { return originalCount - remainingCount }
 
                     let chunkCount = min(remainingPrintableCount, available)
                     grid.writeSingleWidthDefaultASCIIBytes(
@@ -801,12 +895,14 @@ final class TerminalModel {
                 cursor.col = 0
                 cursor.pendingWrap = false
             default:
-                return
+                return originalCount - remainingCount
             }
 
             pointer = pointer.advanced(by: 1)
             remainingCount -= 1
         }
+
+        return originalCount
     }
 
     private func consumeSimpleESCBytes(
@@ -900,11 +996,13 @@ final class TerminalModel {
     }
 
     private func handleASCIIRun(_ codepoints: UnsafePointer<UInt32>, count: Int) {
+        previousPrintableEndsWithZWJ = false
         handleSingleWidthCodepointRun(codepoints, count: count)
     }
 
     private func handleSingleWidthCodepointRun(_ codepoints: UnsafePointer<UInt32>, count: Int) {
         guard count > 0 else { return }
+        previousPrintableEndsWithZWJ = false
         let attributes = currentPrintAttributes()
         let usesDefaultAttributes = attributes == .default
         if grid.hasOnlySingleWidthLines {
@@ -1032,6 +1130,7 @@ final class TerminalModel {
 
     private func handleDoubleWidthCodepointRun(_ codepoints: UnsafePointer<UInt32>, count: Int) {
         guard count > 0 else { return }
+        previousPrintableEndsWithZWJ = false
         let attributes = currentPrintAttributes()
         let usesDefaultAttributes = attributes == .default
         if grid.hasOnlySingleWidthLines {
@@ -1930,6 +2029,7 @@ final class TerminalModel {
 
     private func handleASCIIByteRun(_ bytes: UnsafePointer<UInt8>, count: Int, containsSpace: Bool) {
         guard count > 0 else { return }
+        previousPrintableEndsWithZWJ = false
 
         let attributes = currentPrintAttributes()
         if grid.hasOnlySingleWidthLines {
@@ -2122,6 +2222,7 @@ final class TerminalModel {
 
     private func handleRepeatedASCIIByte(_ byte: UInt8, count: Int) {
         guard count > 0 else { return }
+        previousPrintableEndsWithZWJ = false
 
         var remainingCount = count
         let attributes = currentPrintAttributes()
@@ -2232,8 +2333,11 @@ final class TerminalModel {
         }
         guard width >= 0 else { return } // Non-printable
 
-        if tryAppendToPreviousGraphemeCluster(translatedCodepoint, width: width) {
-            return
+        if shouldAttemptAppendToPreviousGraphemeCluster(translatedCodepoint, width: width) {
+            if tryAppendToPreviousGraphemeCluster(translatedCodepoint, width: width) {
+                previousPrintableEndsWithZWJ = translatedCodepoint == 0x200D
+                return
+            }
         }
 
         // Handle pending wrap
@@ -2280,6 +2384,7 @@ final class TerminalModel {
                     cursor.col = visibleCols - 1
                 }
             }
+            previousPrintableEndsWithZWJ = translatedCodepoint == 0x200D
             return
         }
 
@@ -2317,6 +2422,7 @@ final class TerminalModel {
                 cursor.col = visibleCols - 1
             }
         }
+        previousPrintableEndsWithZWJ = translatedCodepoint == 0x200D
     }
 
     // MARK: - C0 Controls
@@ -3628,34 +3734,32 @@ final class TerminalModel {
         }
     }
 
-    func handleKittyGraphicsAPCPayload(_ payload: String) {
-        guard payload.first == "G" else { return }
-        let body = payload.dropFirst()
-        let parts = body.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
-        guard let controlPart = parts.first else { return }
-
-        var options: [Substring: Substring] = [:]
-        for entry in controlPart.split(separator: ",", omittingEmptySubsequences: true) {
-            let kv = entry.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-            guard let key = kv.first, kv.count == 2 else { continue }
-            options[key] = kv[1]
+    func handleKittyGraphicsAPCPayloadString(_ payload: String) {
+        payload.utf8CString.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress, buffer.count > 1 else { return }
+            let bytes = UnsafeBufferPointer(
+                start: UnsafePointer<UInt8>(OpaquePointer(base)),
+                count: buffer.count - 1
+            )
+            if let job = handleKittyGraphicsAPCPayload(bytes) {
+                executeDeferredKittyImagePayload(job)
+            }
         }
+    }
 
-        let action = options["a"].flatMap(\.first) ?? "t"
-        guard action == "T" || action == "t" else { return }
+    func handleKittyGraphicsAPCPayload(_ payload: UnsafeBufferPointer<UInt8>) -> DeferredKittyImagePayloadJob? {
+        guard let control = Self.parseKittyGraphicsControl(in: payload) else { return nil }
+        let action = control.action
+        guard action == UInt8(ascii: "T") || action == UInt8(ascii: "t") else { return nil }
 
-        let transmission = options["t"].flatMap(\.first) ?? "d"
-        let encodedPayload = parts.count == 2 ? String(parts[1]) : ""
-        let decodedPayload: Data?
-        switch transmission {
-        case "d":
-            decodedPayload = Data(base64Encoded: encodedPayload)
-        default:
-            decodedPayload = nil
-        }
+        let transmission = control.transmission
+        let compression = control.compression
+        let hasMoreChunks = control.hasMoreChunks
+        let byteOffset = max(control.byteOffset, 0)
+        let byteCount = control.byteCount
 
         let imageIndex: Int
-        if let parsed = options["i"].flatMap({ Int($0) }) {
+        if let parsed = control.imageIndex {
             imageIndex = parsed
             nextKittyImagePlaceholderIndex = max(nextKittyImagePlaceholderIndex, parsed + 1)
         } else {
@@ -3663,33 +3767,431 @@ final class TerminalModel {
             nextKittyImagePlaceholderIndex += 1
         }
 
-        let columnSpan = max(options["c"].flatMap { Int($0) } ?? 1, 1)
-        let rowSpan = max(options["r"].flatMap { Int($0) } ?? 1, 1)
-        placeInlineImage(
-            imageIndex: imageIndex,
-            columns: columnSpan,
-            rows: rowSpan
+        let columnSpan = max(control.columnSpan, 1)
+        let rowSpan = max(control.rowSpan, 1)
+        let startRow = cursor.row
+        let startCol = cursor.col
+        let hasExistingAccumulator = kittyImageChunkAccumulators[imageIndex] != nil
+        if !hasExistingAccumulator && !hasMoreChunks {
+            placeInlineImage(
+                atRow: startRow,
+                startCol: startCol,
+                imageIndex: imageIndex,
+                columns: columnSpan,
+                rows: rowSpan
+            )
+        }
+
+        let format = control.formatCode.flatMap(TerminalImagePayloadFormat.init(kittyFormatCode:))
+        let encodedPayload = UnsafeBufferPointer(
+            start: payload.baseAddress!.advanced(by: control.encodedPayloadStart),
+            count: payload.count - control.encodedPayloadStart
         )
 
-        guard let decodedPayload,
-              !decodedPayload.isEmpty else {
+        if hasMoreChunks || hasExistingAccumulator {
+            var accumulator = kittyImageChunkAccumulators[imageIndex] ?? KittyImageChunkAccumulator(
+                startRow: startRow,
+                startCol: startCol,
+                transmission: transmission,
+                compression: compression,
+                pixelWidth: control.pixelWidth,
+                pixelHeight: control.pixelHeight,
+                columnSpan: columnSpan,
+                rowSpan: rowSpan,
+                format: format,
+                byteOffset: byteOffset,
+                byteCount: byteCount,
+                encodedPayloadFileURL: Self.makeKittyImageEncodedPayloadFileURL()
+            )
+            let appendedChunk = Self.appendKittyEncodedPayload(encodedPayload, to: accumulator.encodedPayloadFileURL)
+            guard appendedChunk else {
+                try? FileManager.default.removeItem(at: accumulator.encodedPayloadFileURL)
+                kittyImageChunkAccumulators.removeValue(forKey: imageIndex)
+                return nil
+            }
+            kittyImageChunkAccumulators[imageIndex] = accumulator
+            if hasMoreChunks {
+                return nil
+            }
+        }
+
+        let resolvedPayloadFileURL: URL
+        if let accumulator = kittyImageChunkAccumulators.removeValue(forKey: imageIndex) {
+            resolvedPayloadFileURL = accumulator.encodedPayloadFileURL
+            placeInlineImage(
+                atRow: accumulator.startRow,
+                startCol: accumulator.startCol,
+                imageIndex: imageIndex,
+                columns: accumulator.columnSpan,
+                rows: accumulator.rowSpan
+            )
+        } else {
+            let payloadFileURL = Self.makeKittyImageEncodedPayloadFileURL()
+            let appendedChunk = Self.appendKittyEncodedPayload(encodedPayload, to: payloadFileURL)
+            guard appendedChunk else {
+                try? FileManager.default.removeItem(at: payloadFileURL)
+                return nil
+            }
+            resolvedPayloadFileURL = payloadFileURL
+        }
+
+        return DeferredKittyImagePayloadJob(
+            imageIndex: imageIndex,
+            encodedPayloadFileURL: resolvedPayloadFileURL,
+            transmission: transmission,
+            compression: compression,
+            format: format,
+            pixelWidth: control.pixelWidth,
+            pixelHeight: control.pixelHeight,
+            columnSpan: columnSpan,
+            rowSpan: rowSpan,
+            byteOffset: byteOffset,
+            byteCount: byteCount
+        )
+    }
+
+    func executeDeferredKittyImagePayload(_ job: DeferredKittyImagePayloadJob) {
+        defer {
+            try? FileManager.default.removeItem(at: job.encodedPayloadFileURL)
+        }
+        guard let decodedPayload = Self.resolveKittyGraphicsPayload(
+            encodedPayloadFileURL: job.encodedPayloadFileURL,
+            transmission: job.transmission,
+            compression: job.compression,
+            format: job.format,
+            pixelWidth: job.pixelWidth,
+            pixelHeight: job.pixelHeight,
+            byteOffset: job.byteOffset,
+            byteCount: job.byteCount
+        ),
+        !decodedPayload.isEmpty else {
             return
         }
 
-        let format = options["f"]
-            .flatMap { Int($0) }
-            .flatMap(TerminalImagePayloadFormat.init(kittyFormatCode:))
-            ?? inferredKittyImagePayloadFormat(for: decodedPayload)
-        guard let format else { return }
+        let resolvedFormat = job.format ?? inferredKittyImagePayloadFormat(for: decodedPayload)
+        guard let resolvedFormat else { return }
 
-        let pixelWidth = options["s"].flatMap { Int($0) }
-        let pixelHeight = options["v"].flatMap { Int($0) }
-        onKittyImagePayload?(imageIndex, decodedPayload, format, pixelWidth, pixelHeight, columnSpan, rowSpan)
+        onKittyImagePayload?(
+            job.imageIndex,
+            decodedPayload,
+            resolvedFormat,
+            job.pixelWidth,
+            job.pixelHeight,
+            job.columnSpan,
+            job.rowSpan
+        )
     }
 
-    private func placeInlineImage(imageIndex: Int, columns: Int, rows rowSpan: Int) {
-        let startRow = cursor.row
-        let startCol = cursor.col
+    private static func parseKittyGraphicsControl(in payload: UnsafeBufferPointer<UInt8>) -> KittyGraphicsControl? {
+        guard let base = payload.baseAddress, payload.count >= 1, base[0] == UInt8(ascii: "G") else {
+            return nil
+        }
+
+        var control = KittyGraphicsControl()
+        var semicolonIndex = payload.count
+        var index = 1
+        while index < payload.count {
+            if base[index] == UInt8(ascii: ";") {
+                semicolonIndex = index
+                break
+            }
+            index += 1
+        }
+        control.encodedPayloadStart = min(semicolonIndex + 1, payload.count)
+
+        var entryStart = 1
+        while entryStart < semicolonIndex {
+            var entryEnd = entryStart
+            while entryEnd < semicolonIndex, base[entryEnd] != UInt8(ascii: ",") {
+                entryEnd += 1
+            }
+
+            var equalsIndex = entryStart
+            while equalsIndex < entryEnd, base[equalsIndex] != UInt8(ascii: "=") {
+                equalsIndex += 1
+            }
+
+            if equalsIndex < entryEnd {
+                let key = base[entryStart]
+                let valueStart = equalsIndex + 1
+                let value = UnsafeBufferPointer(
+                    start: base.advanced(by: valueStart),
+                    count: entryEnd - valueStart
+                )
+                switch key {
+                case UInt8(ascii: "a"):
+                    control.action = value.first ?? control.action
+                case UInt8(ascii: "t"):
+                    control.transmission = value.first ?? control.transmission
+                case UInt8(ascii: "o"):
+                    control.compression = value.first
+                case UInt8(ascii: "m"):
+                    control.hasMoreChunks = value.count == 1 && value[0] == UInt8(ascii: "1")
+                case UInt8(ascii: "O"):
+                    control.byteOffset = max(parseASCIIInt(value) ?? 0, 0)
+                case UInt8(ascii: "S"):
+                    control.byteCount = parseASCIIInt(value)
+                case UInt8(ascii: "i"):
+                    control.imageIndex = parseASCIIInt(value)
+                case UInt8(ascii: "c"):
+                    control.columnSpan = max(parseASCIIInt(value) ?? 1, 1)
+                case UInt8(ascii: "r"):
+                    control.rowSpan = max(parseASCIIInt(value) ?? 1, 1)
+                case UInt8(ascii: "s"):
+                    control.pixelWidth = parseASCIIInt(value)
+                case UInt8(ascii: "v"):
+                    control.pixelHeight = parseASCIIInt(value)
+                case UInt8(ascii: "f"):
+                    control.formatCode = parseASCIIInt(value)
+                default:
+                    break
+                }
+            }
+
+            entryStart = entryEnd + 1
+        }
+
+        return control
+    }
+
+    private static func parseASCIIInt(_ bytes: UnsafeBufferPointer<UInt8>) -> Int? {
+        guard !bytes.isEmpty else { return nil }
+        var value = 0
+        for byte in bytes {
+            guard byte >= UInt8(ascii: "0"), byte <= UInt8(ascii: "9") else { return nil }
+            value = value * 10 + Int(byte - UInt8(ascii: "0"))
+        }
+        return value
+    }
+
+    private static func resolveKittyGraphicsPayload(
+        encodedPayloadFileURL: URL,
+        transmission: UInt8,
+        compression: UInt8?,
+        format: TerminalImagePayloadFormat?,
+        pixelWidth: Int?,
+        pixelHeight: Int?,
+        byteOffset: Int,
+        byteCount: Int?
+    ) -> Data? {
+        guard let encodedPayloadData = try? Data(contentsOf: encodedPayloadFileURL, options: .mappedIfSafe) else {
+            return nil
+        }
+        let loadedData: Data?
+        switch transmission {
+        case UInt8(ascii: "d"):
+            loadedData = Data(base64Encoded: encodedPayloadData)
+        case UInt8(ascii: "f"):
+            guard let pathData = Data(base64Encoded: encodedPayloadData) else {
+                return nil
+            }
+            let path = String(decoding: pathData, as: UTF8.self)
+            loadedData = loadKittyGraphicsFilePayload(
+                atPath: path,
+                byteOffset: byteOffset,
+                byteCount: byteCount
+            )
+        case UInt8(ascii: "s"):
+            guard let nameData = Data(base64Encoded: encodedPayloadData) else {
+                return nil
+            }
+            let name = String(decoding: nameData, as: UTF8.self)
+            loadedData = loadKittyGraphicsSharedMemoryPayload(
+                named: name,
+                byteOffset: byteOffset,
+                byteCount: byteCount
+            )
+        default:
+            loadedData = nil
+        }
+
+        guard let loadedData else { return nil }
+        guard compression == UInt8(ascii: "z") else { return loadedData }
+        return decompressKittyGraphicsPayload(
+            loadedData,
+            format: format,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight
+        )
+    }
+
+    private static func makeKittyImageEncodedPayloadFileURL() -> URL {
+        kittyImageEncodedPayloadDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: false)
+            .appendingPathExtension("b64")
+    }
+
+    private static func appendKittyEncodedPayload(
+        _ bytes: UnsafeBufferPointer<UInt8>,
+        to fileURL: URL
+    ) -> Bool {
+        guard let baseAddress = bytes.baseAddress else { return true }
+
+        let path = fileURL.path
+        let fd: Int32
+        if FileManager.default.fileExists(atPath: path) {
+            fd = open(path, O_WRONLY | O_APPEND)
+        } else {
+            fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR)
+        }
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+
+        var bytesRemaining = bytes.count
+        var currentPointer = baseAddress
+        while bytesRemaining > 0 {
+            let written = write(fd, currentPointer, bytesRemaining)
+            if written <= 0 {
+                return false
+            }
+            bytesRemaining -= written
+            currentPointer = currentPointer.advanced(by: written)
+        }
+        return true
+    }
+
+    private static func loadKittyGraphicsFilePayload(
+        atPath path: String,
+        byteOffset: Int,
+        byteCount: Int?
+    ) -> Data? {
+        let url = URL(fileURLWithPath: path)
+        guard url.isFileURL else { return nil }
+        let standardizedURL = url.standardizedFileURL
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: standardizedURL.path),
+              let fileType = attributes[.type] as? FileAttributeType,
+              fileType == .typeRegular else {
+            return nil
+        }
+
+        let descriptor = open(standardizedURL.path, O_RDONLY)
+        guard descriptor >= 0 else { return nil }
+        defer { close(descriptor) }
+
+        let fileLength = Int((attributes[.size] as? NSNumber)?.intValue ?? 0)
+        guard fileLength > 0, byteOffset >= 0, byteOffset < fileLength else {
+            return nil
+        }
+        let bytesToRead = min(byteCount ?? (fileLength - byteOffset), fileLength - byteOffset)
+        guard bytesToRead > 0 else { return nil }
+
+        guard let mapped = mmap(nil, fileLength, PROT_READ, MAP_PRIVATE, descriptor, 0),
+              mapped != MAP_FAILED else {
+            return nil
+        }
+
+        let base = mapped.advanced(by: byteOffset)
+        return Data(
+            bytesNoCopy: base,
+            count: bytesToRead,
+            deallocator: .custom { _, _ in
+                munmap(mapped, fileLength)
+            }
+        )
+    }
+
+    private static func loadKittyGraphicsSharedMemoryPayload(
+        named name: String,
+        byteOffset: Int,
+        byteCount: Int?
+    ) -> Data? {
+        let descriptor = name.withCString { posixShmOpen($0, O_RDONLY, 0) }
+        guard descriptor >= 0 else { return nil }
+        defer { close(descriptor) }
+
+        var statBuffer = stat()
+        guard fstat(descriptor, &statBuffer) == 0 else { return nil }
+        let mappingLength = Int(statBuffer.st_size)
+        guard mappingLength > 0, byteOffset >= 0, byteOffset < mappingLength else { return nil }
+        let bytesToRead = min(byteCount ?? (mappingLength - byteOffset), mappingLength - byteOffset)
+        guard bytesToRead > 0 else { return nil }
+
+        guard let mapped = mmap(nil, mappingLength, PROT_READ, MAP_SHARED, descriptor, 0),
+              mapped != MAP_FAILED else {
+            return nil
+        }
+        _ = name.withCString { shm_unlink($0) }
+
+        let base = mapped.advanced(by: byteOffset)
+        return Data(
+            bytesNoCopy: base,
+            count: bytesToRead,
+            deallocator: .custom { _, _ in
+                munmap(mapped, mappingLength)
+            }
+        )
+    }
+
+    private static func decompressKittyGraphicsPayload(
+        _ data: Data,
+        format: TerminalImagePayloadFormat?,
+        pixelWidth: Int?,
+        pixelHeight: Int?
+    ) -> Data? {
+        let expectedSize: Int? = {
+            switch format {
+            case .rawRGB:
+                guard let pixelWidth, let pixelHeight else { return nil }
+                return pixelWidth * pixelHeight * 3
+            case .rawRGBA:
+                guard let pixelWidth, let pixelHeight else { return nil }
+                return pixelWidth * pixelHeight * 4
+            case .png, .jpeg, .gif, .webp, .none:
+                return nil
+            }
+        }()
+
+        let dummyDestination = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
+        let dummySource = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
+        defer {
+            dummyDestination.deallocate()
+            dummySource.deallocate()
+        }
+        var stream = compression_stream(
+            dst_ptr: dummyDestination,
+            dst_size: 0,
+            src_ptr: UnsafePointer(dummySource),
+            src_size: 0,
+            state: nil
+        )
+        var status = compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB)
+        guard status != COMPRESSION_STATUS_ERROR else { return nil }
+        defer { compression_stream_destroy(&stream) }
+
+        let destinationChunkSize = max(expectedSize ?? 0, 64 * 1024)
+        var destination = Data()
+        if let expectedSize {
+            destination.reserveCapacity(expectedSize)
+        }
+
+        return data.withUnsafeBytes { sourceBuffer -> Data? in
+            guard let sourceBase = sourceBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return nil
+            }
+            stream.src_ptr = sourceBase
+            stream.src_size = data.count
+
+            var chunk = [UInt8](repeating: 0, count: destinationChunkSize)
+            repeat {
+                let chunkCount = chunk.count
+                var produced = 0
+                chunk.withUnsafeMutableBytes { destinationBuffer in
+                    stream.dst_ptr = destinationBuffer.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                    stream.dst_size = chunkCount
+                    status = compression_stream_process(&stream, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
+                    produced = chunkCount - stream.dst_size
+                }
+                if produced > 0 {
+                    destination.append(contentsOf: chunk.prefix(produced))
+                }
+            } while status == COMPRESSION_STATUS_OK
+
+            guard status == COMPRESSION_STATUS_END else { return nil }
+            return destination
+        }
+    }
+
+    private func placeInlineImage(atRow startRow: Int, startCol: Int, imageIndex: Int, columns: Int, rows rowSpan: Int) {
         let clampedColumns = max(1, min(columns, cols - startCol))
         let clampedRows = max(1, min(rowSpan, self.rows - startRow))
         guard clampedColumns > 0, clampedRows > 0 else { return }

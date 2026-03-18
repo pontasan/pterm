@@ -826,6 +826,185 @@ final class AppInfrastructureTests: XCTestCase {
         }
     }
 
+    func testPastedImageRegistryTransientRawKittyImageUsesBlobStorageAndStaysRenderable() throws {
+        try withTemporaryPtermConfig { _ in
+            let registry = PastedImageRegistry()
+            let rawRGBA = Data([
+                255, 0, 0, 255,
+                0, 255, 0, 255,
+                0, 0, 255, 255,
+                255, 255, 0, 255
+            ])
+
+            try registry.registerTransient(
+                imageData: rawRGBA,
+                format: .rawRGBA,
+                placeholderIndex: 9,
+                pixelWidth: 2,
+                pixelHeight: 2,
+                columns: 2,
+                rows: 2
+            )
+
+            let registered = try XCTUnwrap(registry.registeredImage(forPlaceholderIndex: 9))
+            XCTAssertNil(registered.url)
+            XCTAssertNotNil(registered.blobURL)
+            XCTAssertNil(registered.rawPixelData)
+            XCTAssertEqual(registered.rawPixelFormat, .rawRGBA)
+            XCTAssertNotNil(TerminalInlineImageSupport.cgImage(for: registered))
+            XCTAssertEqual(registered.columns, 2)
+            XCTAssertEqual(registered.rows, 2)
+        }
+    }
+
+    func testPastedImageRegistryRawBlobCanMaterializePreviewURLLazily() throws {
+        try withTemporaryPtermConfig { _ in
+            let registry = PastedImageRegistry()
+            let rawRGBA = Data([
+                255, 0, 0, 255,
+                0, 255, 0, 255,
+                0, 0, 255, 255,
+                255, 255, 0, 255
+            ])
+
+            try registry.registerTransient(
+                imageData: rawRGBA,
+                format: .rawRGBA,
+                placeholderIndex: 11,
+                pixelWidth: 2,
+                pixelHeight: 2
+            )
+
+            let url = try XCTUnwrap(registry.url(forPlaceholderIndex: 11))
+            XCTAssertEqual(url.pathExtension, "png")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+            XCTAssertNotNil(NSImage(contentsOf: url))
+        }
+    }
+
+    func testPastedImageRegistryStoresCompressedTransientKittyImageOnDiskInsteadOfHeap() throws {
+        try withTemporaryPtermConfig { _ in
+            let registry = PastedImageRegistry()
+            let maybeBitmap = NSBitmapImageRep(
+                bitmapDataPlanes: nil,
+                pixelsWide: 4,
+                pixelsHigh: 4,
+                bitsPerSample: 8,
+                samplesPerPixel: 4,
+                hasAlpha: true,
+                isPlanar: false,
+                colorSpaceName: .deviceRGB,
+                bytesPerRow: 0,
+                bitsPerPixel: 0
+            )
+            let bitmap = try XCTUnwrap(maybeBitmap)
+            let context = try XCTUnwrap(NSGraphicsContext(bitmapImageRep: bitmap))
+            NSGraphicsContext.saveGraphicsState()
+            defer { NSGraphicsContext.restoreGraphicsState() }
+            NSGraphicsContext.current = context
+            NSColor.systemRed.setFill()
+            NSBezierPath(rect: NSRect(x: 0, y: 0, width: 4, height: 4)).fill()
+            let pngData = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+
+            try registry.registerTransient(
+                imageData: pngData,
+                format: .png,
+                placeholderIndex: 10,
+                pixelWidth: 4,
+                pixelHeight: 4,
+                columns: 2,
+                rows: 2
+            )
+
+            let registered = try XCTUnwrap(registry.registeredImage(forPlaceholderIndex: 10))
+            let url = try XCTUnwrap(registered.url)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+            XCTAssertNil(registered.rawPixelData)
+            XCTAssertNil(registered.rawPixelFormat)
+            XCTAssertEqual(registered.columns, 2)
+            XCTAssertEqual(registered.rows, 2)
+            XCTAssertNotNil(NSImage(contentsOf: url))
+        }
+    }
+
+    func testPastedImageRegistryScopesTransientKittyImagesByOwnerAndPurgesInvalidatedOwner() throws {
+        try withTemporaryPtermConfig { _ in
+            let registry = PastedImageRegistry()
+            let ownerA = UUID()
+            let ownerB = UUID()
+            let rawRGBAA = Data([255, 0, 0, 255])
+            let rawRGBAB = Data([0, 255, 0, 255])
+
+            try registry.registerTransient(
+                imageData: rawRGBAA,
+                format: .rawRGBA,
+                placeholderIndex: 1,
+                ownerID: ownerA,
+                pixelWidth: 1,
+                pixelHeight: 1
+            )
+            try registry.registerTransient(
+                imageData: rawRGBAB,
+                format: .rawRGBA,
+                placeholderIndex: 1,
+                ownerID: ownerB,
+                pixelWidth: 1,
+                pixelHeight: 1
+            )
+
+            XCTAssertNotNil(registry.registeredImage(ownerID: ownerA, forPlaceholderIndex: 1))
+            XCTAssertNotNil(registry.registeredImage(ownerID: ownerB, forPlaceholderIndex: 1))
+
+            registry.removeImages(ownerID: ownerA)
+
+            XCTAssertNil(registry.registeredImage(ownerID: ownerA, forPlaceholderIndex: 1))
+            XCTAssertNotNil(registry.registeredImage(ownerID: ownerB, forPlaceholderIndex: 1))
+
+            try registry.registerTransient(
+                imageData: rawRGBAA,
+                format: .rawRGBA,
+                placeholderIndex: 1,
+                ownerID: ownerA,
+                pixelWidth: 1,
+                pixelHeight: 1
+            )
+            XCTAssertNil(registry.registeredImage(ownerID: ownerA, forPlaceholderIndex: 1))
+        }
+    }
+
+    func testPastedImageRegistryPurgesOnlyOwnerImagesThatAreNoLongerLive() throws {
+        try withTemporaryPtermConfig { _ in
+            let registry = PastedImageRegistry()
+            let owner = UUID()
+            let pngBytes = Data([
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+                0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52
+            ])
+
+            try registry.registerTransient(
+                imageData: pngBytes,
+                format: .png,
+                placeholderIndex: 1,
+                ownerID: owner
+            )
+            try registry.registerTransient(
+                imageData: pngBytes,
+                format: .png,
+                placeholderIndex: 2,
+                ownerID: owner
+            )
+
+            _ = registry.url(ownerID: owner, forPlaceholderIndex: 1)
+            _ = registry.url(ownerID: owner, forPlaceholderIndex: 2)
+
+            let removed = registry.purgeUnreferencedImages(ownerID: owner, retainingPlaceholderIndices: [2])
+
+            XCTAssertEqual(removed.count, 1)
+            XCTAssertNil(registry.registeredImage(ownerID: owner, forPlaceholderIndex: 1))
+            XCTAssertNotNil(registry.registeredImage(ownerID: owner, forPlaceholderIndex: 2))
+        }
+    }
+
     func testPastedImageRegistryPreservesKittyCellPlacementMetadata() throws {
         try withTemporaryPtermConfig { _ in
             let registry = PastedImageRegistry()
@@ -1228,6 +1407,27 @@ final class AppInfrastructureTests: XCTestCase {
 
             let loaded = PtermConfigStore.load(from: configURL)
             XCTAssertFalse(loaded.textInteraction.typewriterSoundEnabled)
+        }
+    }
+
+    func testPtermConfigStoreDefaultsOutputFrameThrottlingToEnabled() {
+        let loaded = PtermConfigStore.load(from: URL(fileURLWithPath: "/nonexistent/config.json"))
+
+        XCTAssertEqual(loaded.textInteraction.outputFrameThrottlingMode, .continuous)
+    }
+
+    func testPtermConfigStoreLoadsOutputFrameThrottlingSetting() throws {
+        try withTemporaryPtermConfig { configURL in
+            let json: [String: Any] = [
+                "text_interaction": [
+                    "output_frame_throttling_mode": "continuous"
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try AtomicFileWriter.write(data, to: configURL, permissions: 0o600)
+
+            let loaded = PtermConfigStore.load(from: configURL)
+            XCTAssertEqual(loaded.textInteraction.outputFrameThrottlingMode, .continuous)
         }
     }
 

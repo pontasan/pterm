@@ -33,7 +33,12 @@ final class TerminalGrid {
         width: 0,
         isWideContinuation: true
     )
-
+    private static let defaultDoubleWidthCellTemplate = Cell(
+        codepoint: 0,
+        attributes: .default,
+        width: 2,
+        isWideContinuation: false
+    )
     /// Number of rows
     private(set) var rows: Int
 
@@ -424,10 +429,26 @@ final class TerminalGrid {
     ) {
         guard count > 0 else { return }
         let physicalRow = physicalRow(for: row)
-        materializePhysicalRowIfNeeded(physicalRow)
+        let writtenCellCount = count * 2
+        let rowWasBlank = physicalBlankRows[physicalRow]
+        let priorSparsePrefixCount = physicalSparseCompactDefaultPrefixCounts[physicalRow]
+        let canUseSparseFastPath = startCol == 0 && rowWasBlank
+        let canExtendSparseFastPath = priorSparsePrefixCount > 0 && startCol == priorSparsePrefixCount
+        if !(canUseSparseFastPath || canExtendSparseFastPath) {
+            materializePhysicalRowIfNeeded(physicalRow)
+        }
         let offset = physicalRow * cols + startCol
-        initializeDoubleWidthDefaultCells(at: offset, codepoints: codepoints, count: count)
-        markRowEncodingHintDirty(row)
+        cells.withUnsafeMutableBufferPointer { cellBuffer in
+            guard let destination = cellBuffer.baseAddress?.advanced(by: offset) else { return }
+            Self.writeDoubleWidthDefaultCells(into: destination, from: codepoints, count: count)
+        }
+        physicalBlankRows[physicalRow] = false
+        if canUseSparseFastPath || canExtendSparseFastPath {
+            physicalSparseCompactDefaultPrefixCounts[physicalRow] = startCol + writtenCellCount
+        } else {
+            physicalSparseCompactDefaultPrefixCounts[physicalRow] = 0
+        }
+        rowEncodingHintStates[physicalRow] = .dirty
     }
 
 
@@ -975,6 +996,19 @@ final class TerminalGrid {
         }
         let end = min(start + dimensions.cols, cells.count)
         return cells[start..<end]
+    }
+
+    func liveInlineImageIDs() -> Set<Int> {
+        var ids = Set<Int>()
+        ids.reserveCapacity(8)
+        let dimensions = readableDimensions()
+        guard dimensions.rows > 0 else { return ids }
+        for row in 0..<dimensions.rows {
+            for cell in rowCells(row) where cell.hasInlineImage {
+                ids.insert(Int(cell.imageID))
+            }
+        }
+        return ids
     }
 
     /// Return only the cells that scrollback serialization actually needs.
@@ -1616,22 +1650,29 @@ final class TerminalGrid {
         count: Int
     ) {
         cells.withUnsafeMutableBufferPointer { buffer in
-            guard var destination = buffer.baseAddress?.advanced(by: offset) else { return }
-            var source = codepoints
-            var remaining = count
-            let continuation = Self.defaultWideContinuationCell
-            while remaining > 0 {
-                destination.pointee = Cell(
-                    codepoint: source.pointee,
-                    attributes: .default,
-                    width: 2,
-                    isWideContinuation: false
-                )
-                destination.advanced(by: 1).pointee = continuation
-                destination += 2
-                source += 1
-                remaining -= 1
-            }
+            guard let destination = buffer.baseAddress?.advanced(by: offset) else { return }
+            Self.writeDoubleWidthDefaultCells(into: destination, from: codepoints, count: count)
+        }
+    }
+
+    @inline(__always)
+    private static func writeDoubleWidthDefaultCells(
+        into destination: UnsafeMutablePointer<Cell>,
+        from source: UnsafePointer<UInt32>,
+        count: Int
+    ) {
+        var destination = destination
+        var source = source
+        var remaining = count
+        let continuation = Self.defaultWideContinuationCell
+        var template = Self.defaultDoubleWidthCellTemplate
+        while remaining > 0 {
+            template.codepoint = source.pointee
+            destination.pointee = template
+            destination.advanced(by: 1).pointee = continuation
+            destination += 2
+            source += 1
+            remaining -= 1
         }
     }
 

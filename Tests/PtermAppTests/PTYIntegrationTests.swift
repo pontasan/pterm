@@ -317,10 +317,10 @@ final class PTYIntegrationTests: XCTestCase {
             let doneMarker = "__PTERM_KITTEN_DONE__"
             let exitExpectation = expectation(description: "controller-exit-kitten-benchmark")
             let longEscapeExpectation = expectation(description: "controller-kitten-long-escape-visible")
-            let finalizeExpectation = expectation(description: "controller-kitten-finalize-visible")
+            let completionExpectation = expectation(description: "controller-kitten-completion-visible")
             var exited = false
             var sawLongEscape = false
-            var sawFinalize = false
+            var sawCompletion = false
             controller.onExit = {
                 guard !exited else { return }
                 exited = true
@@ -332,9 +332,10 @@ final class PTYIntegrationTests: XCTestCase {
                     sawLongEscape = true
                     longEscapeExpectation.fulfill()
                 }
-                if !sawFinalize, text.contains("Waiting for response indicating parsing finished") {
-                    sawFinalize = true
-                    finalizeExpectation.fulfill()
+                if !sawCompletion,
+                   (text.contains("Results:") || text.contains(doneMarker)) {
+                    sawCompletion = true
+                    completionExpectation.fulfill()
                 }
             }
 
@@ -350,7 +351,7 @@ final class PTYIntegrationTests: XCTestCase {
                 + "exit\n"
             )
 
-            wait(for: [longEscapeExpectation, finalizeExpectation, exitExpectation], timeout: 45.0)
+            wait(for: [longEscapeExpectation, completionExpectation, exitExpectation], timeout: 45.0)
             drainMainQueue(testCase: self)
 
             let terminalText = controller.allText()
