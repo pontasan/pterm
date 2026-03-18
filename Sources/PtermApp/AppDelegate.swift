@@ -1817,6 +1817,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.title = newTitle
     }
 
+    func handleVisibleTerminalTitleChange(for controller: TerminalController) {
+        updateWindowTitle()
+
+        switch viewMode {
+        case .integrated:
+            integratedView?.invalidateDynamicThumbnailCaches()
+
+        case .focused(let focusedController):
+            guard focusedController.id == controller.id else { break }
+            terminalView?.setNeedsDisplay(terminalView?.bounds ?? .zero)
+
+        case .split(let controllers):
+            guard controllers.contains(where: { $0.id == controller.id }) else { break }
+            splitContainerView?.requestRender()
+        }
+
+        requestSessionPersist()
+    }
+
     // MARK: - Actions
 
     @objc func newTerminal(_ sender: Any?) {
@@ -2019,10 +2038,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.resizeWindowToPixelContent(width: width, height: height)
             }
         }
-        controller.onTitleChange = { [weak self] _ in
+        controller.onTitleChange = { [weak self, weak controller] _ in
             DispatchQueue.main.async {
-                self?.updateWindowTitle()
-                self?.requestSessionPersist()
+                guard let self, let controller else { return }
+                self.handleVisibleTerminalTitleChange(for: controller)
+            }
+        }
+        controller.onWorkspaceNameChange = { [weak self, weak controller] _ in
+            DispatchQueue.main.async {
+                guard let self, let controller else { return }
+                self.handleVisibleTerminalTitleChange(for: controller)
             }
         }
         controller.onStateChange = { [weak self] in
@@ -2861,6 +2886,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let targets = manager.terminals.filter { $0.sessionSnapshot.workspaceName == source }
         for controller in targets {
             controller.setWorkspaceName(target)
+            handleVisibleTerminalTitleChange(for: controller)
         }
         if let index = workspaceNames.firstIndex(of: source) {
             workspaceNames[index] = target
@@ -2873,6 +2899,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func moveTerminal(_ controller: TerminalController, toWorkspace workspace: String) {
         let normalized = normalizedWorkspaceName(workspace)
         controller.setWorkspaceName(normalized)
+        handleVisibleTerminalTitleChange(for: controller)
         ensureWorkspaceExists(named: normalized)
         requestSessionPersist()
     }
@@ -2915,6 +2942,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func reorderTerminal(_ controller: TerminalController, toWorkspace workspace: String, atIndex index: Int) {
         let normalized = normalizedWorkspaceName(workspace)
         controller.setWorkspaceName(normalized)
+        handleVisibleTerminalTitleChange(for: controller)
         ensureWorkspaceExists(named: normalized)
         manager.reorderTerminal(controller, toWorkspace: normalized, atIndex: index)
         requestSessionPersist()

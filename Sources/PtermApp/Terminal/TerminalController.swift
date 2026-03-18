@@ -176,6 +176,7 @@ final class TerminalController {
 
     /// Callback when title changes
     var onTitleChange: ((String) -> Void)?
+    var onWorkspaceNameChange: ((String) -> Void)?
     var onStateChange: (() -> Void)?
     var onInlineImageReachabilityChange: ((UUID, Set<Int>) -> Void)?
 
@@ -665,10 +666,12 @@ final class TerminalController {
     }
 
     func setWorkspaceName(_ name: String) {
-        lock.withWriteLock {
+        let effectiveWorkspaceName = lock.withWriteLock { () -> String in
             workspaceName = FileNameSanitizer.sanitize(name, fallback: "Uncategorized")
+            return workspaceName
         }
         DispatchQueue.main.async { [weak self] in
+            self?.onWorkspaceNameChange?(effectiveWorkspaceName)
             self?.onStateChange?()
         }
     }

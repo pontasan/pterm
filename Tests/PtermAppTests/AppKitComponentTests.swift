@@ -8523,6 +8523,56 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(restoredOriginalSplit.controllers.map(\.id), expectedOriginalIDs)
     }
 
+    func testRenamingTerminalTitleClearsIntegratedThumbnailCaches() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let controller = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let second = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+
+        let harness = try makeAppHarness(renderer: renderer, manager: manager)
+        harness.delegate.switchToSplit([controller, second])
+        harness.delegate.backToIntegratedView(nil)
+        drainMainQueue(testCase: self)
+
+        let integratedView = try currentIntegratedView(in: harness.hostedContentView)
+        integratedView.debugSeedThumbnailSurfaceCacheForTesting(controllerID: controller.id)
+        XCTAssertTrue(integratedView.debugHasThumbnailSurfaceCacheEntry(for: controller.id))
+
+        harness.delegate.handleVisibleTerminalTitleChange(for: controller)
+
+        XCTAssertFalse(integratedView.debugHasThumbnailSurfaceCacheEntry(for: controller.id))
+    }
+
+    func testRenamingWorkspaceClearsIntegratedThumbnailCaches() throws {
+        let renderer = try makeRendererOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let controller = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let second = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+
+        let harness = try makeAppHarness(renderer: renderer, manager: manager)
+        controller.onWorkspaceNameChange = { [weak delegate = harness.delegate, weak controller] _ in
+            guard let delegate, let controller else { return }
+            DispatchQueue.main.async {
+                delegate.handleVisibleTerminalTitleChange(for: controller)
+            }
+        }
+        harness.delegate.switchToSplit([controller, second])
+        harness.delegate.backToIntegratedView(nil)
+        drainMainQueue(testCase: self)
+
+        let integratedView = try currentIntegratedView(in: harness.hostedContentView)
+        integratedView.debugSeedThumbnailSurfaceCacheForTesting(controllerID: controller.id)
+        XCTAssertTrue(integratedView.debugHasThumbnailSurfaceCacheEntry(for: controller.id))
+
+        controller.setWorkspaceName("Beta")
+        harness.delegate.handleVisibleTerminalTitleChange(for: controller)
+        drainMainQueue(testCase: self)
+
+        XCTAssertFalse(integratedView.debugHasThumbnailSurfaceCacheEntry(for: controller.id))
+    }
+
     func testFocusedReturnFromDerivedSplitRestoresDerivedSplitBeforeOriginalSplit() throws {
         let renderer = try makeRendererOrSkip()
         let manager = TerminalManager(rows: 24, cols: 80, config: .default)
@@ -9020,6 +9070,10 @@ final class AppKitComponentTests: XCTestCase {
 
     private func currentSplitContainer(in hostedContentView: NSView) throws -> SplitTerminalContainerView {
         try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? SplitTerminalContainerView }.first)
+    }
+
+    private func currentIntegratedView(in hostedContentView: NSView) throws -> IntegratedView {
+        try XCTUnwrap(allSubviews(in: hostedContentView).compactMap { $0 as? IntegratedView }.first)
     }
 
     private func currentFocusedScrollView(in hostedContentView: NSView) throws -> TerminalScrollView {
