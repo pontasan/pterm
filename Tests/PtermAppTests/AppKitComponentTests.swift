@@ -1162,6 +1162,46 @@ final class AppKitComponentTests: XCTestCase {
         }
     }
 
+    func testRendererClampsSnapshotCursorToVisibleRowsDuringSplitChurn() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 3,
+            cols: 8,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/split-cursor-clamp"
+        )
+        defer { controller.stop(waitForExit: true) }
+
+        controller.debugProcessPTYOutputForTesting(Data("hello".utf8))
+        let snapshot = controller.captureRenderSnapshot()
+        var cursor = snapshot.cursor
+        cursor.row = snapshot.visibleRows.count + 16
+        cursor.col = snapshot.cols + 16
+
+        let invalidSnapshot = TerminalController.RenderSnapshot(
+            contentVersion: snapshot.contentVersion,
+            rows: snapshot.rows,
+            cols: snapshot.cols,
+            cursor: cursor,
+            reverseVideo: snapshot.reverseVideo,
+            scrollOffset: snapshot.scrollOffset,
+            scrollbackRowCount: snapshot.scrollbackRowCount,
+            firstVisibleAbsoluteRow: snapshot.firstVisibleAbsoluteRow,
+            ownerID: snapshot.ownerID,
+            hasInlineImages: snapshot.hasInlineImages,
+            inlineImagePlacements: snapshot.inlineImagePlacements,
+            visibleRows: snapshot.visibleRows
+        )
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(snapshot: invalidSnapshot)
+        XCTAssertFalse(vertexData.cursorVertices.isEmpty)
+    }
+
     func testSplitRenderViewInlineKittyImageLayerAppearsForVisiblePlaceholder() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(

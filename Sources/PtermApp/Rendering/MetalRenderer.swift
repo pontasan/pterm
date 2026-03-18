@@ -1726,7 +1726,7 @@ final class MetalRenderer {
         let lineThickness = max(1.0, scaleFactor)
         let cursorThickness = max(1.0, scaleFactor * 2.0)
 
-        let viewRows = snapshot.rows
+        let viewRows = snapshot.visibleRows.count
         let viewCols = snapshot.cols
         let approximateCellCount = max(1, viewRows * viewCols)
         vd.bgVertices.reserveCapacity(approximateCellCount * floatsPerQuad)
@@ -2212,10 +2212,16 @@ final class MetalRenderer {
             }
         }
 
-        if snapshot.scrollOffset == 0 && snapshot.cursor.visible {
+        if snapshot.scrollOffset == 0 && snapshot.cursor.visible && viewRows > 0 {
             let cursorOverlay = transientTextOverlays.last { $0.cursorRow != nil && $0.cursorCol != nil }
-            let cursorCol = cursorOverlay?.cursorCol.map { min(max($0, 0), max(viewCols - 1, 0)) } ?? snapshot.cursor.col
-            let cursorRow = cursorOverlay?.cursorRow.map { min(max($0, 0), max(viewRows - 1, 0)) } ?? snapshot.cursor.row
+            let cursorCol = min(
+                max(cursorOverlay?.cursorCol ?? snapshot.cursor.col, 0),
+                max(viewCols - 1, 0)
+            )
+            let cursorRow = min(
+                max(cursorOverlay?.cursorRow ?? snapshot.cursor.row, 0),
+                max(viewRows - 1, 0)
+            )
             let cursorLineAttribute = snapshot.visibleRows[cursorRow].lineAttribute
             let cursorColumnWidth = cursorLineAttribute.isDoubleWidth ? cellW * 2.0 : cellW
             let cx = padX + Float(cursorCol) * cursorColumnWidth

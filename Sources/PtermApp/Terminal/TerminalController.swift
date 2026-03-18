@@ -1539,7 +1539,14 @@ final class TerminalController {
         let dimensions = visibleGridDimensionsLocked()
         let rows = dimensions.rows
         let cols = dimensions.cols
-        let cursor = model.cursor
+        var cursor = model.cursor
+        if rows > 0, cols > 0 {
+            cursor.clamp(rows: rows, cols: cols)
+        } else {
+            cursor.row = 0
+            cursor.col = 0
+            cursor.visible = false
+        }
         let reverseVideo = model.reverseVideoEnabled
         let offset = scrollOffset
         let scrollbackCount = scrollback.rowCount
