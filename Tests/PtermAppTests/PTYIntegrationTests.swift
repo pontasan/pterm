@@ -372,6 +372,84 @@ final class PTYIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminalControllerRealPTYKittenBenchmarkNamedStagesCompleteIndividually() throws {
+        guard let kittenPath = Self.findExecutable(named: "kitten") else {
+            throw XCTSkip("kitten is not installed in this environment")
+        }
+
+        let stages: [(argument: String, resultLabel: String)] = [
+            ("ascii", "Only ASCII chars"),
+            ("unicode", "Unicode chars"),
+            ("csi", "CSI codes with few chars"),
+            ("long_escape_codes", "Long escape codes"),
+            ("images", "Images"),
+        ]
+
+        try withTemporaryDirectory { directory in
+            for stage in stages {
+                let controller = TerminalController(
+                    rows: 24,
+                    cols: 100,
+                    termEnv: "xterm-kitty",
+                    textEncoding: .utf8,
+                    scrollbackInitialCapacity: 16 * 1024 * 1024,
+                    scrollbackMaxCapacity: 16 * 1024 * 1024,
+                    fontName: "Menlo",
+                    fontSize: 13
+                )
+                defer { controller.stop(waitForExit: true) }
+
+                let outputPath = directory.appendingPathComponent("kitten-benchmark-\(stage.argument).txt").path
+                let doneMarker = "__PTERM_KITTEN_STAGE_DONE_\(stage.argument)__"
+                let exitExpectation = expectation(description: "controller-exit-kitten-\(stage.argument)")
+                let completionExpectation = expectation(description: "controller-kitten-\(stage.argument)-completion-visible")
+                var exited = false
+                var sawCompletion = false
+
+                controller.onExit = {
+                    guard !exited else { return }
+                    exited = true
+                    exitExpectation.fulfill()
+                }
+                controller.onOutputActivity = {
+                    let text = controller.allText()
+                    if !sawCompletion,
+                       (text.contains("Results:") || text.contains(doneMarker)) {
+                        sawCompletion = true
+                        completionExpectation.fulfill()
+                    }
+                }
+
+                try controller.start()
+                try Self.waitForTerminalText(controller, toContain: "%", timeout: 8.0)
+                controller.sendInput(
+                    "'\(Self.shellSingleQuoted(kittenPath))' __benchmark__ --repetitions 1 \(stage.argument) 2>&1 | tee '\(Self.shellSingleQuoted(outputPath))'; "
+                    + "printf '\(doneMarker)\\n'; "
+                    + "exit\n"
+                )
+
+                wait(for: [completionExpectation, exitExpectation], timeout: 30.0)
+                drainMainQueue(testCase: self)
+
+                let terminalText = controller.allText()
+                let benchmarkOutput = (try? String(contentsOfFile: outputPath, encoding: .utf8)) ?? ""
+                XCTAssertTrue(
+                    terminalText.contains(doneMarker),
+                    "benchmark stage \(stage.argument) should complete. tail=\(String(terminalText.suffix(500)))"
+                )
+                XCTAssertTrue(
+                    benchmarkOutput.contains("Results:"),
+                    "benchmark stage \(stage.argument) should emit results. file tail=\(String(benchmarkOutput.suffix(500)))"
+                )
+                XCTAssertTrue(
+                    benchmarkOutput.contains(stage.resultLabel),
+                    "benchmark stage \(stage.argument) should emit the expected results label. file tail=\(String(benchmarkOutput.suffix(500)))"
+                )
+            }
+        }
+    }
+
+    @MainActor
     func testTerminalControllerRealPTYKittenImagesStageUsesInlineImagesWithoutPlaceholderText() throws {
         guard let kittenPath = Self.findExecutable(named: "kitten") else {
             throw XCTSkip("kitten is not installed in this environment")

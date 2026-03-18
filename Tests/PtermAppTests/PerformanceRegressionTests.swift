@@ -46,6 +46,7 @@ final class PerformanceRegressionTests: XCTestCase {
 
     private static let allowedRegressionMultiplier = 2.0
     private static var baselineResetPerformedForCurrentRun = false
+    private static let cachedBaselineEnvironment = computeCurrentBaselineEnvironment()
 
     private struct HistoricalReference {
         let beforeNanoseconds: UInt64
@@ -58,8 +59,18 @@ final class PerformanceRegressionTests: XCTestCase {
         let recordedAt: String
     }
 
+    private struct BaselineEnvironment: Codable, Equatable {
+        let host: String
+        let arch: String
+        let swiftVersion: String
+        let osVersion: String
+        let osBuild: String
+    }
+
     private struct BaselineFile: Codable {
+        var schemaVersion: Int?
         var machine: String
+        var environment: BaselineEnvironment?
         var records: [String: BaselineRecord]
     }
 
@@ -103,18 +114,77 @@ final class PerformanceRegressionTests: XCTestCase {
     }
 
     private static func baselineURL() -> URL {
-        let host = ProcessInfo.processInfo.hostName
-            .replacingOccurrences(of: #"[^A-Za-z0-9._-]"#, with: "-", options: .regularExpression)
-        #if arch(arm64)
-        let arch = "arm64"
-        #elseif arch(x86_64)
-        let arch = "x86_64"
-        #else
-        let arch = "unknown"
-        #endif
+        let host = sanitizedHostName()
+        let arch = currentArchitecture()
         return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".pterm/performance-baselines", isDirectory: true)
             .appendingPathComponent("\(host)-\(arch).json")
+    }
+
+    private static func sanitizedHostName() -> String {
+        ProcessInfo.processInfo.hostName
+            .replacingOccurrences(of: #"[^A-Za-z0-9._-]"#, with: "-", options: .regularExpression)
+    }
+
+    private static func currentArchitecture() -> String {
+        #if arch(arm64)
+        return "arm64"
+        #elseif arch(x86_64)
+        return "x86_64"
+        #else
+        return "unknown"
+        #endif
+    }
+
+    private static func computeCurrentBaselineEnvironment() -> BaselineEnvironment {
+        let processInfo = ProcessInfo.processInfo
+        let operatingSystem = processInfo.operatingSystemVersion
+        return BaselineEnvironment(
+            host: sanitizedHostName(),
+            arch: currentArchitecture(),
+            swiftVersion: shellOutput(
+                executable: "/usr/bin/xcrun",
+                arguments: ["swift", "--version"]
+            ) ?? "unknown",
+            osVersion: "\(operatingSystem.majorVersion).\(operatingSystem.minorVersion).\(operatingSystem.patchVersion)",
+            osBuild: shellOutput(
+                executable: "/usr/bin/sw_vers",
+                arguments: ["-buildVersion"]
+            ) ?? "unknown"
+        )
+    }
+
+    private static func currentBaselineEnvironment() -> BaselineEnvironment {
+        cachedBaselineEnvironment
+    }
+
+    private static func shellOutput(executable: String, arguments: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return output?.isEmpty == false ? output : nil
+        } catch {
+            return nil
+        }
+    }
+
+    private static func emptyBaselineFile() -> BaselineFile {
+        BaselineFile(
+            schemaVersion: 2,
+            machine: sanitizedHostName(),
+            environment: currentBaselineEnvironment(),
+            records: [:]
+        )
     }
 
     private func makeRendererOrSkip() throws -> MetalRenderer {
@@ -439,10 +509,15 @@ final class PerformanceRegressionTests: XCTestCase {
             Self.baselineResetPerformedForCurrentRun = true
         }
         guard FileManager.default.fileExists(atPath: url.path) else {
-            return BaselineFile(machine: ProcessInfo.processInfo.hostName, records: [:])
+            return Self.emptyBaselineFile()
         }
         let data = try Data(contentsOf: url)
-        return try JSONDecoder().decode(BaselineFile.self, from: data)
+        let decoded = try JSONDecoder().decode(BaselineFile.self, from: data)
+        let currentEnvironment = Self.currentBaselineEnvironment()
+        guard decoded.environment == currentEnvironment else {
+            return Self.emptyBaselineFile()
+        }
+        return decoded
     }
 
     private func persistBaselineFile(_ file: BaselineFile, to url: URL) throws {
