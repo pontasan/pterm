@@ -24,7 +24,7 @@ A fast, secure, and memory-efficient terminal emulator for macOS.
 
 ## Install
 
-Download the latest `pterm.zip` from [Releases](https://github.com/user/pterm/releases), unzip, and move `pterm.app` to `/Applications`.
+Download the latest `pterm.zip` from [Releases](https://github.com/pontasan/pterm/releases), unzip, and move `pterm.app` to `/Applications`.
 
 ## Build from Source
 
