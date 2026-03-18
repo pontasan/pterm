@@ -33,6 +33,12 @@ final class TerminalGrid {
         width: 0,
         isWideContinuation: true
     )
+    private static let defaultSingleWidthCellTemplate = Cell(
+        codepoint: 0,
+        attributes: .default,
+        width: 1,
+        isWideContinuation: false
+    )
     private static let defaultDoubleWidthCellTemplate = Cell(
         codepoint: 0,
         attributes: .default,
@@ -448,6 +454,29 @@ final class TerminalGrid {
         } else {
             physicalSparseCompactDefaultPrefixCounts[physicalRow] = 0
         }
+        rowEncodingHintStates[physicalRow] = .dirty
+    }
+
+    @inline(__always)
+    func writeFullRowDoubleWidthDefaultCellsAtRowStart(
+        _ codepoints: UnsafePointer<UInt32>,
+        atRow row: Int
+    ) {
+        let fullRowCount = cols / 2
+        guard fullRowCount > 0 else { return }
+        let physicalRow = physicalRow(for: row)
+        if !physicalBlankRows[physicalRow] {
+            writeDoubleWidthDefaultCells(codepoints, count: fullRowCount, atRow: row, startCol: 0)
+            return
+        }
+
+        let offset = physicalRow * cols
+        cells.withUnsafeMutableBufferPointer { cellBuffer in
+            guard let destination = cellBuffer.baseAddress?.advanced(by: offset) else { return }
+            Self.writeDoubleWidthDefaultCells(into: destination, from: codepoints, count: fullRowCount)
+        }
+        physicalBlankRows[physicalRow] = false
+        physicalSparseCompactDefaultPrefixCounts[physicalRow] = cols
         rowEncodingHintStates[physicalRow] = .dirty
     }
 
@@ -1547,13 +1576,15 @@ final class TerminalGrid {
             guard var destination = buffer.baseAddress?.advanced(by: offset) else { return }
             var source = codepoints
             var remaining = count
+            var template = Self.defaultSingleWidthCellTemplate
             while remaining > 0 {
-                destination.pointee = Cell(
-                    codepoint: source.pointee,
-                    attributes: .default,
-                    width: 1,
-                    isWideContinuation: false
-                )
+                let codepoint = source.pointee
+                if codepoint == Cell.empty.codepoint {
+                    destination.pointee = .empty
+                } else {
+                    template.codepoint = codepoint
+                    destination.pointee = template
+                }
                 destination += 1
                 source += 1
                 remaining -= 1
@@ -1569,21 +1600,32 @@ final class TerminalGrid {
         startCol: Int,
         priorSerializedCount: Int
     ) -> Int {
-        cells.withUnsafeMutableBufferPointer { buffer in
+        if startCol >= priorSerializedCount {
+            return initializeSingleWidthDefaultCellsAppendingSerializedCount(
+                at: offset,
+                codepoints: codepoints,
+                count: count,
+                startCol: startCol,
+                priorSerializedCount: priorSerializedCount
+            )
+        }
+
+        return cells.withUnsafeMutableBufferPointer { buffer in
             guard var destination = buffer.baseAddress?.advanced(by: offset) else { return -1 }
             var source = codepoints
             var remaining = count
             var column = startCol
             var serializedCount = priorSerializedCount
+            var template = Self.defaultSingleWidthCellTemplate
 
             while remaining > 0 {
                 let codepoint = source.pointee
-                destination.pointee = Cell(
-                    codepoint: codepoint,
-                    attributes: .default,
-                    width: 1,
-                    isWideContinuation: false
-                )
+                if codepoint == Cell.empty.codepoint {
+                    destination.pointee = .empty
+                } else {
+                    template.codepoint = codepoint
+                    destination.pointee = template
+                }
                 if codepoint != Cell.empty.codepoint {
                     serializedCount = column + 1
                 } else if column < priorSerializedCount {
@@ -1597,6 +1639,42 @@ final class TerminalGrid {
             }
 
             return serializedCount
+        }
+    }
+
+    @inline(__always)
+    private func initializeSingleWidthDefaultCellsAppendingSerializedCount(
+        at offset: Int,
+        codepoints: UnsafePointer<UInt32>,
+        count: Int,
+        startCol: Int,
+        priorSerializedCount: Int
+    ) -> Int {
+        return cells.withUnsafeMutableBufferPointer { buffer in
+            guard var destination = buffer.baseAddress?.advanced(by: offset) else { return -1 }
+            var source = codepoints
+            var remaining = count
+            var processed = 0
+            var lastNonSpaceCount = 0
+            var template = Self.defaultSingleWidthCellTemplate
+
+            while remaining > 0 {
+                let codepoint = source.pointee
+                if codepoint == Cell.empty.codepoint {
+                    destination.pointee = .empty
+                } else {
+                    template.codepoint = codepoint
+                    destination.pointee = template
+                    lastNonSpaceCount = processed + 1
+                }
+
+                destination += 1
+                source += 1
+                remaining -= 1
+                processed += 1
+            }
+
+            return max(priorSerializedCount, startCol + lastNonSpaceCount)
         }
     }
 
@@ -1668,8 +1746,8 @@ final class TerminalGrid {
         var template = Self.defaultDoubleWidthCellTemplate
         while remaining > 0 {
             template.codepoint = source.pointee
-            destination.pointee = template
-            destination.advanced(by: 1).pointee = continuation
+            destination[0] = template
+            destination[1] = continuation
             destination += 2
             source += 1
             remaining -= 1

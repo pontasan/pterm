@@ -1242,8 +1242,22 @@ final class TerminalController {
 
     private func asciiSTTerminatorOffset(in bytes: UnsafeBufferPointer<UInt8>) -> Int? {
         guard let base = bytes.baseAddress, bytes.count >= 2 else { return nil }
-        for index in 0..<(bytes.count - 1) where base[index] == 0x1B && base[index + 1] == UInt8(ascii: "\\") {
-            return index
+        let terminatorByte = Int32(0x1B)
+        var searchPointer: UnsafePointer<UInt8>? = base
+        var bytesRemaining = bytes.count
+
+        while let currentPointer = searchPointer, bytesRemaining >= 2 {
+            guard let foundPointer = memchr(currentPointer, terminatorByte, bytesRemaining - 1)
+                .map({ UnsafePointer<UInt8>($0.assumingMemoryBound(to: UInt8.self)) }) else {
+                return nil
+            }
+            let offset = base.distance(to: foundPointer)
+            if foundPointer[1] == UInt8(ascii: "\\") {
+                return offset
+            }
+            let nextPointer = foundPointer.advanced(by: 1)
+            searchPointer = nextPointer
+            bytesRemaining = bytes.count - base.distance(to: nextPointer)
         }
         return nil
     }

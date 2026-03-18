@@ -1091,6 +1091,30 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(captures.first?.1, expectedPayload)
     }
 
+    func testTerminalModelKittyGraphicsPayloadAccumulatesMultipleIntermediateChunks() {
+        let harness = TerminalModelHarness()
+        let expectedPayload = Data([0x89, 0x50, 0x4E, 0x47, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80])
+        let encoded = expectedPayload.base64EncodedString()
+        let firstBreak = encoded.index(encoded.startIndex, offsetBy: encoded.count / 3)
+        let secondBreak = encoded.index(firstBreak, offsetBy: encoded.distance(from: firstBreak, to: encoded.endIndex) / 2)
+        let first = String(encoded[..<firstBreak])
+        let second = String(encoded[firstBreak..<secondBreak])
+        let third = String(encoded[secondBreak...])
+        var captures: [(Int, Data)] = []
+        harness.model.onKittyImagePayload = { index, data, _, _, _, _, _ in
+            captures.append((index, data))
+        }
+
+        harness.model.handleKittyGraphicsAPCPayloadString("Gi=13,a=T,f=100,t=d,m=1;\(first)")
+        harness.model.handleKittyGraphicsAPCPayloadString("Gi=13,a=T,f=100,t=d,m=1;\(second)")
+        XCTAssertTrue(captures.isEmpty)
+
+        harness.model.handleKittyGraphicsAPCPayloadString("Gi=13,a=T,f=100,t=d,m=0;\(third)")
+        XCTAssertEqual(captures.count, 1)
+        XCTAssertEqual(captures.first?.0, 13)
+        XCTAssertEqual(captures.first?.1, expectedPayload)
+    }
+
     func testTerminalModelKittyGraphicsPayloadLoadsFileTransfer() throws {
         let harness = TerminalModelHarness()
         let expectedPayload = Data([0x89, 0x50, 0x4E, 0x47, 0x11, 0x22, 0x33, 0x44])
@@ -1114,7 +1138,7 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(captured?.format, .png)
     }
 
-    func testTerminalModelKittyGraphicsDeferredJobUsesSpoolFileAndCleansItUp() throws {
+    func testTerminalModelKittyGraphicsDeferredJobKeepsDirectSingleChunkPayloadInMemory() throws {
         let harness = TerminalModelHarness()
         let expectedPayload = Data([0x89, 0x50, 0x4E, 0x47, 0x55, 0x66, 0x77, 0x88])
         let command = "Gi=12,a=T,f=100,t=d;\(expectedPayload.base64EncodedString())"
@@ -1133,10 +1157,14 @@ final class TerminalModelRegressionTests: XCTestCase {
             return
         }
 
-        XCTAssertTrue(FileManager.default.fileExists(atPath: job.encodedPayloadFileURL.path))
+        switch job.encodedPayloadSource {
+        case .encodedData(let encodedData):
+            XCTAssertEqual(Data(base64Encoded: encodedData), expectedPayload)
+        case .file:
+            XCTFail("expected direct single-chunk kitty payload to stay in memory")
+        }
         harness.model.executeDeferredKittyImagePayload(job)
         XCTAssertEqual(captured, expectedPayload)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: job.encodedPayloadFileURL.path))
     }
 
     func testTerminalModelSaveRestoreCursorRoundTripsPositionAndAttributes() {

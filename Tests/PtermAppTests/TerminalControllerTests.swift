@@ -1770,6 +1770,48 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertEqual(bulkCursor.2, byteWiseCursor.2)
     }
 
+    func testDebugProcessPTYOutputMatchesByteWiseProcessingForKittyGraphicsAPCWithSplitTerminator() throws {
+        let registry = PastedImageRegistry.shared
+        registry.reset()
+        defer { registry.reset() }
+
+        let bulk = makeController(rows: 6, cols: 12)
+        let byteWise = makeController(rows: 6, cols: 12)
+        let expectedPayload = Data([0x89, 0x50, 0x4E, 0x47, 0xAA, 0xBB, 0xCC, 0xDD])
+        let payloadString = "\u{1B}_Gi=77,a=T,f=100,t=d,c=2,r=1;\(expectedPayload.base64EncodedString())\u{1B}\\"
+        let payload = Data(payloadString.utf8)
+
+        bulk.debugProcessPTYOutputForTesting(payload)
+        for byte in payload {
+            byteWise.debugProcessPTYOutputForTesting(Data([byte]))
+        }
+        let deadline = Date().addingTimeInterval(2.0)
+        while Date() < deadline {
+            drainMainQueue(testCase: self)
+            if registry.registeredImage(ownerID: bulk.id, forPlaceholderIndex: 77) != nil,
+               registry.registeredImage(ownerID: byteWise.id, forPlaceholderIndex: 77) != nil {
+                break
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+
+        let bulkImage = try XCTUnwrap(registry.registeredImage(ownerID: bulk.id, forPlaceholderIndex: 77))
+        let byteWiseImage = try XCTUnwrap(registry.registeredImage(ownerID: byteWise.id, forPlaceholderIndex: 77))
+        XCTAssertEqual(bulkImage.columns, 2)
+        XCTAssertEqual(byteWiseImage.columns, 2)
+        XCTAssertEqual(bulkImage.rows, 1)
+        XCTAssertEqual(byteWiseImage.rows, 1)
+
+        let bulkLive = bulk.withViewport { model, scrollback, _ in
+            model.grid.liveInlineImageIDs().union(scrollback.liveInlineImageIDs())
+        }
+        let byteWiseLive = byteWise.withViewport { model, scrollback, _ in
+            model.grid.liveInlineImageIDs().union(scrollback.liveInlineImageIDs())
+        }
+        XCTAssertEqual(bulkLive, Set([77]))
+        XCTAssertEqual(byteWiseLive, Set([77]))
+    }
+
     func testAlternateScreenScrollDoesNotAppendScrollback() {
         let controller = makeController(rows: 3, cols: 6)
         let payload = Data(("\u{1B}[?1049h" + "1\n2\n3\n4\n5\n").utf8)

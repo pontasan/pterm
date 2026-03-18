@@ -2646,8 +2646,11 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(view.debugEffectiveDisplayUpdateFPSForTesting, 2)
 
         view.outputFrameThrottlingMode = .continuous
-
-        XCTAssertEqual(view.debugEffectiveDisplayUpdateFPSForTesting, 100)
+        let expectedContinuousCap = min(
+            OutputFrameThrottlingMode.continuous.preferredOutputFPSCap,
+            NSScreen.main?.maximumFramesPerSecond ?? OutputFrameThrottlingMode.continuous.preferredOutputFPSCap
+        )
+        XCTAssertEqual(view.debugEffectiveDisplayUpdateFPSForTesting, expectedContinuousCap)
     }
 
     func testSplitRenderViewOutputPulseTimerTracksActiveOutputState() throws {
