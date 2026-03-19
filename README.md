@@ -33,7 +33,7 @@ Most terminals are good at opening one shell. pterm is built to help you manage 
 - Synchronized updates for flicker-free rendering (DEC 2026)
 - Double-width/double-height lines, reverse video, application cursor/keypad
 - Grapheme clusters and color emoji rendered natively
-- Kitty graphics protocol for inline image display
+- Graphics protocol for inline image display
 - Full Japanese and CJK input via macOS IME
 - ANSI 16, 256-color, and 24-bit truecolor
 
@@ -54,6 +54,8 @@ Most terminals are good at opening one shell. pterm is built to help you manage 
 - Secure file permissions on all persistent state
 
 ## Benchmarks
+
+All benchmarks were run on an **Apple MacBook Pro M1 Max (2021, 16-inch), 64 GB RAM, macOS 26 Tahoe**.
 
 ### Throughput Measured by the [kitten Benchmark](https://sw.kovidgoyal.net/kitty/performance/)
 
