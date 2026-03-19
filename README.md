@@ -30,7 +30,7 @@ Most terminals are good at opening one shell. pterm is built to help you manage 
 
 ### Terminal Compatibility
 - VT escape sequence support validated against vttest replay coverage and high-risk parity scenarios
-- Synchronized updates for flicker-free rendering (DEC 2026)
+- Synchronized updates for flicker-free rendering
 - Double-width/double-height lines, reverse video, application cursor/keypad
 - Grapheme clusters and color emoji rendered natively
 - Graphics protocol for inline image display
