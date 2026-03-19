@@ -129,7 +129,19 @@ final class TerminalView: MTKView, NSTextInputClient {
     /// When true, this view's own draw() does nothing. An external SplitRenderView
     /// handles all rendering into a single MTKView to avoid macOS CAMetalLayer
     /// compositing issues with multiple Metal layers in one window.
-    var renderingSuppressed: Bool = false {
+    private var splitRenderingSuppressed = false {
+        didSet {
+            guard splitRenderingSuppressed != oldValue else { return }
+            refreshEffectiveRenderingSuppression()
+        }
+    }
+    private var terminalRenderingSuppressed = false {
+        didSet {
+            guard terminalRenderingSuppressed != oldValue else { return }
+            refreshEffectiveRenderingSuppression()
+        }
+    }
+    private(set) var renderingSuppressed: Bool = false {
         didSet {
             guard renderingSuppressed != oldValue else { return }
             updateSuppressedRenderingState()
@@ -234,6 +246,18 @@ final class TerminalView: MTKView, NSTextInputClient {
     var debugHasPendingIntentResolutionTimer: Bool { pendingIntentResolutionTimer != nil }
     var debugLastPendingCommittedTextIntentText: String? { pendingCommittedTextIntents.last?.text }
     var debugDeferredResizeNotificationCount: Int { deferredResizeNotificationWorkItems.count }
+
+    func setSplitRenderingSuppressed(_ suppressed: Bool) {
+        splitRenderingSuppressed = suppressed
+    }
+
+    func setTerminalRenderingSuppressed(_ suppressed: Bool) {
+        terminalRenderingSuppressed = suppressed
+    }
+
+    private func refreshEffectiveRenderingSuppression() {
+        renderingSuppressed = splitRenderingSuppressed || terminalRenderingSuppressed
+    }
 
     private func queueInputFeedbackIfEnabled() {
         guard typewriterSoundEnabled else { return }
@@ -670,13 +694,13 @@ final class TerminalView: MTKView, NSTextInputClient {
             self?.updateMarkedTextOverlay()
         }
         controller.onRenderingSuppressedChange = { [weak self] suppressed in
-            self?.renderingSuppressed = suppressed
+            self?.setTerminalRenderingSuppressed(suppressed)
         }
         controller.notifyFocusChanged(window?.isKeyWindow == true)
         updateTerminalSize(notificationMode: .immediateOnly)
         updateCursorBlinkTimer()
         updateOutputPulseTimer()
-        renderingSuppressed = controller.isRenderingSuppressed
+        setTerminalRenderingSuppressed(controller.isRenderingSuppressed)
         // When a controller is assigned to a new view (e.g., returning to split view),
         // ensure we show the latest output, not stale scrollback position.
         controller.scrollToBottom()

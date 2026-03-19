@@ -244,7 +244,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         column.width = sidebarWidth - 4
         tableView.addTableColumn(column)
         tableView.dataSource = self
-        tableView.delegate = self
 
         sidebarScroll.documentView = tableView
         sidebarTableView = tableView
@@ -272,11 +271,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         root.contentScroll = scrollView
 
         sidebarTableView.reloadData()
-        sidebarTableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        showContentForSection(.general)
+        sidebarTableView.selectRowIndexes(IndexSet(integer: currentSection.rawValue), byExtendingSelection: false)
+        sidebarTableView.delegate = self
+        showContentForSection(currentSection)
+    }
+
+    private func endActiveEditingIfNeeded() {
+        guard let window else { return }
+        window.endEditing(for: nil)
+        if let textView = window.firstResponder as? NSTextView, textView.isFieldEditor {
+            window.makeFirstResponder(nil)
+        }
     }
 
     private func showContentForSection(_ section: Section) {
+        endActiveEditingIfNeeded()
         currentSection = section
 
         let documentView = FlippedView()
@@ -797,7 +806,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             launchShellsValues[row] = value
         }
         persistLaunchShells()
-        launchShellsTableView?.reloadData()
+        DispatchQueue.main.async { [weak self] in
+            self?.launchShellsTableView?.reloadData()
+        }
     }
 
     @objc private func scrollPersistenceChanged(_ sender: NSButton) {

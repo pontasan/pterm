@@ -1,26 +1,95 @@
 # pterm
 
-A fast, secure, and memory-efficient terminal emulator for macOS.
+**A fast, secure, bounded-memory terminal emulator for macOS.**
 
-![pterm demo](Resources/demo.gif)
+Built for engineers who keep multiple long-running CLI sessions open at once — agent workflows, log watchers, builds, and interactive shells — all in a single window.
+
+![pterm split view](Resources/screenshot.jpg)
+
+![pterm overview](Resources/demo.gif)
+
+![pterm focused](Resources/demo2.gif)
+
+## Why pterm
+
+Most terminals are good at opening one shell. pterm is built to help you manage **ongoing terminal work**.
+
+- **One window, many terminals** — See every running session at a glance in the overview grid. Click to focus, Shift-select to split.
+- **Memory stays bounded** — Scrollback is capped and rolls automatically. `tail -F` all day without watching memory climb.
+- **Fast** — Metal-accelerated rendering with Apple Silicon optimizations. Designed for high-volume output.
+- **macOS-native** — Liquid Glass on macOS 26, full IME support, zero external dependencies. Code signed and notarized.
 
 ## Features
 
-- **Single window, multiple terminals** — Manage multiple shell sessions in one window with an integrated overview grid.
-- **Memory-controlled scrollback** — Unlike macOS Terminal, scrollback memory is capped and automatically rolled. No more runaway memory from `tail -F`.
-- **Metal-accelerated rendering** — GPU-rendered terminal with sRGB color management, glyph atlas caching, and offscreen thumbnail compositing.
-- **Shell flexibility** — Defaults to your system shell (typically zsh), with automatic fallback to bash and sh.
-- **Full IME support** — Japanese and other multi-byte input via macOS Input Methods with correct cursor positioning.
-- **Workspace management** — Organize terminals into named workspaces with persistent notes.
-- **Workspace identity overlays** — Hold `Cmd` to reveal deterministic workspace/title headers for focused and split terminals.
-- **Dark theme** — Black background, optimized for CLI tools like Claude Code.
-- **Code signed and notarized** — Distributed with Developer ID signature and Apple notarization for Gatekeeper compatibility.
-- **Zero external dependencies** — Built entirely on macOS system frameworks (AppKit, Metal, Security). No third-party libraries.
+### Multi-Session Workflow
+- Overview grid showing all terminals with real-time thumbnails
+- Focus any terminal with a click, or Shift-select multiple for split view
+- Nested split navigation — drill into a subset, then Cmd+Click to return
+- Named workspaces with persistent notes to organize your sessions
+- Hold Cmd to reveal workspace/title identity overlays across all views
+
+### Terminal Compatibility
+- VT escape sequence support validated against vttest replay coverage and high-risk parity scenarios
+- Synchronized updates for flicker-free rendering (DEC 2026)
+- Double-width/double-height lines, reverse video, application cursor/keypad
+- Grapheme clusters and color emoji rendered natively
+- Kitty graphics protocol for inline image display
+- Full Japanese and CJK input via macOS IME
+- ANSI 16, 256-color, and 24-bit truecolor
+
+### AI Agent Integration
+- **MCP server** — Built-in Model Context Protocol server with 20+ tools. AI agents can list terminals, send input, read output (plain text, ANSI, or rendered PNG), and manage workspaces programmatically.
+- **Clipboard-to-file-path** — Paste an image and pterm saves it as a file, inserting the path inline — ready for AI tools that accept file references.
+- **Transient terminals** — Launch one-off commands via `--command` that auto-clean and stay out of your session history.
+
+### CLI Modes
+- `--cli` — Run headless, bridging stdin/stdout to a PTY session without opening a window
+- `--command <path>` — Launch an executable directly in a focused transient terminal
+- `--user-data-dir <path>` — Isolated profile for testing or parallel environments
+- `--restore-session <mode>` — Control session restore (attempt / force / never)
+
+### Security
+- Zero third-party runtime dependencies — built entirely on macOS system frameworks
+- Code signed and notarized for Gatekeeper compatibility
+- Secure file permissions on all persistent state
+
+## Benchmarks
+
+### Throughput Measured by the [kitten Benchmark](https://sw.kovidgoyal.net/kitty/performance/)
+
+Measurement command:
+
+```bash
+kitten __benchmark__ --render --repetitions 100
+```
+
+| Terminal | Only ASCII chars | Unicode chars | CSI codes with few chars | Long escape codes | Images | Average |
+|---|---:|---:|---:|---:|---:|---:|
+| pterm<br>(0.3.2) | **🥇 126.0 MB/s**<br>**(1.59s)** | **🥇 143.1 MB/s**<br>**(1.26s)** | **🥇 114.8 MB/s**<br>**(870.78ms)** | **🥇 527.4 MB/s**<br>**(1.49s)** | **🥇 354.2 MB/s**<br>**(1.51s)** | **🥇 253.1 MB/s** |
+| kitty<br>(0.46.0) | 🥉 89.9 MB/s<br>(2.23s) | 🥉 123.1 MB/s<br>(1.47s) | 🥉 56.2 MB/s<br>(1.78s) | 🥈 270.6 MB/s<br>(2.9s) | 243.8 MB/s<br>(2.19s) | 🥉 156.7 MB/s |
+| WezTerm<br>(20240203-110809-5046fc22) | 25.5 MB/s<br>(7.86s) | 38.4 MB/s<br>(4.71s) | 17.9 MB/s<br>(5.59s) | 🥉 238.9 MB/s<br>(3.28s) | 🥉 295.1 MB/s<br>(1.81s) | 123.2 MB/s |
+| Alacritty<br>(0.16.1) | 🥈 113.2 MB/s<br>(1.77s) | 🥈 142.2 MB/s<br>(1.27s) | 🥈 72.1 MB/s<br>(1.39s) | 171.1 MB/s<br>(4.58s) | 🥈 315.1 MB/s<br>(1.69s) | 🥈 162.7 MB/s |
+| macOS Terminal<br>(2.15) | 27.5 MB/s<br>(7.26s) | 41.1 MB/s<br>(4.41s) | 30.4 MB/s<br>(3.29s) | 93.5 MB/s<br>(8.39s) | 62.3 MB/s<br>(8.56s) | 50.9 MB/s |
+
+### `time seq 1 1000000`
+
+Measurement command:
+
+```bash
+time seq 1 1000000
+```
+
+| Terminal | total |
+|---|---:|
+| pterm<br>(0.3.2) | **🥇 0.799s** |
+| kitty<br>(0.46.0) | 🥉 0.886s |
+| WezTerm<br>(20240203-110809-5046fc22) | 🥈 0.839s |
+| Alacritty<br>(0.16.1) | 1.016s |
+| macOS Terminal<br>(2.15) | 1.158s |
 
 ## Requirements
 
 - macOS 26 (Tahoe) or later
-- Xcode Command Line Tools (for building from source)
 
 ## Install
 
@@ -28,90 +97,17 @@ Download the latest `pterm.zip` from [Releases](https://github.com/pontasan/pter
 
 ## Build from Source
 
-Debug build:
-
 ```bash
+# Debug build
 make debug
 open .build/pterm.app
-```
 
-Release build:
-
-```bash
+# Release build (runs full regression suite)
 make build
-```
 
-`make build` runs the full regression test suite before producing the release app bundle.
-
-Run tests:
-
-```bash
+# Run tests
 make test
 ```
-
-## Profile Directory
-
-By default, pterm stores its persistent state under `~/.pterm`.
-
-This profile root contains:
-
-- `config.json`
-- `sessions/`
-- `sessions/scrollback/`
-- `workspaces/`
-- `audit/`
-- `files/`
-- `lock`
-
-If no launch option is provided, pterm always uses `~/.pterm`.
-
-You can override the profile root at launch time with:
-
-- `--user-data-dir <directory>`
-
-This means: “treat this directory as the pterm profile root instead of `~/.pterm`.”
-
-Examples:
-
-open .build/pterm.app --args --user-data-dir /tmp/.pterm_profile_dev
-```
-
-Or launch the app binary directly:
-
-```bash
-.build/pterm.app/Contents/MacOS/PtermApp --user-data-dir /tmp/.pterm_profile_dev
-```
-
-This is useful for:
-
-- isolated test runs
-- temporary debugging profiles
-- running multiple independent pterm environments
-- Chrome-style external profile directory management
-
-Profile CPU hot paths:
-
-```bash
-make profile-cpu
-```
-
-## Signing and Distribution
-
-Sign with a Developer ID certificate:
-
-```bash
-make sign IDENTITY='Developer ID Application: Your Name (TEAMID)'
-```
-
-Build, sign, notarize, and package in one step:
-
-```bash
-make notarize \
-  IDENTITY='Developer ID Application: Your Name (TEAMID)' \
-  NOTARY_PROFILE='your-notarytool-profile'
-```
-
-The notarized app is stapled and verified automatically. Distribute `.build/pterm.zip`.
 
 ## Development
 

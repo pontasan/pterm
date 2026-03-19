@@ -3,6 +3,46 @@ import PtermCore
 @testable import PtermApp
 import XCTest
 
+func projectRootURL(filePath: StaticString = #filePath) -> URL {
+    URL(fileURLWithPath: "\(filePath)")
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+}
+
+func requiredReleaseAppExecutableURL(
+    filePath: StaticString = #filePath,
+    line: UInt = #line
+) throws -> URL {
+    let environment = ProcessInfo.processInfo.environment
+    let executableURL: URL
+    if let override = environment["PTERM_TEST_RELEASE_APP_EXECUTABLE"], !override.isEmpty {
+        executableURL = URL(fileURLWithPath: override)
+    } else {
+        executableURL = projectRootURL(filePath: filePath)
+            .appendingPathComponent(".build", isDirectory: true)
+            .appendingPathComponent("pterm.app", isDirectory: true)
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("PtermApp", isDirectory: false)
+    }
+
+    guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
+        XCTFail(
+            "Release app executable is required for this regression test. Build and bundle the release app first at \(executableURL.path).",
+            file: filePath,
+            line: line
+        )
+        throw NSError(
+            domain: "PtermAppTests.ReleaseApp",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Missing release app executable at \(executableURL.path)"]
+        )
+    }
+
+    return executableURL
+}
+
 func withTemporaryDirectory<T>(_ body: (URL) throws -> T) throws -> T {
     let directory = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent(UUID().uuidString, isDirectory: true)

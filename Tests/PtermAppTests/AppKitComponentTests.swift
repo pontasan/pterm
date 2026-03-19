@@ -399,6 +399,34 @@ final class AppKitComponentTests: XCTestCase {
         }
     }
 
+    func testSettingsWindowSwitchingSectionsEndsActiveFieldEditorBeforeRebuildingContent() throws {
+        try withTemporaryPtermConfig { configURL in
+            let controller = SettingsWindowController(configURL: configURL)
+            let window = try XCTUnwrap(controller.window)
+            window.makeKeyAndOrderFront(nil)
+
+            let tables = allSubviews(in: window.contentView).compactMap { $0 as? NSTableView }
+            let sidebarTable = try XCTUnwrap(tables.first(where: { $0.identifier?.rawValue != "launchShellsTable" }))
+            let editedField = try XCTUnwrap(
+                allSubviews(in: window.contentView)
+                    .compactMap { $0 as? NSTextField }
+                    .first(where: { $0.identifier?.rawValue == "mcpServerPortField" })
+            )
+
+            window.makeFirstResponder(editedField)
+            editedField.selectText(nil)
+            XCTAssertTrue(window.firstResponder === editedField.currentEditor() || window.firstResponder === editedField)
+
+            sidebarTable.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+            controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: sidebarTable))
+
+            let currentEditor = editedField.currentEditor()
+            XCTAssertFalse(window.firstResponder === editedField)
+            XCTAssertFalse(currentEditor != nil && window.firstResponder === currentEditor)
+            XCTAssertNotNil(allSubviews(in: window.contentView).compactMap { $0 as? NSColorWell }.first)
+        }
+    }
+
     func testSettingsWindowPersistsOutputConfirmedInputAnimationToggle() throws {
         try withTemporaryPtermConfig { configURL in
             let controller = SettingsWindowController(configURL: configURL)
@@ -4636,18 +4664,54 @@ final class AppKitComponentTests: XCTestCase {
         )
         XCTAssertNotNil(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
 
-        view.renderingSuppressed = true
+        view.setSplitRenderingSuppressed(true)
 
         XCTAssertEqual(view.drawableSize, .zero)
         XCTAssertNil(renderer.bufferLength(for: view, slot: .overviewTextGlyph))
         XCTAssertTrue(view.isPaused)
         XCTAssertFalse(view.enableSetNeedsDisplay)
 
-        view.renderingSuppressed = false
+        view.setSplitRenderingSuppressed(false)
 
         XCTAssertGreaterThan(view.drawableSize.width, 0)
         XCTAssertTrue(view.isPaused)
         XCTAssertTrue(view.enableSetNeedsDisplay)
+    }
+
+    func testSplitTerminalPendingUpdateResumeKeepsSplitOverlayRenderingSuppression() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 6,
+            cols: 24,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 32,
+            scrollbackMaxCapacity: 32,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let split = SplitTerminalContainerView(
+            frame: NSRect(x: 0, y: 0, width: 480, height: 280),
+            renderer: renderer,
+            controllers: [controller]
+        )
+
+        split.layoutSubtreeIfNeeded()
+        let scrollView = try XCTUnwrap(allSubviews(in: split).compactMap { $0 as? TerminalScrollView }.first)
+        let terminalView = try XCTUnwrap(scrollView.terminalView)
+
+        XCTAssertTrue(terminalView.renderingSuppressed)
+        XCTAssertEqual(terminalView.drawableSize, .zero)
+
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?2026h".utf8))
+        drainMainQueue(testCase: self)
+        XCTAssertTrue(terminalView.renderingSuppressed)
+        XCTAssertEqual(terminalView.drawableSize, .zero)
+
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?2026l".utf8))
+        drainMainQueue(testCase: self)
+        XCTAssertTrue(terminalView.renderingSuppressed)
+        XCTAssertEqual(terminalView.drawableSize, .zero)
     }
 
     func testTerminalViewIdlePurgeReleasesReusableBuffersAfterRenderedFrame() throws {
@@ -8856,6 +8920,38 @@ final class AppKitComponentTests: XCTestCase {
         derivedSplit.onCommandClickTerminal?(first)
 
         try assertCurrentSplitRenderPathIsConsistent(in: hostedContentView, manager: manager)
+    }
+
+    func testRepeatedNewTerminalFromFocusedSplitLineageKeepsGridInvariantsDuringSplitRender() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let manager = TerminalManager(rows: 24, cols: 80, config: .default)
+        defer { manager.stopAll(waitForExit: true) }
+        let first = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let second = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+        let third = try manager.addTerminal(initialDirectory: NSTemporaryDirectory(), workspaceName: "Alpha", fontName: "Menlo", fontSize: 13)
+
+        primeGridForSplitTransitionStress(first.model.grid)
+        primeGridForSplitTransitionStress(second.model.grid)
+        primeGridForSplitTransitionStress(third.model.grid)
+
+        let harness = try makeAppHarness(renderer: renderer, manager: manager)
+        let delegate = harness.delegate
+        let hostedContentView = harness.hostedContentView
+
+        delegate.switchToSplit([first, second, third])
+        try assertCurrentSplitRenderPathIsConsistent(in: hostedContentView, manager: manager)
+
+        for _ in 0..<8 {
+            let split = try currentSplitContainer(in: hostedContentView)
+            split.onMaximizeTerminal?(first)
+            delegate.newTerminal(nil)
+            try assertCurrentSplitRenderPathIsConsistent(in: hostedContentView, manager: manager)
+
+            let derivedSplit = try currentSplitContainer(in: hostedContentView)
+            XCTAssertTrue(derivedSplit.controllers.map(\.id).contains(first.id))
+            derivedSplit.onCommandClickTerminal?(first)
+            try assertCurrentSplitRenderPathIsConsistent(in: hostedContentView, manager: manager)
+        }
     }
 
     func testDerivedSplitTerminalRemovalFallsBackToFilteredAncestorInsteadOfOverview() throws {

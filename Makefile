@@ -12,8 +12,7 @@ METAL_TOOLCHAIN = TOOLCHAINS=Metal
 
 # Build release
 build: regression-test
-	swift build -c release
-	@$(MAKE) bundle CONFIG=release
+	@echo "Release build and regression suite completed."
 
 # Build debug
 debug:
@@ -38,7 +37,9 @@ test:
 
 # Mandatory regression gate for production/release builds
 regression-test:
-	swift test
+	swift build -c release
+	@$(MAKE) bundle CONFIG=release
+	PTERM_TEST_RELEASE_APP_EXECUTABLE="$(APP_BUNDLE)/Contents/MacOS/PtermApp" swift test -c release
 
 # Clean
 clean:

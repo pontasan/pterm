@@ -222,7 +222,7 @@ final class AppInfrastructureTests: XCTestCase {
 
     func testCLIModePropagatesPipeEOFToForegroundProgram() throws {
         let process = Process()
-        process.executableURL = builtPtermExecutableURL()
+        process.executableURL = try requiredReleaseAppExecutableURL()
         process.arguments = ["--cli", "--", "/bin/cat"]
 
         let inputPipe = Pipe()
@@ -250,7 +250,7 @@ final class AppInfrastructureTests: XCTestCase {
 
     func testCLIModeDoesNotKillForegroundProcessAfterShutdownGracePeriod() throws {
         let process = Process()
-        process.executableURL = builtPtermExecutableURL()
+        process.executableURL = try requiredReleaseAppExecutableURL()
         process.arguments = ["--cli", "--", "/bin/sh", "-lc", "sleep 1; printf done"]
 
         let inputPipe = Pipe()
@@ -2561,17 +2561,6 @@ final class AppInfrastructureTests: XCTestCase {
         pty.debugPrimeReadBufferCapacity(128)
         XCTAssertEqual(pty.debugReadBufferCapacity, 4096)
     }
-}
-
-private func builtPtermExecutableURL(filePath: StaticString = #filePath) -> URL {
-    let sourceFileURL = URL(fileURLWithPath: "\(filePath)")
-    return sourceFileURL
-        .deletingLastPathComponent()
-        .deletingLastPathComponent()
-        .deletingLastPathComponent()
-        .appendingPathComponent(".build", isDirectory: true)
-        .appendingPathComponent("debug", isDirectory: true)
-        .appendingPathComponent("PtermApp", isDirectory: false)
 }
 
 private func encryptedNotePayloadForTest(plaintext: Data, key: Data) throws -> Data {

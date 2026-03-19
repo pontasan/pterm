@@ -196,9 +196,9 @@ final class SplitTerminalContainerView: NSView {
             scrollView.terminalView.imagePreviewURLProvider = imagePreviewURLProvider
             scrollView.terminalView.terminalController = controller
             // Suppress individual rendering after the controller is attached.
-            // TerminalView.setupController() restores the controller-owned
-            // suppression state, so split mode must reassert its own policy here.
-            scrollView.terminalView.renderingSuppressed = true
+            // Split overlay suppression must remain independent from temporary
+            // synchronized-update suppression emitted by the terminal itself.
+            scrollView.terminalView.setSplitRenderingSuppressed(true)
             // Also make the CAMetalLayer invisible so it doesn't interfere
             // with Window Server compositing of the overlay SplitRenderView.
             scrollView.terminalView.alphaValue = 0

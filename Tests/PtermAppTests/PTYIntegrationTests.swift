@@ -372,6 +372,77 @@ final class PTYIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminalControllerRealPTYKittenBenchmarkRepetitions100DoesNotLeakDescriptorsOrKittyPayloadFiles() throws {
+        guard let kittenPath = Self.findExecutable(named: "kitten") else {
+            throw XCTSkip("kitten is not installed in this environment")
+        }
+
+        let baselineDescriptorCount = try Self.openFileDescriptorCount()
+        let baselinePayloadFiles = Self.currentKittyImagePayloadFilenames()
+
+        try withTemporaryPtermConfig { _ in
+            let controller = TerminalController(
+                rows: 24,
+                cols: 100,
+                termEnv: "xterm-kitty",
+                textEncoding: .utf8,
+                scrollbackInitialCapacity: 16 * 1024 * 1024,
+                scrollbackMaxCapacity: 16 * 1024 * 1024,
+                fontName: "Menlo",
+                fontSize: 13
+            )
+
+            let doneMarker = "__PTERM_KITTEN_R100_DONE__"
+            let exitExpectation = expectation(description: "controller-exit-kitten-benchmark-r100")
+            let completionExpectation = expectation(description: "controller-kitten-r100-completion-visible")
+            var exited = false
+            var sawCompletion = false
+
+            controller.onExit = {
+                guard !exited else { return }
+                exited = true
+                exitExpectation.fulfill()
+            }
+            controller.onOutputActivity = {
+                let text = controller.allText()
+                if !sawCompletion, (text.contains("Results:") || text.contains(doneMarker)) {
+                    sawCompletion = true
+                    completionExpectation.fulfill()
+                }
+            }
+
+            try controller.start()
+            try Self.waitForTerminalText(controller, toContain: "%", timeout: 8.0)
+            controller.sendInput(
+                "'\(Self.shellSingleQuoted(kittenPath))' __benchmark__ --render --repetitions 100; "
+                + "printf '\(doneMarker)\\n'; "
+                + "exit\n"
+            )
+
+            wait(for: [completionExpectation, exitExpectation], timeout: 180.0)
+            drainMainQueue(testCase: self, timeout: 3.0)
+            controller.stop(waitForExit: true)
+            drainMainQueue(testCase: self, timeout: 3.0)
+
+            try Self.waitForCondition(
+                timeout: 10.0,
+                pollInterval: 0.05,
+                description: "file descriptor count should return to baseline after kitten benchmark"
+            ) {
+                try Self.openFileDescriptorCount() <= baselineDescriptorCount + 8
+            }
+
+            try Self.waitForCondition(
+                timeout: 10.0,
+                pollInterval: 0.05,
+                description: "kitty image payload temp files should be cleaned up after kitten benchmark"
+            ) {
+                Self.currentKittyImagePayloadFilenames().subtracting(baselinePayloadFiles).isEmpty
+            }
+        }
+    }
+
+    @MainActor
     func testTerminalControllerRealPTYKittenBenchmarkNamedStagesCompleteIndividually() throws {
         guard let kittenPath = Self.findExecutable(named: "kitten") else {
             throw XCTSkip("kitten is not installed in this environment")
@@ -3488,6 +3559,42 @@ final class PTYIntegrationTests: XCTestCase {
 
     private static func shellSingleQuoted(_ value: String) -> String {
         value.replacingOccurrences(of: "'", with: "'\"'\"'")
+    }
+
+    private static func openFileDescriptorCount() throws -> Int {
+        try FileManager.default.contentsOfDirectory(atPath: "/dev/fd")
+            .compactMap { Int($0) }
+            .count
+    }
+
+    private static func currentKittyImagePayloadFilenames() -> Set<String> {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("pterm-kitty-image-payloads", isDirectory: true)
+        let contents = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )
+        return Set(contents?.map(\.lastPathComponent) ?? [])
+    }
+
+    @MainActor
+    private static func waitForCondition(
+        timeout: TimeInterval,
+        pollInterval: TimeInterval,
+        description: String,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        condition: () throws -> Bool
+    ) throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if try condition() {
+                return
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(pollInterval))
+        }
+        XCTFail("Timed out waiting for condition: \(description)", file: file, line: line)
     }
 
     @MainActor

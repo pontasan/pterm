@@ -25,7 +25,6 @@ final class TerminalModel {
         let byteOffset: Int
         let byteCount: Int?
         let encodedPayloadFileURL: URL
-        let encodedPayloadFileDescriptor: Int32
     }
 
     private struct KittyGraphicsControl {
@@ -191,6 +190,7 @@ final class TerminalModel {
     private var protectedAreaModeEnabled = false
     private var nextKittyImagePlaceholderIndex = 1
     private var kittyImageChunkAccumulators: [Int: KittyImageChunkAccumulator] = [:]
+    private var pendingKittyImageChunkContinuationIndex: Int?
     private var previousPrintableEndsWithZWJ = false
     private static let answerbackMessage = "pterm"
     static let kittyImageEncodedPayloadDirectory: URL = {
@@ -210,7 +210,6 @@ final class TerminalModel {
 
     deinit {
         for accumulator in kittyImageChunkAccumulators.values {
-            close(accumulator.encodedPayloadFileDescriptor)
             Self.removeKittyEncodedPayloadFile(at: accumulator.encodedPayloadFileURL)
         }
     }
@@ -3866,15 +3865,7 @@ final class TerminalModel {
         guard let control = Self.parseKittyGraphicsControl(in: payload) else { return nil }
         let action = control.action
         guard action == UInt8(ascii: "T") || action == UInt8(ascii: "t") else { return nil }
-
-        let imageIndex: Int
-        if let parsed = control.imageIndex {
-            imageIndex = parsed
-            nextKittyImagePlaceholderIndex = max(nextKittyImagePlaceholderIndex, parsed + 1)
-        } else {
-            imageIndex = nextKittyImagePlaceholderIndex
-            nextKittyImagePlaceholderIndex += 1
-        }
+        let imageIndex = resolveKittyImageIndex(for: control)
 
         let startRow = cursor.row
         let startCol = cursor.col
@@ -3919,14 +3910,7 @@ final class TerminalModel {
             return nil
         }
 
-        let imageIndex: Int
-        if let parsed = control.imageIndex {
-            imageIndex = parsed
-            nextKittyImagePlaceholderIndex = max(nextKittyImagePlaceholderIndex, parsed + 1)
-        } else {
-            imageIndex = nextKittyImagePlaceholderIndex
-            nextKittyImagePlaceholderIndex += 1
-        }
+        let imageIndex = resolveKittyImageIndex(for: control)
 
         let format = control.formatCode.flatMap(TerminalImagePayloadFormat.init(kittyFormatCode:))
         return handleKittyGraphicsAPCPayload(
@@ -3957,25 +3941,19 @@ final class TerminalModel {
 
         if hasMoreChunks {
             if let accumulator = kittyImageChunkAccumulators[imageIndex] {
-                guard Self.appendKittyEncodedPayload(
-                    encodedPayloadBytes,
-                    to: accumulator.encodedPayloadFileDescriptor
-                ) else {
-                    close(accumulator.encodedPayloadFileDescriptor)
+                guard Self.appendKittyEncodedPayload(encodedPayloadBytes, to: accumulator.encodedPayloadFileURL) else {
                     Self.removeKittyEncodedPayloadFile(at: accumulator.encodedPayloadFileURL)
                     kittyImageChunkAccumulators.removeValue(forKey: imageIndex)
+                    clearPendingAnonymousKittyImageChunkIndexIfNeeded(imageIndex)
                     return nil
                 }
                 return nil
             }
 
             let payloadFileURL = Self.makeKittyImageEncodedPayloadFileURL()
-            guard let descriptor = Self.createKittyEncodedPayloadFile(at: payloadFileURL) else {
-                return nil
-            }
-            guard Self.appendKittyEncodedPayload(encodedPayloadBytes, to: descriptor) else {
-                close(descriptor)
+            guard Self.appendKittyEncodedPayload(encodedPayloadBytes, to: payloadFileURL) else {
                 Self.removeKittyEncodedPayloadFile(at: payloadFileURL)
+                clearPendingAnonymousKittyImageChunkIndexIfNeeded(imageIndex)
                 return nil
             }
 
@@ -3991,8 +3969,7 @@ final class TerminalModel {
                 format: format,
                 byteOffset: byteOffset,
                 byteCount: byteCount,
-                encodedPayloadFileURL: payloadFileURL,
-                encodedPayloadFileDescriptor: descriptor
+                encodedPayloadFileURL: payloadFileURL
             )
             return nil
         }
@@ -4009,12 +3986,12 @@ final class TerminalModel {
             )
         }
 
-        guard Self.appendKittyEncodedPayload(encodedPayloadBytes, to: accumulator.encodedPayloadFileDescriptor) else {
-            close(accumulator.encodedPayloadFileDescriptor)
+        guard Self.appendKittyEncodedPayload(encodedPayloadBytes, to: accumulator.encodedPayloadFileURL) else {
             Self.removeKittyEncodedPayloadFile(at: accumulator.encodedPayloadFileURL)
+            clearPendingAnonymousKittyImageChunkIndexIfNeeded(imageIndex)
             return nil
         }
-        close(accumulator.encodedPayloadFileDescriptor)
+        clearPendingAnonymousKittyImageChunkIndexIfNeeded(imageIndex)
         placeInlineImage(
             atRow: accumulator.startRow,
             startCol: accumulator.startCol,
@@ -4064,63 +4041,54 @@ final class TerminalModel {
         }
 
         if hasMoreChunks {
-            if var accumulator = kittyImageChunkAccumulators[imageIndex] {
+            if let accumulator = kittyImageChunkAccumulators[imageIndex] {
                 let appendedChunk: Bool
                 switch encodedPayloadSource {
                 case .file(let encodedPayloadFileURL):
                     if accumulator.encodedPayloadFileURL == encodedPayloadFileURL {
                         appendedChunk = true
                     } else {
-                        appendedChunk = Self.appendKittyEncodedPayload(
-                            from: encodedPayloadFileURL,
-                            to: accumulator.encodedPayloadFileDescriptor
-                        )
+                        appendedChunk = Self.appendKittyEncodedPayload(from: encodedPayloadFileURL, to: accumulator.encodedPayloadFileURL)
                         Self.removeKittyEncodedPayloadFile(at: encodedPayloadFileURL)
                     }
                 case .encodedData(let data):
                     appendedChunk = data.withUnsafeBytes { rawBuffer -> Bool in
                         guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return true }
                         let payloadBytes = UnsafeBufferPointer(start: baseAddress, count: rawBuffer.count)
-                        return Self.appendKittyEncodedPayload(payloadBytes, to: accumulator.encodedPayloadFileDescriptor)
+                        return Self.appendKittyEncodedPayload(payloadBytes, to: accumulator.encodedPayloadFileURL)
                     }
                 }
                 guard appendedChunk else {
-                    close(accumulator.encodedPayloadFileDescriptor)
                     Self.removeKittyEncodedPayloadFile(at: accumulator.encodedPayloadFileURL)
                     kittyImageChunkAccumulators.removeValue(forKey: imageIndex)
+                    clearPendingAnonymousKittyImageChunkIndexIfNeeded(imageIndex)
                     return nil
                 }
-                kittyImageChunkAccumulators[imageIndex] = accumulator
                 return nil
             }
 
             let accumulatorFileURL: URL
-            let accumulatorFileDescriptor: Int32
             switch encodedPayloadSource {
             case .file(let fileURL):
                 accumulatorFileURL = fileURL
-                guard let descriptor = Self.openKittyEncodedPayloadFileForAppending(at: fileURL) else {
+                guard FileManager.default.fileExists(atPath: fileURL.path) else {
                     Self.removeKittyEncodedPayloadFile(at: fileURL)
+                    clearPendingAnonymousKittyImageChunkIndexIfNeeded(imageIndex)
                     return nil
                 }
-                accumulatorFileDescriptor = descriptor
             case .encodedData(let data):
                 let payloadFileURL = Self.makeKittyImageEncodedPayloadFileURL()
-                guard let descriptor = Self.createKittyEncodedPayloadFile(at: payloadFileURL) else {
-                    return nil
-                }
                 let appendedChunk = data.withUnsafeBytes { rawBuffer -> Bool in
                     guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return true }
                     let payloadBytes = UnsafeBufferPointer(start: baseAddress, count: rawBuffer.count)
-                    return Self.appendKittyEncodedPayload(payloadBytes, to: descriptor)
+                    return Self.appendKittyEncodedPayload(payloadBytes, to: payloadFileURL)
                 }
                 guard appendedChunk else {
-                    close(descriptor)
                     Self.removeKittyEncodedPayloadFile(at: payloadFileURL)
+                    clearPendingAnonymousKittyImageChunkIndexIfNeeded(imageIndex)
                     return nil
                 }
                 accumulatorFileURL = payloadFileURL
-                accumulatorFileDescriptor = descriptor
             }
             kittyImageChunkAccumulators[imageIndex] = KittyImageChunkAccumulator(
                 startRow: startRow,
@@ -4134,26 +4102,21 @@ final class TerminalModel {
                 format: format,
                 byteOffset: byteOffset,
                 byteCount: byteCount,
-                encodedPayloadFileURL: accumulatorFileURL,
-                encodedPayloadFileDescriptor: accumulatorFileDescriptor
+                encodedPayloadFileURL: accumulatorFileURL
             )
             return nil
         }
 
         let resolvedPayloadSource: DeferredKittyImagePayloadSource
         if let accumulator = kittyImageChunkAccumulators.removeValue(forKey: imageIndex) {
-            let accumulatorFileDescriptor = accumulator.encodedPayloadFileDescriptor
             switch encodedPayloadSource {
             case .file(let encodedPayloadFileURL):
                 if accumulator.encodedPayloadFileURL != encodedPayloadFileURL {
-                    let appendedChunk = Self.appendKittyEncodedPayload(
-                        from: encodedPayloadFileURL,
-                        to: accumulatorFileDescriptor
-                    )
+                    let appendedChunk = Self.appendKittyEncodedPayload(from: encodedPayloadFileURL, to: accumulator.encodedPayloadFileURL)
                     Self.removeKittyEncodedPayloadFile(at: encodedPayloadFileURL)
                     guard appendedChunk else {
-                        close(accumulatorFileDescriptor)
                         Self.removeKittyEncodedPayloadFile(at: accumulator.encodedPayloadFileURL)
+                        clearPendingAnonymousKittyImageChunkIndexIfNeeded(imageIndex)
                         return nil
                     }
                 }
@@ -4161,16 +4124,16 @@ final class TerminalModel {
                 let appendedChunk = data.withUnsafeBytes { rawBuffer -> Bool in
                     guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return true }
                     let payloadBytes = UnsafeBufferPointer(start: baseAddress, count: rawBuffer.count)
-                    return Self.appendKittyEncodedPayload(payloadBytes, to: accumulatorFileDescriptor)
+                    return Self.appendKittyEncodedPayload(payloadBytes, to: accumulator.encodedPayloadFileURL)
                 }
                 guard appendedChunk else {
-                    close(accumulatorFileDescriptor)
                     Self.removeKittyEncodedPayloadFile(at: accumulator.encodedPayloadFileURL)
+                    clearPendingAnonymousKittyImageChunkIndexIfNeeded(imageIndex)
                     return nil
                 }
             }
-            close(accumulatorFileDescriptor)
             resolvedPayloadSource = .file(accumulator.encodedPayloadFileURL)
+            clearPendingAnonymousKittyImageChunkIndexIfNeeded(imageIndex)
             placeInlineImage(
                 atRow: accumulator.startRow,
                 startCol: accumulator.startCol,
@@ -4195,6 +4158,36 @@ final class TerminalModel {
             byteOffset: byteOffset,
             byteCount: byteCount
         )
+    }
+
+    private func resolveKittyImageIndex(for control: KittyGraphicsControl) -> Int {
+        if let parsed = control.imageIndex {
+            nextKittyImagePlaceholderIndex = max(nextKittyImagePlaceholderIndex, parsed + 1)
+            if control.hasMoreChunks {
+                pendingKittyImageChunkContinuationIndex = parsed
+            }
+            return parsed
+        }
+
+        if control.hasMoreChunks || pendingKittyImageChunkContinuationIndex != nil {
+            if let pendingKittyImageChunkContinuationIndex {
+                return pendingKittyImageChunkContinuationIndex
+            }
+            let placeholder = nextKittyImagePlaceholderIndex
+            nextKittyImagePlaceholderIndex += 1
+            pendingKittyImageChunkContinuationIndex = placeholder
+            return placeholder
+        }
+
+        let placeholder = nextKittyImagePlaceholderIndex
+        nextKittyImagePlaceholderIndex += 1
+        return placeholder
+    }
+
+    private func clearPendingAnonymousKittyImageChunkIndexIfNeeded(_ imageIndex: Int) {
+        if pendingKittyImageChunkContinuationIndex == imageIndex {
+            pendingKittyImageChunkContinuationIndex = nil
+        }
     }
 
     func executeDeferredKittyImagePayload(_ job: DeferredKittyImagePayloadJob) {
@@ -4397,7 +4390,7 @@ final class TerminalModel {
         _ bytes: UnsafeBufferPointer<UInt8>,
         to fileURL: URL
     ) -> Bool {
-        guard let baseAddress = bytes.baseAddress else { return true }
+        guard bytes.baseAddress != nil else { return true }
 
         let fd: Int32
         if FileManager.default.fileExists(atPath: fileURL.path) {
@@ -4411,6 +4404,22 @@ final class TerminalModel {
         defer { close(fd) }
 
         return appendKittyEncodedPayload(bytes, to: fd)
+    }
+
+    private static func appendKittyEncodedPayload(
+        from sourceFileURL: URL,
+        to destinationFileURL: URL
+    ) -> Bool {
+        let destinationDescriptor: Int32
+        if FileManager.default.fileExists(atPath: destinationFileURL.path) {
+            guard let descriptor = openKittyEncodedPayloadFileForAppending(at: destinationFileURL) else { return false }
+            destinationDescriptor = descriptor
+        } else {
+            guard let descriptor = createKittyEncodedPayloadFile(at: destinationFileURL) else { return false }
+            destinationDescriptor = descriptor
+        }
+        defer { close(destinationDescriptor) }
+        return appendKittyEncodedPayload(from: sourceFileURL, to: destinationDescriptor)
     }
 
     private static func appendKittyEncodedPayload(

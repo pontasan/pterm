@@ -553,6 +553,51 @@ final class TextModelTests: XCTestCase {
         XCTAssertEqual(grid.cell(at: 0, col: 6).codepoint, Cell.empty.codepoint)
     }
 
+    func testTerminalGridRowOnlyResizeMaterializesSparseRowsBackToViewportWidth() {
+        let grid = TerminalGrid(rows: 1, cols: 8)
+        [UInt32(0x03B1), 0x03B2, 0x03B3].withUnsafeBufferPointer { buffer in
+            grid.writeSingleWidthDefaultCells(
+                buffer.baseAddress!,
+                count: buffer.count,
+                atRow: 0,
+                startCol: 0
+            )
+        }
+
+        XCTAssertEqual(grid.rowCells(0).count, 3)
+
+        _ = grid.resize(newRows: 2, newCols: 8, cursorRow: 0, cursorCol: 2)
+
+        XCTAssertEqual(grid.rowCells(0).count, 8)
+        XCTAssertEqual(grid.rowCells(1).count, 8)
+        XCTAssertEqual(grid.cell(at: 0, col: 0).codepoint, 0x03B1)
+        XCTAssertEqual(grid.cell(at: 0, col: 1).codepoint, 0x03B2)
+        XCTAssertEqual(grid.cell(at: 0, col: 2).codepoint, 0x03B3)
+        XCTAssertEqual(grid.cell(at: 0, col: 3).codepoint, Cell.empty.codepoint)
+        XCTAssertTrue(grid.debugValidateInternalInvariants().isEmpty)
+    }
+
+    func testTerminalGridRowOnlyResizeRepairsUnreadableMetadataRowsIntoBlankRows() {
+        let grid = TerminalGrid(rows: 3, cols: 4)
+        grid.setCell(Cell(codepoint: 65, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 0)
+        grid.setCell(Cell(codepoint: 66, attributes: .default, width: 1, isWideContinuation: false), at: 1, col: 0)
+        grid.debugCorruptReadableStateForTesting(
+            physicalSparseCompactDefaultPrefixCounts: [0, 0],
+            rowEncodingHintStatesCount: 2
+        )
+
+        let result = grid.resize(newRows: 4, newCols: 4, cursorRow: 2, cursorCol: 0)
+
+        XCTAssertEqual(result.cursorRow, 2)
+        XCTAssertEqual(grid.rowCells(0).count, 4)
+        XCTAssertEqual(grid.rowCells(1).count, 4)
+        XCTAssertEqual(grid.rowCells(2).count, 4)
+        XCTAssertEqual(grid.cell(at: 0, col: 0).codepoint, 65)
+        XCTAssertEqual(grid.cell(at: 1, col: 0).codepoint, 66)
+        XCTAssertEqual(grid.cell(at: 2, col: 0).codepoint, Cell.empty.codepoint)
+        XCTAssertTrue(grid.debugValidateInternalInvariants().isEmpty)
+    }
+
     func testTerminalGridOutOfBoundsAccessIsSafe() {
         let grid = TerminalGrid(rows: 2, cols: 2)
         XCTAssertEqual(grid.cell(at: -1, col: 0).codepoint, 0x20)

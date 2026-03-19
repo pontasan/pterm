@@ -850,11 +850,30 @@ final class TerminalGrid {
 
     /// Simple row-only resize (column count unchanged).
     private func resizeRowsOnly(newRows: Int, cursorRow: Int, cursorCol: Int) -> ResizeResult {
+        let dimensions = readableDimensions()
+        let readableRowCount = min(rows, dimensions.rows)
         var newCursorRow = cursorRow
         var trimmedRows: [TrimmedRow] = []
-        var logicalRows = (0..<rows).map { Array(rowCells($0)) }
-        var wrappedFlags = wrappedFlagsArray(startingAt: 0, count: rows)
-        var lineAttributes = (0..<rows).map(lineAttribute(at:))
+        var logicalRows = (0..<readableRowCount).map { row -> [Cell] in
+            let rowSnapshot = Array(rowCells(row))
+            if rowSnapshot.count == cols {
+                return rowSnapshot
+            }
+            if rowSnapshot.count > cols {
+                return Array(rowSnapshot.prefix(cols))
+            }
+            return rowSnapshot + Array(repeating: Cell.empty, count: cols - rowSnapshot.count)
+        }
+        var wrappedFlags = wrappedFlagsArray(startingAt: 0, count: readableRowCount)
+        var lineAttributes = (0..<readableRowCount).map(lineAttribute(at:))
+
+        if readableRowCount < rows {
+            let unreadableRows = rows - readableRowCount
+            logicalRows.append(contentsOf:
+                Array(repeating: Array(repeating: Cell.empty, count: cols), count: unreadableRows))
+            wrappedFlags.append(contentsOf: Array(repeating: false, count: unreadableRows))
+            lineAttributes.append(contentsOf: Array(repeating: .singleWidth, count: unreadableRows))
+        }
 
         if newRows < rows {
             // Shrinking: if cursor is below new bottom, scroll content up

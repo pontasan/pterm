@@ -1115,6 +1115,78 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(captures.first?.1, expectedPayload)
     }
 
+    func testTerminalModelKittyGraphicsChunkAccumulatorsDoNotHoldDescriptorsOpen() throws {
+        let harness = TerminalModelHarness()
+        let baselineDescriptorCount = try openFileDescriptorCount()
+        let payloadFragment = Data(repeating: 0x41, count: 96).base64EncodedString()
+
+        for imageIndex in 1...256 {
+            harness.model.handleKittyGraphicsAPCPayloadString(
+                "Gi=\(imageIndex),a=T,f=100,t=d,m=1;\(payloadFragment)"
+            )
+        }
+
+        let descriptorCountAfterChunkStarts = try openFileDescriptorCount()
+        XCTAssertLessThanOrEqual(
+            descriptorCountAfterChunkStarts,
+            baselineDescriptorCount + 8,
+            "chunked kitty image accumulation should not keep one open descriptor per in-flight image"
+        )
+    }
+
+    func testTerminalModelKittyGraphicsAnonymousChunkSequenceCompletesAndCleansUpPayloadFile() {
+        let harness = TerminalModelHarness()
+        let baselinePayloadFiles = currentKittyImagePayloadFilenames()
+        let expectedPayload = Data([0x89, 0x50, 0x4E, 0x47, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60])
+        let encoded = expectedPayload.base64EncodedString()
+        let firstBreak = encoded.index(encoded.startIndex, offsetBy: encoded.count / 3)
+        let secondBreak = encoded.index(encoded.startIndex, offsetBy: (encoded.count * 2) / 3)
+        let first = String(encoded[..<firstBreak])
+        let second = String(encoded[firstBreak..<secondBreak])
+        let third = String(encoded[secondBreak...])
+        var captures: [(Int, Data)] = []
+        harness.model.onKittyImagePayload = { index, data, _, _, _, _, _ in
+            captures.append((index, data))
+        }
+
+        harness.model.handleKittyGraphicsAPCPayloadString("Ga=T,f=100,t=d,m=1;\(first)")
+        harness.model.handleKittyGraphicsAPCPayloadString("Ga=T,f=100,t=d,m=1;\(second)")
+        XCTAssertTrue(captures.isEmpty)
+
+        harness.model.handleKittyGraphicsAPCPayloadString("Ga=T,f=100,t=d,m=0;\(third)")
+
+        XCTAssertEqual(captures.count, 1)
+        XCTAssertEqual(captures.first?.1, expectedPayload)
+        XCTAssertEqual(currentKittyImagePayloadFilenames(), baselinePayloadFiles)
+    }
+
+    func testTerminalModelKittyGraphicsChunkSequenceReusesExplicitImageIndexWhenFollowupChunksOmitIt() {
+        let harness = TerminalModelHarness()
+        let baselinePayloadFiles = currentKittyImagePayloadFilenames()
+        let expectedPayload = Data([0x89, 0x50, 0x4E, 0x47, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE])
+        let encoded = expectedPayload.base64EncodedString()
+        let firstBreak = encoded.index(encoded.startIndex, offsetBy: encoded.count / 3)
+        let secondBreak = encoded.index(encoded.startIndex, offsetBy: (encoded.count * 2) / 3)
+        let first = String(encoded[..<firstBreak])
+        let second = String(encoded[firstBreak..<secondBreak])
+        let third = String(encoded[secondBreak...])
+        var captures: [(Int, Data)] = []
+        harness.model.onKittyImagePayload = { index, data, _, _, _, _, _ in
+            captures.append((index, data))
+        }
+
+        harness.model.handleKittyGraphicsAPCPayloadString("Gi=41,a=T,f=100,t=d,m=1;\(first)")
+        harness.model.handleKittyGraphicsAPCPayloadString("Ga=T,f=100,t=d,m=1;\(second)")
+        XCTAssertTrue(captures.isEmpty)
+
+        harness.model.handleKittyGraphicsAPCPayloadString("Ga=T,f=100,t=d,m=0;\(third)")
+
+        XCTAssertEqual(captures.count, 1)
+        XCTAssertEqual(captures.first?.0, 41)
+        XCTAssertEqual(captures.first?.1, expectedPayload)
+        XCTAssertEqual(currentKittyImagePayloadFilenames(), baselinePayloadFiles)
+    }
+
     func testTerminalModelKittyGraphicsPayloadLoadsFileTransfer() throws {
         let harness = TerminalModelHarness()
         let expectedPayload = Data([0x89, 0x50, 0x4E, 0x47, 0x11, 0x22, 0x33, 0x44])
@@ -1165,6 +1237,21 @@ final class TerminalModelRegressionTests: XCTestCase {
         }
         harness.model.executeDeferredKittyImagePayload(job)
         XCTAssertEqual(captured, expectedPayload)
+    }
+
+    private func openFileDescriptorCount() throws -> Int {
+        try FileManager.default.contentsOfDirectory(atPath: "/dev/fd")
+            .compactMap { Int($0) }
+            .count
+    }
+
+    private func currentKittyImagePayloadFilenames() -> Set<String> {
+        let contents = try? FileManager.default.contentsOfDirectory(
+            at: TerminalModel.kittyImageEncodedPayloadDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )
+        return Set(contents?.map(\.lastPathComponent) ?? [])
     }
 
     func testTerminalModelSaveRestoreCursorRoundTripsPositionAndAttributes() {
