@@ -36,6 +36,8 @@ final class TerminalView: MTKView, NSTextInputClient {
         enum Kind {
             case fadeIn
             case fadeOut
+            /// Hold at full alpha — bridges marked-text-to-grid transition.
+            case hold
         }
 
         let text: String
@@ -206,8 +208,16 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var idleBufferReleaseTimer: Timer?
     private var deferredResizeNotificationWorkItems: [DispatchWorkItem] = []
     private var markedTextLayer: CATextLayer?
+    private var markedTextGlyphFrames: [CGRect] = []
     private var markedTextStorage: NSMutableAttributedString?
     private var markedTextSelection = NSRange(location: NSNotFound, length: 0)
+    private var deferredMarkedTextOverlayStorage: NSMutableAttributedString?
+    private var deferredMarkedTextOverlaySelection = NSRange(location: NSNotFound, length: 0)
+    private var deferredMarkedTextOverlayClearWorkItem: DispatchWorkItem?
+    private var markedTextPreviewStartedAt: CFTimeInterval?
+    private var lastMarkedTextForAnimation: String?
+    private var pendingMarkedTextContinuation: String?
+    private var markedTextAnimatedSegment: (text: String, colOffset: Int, startedAt: CFTimeInterval)?
     private var committedTextPreviews: [CommittedTextPreview] = []
     private var recentCommittedInsertions: [RecentCommittedInsertion] = []
     private var pendingCommittedTextIntents: [CommittedTextAnimationIntent] = []
@@ -238,13 +248,34 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
     var debugHasKeyboardHandler: Bool { keyboardHandler != nil }
     var debugHasMarkedTextStorage: Bool { markedTextStorage != nil }
+    var debugMarkedTextLayerForTesting: CATextLayer? { markedTextLayer }
+    var debugMarkedTextGlyphFramesForTesting: [CGRect] {
+        markedTextGlyphFrames.sorted { lhs, rhs in
+            if lhs.minY == rhs.minY { return lhs.minX < rhs.minX }
+            return lhs.minY < rhs.minY
+        }
+    }
     var debugHasOutputPulseTimer: Bool { outputPulseTimer != nil }
     var debugEffectiveDisplayUpdateFPSForTesting: Int { effectiveDisplayUpdateFPS() }
     var debugHasCommittedTextPreview: Bool { !activeCommittedTextPreviewOverlays().isEmpty }
     var debugCommittedTextPreviewCount: Int { committedTextPreviews.count }
+    var debugCommittedTextPreviewAlphas: [Float] { activeCommittedTextPreviewOverlays().map(\.alpha) }
+    var debugCommittedTextPreviewKinds: [String] {
+        committedTextPreviews.map {
+            switch $0.kind {
+            case .fadeIn: return "fadeIn"
+            case .fadeOut: return "fadeOut"
+            case .hold: return "hold"
+            }
+        }
+    }
+    var debugCommittedTextPreviewTexts: [String] { committedTextPreviews.map(\.text) }
     var debugPendingCommittedTextIntentCount: Int { pendingCommittedTextIntents.count }
     var debugHasPendingIntentResolutionTimer: Bool { pendingIntentResolutionTimer != nil }
     var debugLastPendingCommittedTextIntentText: String? { pendingCommittedTextIntents.last?.text }
+    var debugMarkedTextTransientOverlayCount: Int { activeMarkedTextTransientOverlays().count }
+    var debugMarkedTextTransientOverlayAlphas: [Float] { activeMarkedTextTransientOverlays().map(\.alpha) }
+    var debugMarkedTextTransientOverlayTexts: [String] { activeMarkedTextTransientOverlays().map(\.text) }
     var debugDeferredResizeNotificationCount: Int { deferredResizeNotificationWorkItems.count }
     var debugIsDisplayUpdateScheduledForTesting: Bool { displayUpdateScheduled }
 
@@ -300,16 +331,16 @@ final class TerminalView: MTKView, NSTextInputClient {
     func debugRenderFrameToTextureForTesting(_ texture: MTLTexture) {
         guard let controller = terminalController,
               let renderer else { return }
-        let committedTextPreviews = activeCommittedTextPreviewOverlays()
+        let transientTextOverlays = activeTransientTextOverlaysForRendering()
         let suppressCursorBlink =
-            !committedTextPreviews.isEmpty || !pendingCommittedTextIntents.isEmpty || hasMarkedText()
+            !transientTextOverlays.isEmpty || !pendingCommittedTextIntents.isEmpty || hasMarkedText()
         let snapshot = controller.captureRenderSnapshot()
 
         renderer.debugRenderToTextureForTesting(
             snapshot: snapshot,
             texture: texture,
             selection: selection,
-            transientTextOverlays: committedTextPreviews,
+            transientTextOverlays: transientTextOverlays,
             suppressCursorBlink: suppressCursorBlink
         )
     }
@@ -781,8 +812,37 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     private func destroyMarkedTextLayer() {
+        markedTextGlyphFrames.removeAll(keepingCapacity: false)
         markedTextLayer?.removeFromSuperlayer()
         markedTextLayer = nil
+    }
+
+    private func cancelDeferredMarkedTextOverlayClear() {
+        deferredMarkedTextOverlayClearWorkItem?.cancel()
+        deferredMarkedTextOverlayClearWorkItem = nil
+    }
+
+    private func clearDeferredMarkedTextOverlay() {
+        cancelDeferredMarkedTextOverlayClear()
+        deferredMarkedTextOverlayStorage = nil
+        deferredMarkedTextOverlaySelection = NSRange(location: NSNotFound, length: 0)
+    }
+
+    private func visibleMarkedTextStorage() -> NSMutableAttributedString? {
+        if let markedTextStorage, !markedTextStorage.string.isEmpty {
+            return markedTextStorage
+        }
+        if let deferredMarkedTextOverlayStorage, !deferredMarkedTextOverlayStorage.string.isEmpty {
+            return deferredMarkedTextOverlayStorage
+        }
+        return nil
+    }
+
+    private func visibleMarkedTextSelection() -> NSRange {
+        if let markedTextStorage, !markedTextStorage.string.isEmpty {
+            return markedTextSelection
+        }
+        return deferredMarkedTextOverlaySelection
     }
 
     private func clearCommittedTextPreview() {
@@ -792,6 +852,20 @@ final class TerminalView: MTKView, NSTextInputClient {
         pendingIntentResolutionTimer = nil
         committedTextPreviews.removeAll(keepingCapacity: false)
         recentCommittedInsertions.removeAll(keepingCapacity: false)
+        pendingCommittedTextIntents.removeAll(keepingCapacity: false)
+        clearDeferredMarkedTextOverlay()
+        markedTextPreviewStartedAt = nil
+        lastMarkedTextForAnimation = nil
+        pendingMarkedTextContinuation = nil
+        markedTextAnimatedSegment = nil
+    }
+
+    private func clearCommittedInputAnimationState() {
+        committedTextPreviewTimer?.invalidate()
+        committedTextPreviewTimer = nil
+        pendingIntentResolutionTimer?.invalidate()
+        pendingIntentResolutionTimer = nil
+        committedTextPreviews.removeAll(keepingCapacity: false)
         pendingCommittedTextIntents.removeAll(keepingCapacity: false)
     }
 
@@ -1919,8 +1993,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     private func updateMarkedTextOverlay() {
-        guard let markedTextStorage,
-              !markedTextStorage.string.isEmpty,
+        guard let visibleMarkedTextStorage = visibleMarkedTextStorage(),
               let renderer = renderer else {
             destroyMarkedTextLayer()
             return
@@ -1930,85 +2003,65 @@ final class TerminalView: MTKView, NSTextInputClient {
 
         let font = NSFont(name: renderer.glyphAtlas.fontName, size: renderer.glyphAtlas.fontSize)
             ?? NSFont.monospacedSystemFont(ofSize: renderer.glyphAtlas.fontSize, weight: .regular)
-        let attributed = NSMutableAttributedString(
-            string: markedTextStorage.string,
-            attributes: [
-                .font: font,
-                .foregroundColor: NSColor.white,
-                .underlineStyle: NSUnderlineStyle.single.rawValue
-            ]
-        )
-        let desiredMetrics = desiredMarkedTextRendererMetrics(for: markedTextStorage.string)
-        if let desiredWidth = desiredMetrics?.width {
-            let naturalWidth = attributed.size().width
-            let characterCount = markedTextStorage.string.count
-            if characterCount > 1 {
-                let tracking = (desiredWidth - naturalWidth) / CGFloat(characterCount - 1)
-                if tracking != 0 {
-                    var location = 0
-                    for character in markedTextStorage.string {
-                        let range = NSRange(location: location, length: String(character).utf16.count)
-                        if location + range.length < attributed.length {
-                            attributed.addAttribute(.kern, value: tracking, range: range)
-                        }
-                        location += range.length
-                    }
-                }
-            }
-        }
         let cursorRect = currentCursorRect()
-        markedTextLayer.string = attributed
         markedTextLayer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
-        let desiredWidth = desiredMetrics?.width ?? attributed.size().width
-        let desiredOriginX = desiredMetrics?.originX ?? 0
-        let size = attributed.size()
-        markedTextLayer.frame = NSRect(
-            x: cursorRect.minX + desiredOriginX,
-            y: cursorRect.minY + max(0, (cursorRect.height - size.height) / 2),
-            width: max(desiredWidth, 1),
-            height: max(size.height, cursorRect.height)
+        markedTextLayer.string = nil
+        markedTextLayer.frame = bounds
+        rebuildMarkedTextGlyphLayers(
+            for: visibleMarkedTextStorage.string,
+            font: font,
+            cursorRect: cursorRect,
+            contentsScale: markedTextLayer.contentsScale
         )
-        markedTextLayer.isHidden = false
+        markedTextLayer.isHidden = true
     }
 
-    private func desiredMarkedTextRendererMetrics(for text: String) -> (originX: CGFloat, width: CGFloat)? {
-        guard let renderer else { return nil }
+    private func rebuildMarkedTextGlyphLayers(
+        for text: String,
+        font: NSFont,
+        cursorRect: CGRect,
+        contentsScale: CGFloat
+    ) {
+        guard let renderer else { return }
+
+        markedTextGlyphFrames.removeAll(keepingCapacity: false)
+
         let scale = renderer.glyphAtlas.scaleFactor
-        let cellWidthPixels = renderer.glyphAtlas.cellWidth * scale
+        let baseY = cursorRect.minY
+        let textHeight = max(font.boundingRectForFont.height, cursorRect.height)
+        var columnOffsetPoints: CGFloat = 0
 
-        var columnOffset: CGFloat = 0
-        var minX = CGFloat.greatestFiniteMagnitude
-        var maxX = -CGFloat.greatestFiniteMagnitude
-        var sawRenderableGlyph = false
+        for character in text {
+            let grapheme = String(character)
+            let columnWidth = max(self.columnWidth(for: grapheme), 1)
+            defer { columnOffsetPoints += CGFloat(columnWidth) * renderer.glyphAtlas.cellWidth }
 
-        for scalar in text.unicodeScalars {
-            let characterWidth = max(CharacterWidth.width(of: scalar.value), 1)
-            defer { columnOffset += CGFloat(characterWidth) * cellWidthPixels }
-
-            guard scalar.value > 0x20,
-                  let glyph = renderer.glyphAtlas.glyphInfo(for: scalar.value),
+            guard let firstScalar = grapheme.unicodeScalars.first,
+                  firstScalar.value > 0x20,
+                  let glyph = renderer.glyphAtlas.glyphInfo(for: firstScalar.value),
                   glyph.pixelWidth > 0 else {
                 continue
             }
 
             let glyphX: CGFloat
-            if characterWidth == 1 {
-                glyphX = columnOffset + CGFloat(glyph.cellOffsetX)
+            if columnWidth == 1 {
+                glyphX = cursorRect.minX + columnOffsetPoints + (CGFloat(glyph.cellOffsetX) / scale)
             } else {
-                let spanWidth = CGFloat(characterWidth) * cellWidthPixels
-                glyphX = columnOffset + CGFloat(glyph.cellOffsetX) + ((spanWidth - cellWidthPixels) * 0.5)
+                let spanWidth = CGFloat(columnWidth) * renderer.glyphAtlas.cellWidth
+                glyphX = cursorRect.minX +
+                    columnOffsetPoints +
+                    (CGFloat(glyph.cellOffsetX) / scale) +
+                    ((spanWidth - renderer.glyphAtlas.cellWidth) * 0.5)
             }
-            let glyphMaxX = glyphX + CGFloat(glyph.pixelWidth)
-            minX = min(minX, glyphX)
-            maxX = max(maxX, glyphMaxX)
-            sawRenderableGlyph = true
-        }
 
-        guard sawRenderableGlyph else { return nil }
-        return (
-            originX: minX / scale,
-            width: (maxX - minX) / scale
-        )
+            let glyphFrame = NSRect(
+                x: glyphX,
+                y: baseY,
+                width: max(CGFloat(glyph.pixelWidth) / scale, 1),
+                height: textHeight
+            )
+            markedTextGlyphFrames.append(glyphFrame)
+        }
     }
 
     private func shouldAnimateCommittedTextPreview(for text: String) -> Bool {
@@ -2030,6 +2083,8 @@ final class TerminalView: MTKView, NSTextInputClient {
             return Float(0.02 + 0.98 * smoothedProgress)
         case .fadeOut:
             return Float(0.4 * (1.0 - easedProgress))
+        case .hold:
+            return 1.0
         }
     }
 
@@ -2045,7 +2100,7 @@ final class TerminalView: MTKView, NSTextInputClient {
             columnWidth: committedTextPreview.columnWidth,
             cursorRow: committedTextPreview.cursorRow,
             cursorCol: committedTextPreview.cursorCol,
-            masksGridGlyphs: committedTextPreview.kind == .fadeIn,
+            masksGridGlyphs: committedTextPreview.kind == .fadeIn || committedTextPreview.kind == .hold,
             verticalOffset: committedTextPreview.kind == .fadeOut ? Float(20.0 * easedFall(progress)) : 0,
             alpha: alpha
         )
@@ -2067,10 +2122,190 @@ final class TerminalView: MTKView, NSTextInputClient {
         progress * progress * (3.0 - 2.0 * progress)
     }
 
+    private func activeMarkedTextTransientOverlays() -> [MetalRenderer.TransientTextOverlay] {
+        let now = CACurrentMediaTime()
+        guard let controller = terminalController,
+              let visibleMarkedTextStorage = visibleMarkedTextStorage() else {
+            return []
+        }
+
+        if let segment = markedTextAnimatedSegment,
+           now - segment.startedAt >= 0.20 {
+            markedTextAnimatedSegment = nil
+        }
+
+        let cursor = controller.withModel { $0.cursor }
+        let visibleString = visibleMarkedTextStorage.string
+        let visibleSelection = visibleMarkedTextSelection()
+        let nsString = visibleString as NSString
+        let selectionLocation = visibleSelection.location == NSNotFound
+            ? nsString.length
+            : min(max(0, visibleSelection.location), nsString.length)
+        let prefix = nsString.substring(to: selectionLocation)
+        let cursorCol = cursor.col + (prefix.isEmpty ? 0 : columnWidth(for: prefix))
+        let markedTextAlpha: Float = 0.4
+
+        guard let segment = markedTextAnimatedSegment,
+              !segment.text.isEmpty else {
+            return [
+                MetalRenderer.TransientTextOverlay(
+                    text: visibleString,
+                    row: cursor.row,
+                    col: cursor.col,
+                    columnWidth: columnWidth(for: visibleString),
+                    cursorRow: cursor.row,
+                    cursorCol: cursorCol,
+                    masksGridGlyphs: true,
+                    verticalOffset: 0,
+                    alpha: markedTextAlpha,
+                    underline: true
+                )
+            ]
+        }
+
+        let characters = Array(visibleString)
+        let prefixCharacters = characters.prefix(segment.colOffset)
+        let animatedCharacters = Array(segment.text)
+        let suffixCharacters = characters.dropFirst(segment.colOffset + animatedCharacters.count)
+        let stablePrefix = String(prefixCharacters)
+        let stableSuffix = String(suffixCharacters)
+        let animatedCol = cursor.col + (stablePrefix.isEmpty ? 0 : columnWidth(for: stablePrefix))
+        let suffixCol = animatedCol + columnWidth(for: segment.text)
+
+        var overlays: [MetalRenderer.TransientTextOverlay] = []
+        if !stablePrefix.isEmpty {
+            overlays.append(
+                MetalRenderer.TransientTextOverlay(
+                    text: stablePrefix,
+                    row: cursor.row,
+                    col: cursor.col,
+                    columnWidth: columnWidth(for: stablePrefix),
+                    cursorRow: nil,
+                    cursorCol: nil,
+                    masksGridGlyphs: true,
+                    verticalOffset: 0,
+                    alpha: markedTextAlpha,
+                    underline: true
+                )
+            )
+        }
+
+        let animatedPreview = CommittedTextPreview(
+            text: segment.text,
+            row: cursor.row,
+            col: animatedCol,
+            columnWidth: columnWidth(for: segment.text),
+            cursorRow: cursor.row,
+            cursorCol: cursorCol,
+            startedAt: segment.startedAt,
+            duration: 0.20,
+            kind: .fadeIn
+        )
+        if var animatedOverlay = overlay(for: animatedPreview, at: now) {
+            animatedOverlay.alpha = min(animatedOverlay.alpha, markedTextAlpha)
+            animatedOverlay.underline = true
+            overlays.append(animatedOverlay)
+        }
+
+        if !stableSuffix.isEmpty {
+            overlays.append(
+                MetalRenderer.TransientTextOverlay(
+                    text: stableSuffix,
+                    row: cursor.row,
+                    col: suffixCol,
+                    columnWidth: columnWidth(for: stableSuffix),
+                    cursorRow: nil,
+                    cursorCol: nil,
+                    masksGridGlyphs: true,
+                    verticalOffset: 0,
+                    alpha: markedTextAlpha,
+                    underline: true
+                )
+            )
+        }
+        return overlays
+    }
+
+    func activeTransientTextOverlaysForRendering() -> [MetalRenderer.TransientTextOverlay] {
+        activeCommittedTextPreviewOverlays() + activeMarkedTextTransientOverlays()
+    }
+
     private func columnWidth(for text: String) -> Int {
         max(1, text.unicodeScalars.reduce(0) { partial, scalar in
             max(partial + max(CharacterWidth.width(of: scalar.value), 0), 1)
         })
+    }
+
+    private func animatedMarkedTextSegment(
+        previous previousText: String?,
+        current currentText: String
+    ) -> (text: String, colOffset: Int)? {
+        let currentCharacters = Array(currentText)
+        guard !currentCharacters.isEmpty else { return nil }
+        guard let previousText, !previousText.isEmpty else {
+            let lastIndex = max(currentCharacters.count - 1, 0)
+            return (String(currentCharacters[lastIndex]), lastIndex)
+        }
+
+        let previousCharacters = Array(previousText)
+        var prefixCount = 0
+        let prefixLimit = min(previousCharacters.count, currentCharacters.count)
+        while prefixCount < prefixLimit && previousCharacters[prefixCount] == currentCharacters[prefixCount] {
+            prefixCount += 1
+        }
+
+        if prefixCount == currentCharacters.count {
+            return nil
+        }
+        let lastIndex = currentCharacters.count - 1
+        let segmentStart = max(prefixCount, lastIndex)
+        return (String(currentCharacters[lastIndex]), segmentStart)
+    }
+
+    /// Create fade-out animations for characters removed or replaced during IME
+    /// composition, so that the visual behavior matches non-IME deletion.
+    private func showMarkedTextDeletionPreviews(previous previousText: String?, current currentText: String) {
+        guard let previousText, !previousText.isEmpty,
+              let controller = terminalController else { return }
+        let previousCharacters = Array(previousText)
+        let currentCharacters = Array(currentText)
+
+        // Find the common prefix that is unchanged.
+        var prefixCount = 0
+        let prefixLimit = min(previousCharacters.count, currentCharacters.count)
+        while prefixCount < prefixLimit && previousCharacters[prefixCount] == currentCharacters[prefixCount] {
+            prefixCount += 1
+        }
+
+        // Nothing was removed or replaced.
+        guard prefixCount < previousCharacters.count else { return }
+
+        let cursor = controller.withModel { $0.cursor }
+
+        // Compute the column offset of the first changed character.
+        var colOffset = 0
+        for i in 0..<prefixCount {
+            colOffset += columnWidth(for: String(previousCharacters[i]))
+        }
+
+        // Fade out every previous character beyond the common prefix.
+        // No shouldAnimateCommittedTextPreview check: these characters
+        // were already visible as marked text, so we know they're printable.
+        for i in prefixCount..<previousCharacters.count {
+            let charText = String(previousCharacters[i])
+            let charWidth = columnWidth(for: charText)
+            showCommittedTextPreview(
+                text: charText,
+                row: cursor.row,
+                col: cursor.col + colOffset,
+                columnWidth: charWidth,
+                cursorRow: nil,
+                cursorCol: nil,
+                kind: .fadeOut,
+                duration: 0.34
+            )
+            colOffset += charWidth
+        }
     }
 
     private func showCommittedTextPreview(
@@ -2102,10 +2337,22 @@ final class TerminalView: MTKView, NSTextInputClient {
         if committedTextPreviews.count > PreviewPolicy.maxCommittedTextPreviewCount {
             committedTextPreviews.removeFirst(committedTextPreviews.count - PreviewPolicy.maxCommittedTextPreviewCount)
         }
+        ensureTransientOverlayAnimationTimer()
+        requestDisplayUpdate()
+    }
+
+    private func hasActiveMarkedTextAnimations(at now: CFTimeInterval = CACurrentMediaTime()) -> Bool {
+        guard hasMarkedText(), let startedAt = markedTextPreviewStartedAt else {
+            return false
+        }
+        return now - startedAt < 0.20 || markedTextAnimatedSegment != nil
+    }
+
+    private func ensureTransientOverlayAnimationTimer() {
         committedTextPreviewTimer?.invalidate()
         let timer = Timer.scheduledTimer(withTimeInterval: committedTextPreviewFrameInterval(), repeats: true) { [weak self] _ in
             guard let self else { return }
-            if self.activeCommittedTextPreviewOverlays().isEmpty {
+            if self.activeCommittedTextPreviewOverlays().isEmpty && !self.hasActiveMarkedTextAnimations() {
                 self.committedTextPreviewTimer?.invalidate()
                 self.committedTextPreviewTimer = nil
                 return
@@ -2114,7 +2361,6 @@ final class TerminalView: MTKView, NSTextInputClient {
         }
         RunLoop.main.add(timer, forMode: .common)
         committedTextPreviewTimer = timer
-        requestDisplayUpdate()
     }
 
     private func recordRecentCommittedInsertion(text: String, row: Int, col: Int, columnWidth: Int) {
@@ -2432,8 +2678,8 @@ extension TerminalView: MTKViewDelegate {
         }
 
         let border = effectiveBorderConfig()
-        let committedTextPreviews = activeCommittedTextPreviewOverlays()
-        let suppressCursorBlink = !committedTextPreviews.isEmpty || !pendingCommittedTextIntents.isEmpty || hasMarkedText()
+        let transientTextOverlays = activeTransientTextOverlaysForRendering()
+        let suppressCursorBlink = !transientTextOverlays.isEmpty || !pendingCommittedTextIntents.isEmpty || hasMarkedText()
         // Capture the exact visible frame under the controller read lock, then
         // release the lock before vertex building and Metal submission.
         guard let snapshot = controller.captureRenderSnapshotIfAvailable() else {
@@ -2448,7 +2694,7 @@ extension TerminalView: MTKViewDelegate {
             linkUnderline: linkUL,
             borderConfig: border,
             headerOverlayConfig: commandIdentityHeaderConfig(),
-            transientTextOverlays: committedTextPreviews,
+            transientTextOverlays: transientTextOverlays,
             suppressCursorBlink: suppressCursorBlink,
             in: view
         )
@@ -2483,13 +2729,55 @@ extension TerminalView {
             text = String(describing: string)
         }
         guard !text.isEmpty else { return }
-        let committedFromMarkedText = hasMarkedText()
+        let previousMarkedString = markedTextStorage?.string
+        let hadVisibleMarkedText = previousMarkedString != nil && !previousMarkedString!.isEmpty
         pendingTextInputHandled = true
         markedTextStorage = nil
         markedTextSelection = NSRange(location: NSNotFound, length: 0)
+        clearDeferredMarkedTextOverlay()
+        markedTextPreviewStartedAt = nil
+        lastMarkedTextForAnimation = nil
+        pendingMarkedTextContinuation = nil
+        markedTextAnimatedSegment = nil
         destroyMarkedTextLayer()
-        let shouldShowCommittedPreview = !committedFromMarkedText && shouldAnimateCommittedTextPreview(for: text)
-        if shouldShowCommittedPreview {
+        let shouldShowCommittedPreview = shouldAnimateCommittedTextPreview(for: text)
+        if hadVisibleMarkedText && shouldShowCommittedPreview {
+            let cursor = controller.withModel { $0.cursor }
+            let width = columnWidth(for: text)
+            if text == previousMarkedString {
+                // Same text committed: hold at full alpha so it doesn't
+                // flash while waiting for the grid to update via PTY.
+                showCommittedTextPreview(
+                    text: text,
+                    row: cursor.row,
+                    col: cursor.col,
+                    columnWidth: width,
+                    cursorRow: cursor.row,
+                    cursorCol: cursor.col + width,
+                    kind: .hold,
+                    duration: 0.40
+                )
+            } else {
+                // Converted (e.g. "かな" → "仮名"): fade out old, fade in new.
+                showMarkedTextDeletionPreviews(
+                    previous: previousMarkedString,
+                    current: ""
+                )
+                showCommittedTextPreview(
+                    text: text,
+                    row: cursor.row,
+                    col: cursor.col,
+                    columnWidth: width,
+                    cursorRow: cursor.row,
+                    cursorCol: cursor.col + width,
+                    kind: .fadeIn,
+                    duration: 0.20
+                )
+            }
+            if outputConfirmedInputAnimationsEnabled {
+                enqueueCommittedInsertIntentIfNeeded(for: text)
+            }
+        } else if shouldShowCommittedPreview {
             if outputConfirmedInputAnimationsEnabled {
                 enqueueCommittedInsertIntentIfNeeded(for: text)
             } else {
@@ -2497,6 +2785,7 @@ extension TerminalView {
             }
         }
         controller.sendInput(text)
+        requestDisplayUpdate()
         queueInputFeedbackIfEnabled()
     }
 
@@ -2509,19 +2798,56 @@ extension TerminalView {
         } else {
             attributed = NSAttributedString(string: String(describing: string))
         }
+        let previousText = markedTextStorage?.string
+            ?? deferredMarkedTextOverlayStorage?.string
+            ?? pendingMarkedTextContinuation
+            ?? lastMarkedTextForAnimation
+        let nextAnimatedSegment = animatedMarkedTextSegment(previous: previousText, current: attributed.string)
+        let shouldRestartPreview = nextAnimatedSegment != nil
         pendingTextInputHandled = true
+        clearCommittedInputAnimationState()
+        clearDeferredMarkedTextOverlay()
+        showMarkedTextDeletionPreviews(previous: previousText, current: attributed.string)
         markedTextStorage = NSMutableAttributedString(attributedString: attributed)
         markedTextSelection = selectedRange
+        if shouldRestartPreview {
+            markedTextPreviewStartedAt = CACurrentMediaTime()
+        }
+        markedTextAnimatedSegment = nextAnimatedSegment.map { ($0.text, $0.colOffset, markedTextPreviewStartedAt ?? CACurrentMediaTime()) }
+        lastMarkedTextForAnimation = attributed.string
+        pendingMarkedTextContinuation = nil
         updateMarkedTextOverlay()
+        ensureTransientOverlayAnimationTimer()
+        requestDisplayUpdate()
         if attributed.length > 0 {
             queueInputFeedbackIfEnabled()
         }
     }
 
     func unmarkText() {
+        pendingMarkedTextContinuation = markedTextStorage?.string
+        if let markedTextStorage, !markedTextStorage.string.isEmpty {
+            deferredMarkedTextOverlayStorage = NSMutableAttributedString(attributedString: markedTextStorage)
+            deferredMarkedTextOverlaySelection = markedTextSelection
+            cancelDeferredMarkedTextOverlayClear()
+            let clearWorkItem = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.deferredMarkedTextOverlayStorage = nil
+                self.deferredMarkedTextOverlaySelection = NSRange(location: NSNotFound, length: 0)
+                self.deferredMarkedTextOverlayClearWorkItem = nil
+                self.updateMarkedTextOverlay()
+                self.requestDisplayUpdate()
+            }
+            deferredMarkedTextOverlayClearWorkItem = clearWorkItem
+            DispatchQueue.main.async(execute: clearWorkItem)
+        }
         markedTextStorage = nil
         markedTextSelection = NSRange(location: NSNotFound, length: 0)
+        markedTextPreviewStartedAt = nil
+        markedTextAnimatedSegment = nil
         updateMarkedTextOverlay()
+        ensureTransientOverlayAnimationTimer()
+        requestDisplayUpdate()
     }
 
     func selectedRange() -> NSRange {

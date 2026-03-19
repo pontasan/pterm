@@ -420,7 +420,7 @@ extension SplitRenderView: MTKViewDelegate {
             let selection = ref.terminalView?.selection
             let border = ref.terminalView.flatMap { borderConfigProvider?($0) }
             let headerOverlay = headerOverlayConfigProvider?(ref.controller)
-            let transientTextOverlays = ref.terminalView?.activeCommittedTextPreviewOverlays() ?? []
+            let transientTextOverlays = ref.terminalView?.activeTransientTextOverlaysForRendering() ?? []
             let suppressCursorBlink =
                 !transientTextOverlays.isEmpty ||
                 ((ref.terminalView?.debugPendingCommittedTextIntentCount ?? 0) > 0) ||

@@ -893,7 +893,8 @@ final class MetalRenderer {
         let cursorCol: Int?
         let masksGridGlyphs: Bool
         let verticalOffset: Float
-        let alpha: Float
+        var alpha: Float
+        var underline: Bool = false
     }
 
     func render(model: TerminalModel, scrollback: ScrollbackBuffer,
@@ -1699,7 +1700,8 @@ final class MetalRenderer {
                 scaleFactor: scaleFactor,
                 cachedGlyphs: &cachedGlyphs,
                 missingGlyphs: &missingGlyphs,
-                to: &vd.glyphVertices
+                to: &vd.glyphVertices,
+                overlayVertices: &vd.overlayVertices
             )
         }
 
@@ -2252,7 +2254,8 @@ final class MetalRenderer {
                 scaleFactor: scaleFactor,
                 cachedGlyphs: &cachedGlyphs,
                 missingGlyphs: &missingGlyphs,
-                to: &vd.glyphVertices
+                to: &vd.glyphVertices,
+                overlayVertices: &vd.overlayVertices
             )
         }
 
@@ -2575,7 +2578,8 @@ final class MetalRenderer {
         scaleFactor: Float,
         cachedGlyphs: inout [UInt32: GlyphAtlas.GlyphInfo],
         missingGlyphs: inout Set<UInt32>,
-        to vertices: inout [Float]
+        to vertices: inout [Float],
+        overlayVertices: inout [Float]
     ) {
         guard overlay.alpha > 0.001 else { return }
         let cellW = Float(glyphAtlas.cellWidth) * scaleFactor
@@ -2633,6 +2637,21 @@ final class MetalRenderer {
                    fg: (1.0, 1.0, 1.0, overlay.alpha),
                    bg: (0, 0, 0, 0))
             columnOffset += Float(characterWidth) * cellW
+        }
+
+        if overlay.underline {
+            let totalWidth = Float(overlay.columnWidth) * cellW
+            let lineThickness = max(1.0, scaleFactor)
+            let cellBottom = padY + Float(overlay.row) * cellH + cellH + overlay.verticalOffset * scaleFactor
+            let underlineY = cellBottom - lineThickness
+            addUnderlineQuad(
+                to: &overlayVertices,
+                x: padX + Float(overlay.col) * cellW,
+                y: underlineY,
+                width: totalWidth,
+                thickness: lineThickness,
+                color: (1.0, 1.0, 1.0, overlay.alpha)
+            )
         }
     }
 

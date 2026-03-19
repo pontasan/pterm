@@ -2890,15 +2890,204 @@ final class AppKitComponentTests: XCTestCase {
         view.setMarkedText("日本語", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
         view.updateMarkedTextOverlayPublic()
 
-        let textLayer = view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first
-        let rendered = textLayer?.string as? NSAttributedString
+        let textLayer = view.debugMarkedTextLayerForTesting
+        let glyphFrames = view.debugMarkedTextGlyphFramesForTesting
 
         XCTAssertTrue(view.hasMarkedText())
         XCTAssertEqual(view.markedRange(), NSRange(location: 0, length: 3))
         XCTAssertEqual(view.selectedRange(), NSRange(location: 1, length: 0))
-        XCTAssertEqual(rendered?.string, "日本語")
-        XCTAssertEqual(textLayer?.isHidden, false)
-        XCTAssertGreaterThan(textLayer?.frame.width ?? 0, 0)
+        XCTAssertEqual(textLayer?.isHidden, true)
+        XCTAssertEqual(glyphFrames.count, 3)
+        XCTAssertGreaterThan(glyphFrames.last?.maxX ?? 0, glyphFrames.first?.minX ?? 0)
+    }
+
+    func testTerminalViewMarkedTextStartsWithFadeInTransientOverlay() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        view.setMarkedText("かな", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayTexts, ["か", "な"])
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayCount, 2)
+        // Stable prefix at markedTextAlpha (0.4), animated segment below that.
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayAlphas.filter { $0 >= 0.39 && $0 <= 0.41 }.count, 1)
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayAlphas.filter { $0 < 0.39 }.count, 1)
+    }
+
+    func testTerminalViewMarkedTextChangeKeepsStablePrefixAndAnimatedDelta() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        view.setMarkedText("か", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        view.setMarkedText("かな", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayCount, 2)
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayTexts, ["か", "な"])
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayAlphas.count, 2)
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayAlphas.filter { $0 >= 0.39 && $0 <= 0.41 }.count, 1)
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayAlphas.filter { $0 < 0.39 }.count, 1)
+    }
+
+    func testTerminalViewMarkedTextAppendedCharacterAnimatesOnlyDeltaSegment() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        view.setMarkedText("あ", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        view.setMarkedText("ああ", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayCount, 2)
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayTexts, ["あ", "あ"])
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayAlphas.count, 2)
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayAlphas.filter { $0 >= 0.39 && $0 <= 0.41 }.count, 1)
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayAlphas.filter { $0 < 0.39 }.count, 1)
+    }
+
+    func testTerminalViewMarkedTextContinuationAcrossUnmarkKeepsOnlyDeltaAnimated() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        view.setMarkedText("あ", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        view.unmarkText()
+        view.setMarkedText("ああ", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayTexts, ["あ", "あ"])
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayCount, 2)
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayAlphas.filter { $0 >= 0.39 && $0 <= 0.41 }.count, 1)
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayAlphas.filter { $0 < 0.39 }.count, 1)
+    }
+
+    func testTerminalViewUnmarkTextKeepsVisibleCompositionUntilNextRunLoop() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        view.setMarkedText("あ", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        view.unmarkText()
+
+        XCTAssertFalse(view.hasMarkedText())
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayTexts, ["あ"])
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayCount, 1)
+
+        drainMainQueue(testCase: self)
+
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayCount, 0)
+        XCTAssertNil(view.debugMarkedTextLayerForTesting)
+    }
+
+    func testTerminalViewMarkedTextFadeInMatchesCommittedTextPreviewAlphaProfile() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = false
+
+        view.insertText("abc", replacementRange: NSRange(location: NSNotFound, length: 0))
+        let committedAlpha = try XCTUnwrap(view.debugCommittedTextPreviewAlphas.first)
+
+        view.unmarkText()
+        view.setMarkedText("かな", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        let markedAlpha = try XCTUnwrap(view.debugMarkedTextTransientOverlayAlphas.last)
+
+        XCTAssertEqual(markedAlpha, committedAlpha, accuracy: 0.001)
     }
 
     func testTerminalViewJapaneseMarkedTextOverlayWidthMatchesCommittedRendererWidth() throws {
@@ -2926,10 +3115,11 @@ final class AppKitComponentTests: XCTestCase {
         view.setMarkedText(sample, selectedRange: NSRange(location: sample.count, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
         view.updateMarkedTextOverlayPublic()
 
-        let textLayer = try XCTUnwrap(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first)
+        let glyphFrames = view.debugMarkedTextGlyphFramesForTesting
         let rendererWidth = try rendererWidthInPoints(for: sample, renderer: renderer, rows: 1, cols: 16)
+        let overlayWidth = (glyphFrames.last?.maxX ?? 0) - (glyphFrames.first?.minX ?? 0)
 
-        XCTAssertEqual(textLayer.frame.width, rendererWidth, accuracy: 1.0)
+        XCTAssertEqual(overlayWidth, rendererWidth, accuracy: 1.0)
     }
 
     func testTerminalViewJapaneseMarkedTextOverlayWidthMatchesCommittedRendererAcrossRepresentativeSamples() throws {
@@ -2957,10 +3147,11 @@ final class AppKitComponentTests: XCTestCase {
             view.setMarkedText(sample, selectedRange: NSRange(location: sample.count, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
             view.updateMarkedTextOverlayPublic()
 
-            let textLayer = try XCTUnwrap(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first)
+            let glyphFrames = view.debugMarkedTextGlyphFramesForTesting
             let rendererWidth = try rendererWidthInPoints(for: sample, renderer: renderer, rows: 2, cols: 24)
+            let overlayWidth = (glyphFrames.last?.maxX ?? 0) - (glyphFrames.first?.minX ?? 0)
 
-            XCTAssertEqual(textLayer.frame.width, rendererWidth, accuracy: 1.0, "sample=\(sample)")
+            XCTAssertEqual(overlayWidth, rendererWidth, accuracy: 1.0, "sample=\(sample)")
         }
     }
 
@@ -2989,8 +3180,7 @@ final class AppKitComponentTests: XCTestCase {
         view.setMarkedText(sample, selectedRange: NSRange(location: sample.count, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
         view.updateMarkedTextOverlayPublic()
 
-        let textLayer = try XCTUnwrap(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first)
-        let overlayOrigins = try overlayGlyphOriginsInPoints(from: textLayer)
+        let overlayOrigins = view.debugMarkedTextGlyphFramesForTesting.map(\.minX)
         let rendererRects = try rendererGlyphRectsInPoints(for: sample, renderer: renderer, rows: 1, cols: 16)
         let rendererOrigins = rendererRects.map(\.minX)
 
@@ -3003,6 +3193,80 @@ final class AppKitComponentTests: XCTestCase {
             rendererOrigins[1] - rendererOrigins[0],
             accuracy: 1.0
         )
+    }
+
+    func testTerminalViewJapaneseMarkedTextGlyphFramesMatchCommittedRendererAcrossEntireComposition() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 24,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 480, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        let sample = "日本語入力"
+        view.setMarkedText(sample, selectedRange: NSRange(location: sample.count, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        view.updateMarkedTextOverlayPublic()
+
+        let overlayFrames = view.debugMarkedTextGlyphFramesForTesting
+        let rendererFrames = try rendererGlyphRectsInPoints(for: sample, renderer: renderer, rows: 2, cols: 24)
+
+        XCTAssertEqual(overlayFrames.count, sample.count)
+        XCTAssertEqual(rendererFrames.count, sample.count)
+
+        for (overlay, rendererRect) in zip(overlayFrames, rendererFrames) {
+            XCTAssertEqual(overlay.minX, rendererRect.minX, accuracy: 1.0)
+            XCTAssertEqual(overlay.width, rendererRect.width, accuracy: 1.0)
+        }
+
+        XCTAssertGreaterThan(overlayFrames.last?.maxX ?? 0, overlayFrames.first?.maxX ?? 0)
+    }
+
+    func testTerminalViewJapaneseMarkedTextVisibleRenderMatchesCommittedRendererAcrossEntireComposition() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 24,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 480, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        let sample = "日本語入力"
+        view.setMarkedText(sample, selectedRange: NSRange(location: sample.count, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: renderer, width: 640, height: 240))
+        view.debugRenderFrameToTextureForTesting(texture)
+
+        let renderedBounds = try XCTUnwrap(brightPixelBounds(in: texture, threshold: 32))
+        let rendererFrames = try rendererGlyphRectsInPoints(for: sample, renderer: renderer, rows: 2, cols: 24)
+        let expectedWidth = Int(ceil((rendererFrames.last?.maxX ?? 0) - (rendererFrames.first?.minX ?? 0)))
+
+        XCTAssertGreaterThan(renderedBounds.width, 0)
+        XCTAssertGreaterThanOrEqual(renderedBounds.width, Int(Float(expectedWidth) * 0.55))
     }
 
     func testTerminalViewDoesNotCreateMarkedTextLayerUntilIMECompositionBegins() throws {
@@ -3031,7 +3295,8 @@ final class AppKitComponentTests: XCTestCase {
 
         view.setMarkedText("かな", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
 
-        XCTAssertEqual(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.count, 1)
+        XCTAssertNotNil(view.debugMarkedTextLayerForTesting)
+        XCTAssertEqual(view.debugMarkedTextGlyphFramesForTesting.count, 2)
         XCTAssertTrue(view.debugHasMarkedTextStorage)
     }
 
@@ -3680,6 +3945,230 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(view.debugHasCommittedTextPreview)
     }
 
+    func testTerminalViewIMECommittedInsertTextShowsTransientCommittedTextPreview() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = false
+
+        view.setMarkedText("かな", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        view.insertText("仮名", replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertFalse(view.hasMarkedText())
+        XCTAssertTrue(view.debugHasCommittedTextPreview)
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayCount, 0)
+    }
+
+    func testTerminalViewMarkedTextBackspaceCreatesFadeOutOverlay() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = false
+
+        // Compose "ab" then backspace to "a" — "b" should fade out.
+        view.setMarkedText("ab", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        view.setMarkedText("a", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertTrue(view.debugHasCommittedTextPreview)
+        XCTAssertEqual(view.debugCommittedTextPreviewKinds, ["fadeOut"])
+        XCTAssertEqual(view.debugCommittedTextPreviewTexts, ["b"])
+    }
+
+    func testTerminalViewMarkedTextConversionCreatesFadeOutForOldAndFadeInForNew() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = false
+
+        // Compose "ka" then convert to "か" — "k" and "a" should fade out.
+        view.setMarkedText("ka", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        view.setMarkedText("か", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        // "k" and "a" fade out; "か" fades in via the marked-text animated segment.
+        XCTAssertTrue(view.debugHasCommittedTextPreview)
+        XCTAssertEqual(view.debugCommittedTextPreviewKinds, ["fadeOut", "fadeOut"])
+        XCTAssertEqual(view.debugCommittedTextPreviewTexts, ["k", "a"])
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayTexts, ["か"])
+    }
+
+    func testTerminalViewMarkedTextClearCreatesAllFadeOut() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = false
+
+        // Compose "か" then cancel (empty setMarkedText) — "か" should fade out.
+        view.setMarkedText("か", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        view.setMarkedText("", selectedRange: NSRange(location: 0, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertTrue(view.debugHasCommittedTextPreview)
+        XCTAssertEqual(view.debugCommittedTextPreviewKinds, ["fadeOut"])
+        XCTAssertEqual(view.debugCommittedTextPreviewTexts, ["か"])
+    }
+
+    func testTerminalViewIMECommitSameTextCreatesHoldOverlay() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = false
+
+        // Compose "かな" then commit as-is — hold overlay, no flash.
+        view.setMarkedText("かな", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        view.insertText("かな", replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertFalse(view.hasMarkedText())
+        XCTAssertTrue(view.debugHasCommittedTextPreview)
+        XCTAssertEqual(view.debugCommittedTextPreviewKinds, ["hold"])
+        XCTAssertEqual(view.debugCommittedTextPreviewTexts, ["かな"])
+    }
+
+    func testTerminalViewIMECommitDifferentTextCreatesFadeOutAndFadeIn() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = false
+
+        // Compose "かな" then commit as kanji "仮名" — old fades out, new fades in.
+        view.setMarkedText("かな", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        view.insertText("仮名", replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertFalse(view.hasMarkedText())
+        XCTAssertTrue(view.debugHasCommittedTextPreview)
+        let kinds = view.debugCommittedTextPreviewKinds
+        let texts = view.debugCommittedTextPreviewTexts
+        // Fade-out for "か" and "な", fade-in for "仮名".
+        XCTAssertEqual(kinds, ["fadeOut", "fadeOut", "fadeIn"])
+        XCTAssertEqual(texts, ["か", "な", "仮名"])
+    }
+
+    func testTerminalViewSetMarkedTextClearsCommittedTextPreviewAnimations() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        view.outputConfirmedInputAnimationsEnabled = false
+
+        view.insertText("a", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(view.debugHasCommittedTextPreview)
+
+        view.setMarkedText("あ", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        XCTAssertFalse(view.debugHasCommittedTextPreview)
+        XCTAssertEqual(view.debugPendingCommittedTextIntentCount, 0)
+        XCTAssertEqual(view.debugMarkedTextTransientOverlayTexts, ["あ"])
+    }
+
     func testTerminalViewDeleteBackwardShowsTransientFadeOutPreview() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(
@@ -4183,7 +4672,7 @@ final class AppKitComponentTests: XCTestCase {
         view.syncScaleFactorIfNeeded()
 
         let scale = window.backingScaleFactor
-        let textLayer = view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first
+        let textLayer = view.debugMarkedTextLayerForTesting
 
         XCTAssertEqual(renderer.glyphAtlas.scaleFactor, scale)
         XCTAssertEqual(textLayer?.contentsScale, scale)
@@ -4217,7 +4706,7 @@ final class AppKitComponentTests: XCTestCase {
         window.testBackingScaleFactor = 2.5
         view.viewDidChangeBackingProperties()
 
-        let textLayer = view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first
+        let textLayer = view.debugMarkedTextLayerForTesting
         XCTAssertEqual(renderer.glyphAtlas.scaleFactor, 2.5)
         XCTAssertEqual(textLayer?.contentsScale, 2.5)
     }
@@ -4250,15 +4739,14 @@ final class AppKitComponentTests: XCTestCase {
             view.viewDidChangeBackingProperties()
             view.updateMarkedTextOverlayPublic()
 
-            let textLayer = try XCTUnwrap(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.first)
-            let rendered = try XCTUnwrap(textLayer.string as? NSAttributedString)
+            let textLayer = try XCTUnwrap(view.debugMarkedTextLayerForTesting)
+            let glyphFrames = view.debugMarkedTextGlyphFramesForTesting
             XCTAssertTrue(view.hasMarkedText())
-            XCTAssertEqual(rendered.string, "日本語")
             XCTAssertEqual(renderer.glyphAtlas.scaleFactor, scale)
             XCTAssertEqual(textLayer.contentsScale, scale)
-            XCTAssertFalse(textLayer.isHidden)
-            XCTAssertGreaterThan(textLayer.frame.width, 0)
-            XCTAssertGreaterThan(textLayer.frame.height, 0)
+            XCTAssertTrue(textLayer.isHidden)
+            XCTAssertEqual(glyphFrames.count, 3)
+            XCTAssertGreaterThan(glyphFrames.last?.maxX ?? 0, glyphFrames.first?.minX ?? 0)
         }
     }
 
@@ -4289,7 +4777,7 @@ final class AppKitComponentTests: XCTestCase {
 
         XCTAssertFalse(view.hasMarkedText())
         XCTAssertEqual(renderer.glyphAtlas.scaleFactor, 2.0)
-        XCTAssertTrue(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.isEmpty ?? true)
+        XCTAssertNil(view.debugMarkedTextLayerForTesting)
     }
 
     func testTerminalViewUnmarkTextAfterDisplayScaleChangeClearsOverlayWhileKeepingUpdatedScale() throws {
@@ -4319,7 +4807,7 @@ final class AppKitComponentTests: XCTestCase {
 
         XCTAssertFalse(view.hasMarkedText())
         XCTAssertEqual(renderer.glyphAtlas.scaleFactor, 2.5)
-        XCTAssertTrue(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.isEmpty ?? true)
+        XCTAssertNil(view.debugMarkedTextLayerForTesting)
     }
 
     func testTerminalViewUnmarkTextReleasesMarkedTextLayerStorage() throws {
@@ -4344,11 +4832,14 @@ final class AppKitComponentTests: XCTestCase {
         view.terminalController = controller
 
         view.setMarkedText("未確定", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
-        XCTAssertEqual(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.count, 1)
+        XCTAssertNotNil(view.debugMarkedTextLayerForTesting)
+        XCTAssertEqual(view.debugMarkedTextGlyphFramesForTesting.count, 3)
 
         view.unmarkText()
 
-        XCTAssertTrue(view.layer?.sublayers?.compactMap { $0 as? CATextLayer }.isEmpty ?? true)
+        drainMainQueue(testCase: self)
+
+        XCTAssertNil(view.debugMarkedTextLayerForTesting)
     }
 
     func testTerminalViewAttributedSubstringAfterDisplayScaleChangePreservesMarkedTextRange() throws {
