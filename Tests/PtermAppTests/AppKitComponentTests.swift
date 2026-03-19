@@ -4761,6 +4761,53 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertGreaterThan(view.drawableSize.height, 0)
     }
 
+    func testTerminalViewSingleOutputAfterIdleDrawableReleaseDoesNotLatchDisplayScheduling() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let controller = TerminalController(
+            rows: 6,
+            cols: 24,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/single-output-redraw"
+        )
+
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 200), renderer: renderer)
+        view.terminalController = controller
+        let window = TestScaleWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220))
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        window.makeKeyAndOrderFront(nil)
+        drainMainQueue(testCase: self)
+        renderFrame(for: view)
+
+        view.debugReleaseIdleBuffersNow()
+        XCTAssertEqual(view.drawableSize, .zero)
+        XCTAssertFalse(view.debugIsDisplayUpdateScheduledForTesting)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+
+        let initialVersion = controller.currentRenderContentVersion
+        controller.debugProcessPTYOutputForTesting(Data("aaa".utf8))
+        drainMainQueue(testCase: self)
+
+        XCTAssertGreaterThan(controller.currentRenderContentVersion, initialVersion)
+        XCTAssertFalse(view.debugIsDisplayUpdateScheduledForTesting)
+        XCTAssertGreaterThan(view.drawableSize.width, 0)
+        XCTAssertGreaterThan(view.drawableSize.height, 0)
+
+        let secondVersion = controller.currentRenderContentVersion
+        controller.debugProcessPTYOutputForTesting(Data("bbb".utf8))
+        drainMainQueue(testCase: self)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        drainMainQueue(testCase: self)
+
+        XCTAssertGreaterThan(controller.currentRenderContentVersion, secondVersion)
+        XCTAssertFalse(view.debugIsDisplayUpdateScheduledForTesting)
+    }
+
     func testTerminalViewIdlePurgeKeepsDrawableForFocusedFirstResponder() throws {
         let renderer = try makeRendererWithPipelinesOrSkip()
         let controller = TerminalController(

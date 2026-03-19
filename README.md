@@ -72,6 +72,7 @@ kitten __benchmark__ --render --repetitions 100
 | WezTerm<br>(20240203-110809-5046fc22) | 25.5 MB/s<br>(7.86s) | 38.4 MB/s<br>(4.71s) | 17.9 MB/s<br>(5.59s) | 🥉 238.9 MB/s<br>(3.28s) | 🥉 295.1 MB/s<br>(1.81s) | 123.2 MB/s |
 | Alacritty<br>(0.16.1) | 🥈 113.2 MB/s<br>(1.77s) | 🥈 142.2 MB/s<br>(1.27s) | 🥈 72.1 MB/s<br>(1.39s) | 171.1 MB/s<br>(4.58s) | 🥈 315.1 MB/s<br>(1.69s) | 🥈 162.7 MB/s |
 | macOS Terminal<br>(2.15) | 27.5 MB/s<br>(7.26s) | 41.1 MB/s<br>(4.41s) | 30.4 MB/s<br>(3.29s) | 93.5 MB/s<br>(8.39s) | 62.3 MB/s<br>(8.56s) | 50.9 MB/s |
+| iTerm2<br>(3.6.9) | 11.6 MB/s<br>(17.2s) | 6.6 MB/s<br>(27.29s) | 1.4 MB/s<br>(1m10.05s) | 22.5 MB/s<br>(34.83s) | 9.8 MB/s<br>(54.23s) | 10.4 MB/s |
 
 ### `time seq 1 1000000`
 
@@ -88,6 +89,7 @@ time seq 1 1000000
 | WezTerm<br>(20240203-110809-5046fc22) | 🥈 0.839s |
 | Alacritty<br>(0.16.1) | 1.016s |
 | macOS Terminal<br>(2.15) | 1.158s |
+| iTerm2<br>(3.6.9) | 1.212s |
 
 ## Requirements
 

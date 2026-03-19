@@ -246,6 +246,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     var debugHasPendingIntentResolutionTimer: Bool { pendingIntentResolutionTimer != nil }
     var debugLastPendingCommittedTextIntentText: String? { pendingCommittedTextIntents.last?.text }
     var debugDeferredResizeNotificationCount: Int { deferredResizeNotificationWorkItems.count }
+    var debugIsDisplayUpdateScheduledForTesting: Bool { displayUpdateScheduled }
 
     func setSplitRenderingSuppressed(_ suppressed: Bool) {
         splitRenderingSuppressed = suppressed
@@ -541,6 +542,7 @@ final class TerminalView: MTKView, NSTextInputClient {
             pendingIntentResolutionTimer?.invalidate()
             pendingIntentResolutionTimer = nil
             cancelDeferredResizeNotifications()
+            cancelDeferredDisplayUpdate()
             clearCommittedTextPreview()
             isPaused = true
             enableSetNeedsDisplay = false
@@ -646,6 +648,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         pendingIntentResolutionTimer?.invalidate()
         pendingIntentResolutionTimer = nil
         cancelDeferredResizeNotifications()
+        cancelDeferredDisplayUpdate()
         renderer?.releaseTerminalBuffers(for: self)
         _ = renderer?.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
         keyboardHandler = nil
@@ -678,6 +681,7 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     private func teardownController() {
         cancelDeferredResizeNotifications()
+        cancelDeferredDisplayUpdate()
         terminalController?.onNeedsDisplay = nil
         terminalController?.onRenderingSuppressedChange = nil
         keyboardHandler = nil
@@ -713,6 +717,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         pendingIntentResolutionTimer?.invalidate()
         idleBufferReleaseTimer?.invalidate()
         cancelDeferredResizeNotifications()
+        cancelDeferredDisplayUpdate()
         removeWindowObservers()
         hideImagePreview()
         clearInlineImageLayers()
@@ -883,13 +888,14 @@ final class TerminalView: MTKView, NSTextInputClient {
 
         let scheduleDisplay = { [weak self] in
             guard let self else { return }
+            self.deferredDisplayUpdateWorkItem = nil
+            self.displayUpdateScheduled = false
             self.ensureDrawableStorageAllocatedIfNeeded()
             self.setNeedsDisplay(self.bounds)
         }
 
         if targetTime <= now + 0.0005 {
-            deferredDisplayUpdateWorkItem?.cancel()
-            deferredDisplayUpdateWorkItem = nil
+            cancelDeferredDisplayUpdate()
             scheduleDisplay()
             return
         }
@@ -898,6 +904,12 @@ final class TerminalView: MTKView, NSTextInputClient {
         deferredDisplayUpdateWorkItem?.cancel()
         deferredDisplayUpdateWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + (targetTime - now), execute: workItem)
+    }
+
+    private func cancelDeferredDisplayUpdate() {
+        deferredDisplayUpdateWorkItem?.cancel()
+        deferredDisplayUpdateWorkItem = nil
+        displayUpdateScheduled = false
     }
 
     private func effectiveDisplayUpdateFPS() -> Int {
