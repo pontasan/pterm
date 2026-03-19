@@ -91,6 +91,10 @@ time seq 1 1000000
 | macOS Terminal<br>(2.15) | 1.158s |
 | iTerm2<br>(3.6.9) | 1.212s |
 
+### Video: Six Terminals Benchmarked Side by Side
+
+[![Benchmark video](https://img.youtube.com/vi/CV9ufPY-54A/maxresdefault.jpg)](https://www.youtube.com/watch?v=CV9ufPY-54A)
+
 ## Requirements
 
 - macOS 26 (Tahoe) or later
