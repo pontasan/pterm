@@ -42,7 +42,9 @@ Most terminals are good at opening one shell. pterm is built to help you manage 
 - **Clipboard-to-file-path** — Paste or drop an image and pterm saves it to a managed store, inserting the path inline — ready for AI tools that accept file references. Hover over the pasted path or `[Image #N]` placeholder to see a floating preview.
 - **Transient terminals** — Launch one-off commands via `--command` that auto-clean and stay out of your session history.
 
-![Paste and preview images in the terminal](Resources/pterm3.gif)
+[Watch the demo on YouTube](https://youtu.be/hHrQJYsN0gc)
+
+[![Paste and preview images in the terminal](Resources/pterm3.gif)](https://youtu.be/hHrQJYsN0gc)
 
 ### CLI Modes
 - `--cli` — Run headless, bridging stdin/stdout to a PTY session without opening a window
