@@ -127,7 +127,7 @@ fragment float4 cursor_fragment(
     } else {
         alpha = 1.0;
     }
-    return float4(in.fgColor.rgb, alpha * uniforms.cursorOpacity);
+    return float4(in.fgColor.rgb, in.fgColor.a * alpha * uniforms.cursorOpacity);
 }
 
 // MARK: - Overlay

@@ -1672,18 +1672,24 @@ final class MetalRenderer {
             let cursorOverlay = transientTextOverlays.last { $0.cursorRow != nil && $0.cursorCol != nil }
             let cursorCol = cursorOverlay?.cursorCol.map { min(max($0, 0), max(viewCols - 1, 0)) } ?? model.cursor.col
             let cursorRow = cursorOverlay?.cursorRow.map { min(max($0, 0), max(viewRows - 1, 0)) } ?? model.cursor.row
+            let cursorCellWidth: Float = {
+                let col = cursorCol
+                guard col >= 0 && col < model.cols else { return cellW }
+                let cell = model.grid.cell(at: cursorRow, col: col)
+                return cell.width > 1 ? cellW * Float(cell.width) : cellW
+            }()
             let cx = padX + Float(cursorCol) * cellW
             let cy = padY + Float(cursorRow) * cellH
-            let cursorColor: (Float, Float, Float, Float) = (0.8, 0.8, 0.8, 1)
+            let cursorColor: (Float, Float, Float, Float) = (0.8, 0.8, 0.8, 0.1)
 
             switch model.cursor.shape {
             case .block:
-                addQuad(to: &vd.cursorVertices, x: cx, y: cy, w: cellW, h: cellH,
+                addQuad(to: &vd.cursorVertices, x: cx, y: cy, w: cursorCellWidth, h: cellH,
                        tx: 0, ty: 0, tw: 0, th: 0,
                        fg: cursorColor, bg: cursorColor)
             case .underline:
                 addQuad(to: &vd.cursorVertices, x: cx, y: cy + cellH - cursorThickness,
-                       w: cellW, h: cursorThickness,
+                       w: cursorCellWidth, h: cursorThickness,
                        tx: 0, ty: 0, tw: 0, th: 0,
                        fg: cursorColor, bg: cursorColor)
             case .bar:
@@ -2224,20 +2230,27 @@ final class MetalRenderer {
                 max(cursorOverlay?.cursorRow ?? snapshot.cursor.row, 0),
                 max(viewRows - 1, 0)
             )
-            let cursorLineAttribute = snapshot.visibleRows[cursorRow].lineAttribute
-            let cursorColumnWidth = cursorLineAttribute.isDoubleWidth ? cellW * 2.0 : cellW
-            let cx = padX + Float(cursorCol) * cursorColumnWidth
+            let cursorRowSnapshot = snapshot.visibleRows[cursorRow]
+            let cursorLineAttribute = cursorRowSnapshot.lineAttribute
+            let lineCellW = cursorLineAttribute.isDoubleWidth ? cellW * 2.0 : cellW
+            let cursorCellWidth: Float = {
+                let col = Int(cursorCol)
+                guard col >= 0 && col < cursorRowSnapshot.cells.count else { return lineCellW }
+                let cell = cursorRowSnapshot.cells[col]
+                return cell.width > 1 ? lineCellW * Float(cell.width) : lineCellW
+            }()
+            let cx = padX + Float(cursorCol) * lineCellW
             let cy = padY + Float(cursorRow) * cellH
-            let cursorColor: (Float, Float, Float, Float) = (0.8, 0.8, 0.8, 1)
+            let cursorColor: (Float, Float, Float, Float) = (0.8, 0.8, 0.8, 0.1)
 
             switch snapshot.cursor.shape {
             case .block:
-                addQuad(to: &vd.cursorVertices, x: cx, y: cy, w: cursorColumnWidth, h: cellH,
+                addQuad(to: &vd.cursorVertices, x: cx, y: cy, w: cursorCellWidth, h: cellH,
                         tx: 0, ty: 0, tw: 0, th: 0,
                         fg: cursorColor, bg: cursorColor)
             case .underline:
                 addQuad(to: &vd.cursorVertices, x: cx, y: cy + cellH - cursorThickness,
-                        w: cursorColumnWidth, h: cursorThickness,
+                        w: cursorCellWidth, h: cursorThickness,
                         tx: 0, ty: 0, tw: 0, th: 0,
                         fg: cursorColor, bg: cursorColor)
             case .bar:

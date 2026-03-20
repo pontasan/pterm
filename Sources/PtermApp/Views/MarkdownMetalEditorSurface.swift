@@ -781,12 +781,14 @@ final class MarkdownMetalSurfaceView: MTKView, MTKViewDelegate {
             rect.origin.x -= visibleRect.origin.x
             rect.origin.y -= visibleRect.origin.y
 
+            let markedFgColor = NSColor(calibratedWhite: 1.0, alpha: 0.55)
             let attributed = NSAttributedString(
                 string: character,
                 attributes: [
                     .font: font,
-                    .foregroundColor: MarkdownHighlighter.defaultColor,
-                    .underlineStyle: NSUnderlineStyle.single.rawValue
+                    .foregroundColor: markedFgColor,
+                    .underlineStyle: NSUnderlineStyle.single.rawValue,
+                    .underlineColor: markedFgColor
                 ]
             )
             let glyphWidth = max(CGFloat(glyph.pixelWidth) / renderer.glyphAtlas.scaleFactor, 1)
