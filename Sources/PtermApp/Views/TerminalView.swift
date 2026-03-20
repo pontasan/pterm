@@ -183,7 +183,6 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var suppressCommandIdentityHeaderUntilCommandRelease = false {
         didSet {
             guard suppressCommandIdentityHeaderUntilCommandRelease != oldValue else { return }
-            syncSplitContainerCommandIdentityHeaderVisibility()
             requestDisplayUpdate()
         }
     }
@@ -1155,14 +1154,6 @@ final class TerminalView: MTKView, NSTextInputClient {
         event.charactersIgnoringModifiers == "4"
     }
 
-    private func syncSplitContainerCommandIdentityHeaderVisibility() {
-        guard renderingSuppressed,
-              let splitContainer = enclosingScrollView?.superview as? SplitTerminalContainerView else {
-            return
-        }
-        splitContainer.setIdentityHeaderVisible(commandIdentityHeaderVisible && !suppressCommandIdentityHeaderUntilCommandRelease)
-    }
-
     // MARK: - Grid Position from Mouse
 
     /// Convert a mouse event location (in view coordinates) to a grid position.
@@ -1233,11 +1224,11 @@ final class TerminalView: MTKView, NSTextInputClient {
             suppressCommandIdentityHeaderUntilCommandRelease = false
         }
         commandModifierActive = commandHeld
-        if renderingSuppressed,
-           let splitContainer = enclosingScrollView?.superview as? SplitTerminalContainerView {
-            splitContainer.setCommandModifierActive(commandHeld)
-            splitContainer.setIdentityHeaderVisible(commandIdentityHeaderVisible && !suppressCommandIdentityHeaderUntilCommandRelease)
-        }
+        // Split container identity header visibility is managed exclusively
+        // by AppDelegate via AppWindow.sendEvent → onCommandModifierChange.
+        // Do NOT set it here — commandIdentityHeaderVisible is not updated
+        // for split-view TerminalViews, so the value would always be false,
+        // overwriting the correct state set by AppDelegate.
         updateLinkHover(with: event)
     }
 
