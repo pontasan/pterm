@@ -76,6 +76,11 @@ final class SplitTerminalContainerView: NSView {
             scrollViews.forEach { $0.toolTip = commandClickTooltip }
         }
     }
+    var cmdClickMenuLabel: String? {
+        didSet {
+            scrollViews.forEach { $0.terminalView.cmdClickMenuLabel = cmdClickMenuLabel }
+        }
+    }
 
     init(frame: NSRect, renderer: MetalRenderer, controllers: [TerminalController]) {
         self.renderer = renderer
@@ -235,6 +240,7 @@ final class SplitTerminalContainerView: NSView {
                 self.toggleSplitSelection(for: controller)
             }
             scrollView.toolTip = commandClickTooltip
+            scrollView.terminalView.cmdClickMenuLabel = cmdClickMenuLabel
         }
 
         // Phase 4: Create single-MTKView overlay on top of all scroll views.

@@ -8,6 +8,8 @@ final class StatusBarView: NSView {
 
     private let metricsLabel = NSTextField(labelWithString: "CPU: --.-% | MEM: -- MB")
     private let metricsTemplateLabel = NSTextField(labelWithString: "")
+    private let shiftSelectHintLabel = NSTextField(labelWithString: "Shift+Click: Select multiple")
+    private let shiftSelectHintSeparatorLabel = NSTextField(labelWithString: "|")
     private let overviewHintLabel = NSTextField(labelWithString: "Cmd+A: Show all terminals")
     private let overviewHintSeparatorLabel = NSTextField(labelWithString: "|")
     private var currentCpu: Double = 0
@@ -120,6 +122,19 @@ final class StatusBarView: NSView {
 
         commandClickHintSeparatorLabel.isHidden = true
 
+        shiftSelectHintLabel.textColor = NSColor(calibratedWhite: 0.55, alpha: 1)
+        shiftSelectHintLabel.font = font
+        shiftSelectHintLabel.lineBreakMode = .byTruncatingTail
+        shiftSelectHintLabel.isHidden = true
+        shiftSelectHintLabel.identifier = NSUserInterfaceItemIdentifier("statusbar.shiftSelectHint")
+        addSubview(shiftSelectHintLabel)
+
+        shiftSelectHintSeparatorLabel.textColor = NSColor(calibratedWhite: 0.4, alpha: 1)
+        shiftSelectHintSeparatorLabel.font = font
+        shiftSelectHintSeparatorLabel.isHidden = true
+        shiftSelectHintSeparatorLabel.identifier = NSUserInterfaceItemIdentifier("statusbar.shiftSelectHintSeparator")
+        addSubview(shiftSelectHintSeparatorLabel)
+
         overviewHintLabel.textColor = NSColor(calibratedWhite: 0.55, alpha: 1)
         overviewHintLabel.font = font
         overviewHintLabel.lineBreakMode = .byTruncatingTail
@@ -181,9 +196,10 @@ final class StatusBarView: NSView {
         noteButton.frame = NSRect(x: x, y: vertInset, width: noteButton.frame.width, height: height)
         x = noteButton.frame.maxX + spacing
 
-        x = placeSeparator(commandHintSeparatorLabel, at: x)
-
-        x = placeTruncatingLabel(commandHintLabel, at: x)
+        if !commandHintLabel.isHidden {
+            x = placeSeparator(commandHintSeparatorLabel, at: x)
+            x = placeTruncatingLabel(commandHintLabel, at: x)
+        }
 
         if !multiSelectHintLabel.isHidden {
             x = placeSeparator(multiSelectHintSeparatorLabel, at: x)
@@ -195,6 +211,11 @@ final class StatusBarView: NSView {
             x = placeSeparator(commandClickHintSeparatorLabel, at: x)
 
             x = placeTruncatingLabel(commandClickHintLabel, at: x)
+        }
+
+        if !shiftSelectHintLabel.isHidden {
+            x = placeSeparator(shiftSelectHintSeparatorLabel, at: x)
+            x = placeTruncatingLabel(shiftSelectHintLabel, at: x)
         }
 
         if !overviewHintLabel.isHidden {
@@ -259,6 +280,15 @@ final class StatusBarView: NSView {
     func setOverviewSelectAllHintVisible(_ visible: Bool) {
         overviewHintLabel.isHidden = !visible
         overviewHintSeparatorLabel.isHidden = !visible
+        shiftSelectHintLabel.isHidden = !visible
+        shiftSelectHintSeparatorLabel.isHidden = !visible
+        needsLayout = true
+    }
+
+    func setCommandHintVisible(_ visible: Bool) {
+        guard commandHintLabel.isHidden == visible else { return }
+        commandHintLabel.isHidden = !visible
+        commandHintSeparatorLabel.isHidden = !visible
         needsLayout = true
     }
 

@@ -111,6 +111,9 @@ final class TerminalView: MTKView, NSTextInputClient {
     var onBecameFirstResponder: (() -> Void)?
     /// Callback when user Cmd+clicks (maximize/restore in split view)
     var onCmdClick: (() -> Void)?
+    /// Label for the Cmd+Click action shown in the context menu.
+    /// Mirrors the status bar hint (e.g. "Maximize terminal", "Return to split").
+    var cmdClickMenuLabel: String?
     /// Callback when user Shift+Cmd+clicks in split view to stage terminals for reselection.
     var onShiftCommandClick: (() -> Void)?
     /// Tooltip shown when hovering over this terminal (e.g., Cmd+click hint).
@@ -1541,8 +1544,49 @@ final class TerminalView: MTKView, NSTextInputClient {
         hideImagePreview()
         window?.makeFirstResponder(self)
         if !sendMouseEventIfNeeded(event, phase: .down, buttonOverride: 2) {
-            super.rightMouseDown(with: event)
+            showContextMenu(with: event)
         }
+    }
+
+    private func showContextMenu(with event: NSEvent) {
+        NSMenu.popUpContextMenu(buildContextMenu(), with: event, for: self)
+    }
+
+    func buildContextMenu() -> NSMenu {
+        let menu = NSMenu()
+
+        let copyItem = NSMenuItem(title: "Copy", action: #selector(performContextCopy(_:)), keyEquivalent: "")
+        copyItem.target = self
+        if selection == nil || selection?.isEmpty == true {
+            copyItem.isEnabled = false
+        }
+        menu.addItem(copyItem)
+
+        let pasteItem = NSMenuItem(title: "Paste", action: #selector(performContextPaste(_:)), keyEquivalent: "")
+        pasteItem.target = self
+        menu.addItem(pasteItem)
+
+        menu.addItem(.separator())
+
+        if onCmdClick != nil, let label = cmdClickMenuLabel, !label.isEmpty {
+            let item = NSMenuItem(title: label, action: #selector(performContextToggleView(_:)), keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+        }
+
+        return menu
+    }
+
+    @objc private func performContextCopy(_ sender: Any?) {
+        NSApp.sendAction(Selector(("copy:")), to: nil, from: self)
+    }
+
+    @objc private func performContextPaste(_ sender: Any?) {
+        NSApp.sendAction(Selector(("paste:")), to: nil, from: self)
+    }
+
+    @objc private func performContextToggleView(_ sender: Any?) {
+        onCmdClick?()
     }
 
     override func otherMouseDown(with event: NSEvent) {

@@ -1442,8 +1442,13 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
                 // "Select All" / "Deselect" buttons at bottom-right of workspace
                 let selectBtnH: CGFloat = Layout.titleBarHeight
-                let selectAllW: CGFloat = 70
-                let deselectW: CGFloat = 60
+                let thumbGlyphScale: Float = 0.8
+                let sf = Float(renderer.glyphAtlas.scaleFactor)
+                let btnPadding: CGFloat = 16
+                let selectAllTextW = CGFloat(cachedTextVertices(for: "Select All", scaleFactor: sf, glyphScale: thumbGlyphScale, color: (1,1,1,1)).width / sf)
+                let deselectTextW = CGFloat(cachedTextVertices(for: "Deselect", scaleFactor: sf, glyphScale: thumbGlyphScale, color: (1,1,1,1)).width / sf)
+                let selectAllW = selectAllTextW + btnPadding
+                let deselectW = deselectTextW + btnPadding
                 let selectBtnY = frame.maxY - innerPad - selectBtnH
                 let selectAllFrame = NSRect(x: frame.maxX - innerPad - selectAllW,
                                             y: selectBtnY, width: selectAllW, height: selectBtnH)
@@ -1822,6 +1827,26 @@ final class IntegratedView: MTKView, NSDraggingSource {
         return nil
     }
 
+    /// Returns true when the point is inside a workspace frame but not over
+    /// any interactive element (thumbnail, button, header, title).
+    private func isOverWorkspaceBackground(at point: NSPoint) -> Bool {
+        for workspace in cachedWorkspaceLayouts where workspace.frame.contains(point) {
+            // Exclude header, add/close/select buttons.
+            if workspace.headerFrame.contains(point) { return false }
+            if workspace.addFrame.contains(point) { return false }
+            if workspace.closeFrame.contains(point) { return false }
+            if workspace.selectAllFrame.contains(point) { return false }
+            if workspace.deselectFrame.contains(point) { return false }
+            // Exclude terminal thumbnails and titles.
+            for tl in workspace.terminals {
+                if tl.thumbnail.contains(point) { return false }
+                if tl.title.contains(point) { return false }
+            }
+            return true
+        }
+        return false
+    }
+
     // MARK: - Flipped Coordinates
 
     override var isFlipped: Bool { true }
@@ -2120,11 +2145,17 @@ final class IntegratedView: MTKView, NSDraggingSource {
             text = "Double-click to rename \"\(workspace)\""
         } else if let controller = terminalTitleTarget(at: point) {
             text = "Double-click to rename \"\(controller.title)\""
+        } else if isOverWorkspaceBackground(at: point) {
+            text = "Shift+Click terminals to select multiple\nCmd+A to show all terminals"
         } else {
             text = nil
         }
 
-        if text == currentTooltipText { return }
+        if text == currentTooltipText {
+            // Same text: just reposition to follow the mouse.
+            if text != nil { repositionTooltip(at: point) }
+            return
+        }
         currentTooltipText = text
 
         guard let text else {
@@ -2200,6 +2231,25 @@ final class IntegratedView: MTKView, NSDraggingSource {
 
         tipWindow.setFrame(NSRect(origin: origin, size: winSize), display: true)
         tipWindow.orderFront(nil)
+    }
+
+    private func repositionTooltip(at point: NSPoint) {
+        guard let tipWindow = tooltipWindow, let hostWindow = window else { return }
+        let screenPoint = hostWindow.convertPoint(toScreen: convert(point, to: nil))
+        let winSize = tipWindow.frame.size
+        var origin = NSPoint(x: screenPoint.x + 12, y: screenPoint.y + 16)
+        if let screen = hostWindow.screen ?? NSScreen.main {
+            let visibleFrame = screen.visibleFrame
+            if origin.x + winSize.width > visibleFrame.maxX {
+                origin.x = visibleFrame.maxX - winSize.width
+            }
+            if origin.y + winSize.height > visibleFrame.maxY {
+                origin.y = screenPoint.y - winSize.height - 4
+            }
+            if origin.x < visibleFrame.minX { origin.x = visibleFrame.minX }
+            if origin.y < visibleFrame.minY { origin.y = visibleFrame.minY }
+        }
+        tipWindow.setFrameOrigin(origin)
     }
 
     private func hideTooltip() {

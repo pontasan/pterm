@@ -1563,6 +1563,138 @@ final class AppKitComponentTests: XCTestCase {
         }
     }
 
+    // MARK: - Context menu
+
+    func testContextMenuContainsCopyPasteWithoutSelection() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+
+        let menu = view.buildContextMenu()
+        let titles = menu.items.filter { !$0.isSeparatorItem }.map(\.title)
+
+        XCTAssertTrue(titles.contains("Copy"))
+        XCTAssertTrue(titles.contains("Paste"))
+
+        // Copy should be disabled when there is no selection.
+        let copyItem = menu.items.first { $0.title == "Copy" }
+        XCTAssertEqual(copyItem?.isEnabled, false)
+    }
+
+    func testContextMenuCopyEnabledWithSelection() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+        view.debugSetSelectionForTesting(TerminalSelection(
+            anchor: GridPosition(row: 0, col: 0),
+            active: GridPosition(row: 0, col: 5),
+            mode: .normal
+        ))
+
+        let menu = view.buildContextMenu()
+        let copyItem = menu.items.first { $0.title == "Copy" }
+        XCTAssertEqual(copyItem?.isEnabled, true)
+    }
+
+    func testContextMenuShowsMaximizeInSplitView() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+        view.onCmdClick = {}
+        view.cmdClickMenuLabel = "Maximize terminal"
+
+        let menu = view.buildContextMenu()
+        let titles = menu.items.filter { !$0.isSeparatorItem }.map(\.title)
+        XCTAssertTrue(titles.contains("Maximize terminal"))
+    }
+
+    func testContextMenuShowsReturnToSplitInFocusedView() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+        view.onCmdClick = {}
+        view.cmdClickMenuLabel = "Return to split"
+
+        let menu = view.buildContextMenu()
+        let titles = menu.items.filter { !$0.isSeparatorItem }.map(\.title)
+        XCTAssertTrue(titles.contains("Return to split"))
+    }
+
+    func testContextMenuHidesViewToggleWhenNoCmdClick() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+        // No onCmdClick, no cmdClickMenuLabel.
+
+        let menu = view.buildContextMenu()
+        let titles = menu.items.filter { !$0.isSeparatorItem }.map(\.title)
+        XCTAssertFalse(titles.contains("Maximize terminal"))
+        XCTAssertFalse(titles.contains("Return to split"))
+    }
+
+    func testContextMenuLabelMatchesStatusBarHint() throws {
+        // Verify the label derivation: status bar shows "Cmd+Click: X",
+        // context menu shows "X" (same text without the prefix).
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+        view.onCmdClick = {}
+
+        // Simulate split view with no return target.
+        view.cmdClickMenuLabel = "Maximize terminal"
+        var menu = view.buildContextMenu()
+        var actionItem = menu.items.first { $0.title == "Maximize terminal" }
+        XCTAssertNotNil(actionItem)
+
+        // Simulate split view with return target.
+        view.cmdClickMenuLabel = "Return to split"
+        menu = view.buildContextMenu()
+        actionItem = menu.items.first { $0.title == "Return to split" }
+        XCTAssertNotNil(actionItem)
+
+        // Simulate no label (focused without split origin).
+        view.cmdClickMenuLabel = nil
+        menu = view.buildContextMenu()
+        let nonSeparatorTitles = menu.items.filter { !$0.isSeparatorItem }.map(\.title)
+        XCTAssertEqual(nonSeparatorTitles, ["Copy", "Paste"])
+    }
+
     func testRendererBuildsInlineImageDrawCommandsForKittyImageCells() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(

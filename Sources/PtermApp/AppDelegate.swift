@@ -2837,22 +2837,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshStatusBarCommandHints() {
         let multiSelectHint: String?
-        let commandClickHint: String?
+        let commandClickLabel: String?
         switch viewMode {
         case .split:
             multiSelectHint = "Shift+Cmd+Click: Multi-select terminals"
-            commandClickHint = splitReturnControllers == nil
-                ? "Cmd+Click: Maximize terminal"
-                : "Cmd+Click: Return to split"
+            commandClickLabel = splitReturnControllers == nil
+                ? "Maximize terminal"
+                : "Return to split"
         case .focused:
             multiSelectHint = nil
-            commandClickHint = splitOriginControllers == nil ? nil : "Cmd+Click: Return to split"
+            commandClickLabel = splitOriginControllers == nil ? nil : "Return to split"
         case .integrated:
             multiSelectHint = nil
-            commandClickHint = nil
+            commandClickLabel = nil
+        }
+        if case .integrated = viewMode {
+            statusBarView?.setCommandHintVisible(false)
+        } else {
+            statusBarView?.setCommandHintVisible(true)
         }
         statusBarView?.setMultiSelectHint(multiSelectHint)
-        statusBarView?.setCommandClickHint(commandClickHint)
+        statusBarView?.setCommandClickHint(commandClickLabel.map { "Cmd+Click: \($0)" })
+        // Sync the same label to context menus.
+        terminalView?.cmdClickMenuLabel = commandClickLabel
+        splitContainerView?.cmdClickMenuLabel = commandClickLabel
     }
 
     /// Inject dependencies for unit tests (only visible via @testable import).
