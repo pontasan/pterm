@@ -4758,7 +4758,7 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(view.debugLastPendingCommittedTextIntentText, "あ")
     }
 
-    func testTerminalViewOutputConfirmedIMECommitDoesNotEnqueueCommittedPreviewIntent() throws {
+    func testTerminalViewOutputConfirmedIMECommitCreatesHoldAndEnqueuesIntent() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(
             rows: 4,
@@ -4779,9 +4779,13 @@ final class AppKitComponentTests: XCTestCase {
 
         view.insertText("あああ", replacementRange: NSRange(location: NSNotFound, length: 0))
 
-        XCTAssertEqual(view.debugPendingCommittedTextIntentCount, 0)
-        XCTAssertFalse(view.debugHasCommittedTextPreview)
+        // When the committed text matches the previous marked text, a hold
+        // overlay bridges the visual gap while the pending intent waits for
+        // PTY output confirmation.
         XCTAssertFalse(view.hasMarkedText())
+        XCTAssertTrue(view.debugHasCommittedTextPreview)
+        XCTAssertEqual(view.debugCommittedTextPreviewKinds, ["hold"])
+        XCTAssertEqual(view.debugPendingCommittedTextIntentCount, 1)
     }
 
     func testTerminalViewUnmarkTextClearsIMEOverlayAndSelectionState() throws {
@@ -8230,7 +8234,9 @@ final class AppKitComponentTests: XCTestCase {
 
             let markedLayer = try XCTUnwrap(terminalViews[0].layer?.sublayers?.compactMap { $0 as? CATextLayer }.first)
             XCTAssertEqual(markedLayer.contentsScale, scale)
-            XCTAssertFalse(markedLayer.isHidden)
+            // Rendering is handled by Metal TransientTextOverlay; CATextLayer
+            // is retained for layout data only. Verify that Metal overlays exist.
+            XCTAssertFalse(terminalViews[0].activeTransientTextOverlaysForRendering().isEmpty)
             XCTAssertEqual(renderer.glyphAtlas.scaleFactor, scale)
         }
     }

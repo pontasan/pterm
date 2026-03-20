@@ -2071,7 +2071,16 @@ final class PTYIntegrationTests: XCTestCase {
                 }
                 let terminalTail = { String(controller.allText().suffix(1600)) }
                 let advanceToSetupMenu: (TimeInterval) throws -> Void = { timeout in
-                    let deadline = Date().addingTimeInterval(timeout)
+                    let start = Date()
+                    let deadline = start.addingTimeInterval(timeout)
+                    var outputReceived = false
+                    let previousCallback = controller.onOutputActivity
+                    controller.onOutputActivity = {
+                        previousCallback?()
+                        outputReceived = true
+                    }
+                    defer { controller.onOutputActivity = previousCallback }
+
                     while Date() < deadline {
                         let tail = terminalTail()
                         if tail.contains("Select a number to modify it:") {
@@ -2080,9 +2089,11 @@ final class PTYIntegrationTests: XCTestCase {
                         if tail.contains("Push <RETURN>") {
                             controller.sendInput("\n")
                         }
-                        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                        outputReceived = false
+                        RunLoop.main.run(until: Date().addingTimeInterval(outputReceived ? 0.001 : 0.02))
                     }
-                    XCTFail("Timed out returning to setup menu. Tail=\n\(terminalTail())")
+                    let elapsed = Date().timeIntervalSince(start)
+                    XCTFail("Timed out after \(String(format: "%.1f", elapsed))s returning to setup menu. Tail=\n\(terminalTail())")
                 }
 
                 try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 12):", timeout: 10.0)
@@ -3598,6 +3609,12 @@ final class PTYIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    /// Wait for terminal output containing the given text.
+    ///
+    /// Uses `onOutputActivity` to schedule an immediate re-check via
+    /// the main RunLoop instead of blind 50ms polling.  This keeps the
+    /// RunLoop responsive (callbacks dispatch on main) while reacting
+    /// to PTY output as fast as possible.
     private static func waitForTerminalText(
         _ controller: TerminalController,
         toContain needle: String,
@@ -3605,14 +3622,29 @@ final class PTYIntegrationTests: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if controller.allText().contains(needle) {
-                return
-            }
-            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let start = Date()
+        let deadline = start.addingTimeInterval(timeout)
+
+        // Flag toggled by onOutputActivity to tell the RunLoop spin
+        // to re-check immediately rather than sleeping.
+        var outputReceived = false
+        let previousCallback = controller.onOutputActivity
+        controller.onOutputActivity = {
+            previousCallback?()
+            outputReceived = true
         }
-        XCTFail("Timed out waiting for terminal text containing '\(needle)'. tail=\(String(controller.allText().suffix(500)))", file: file, line: line)
+        defer { controller.onOutputActivity = previousCallback }
+
+        while Date() < deadline {
+            if controller.allText().contains(needle) { return }
+            outputReceived = false
+            // Spin the RunLoop briefly so main-dispatched callbacks
+            // (including onOutputActivity) can fire.
+            RunLoop.main.run(until: Date().addingTimeInterval(outputReceived ? 0.001 : 0.02))
+        }
+        let elapsed = Date().timeIntervalSince(start)
+        let tail = String(controller.allText().suffix(500))
+        XCTFail("Timed out after \(String(format: "%.1f", elapsed))s waiting for terminal text containing '\(needle)'. tail=\(tail)", file: file, line: line)
     }
 
     private static func visibleViewportLines(of controller: TerminalController, count: Int) -> [String] {

@@ -1997,7 +1997,11 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     private func updateMarkedTextOverlay() {
-        guard let visibleMarkedTextStorage = visibleMarkedTextStorage(),
+        // Only create/maintain the CATextLayer for active composition
+        // (markedTextStorage). Deferred overlay storage is handled
+        // exclusively by the Metal TransientTextOverlay pipeline.
+        guard let markedTextStorage,
+              !markedTextStorage.string.isEmpty,
               let renderer = renderer else {
             destroyMarkedTextLayer()
             return
@@ -2012,11 +2016,13 @@ final class TerminalView: MTKView, NSTextInputClient {
         markedTextLayer.string = nil
         markedTextLayer.frame = bounds
         rebuildMarkedTextGlyphLayers(
-            for: visibleMarkedTextStorage.string,
+            for: markedTextStorage.string,
             font: font,
             cursorRect: cursorRect,
             contentsScale: markedTextLayer.contentsScale
         )
+        // Hidden: Metal TransientTextOverlay handles visible rendering.
+        // The layer is kept for layout data (glyph frames, contentsScale).
         markedTextLayer.isHidden = true
     }
 
