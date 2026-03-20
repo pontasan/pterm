@@ -299,6 +299,10 @@ final class TerminalView: MTKView, NSTextInputClient {
         }
     }
 
+    func debugSetSelectionForTesting(_ sel: TerminalSelection?) {
+        selection = sel
+    }
+
     func debugSetSuppressInterpretKeyEvents(_ suppressed: Bool) {
         debugSuppressInterpretKeyEvents = suppressed
     }

@@ -515,13 +515,18 @@ final class MetalRenderer {
     /// Load Metal shaders and create render pipelines.
     /// Must be called after the Metal library is available.
     func setupPipelines(library: MTLLibrary) {
-        // Background pipeline
+        // Background pipeline (with alpha blending for translucent selection)
         if let bgVertex = library.makeFunction(name: "bg_vertex"),
            let bgFragment = library.makeFunction(name: "bg_fragment") {
             let desc = MTLRenderPipelineDescriptor()
             desc.vertexFunction = bgVertex
             desc.fragmentFunction = bgFragment
             desc.colorAttachments[0].pixelFormat = Self.renderTargetPixelFormat
+            desc.colorAttachments[0].isBlendingEnabled = true
+            desc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            desc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            desc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
             bgPipeline = try? device.makeRenderPipelineState(descriptor: desc)
         }
 
@@ -1528,6 +1533,7 @@ final class MetalRenderer {
                     // Inverse XOR selected: swap fg/bg
                     fgColor = resolveBackgroundColorAsForeground(cell.attributes.background)
                     bgColor = resolveForegroundColorAsBackground(cell.attributes.foreground)
+                    if isSelected { bgColor.a = 0.1 }
                 } else {
                     fgColor = resolveForegroundColor(for: cell)
                     bgColor = resolveBackgroundColor(cell.attributes.background)
@@ -2081,6 +2087,7 @@ final class MetalRenderer {
                 if effectiveInverse {
                     fgColor = resolveBackgroundColorAsForeground(cell.attributes.background)
                     bgColor = resolveForegroundColorAsBackground(cell.attributes.foreground)
+                    if isSelected { bgColor.a = 0.1 }
                 } else {
                     fgColor = resolveForegroundColor(for: cell)
                     bgColor = resolveBackgroundColor(cell.attributes.background)

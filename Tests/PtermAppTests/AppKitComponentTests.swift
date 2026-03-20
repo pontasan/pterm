@@ -4137,6 +4137,198 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(texts, ["か", "な", "仮名"])
     }
 
+    // MARK: - IME marked text underline and translucency
+
+    func testTerminalViewMarkedTextOverlayHasUnderlineFlag() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 12,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        view.setMarkedText("あ", selectedRange: NSRange(location: 1, length: 0),
+                           replacementRange: NSRange(location: NSNotFound, length: 0))
+
+        let overlays = view.activeTransientTextOverlaysForRendering()
+        XCTAssertFalse(overlays.isEmpty)
+        XCTAssertTrue(overlays.allSatisfy { $0.underline })
+    }
+
+    func testTerminalViewMarkedTextOverlayAlphaIsCappedAtTranslucency() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 12,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        // Wait for animation to complete so stable overlays are at max alpha.
+        view.setMarkedText("かな", selectedRange: NSRange(location: 2, length: 0),
+                           replacementRange: NSRange(location: NSNotFound, length: 0))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+
+        let overlays = view.activeTransientTextOverlaysForRendering()
+        XCTAssertFalse(overlays.isEmpty)
+        // All overlays must be <= 0.4 (the marked-text translucency cap).
+        for overlay in overlays {
+            XCTAssertLessThanOrEqual(overlay.alpha, 0.41)
+        }
+    }
+
+    // MARK: - Cmd+C preserves selection
+
+    func testTerminalViewCopyToClipboardPreservesSelection() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        // Place text in the grid so selectedText() returns something.
+        controller.withModel { model in
+            for (i, char) in "Hello".unicodeScalars.enumerated() {
+                model.grid.setCell(
+                    Cell(codepoint: char.value, attributes: .default, width: 1, isWideContinuation: false),
+                    at: 0, col: i
+                )
+            }
+        }
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        // Create a selection spanning "Hello".
+        view.debugSetSelectionForTesting(TerminalSelection(
+            anchor: GridPosition(row: 0, col: 0),
+            active: GridPosition(row: 0, col: 5),
+            mode: .normal
+        ))
+        XCTAssertNotNil(view.selection)
+        XCTAssertFalse(view.selection!.isEmpty)
+
+        // Copy to clipboard.
+        let text = view.selectedText()
+        XCTAssertNotNil(text)
+        XCTAssertTrue(text!.hasPrefix("Hello"))
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text!, forType: .string)
+
+        // Selection must still be present after copy.
+        XCTAssertNotNil(view.selection)
+        XCTAssertFalse(view.selection!.isEmpty)
+    }
+
+    // MARK: - Selection background translucency
+
+    func testSelectionBackgroundAlphaIsTranslucent() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        controller.withModel { model in
+            for (i, char) in "ABCDE".unicodeScalars.enumerated() {
+                model.grid.setCell(
+                    Cell(codepoint: char.value, attributes: .default, width: 1, isWideContinuation: false),
+                    at: 0, col: i
+                )
+            }
+        }
+        let selection = TerminalSelection(
+            anchor: GridPosition(row: 0, col: 0),
+            active: GridPosition(row: 0, col: 5),
+            mode: .normal
+        )
+        let vd = controller.withViewport { model, scrollback, scrollOffset in
+            renderer.debugBuildVertexDataForTesting(
+                model: model,
+                scrollback: scrollback,
+                scrollOffset: scrollOffset,
+                selection: selection
+            )
+        }
+        // Background vertices encode 12 floats per vertex (pos2 + tex2 + fg4 + bg4).
+        // bgColor alpha is at offset 11 of each vertex.  Selection bg should be < 1.0.
+        let floatsPerVertex = 12
+        let bgVertices = vd.bgVertices
+        XCTAssertFalse(bgVertices.isEmpty)
+        var foundTranslucent = false
+        for i in stride(from: 0, to: bgVertices.count, by: floatsPerVertex) {
+            let bgAlpha = bgVertices[i + 11]
+            if bgAlpha > 0.001 && bgAlpha < 0.99 {
+                foundTranslucent = true
+                XCTAssertEqual(bgAlpha, 0.1, accuracy: 0.02,
+                               "Selected cell bg alpha should be ~0.1")
+            }
+        }
+        XCTAssertTrue(foundTranslucent, "Expected at least one translucent bg vertex from selection")
+    }
+
+    // MARK: - Cursor width for wide characters
+
+    func testCursorWidthDoublesForWideCharacter() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        // Place a wide character at col 0, cursor on it.
+        controller.withModel { model in
+            model.grid.setCell(
+                Cell(codepoint: 0x3042, attributes: .default, width: 2, isWideContinuation: false),
+                at: 0, col: 0
+            )
+            model.grid.setCell(
+                Cell(codepoint: 0x3042, attributes: .default, width: 2, isWideContinuation: true),
+                at: 0, col: 1
+            )
+            model.cursor.row = 0
+            model.cursor.col = 0
+            model.cursor.visible = true
+            model.cursor.shape = .block
+        }
+        let vd = controller.withViewport { model, scrollback, scrollOffset in
+            renderer.debugBuildVertexDataForTesting(
+                model: model,
+                scrollback: scrollback,
+                scrollOffset: scrollOffset
+            )
+        }
+        // Cursor quad: 6 vertices × 12 floats.  Vertex 0 x vs Vertex 1 x gives width.
+        let cursorVertices = vd.cursorVertices
+        XCTAssertEqual(cursorVertices.count, 72, "Expected exactly one cursor quad (6 vertices × 12 floats)")
+        let x0 = cursorVertices[0]   // first vertex x
+        let x1 = cursorVertices[12]  // second vertex x
+        let cursorWidth = x1 - x0
+        let cellW = Float(renderer.glyphAtlas.cellWidth) * Float(renderer.glyphAtlas.scaleFactor)
+        XCTAssertEqual(cursorWidth, cellW * 2.0, accuracy: 0.5,
+                       "Cursor on wide char should be 2 cells wide")
+    }
+
     func testTerminalViewSetMarkedTextClearsCommittedTextPreviewAnimations() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(

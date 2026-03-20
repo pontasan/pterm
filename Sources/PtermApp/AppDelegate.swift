@@ -1939,7 +1939,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.setString(text, forType: .string)
-            sourceView.clearSelection()
         } else {
             // No selection: send SIGINT (Ctrl+C)
             controller.performInterrupt()
