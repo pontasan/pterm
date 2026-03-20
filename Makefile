@@ -6,13 +6,14 @@
 # Output directories
 BUILD_DIR = .build
 APP_BUNDLE = $(BUILD_DIR)/pterm.app
-DIST_ZIP = $(BUILD_DIR)/pterm.zip
+DIST_ARCHIVE = $(BUILD_DIR)/pterm-darwin-arm64.tar.gz
+DIST_ZIP = $(BUILD_DIR)/pterm-darwin-arm64.zip
 SHADER_DIR = Sources/PtermApp/Rendering/Shaders
 METAL_TOOLCHAIN = TOOLCHAINS=Metal
 
 # Build release
-build: regression-test
-	@echo "Release build and regression suite completed."
+build: regression-test package
+	@echo "Release build, regression suite, and distribution archives completed."
 
 # Build debug
 debug:
@@ -45,6 +46,7 @@ regression-test:
 clean:
 	swift package clean
 	rm -rf $(BUILD_DIR)/pterm.app
+	rm -f $(DIST_ARCHIVE) $(DIST_ZIP)
 
 # Assemble .app bundle
 bundle:
@@ -68,11 +70,13 @@ bundle:
 		-o $(APP_BUNDLE)/Contents/Resources/default.metallib; \
 	echo "Bundle created at $(APP_BUNDLE)"
 
-# Create distributable zip from the bundled app (use 'make build' first)
+# Create distributable archives from the bundled app (use 'make build' first)
 package:
+	@rm -f $(DIST_ARCHIVE)
 	@rm -f $(DIST_ZIP)
+	tar czf $(DIST_ARCHIVE) -C $(BUILD_DIR) pterm.app
 	ditto -c -k --sequesterRsrc --keepParent $(APP_BUNDLE) $(DIST_ZIP)
-	@echo "Package created at $(DIST_ZIP)"
+	@echo "Packages created at $(DIST_ARCHIVE) and $(DIST_ZIP)"
 
 # Verify bundle structure and embedded resources
 verify-bundle: build
