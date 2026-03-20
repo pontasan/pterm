@@ -1005,13 +1005,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sv.terminalView.outputFrameThrottlingMode = config.textInteraction.outputFrameThrottlingMode
         sv.terminalView.typewriterSoundEnabled = config.textInteraction.typewriterSoundEnabled
         sv.terminalView.imagePreviewURLProvider = { [weak self] ownerID, index in
-            self?.pastedImageRegistry.url(ownerID: ownerID, forPlaceholderIndex: index)
+            self?.resolveImageURL(ownerID: ownerID, index: index)
         }
         sv.terminalView.textImagePlaceholderURLProvider = { [weak self] ownerID, index in
-            guard let self, index > 0 else { return nil }
-            guard let list = self.perControllerPastedImages[ownerID], index <= list.count else { return nil }
-            let url = list[index - 1]
-            return FileManager.default.fileExists(atPath: url.path) ? url : nil
+            self?.resolveImageURL(ownerID: ownerID, index: index)
         }
         sv.terminalView.onFileDropURLs = { [weak self] controller, urls in
             guard let self else { return false }
@@ -1104,13 +1101,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         splitView.outputFrameThrottlingMode = config.textInteraction.outputFrameThrottlingMode
         splitView.typewriterSoundEnabled = config.textInteraction.typewriterSoundEnabled
         splitView.imagePreviewURLProvider = { [weak self] ownerID, index in
-            self?.pastedImageRegistry.url(ownerID: ownerID, forPlaceholderIndex: index)
+            self?.resolveImageURL(ownerID: ownerID, index: index)
         }
         splitView.textImagePlaceholderURLProvider = { [weak self] ownerID, index in
-            guard let self, index > 0 else { return nil }
-            guard let list = self.perControllerPastedImages[ownerID], index <= list.count else { return nil }
-            let url = list[index - 1]
-            return FileManager.default.fileExists(atPath: url.path) ? url : nil
+            self?.resolveImageURL(ownerID: ownerID, index: index)
         }
         splitView.onFileDropURLs = { [weak self] controller, urls in
             guard let self else { return false }
@@ -1988,20 +1982,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let pasteboard = NSPasteboard.general
 
-        // Check for file URLs / image data first — these need to be imported
-        // into ~/.pterm/files/ so the managed path is pasted instead of the
-        // raw source path, enabling [Image #N] preview tracking.
-        do {
-            if let result = try clipboardFileStore.importFromPasteboard(pasteboard) {
-                pastedImageRegistry.register(createdFiles: result.createdFiles)
-                trackPastedImagesPerController(result.createdFiles, controller: controller)
-                controller.sendInput(result.textToPaste)
+        // Determine whether the clipboard's primary content is plain text
+        // or file/image data.  When the user copies text (Cmd+C on text),
+        // .string appears before .fileURL in the type list.  When the user
+        // copies a file (Cmd+C on a file in Finder), .fileURL comes first.
+        let primaryIsText: Bool = {
+            guard let types = pasteboard.types else { return false }
+            let stringIndex = types.firstIndex(of: .string)
+            let fileIndex = types.firstIndex(of: .fileURL)
+            if let s = stringIndex, let f = fileIndex { return s < f }
+            return stringIndex != nil
+        }()
+
+        if !primaryIsText {
+            // File URLs / image data: import into ~/.pterm/files/ so the
+            // managed path is pasted, enabling [Image #N] preview tracking.
+            do {
+                if let result = try clipboardFileStore.importFromPasteboard(pasteboard) {
+                    pastedImageRegistry.register(createdFiles: result.createdFiles)
+                    trackPastedImagesPerController(result.createdFiles, controller: controller)
+                    controller.sendInput(result.textToPaste)
+                    return
+                }
+            } catch {
+                let alert = NSAlert(error: error)
+                alert.runModal()
                 return
             }
-        } catch {
-            let alert = NSAlert(error: error)
-            alert.runModal()
-            return
         }
 
         if let text = pasteboard.string(forType: .string) {
@@ -2015,6 +2022,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 controller.sendInput(text)
             }
+            return
+        }
+
+        // No text — try file/image import as last resort.
+        if primaryIsText { return }
+        do {
+            if let result = try clipboardFileStore.importFromPasteboard(pasteboard) {
+                pastedImageRegistry.register(createdFiles: result.createdFiles)
+                trackPastedImagesPerController(result.createdFiles, controller: controller)
+                controller.sendInput(result.textToPaste)
+            }
+        } catch {
+            let alert = NSAlert(error: error)
+            alert.runModal()
         }
     }
 
@@ -2041,6 +2062,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var list = perControllerPastedImages[controller.id] ?? []
         list.append(contentsOf: imageFiles)
         perControllerPastedImages[controller.id] = list
+    }
+
+    /// Resolve image URL for placeholder index, scoped to a controller.
+    /// Checks per-controller pasted images first (for [Image #N] and Kitty
+    /// placeholders from paste/drop), then falls back to explicitly registered
+    /// Kitty images for this ownerID. Never uses the global imageURLs array.
+    private func resolveImageURL(ownerID: UUID, index: Int) -> URL? {
+        guard index > 0 else { return nil }
+        // Per-controller list: matches [Image #N] numbering for paste/drop.
+        if let list = perControllerPastedImages[ownerID], index <= list.count {
+            let url = list[index - 1]
+            if FileManager.default.fileExists(atPath: url.path) { return url }
+        }
+        // Kitty images registered explicitly for this ownerID only.
+        // No global fallback — prevents cross-terminal image leakage.
+        return pastedImageRegistry.explicitURL(ownerID: ownerID, forPlaceholderIndex: index)
     }
 
     private func shouldPasteText(_ text: String) -> Bool {

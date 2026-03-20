@@ -12,8 +12,8 @@ SHADER_DIR = Sources/PtermApp/Rendering/Shaders
 METAL_TOOLCHAIN = TOOLCHAINS=Metal
 
 # Build release
-build: regression-test package
-	@echo "Release build, regression suite, and distribution archives completed."
+build: regression-test
+	@echo "Release build and regression suite completed."
 
 # Build debug
 debug:

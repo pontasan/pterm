@@ -119,6 +119,28 @@ final class PastedImageRegistry {
         return persistIndexedImageIfNeeded(ownerID: ownerID, index: index)
     }
 
+    /// Look up an image registered explicitly for a specific ownerID and index.
+    /// Does NOT fall back to the global imageURLs array. Use this when
+    /// controller-scoped resolution is required (e.g. Kitty images received
+    /// via the graphics protocol for a specific terminal).
+    func explicitURL(ownerID: UUID, forPlaceholderIndex index: Int) -> URL? {
+        guard index > 0 else { return nil }
+        if let url = lock.withLock({ () -> URL? in
+            guard let explicit = indexedImages[ImageKey(ownerID: ownerID, index: index)] else { return nil }
+            guard let explicitURL = explicit.url else { return nil }
+            guard fileManager.fileExists(atPath: explicitURL.path) else { return nil }
+            return explicitURL
+        }) {
+            return url
+        }
+        let hasLazy = lock.withLock {
+            guard let explicit = indexedImages[ImageKey(ownerID: ownerID, index: index)] else { return false }
+            return explicit.url == nil && (explicit.cgImage != nil || explicit.rawPixelData != nil || explicit.blobURL != nil)
+        }
+        guard hasLazy else { return nil }
+        return persistIndexedImageIfNeeded(ownerID: ownerID, index: index)
+    }
+
     func registeredImageCount() -> Int {
         lock.withLock {
             imageURLs.count + indexedImages.count

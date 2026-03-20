@@ -1249,6 +1249,320 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(receivedURLs.map(\.path), [droppedFile.path])
     }
 
+    // MARK: - Image preview: per-controller isolation and text placeholder
+
+    func testTextImagePlaceholderPreviewUsesPerControllerProvider() throws {
+        try withTemporaryPtermConfig { _ in
+            let renderer = try makeRendererOrSkip()
+            let imageURL = PtermDirectories.files.appendingPathComponent("\(UUID().uuidString).png")
+            try FileManager.default.createDirectory(at: PtermDirectories.files, withIntermediateDirectories: true)
+            try makePNGImageData(size: NSSize(width: 2, height: 2)).write(to: imageURL)
+
+            let controller = TerminalController(
+                rows: 4, cols: 20,
+                termEnv: "xterm-256color", textEncoding: .utf8,
+                scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+                fontName: "Menlo", fontSize: 13,
+                initialDirectory: "/tmp/text-placeholder-preview"
+            )
+            defer { controller.stop(waitForExit: true) }
+
+            // Place "[Image #1]" text in the grid.
+            let placeholder = "[Image #1]"
+            controller.withModel { model in
+                for (i, scalar) in placeholder.unicodeScalars.enumerated() {
+                    model.grid.setCell(
+                        Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false),
+                        at: 0, col: i
+                    )
+                }
+            }
+
+            let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+            view.terminalController = controller
+            view.textImagePlaceholderURLProvider = { ownerID, index in
+                guard ownerID == controller.id, index == 1 else { return nil }
+                return imageURL
+            }
+
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                                  styleMask: [.titled], backing: .buffered, defer: false)
+            window.contentView = view
+            window.layoutIfNeeded()
+            renderFrame(for: view)
+
+            let hoverPoint = NSPoint(
+                x: renderer.gridPadding + renderer.glyphAtlas.cellWidth * 5,
+                y: view.bounds.height - renderer.gridPadding - renderer.glyphAtlas.cellHeight * 0.5
+            )
+            let event = try XCTUnwrap(makeMouseEvent(type: .mouseMoved, point: hoverPoint, in: view, window: window))
+            view.mouseMoved(with: event)
+
+            XCTAssertTrue(view.hasActiveImagePreviewWindow)
+            view.debugReleaseImagePreviewWindowNow()
+        }
+    }
+
+    func testTextImagePlaceholderPreviewIsolatesBetweenControllers() throws {
+        try withTemporaryPtermConfig { _ in
+            let renderer = try makeRendererOrSkip()
+
+            let image1URL = PtermDirectories.files.appendingPathComponent("\(UUID().uuidString).png")
+            let image2URL = PtermDirectories.files.appendingPathComponent("\(UUID().uuidString).png")
+            try FileManager.default.createDirectory(at: PtermDirectories.files, withIntermediateDirectories: true)
+            try makePNGImageData(size: NSSize(width: 2, height: 2)).write(to: image1URL)
+            try makePNGImageData(size: NSSize(width: 2, height: 2)).write(to: image2URL)
+
+            let controller1 = TerminalController(
+                rows: 4, cols: 20,
+                termEnv: "xterm-256color", textEncoding: .utf8,
+                scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+                fontName: "Menlo", fontSize: 13,
+                initialDirectory: "/tmp/isolate-ctrl1"
+            )
+            let controller2 = TerminalController(
+                rows: 4, cols: 20,
+                termEnv: "xterm-256color", textEncoding: .utf8,
+                scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+                fontName: "Menlo", fontSize: 13,
+                initialDirectory: "/tmp/isolate-ctrl2"
+            )
+            defer { controller1.stop(waitForExit: true); controller2.stop(waitForExit: true) }
+
+            // Per-controller image lists (simulates what AppDelegate.perControllerPastedImages does).
+            let perController: [UUID: [URL]] = [
+                controller1.id: [image1URL],
+                controller2.id: [image2URL]
+            ]
+            let provider: (UUID, Int) -> URL? = { ownerID, index in
+                guard index > 0, let list = perController[ownerID], index <= list.count else { return nil }
+                return list[index - 1]
+            }
+
+            // Place "[Image #1]" in both controllers.
+            let placeholder = "[Image #1]"
+            for controller in [controller1, controller2] {
+                controller.withModel { model in
+                    for (i, scalar) in placeholder.unicodeScalars.enumerated() {
+                        model.grid.setCell(
+                            Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false),
+                            at: 0, col: i
+                        )
+                    }
+                }
+            }
+
+            // Verify [Image #1] in controller1 resolves to image1.
+            let detected1 = controller1.detectedTextImagePlaceholder(at: GridPosition(row: 0, col: 5))
+            XCTAssertEqual(detected1?.index, 1)
+            XCTAssertEqual(provider(controller1.id, 1), image1URL)
+
+            // Verify [Image #1] in controller2 resolves to image2 (NOT image1).
+            let detected2 = controller2.detectedTextImagePlaceholder(at: GridPosition(row: 0, col: 5))
+            XCTAssertEqual(detected2?.index, 1)
+            XCTAssertEqual(provider(controller2.id, 1), image2URL)
+
+            // Wrong controller returns nil.
+            XCTAssertNil(provider(UUID(), 1))
+        }
+    }
+
+    func testFileDropTracksImagesPerController() throws {
+        try withTemporaryPtermConfig { _ in
+            let renderer = try makeRendererOrSkip()
+
+            let controller1 = TerminalController(
+                rows: 4, cols: 80,
+                termEnv: "xterm-256color", textEncoding: .utf8,
+                scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+                fontName: "Menlo", fontSize: 13,
+                initialDirectory: "/tmp/drop-track1"
+            )
+            let controller2 = TerminalController(
+                rows: 4, cols: 80,
+                termEnv: "xterm-256color", textEncoding: .utf8,
+                scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+                fontName: "Menlo", fontSize: 13,
+                initialDirectory: "/tmp/drop-track2"
+            )
+            defer { controller1.stop(waitForExit: true); controller2.stop(waitForExit: true) }
+
+            // Simulate per-controller tracking (same as AppDelegate.trackPastedImagesPerController).
+            var perController: [UUID: [URL]] = [:]
+            let trackImages: ([URL], TerminalController) -> Void = { urls, ctrl in
+                let imageFiles = urls.filter(PastedImageRegistry.isImageFileURL)
+                guard !imageFiles.isEmpty else { return }
+                var list = perController[ctrl.id] ?? []
+                list.append(contentsOf: imageFiles)
+                perController[ctrl.id] = list
+            }
+
+            let img1 = PtermDirectories.files.appendingPathComponent("\(UUID().uuidString).png")
+            let img2 = PtermDirectories.files.appendingPathComponent("\(UUID().uuidString).png")
+            let img3 = PtermDirectories.files.appendingPathComponent("\(UUID().uuidString).png")
+            try FileManager.default.createDirectory(at: PtermDirectories.files, withIntermediateDirectories: true)
+            for url in [img1, img2, img3] {
+                try makePNGImageData(size: NSSize(width: 1, height: 1)).write(to: url)
+            }
+
+            // Drop image1 on controller1, image2 on controller2, image3 on controller1.
+            trackImages([img1], controller1)
+            trackImages([img2], controller2)
+            trackImages([img3], controller1)
+
+            // Controller1: [Image #1] = img1, [Image #2] = img3.
+            XCTAssertEqual(perController[controller1.id]?.count, 2)
+            XCTAssertEqual(perController[controller1.id]?[0], img1)
+            XCTAssertEqual(perController[controller1.id]?[1], img3)
+
+            // Controller2: [Image #1] = img2.
+            XCTAssertEqual(perController[controller2.id]?.count, 1)
+            XCTAssertEqual(perController[controller2.id]?[0], img2)
+        }
+    }
+
+    func testResolveImageURLNeverLeaksAcrossControllers() throws {
+        try withTemporaryPtermConfig { _ in
+            // Simulate what AppDelegate.resolveImageURL does:
+            // per-controller list first, then PastedImageRegistry.explicitURL.
+            // The global imageURLs array must NEVER be used.
+            let img1 = PtermDirectories.files.appendingPathComponent("\(UUID().uuidString).png")
+            let img2 = PtermDirectories.files.appendingPathComponent("\(UUID().uuidString).png")
+            try FileManager.default.createDirectory(at: PtermDirectories.files, withIntermediateDirectories: true)
+            try makePNGImageData(size: NSSize(width: 1, height: 1)).write(to: img1)
+            try makePNGImageData(size: NSSize(width: 1, height: 1)).write(to: img2)
+
+            let ctrl1ID = UUID()
+            let ctrl2ID = UUID()
+
+            // Register both images in the GLOBAL imageURLs list.
+            let registry = PastedImageRegistry()
+            registry.register(createdFiles: [img1, img2])
+
+            // Per-controller lists: ctrl1 has img1, ctrl2 has img2.
+            let perController: [UUID: [URL]] = [
+                ctrl1ID: [img1],
+                ctrl2ID: [img2]
+            ]
+
+            // Simulate resolveImageURL logic.
+            let resolve: (UUID, Int) -> URL? = { ownerID, index in
+                guard index > 0 else { return nil }
+                if let list = perController[ownerID], index <= list.count {
+                    let url = list[index - 1]
+                    if FileManager.default.fileExists(atPath: url.path) { return url }
+                }
+                return registry.explicitURL(ownerID: ownerID, forPlaceholderIndex: index)
+            }
+
+            // [Image #1] on ctrl1 → img1.
+            XCTAssertEqual(resolve(ctrl1ID, 1), img1)
+            // [Image #1] on ctrl2 → img2, NOT img1.
+            XCTAssertEqual(resolve(ctrl2ID, 1), img2)
+            // [Image #2] on ctrl2 → nil (only 1 image pasted there).
+            XCTAssertNil(resolve(ctrl2ID, 2))
+            // Unknown controller → nil (not img1 from global list).
+            XCTAssertNil(resolve(UUID(), 1))
+        }
+    }
+
+    func testExplicitURLDoesNotFallBackToGlobalImageURLs() throws {
+        try withTemporaryPtermConfig { _ in
+            let img = PtermDirectories.files.appendingPathComponent("\(UUID().uuidString).png")
+            try FileManager.default.createDirectory(at: PtermDirectories.files, withIntermediateDirectories: true)
+            try makePNGImageData(size: NSSize(width: 1, height: 1)).write(to: img)
+
+            let registry = PastedImageRegistry()
+            // Add to global imageURLs (via register(createdFiles:)).
+            registry.register(createdFiles: [img])
+
+            // Global lookup succeeds (as expected for backwards compat).
+            XCTAssertEqual(registry.url(ownerID: nil, forPlaceholderIndex: 1), img)
+
+            // Scoped lookup with a specific ownerID must NOT reach global list.
+            let unknownOwner = UUID()
+            XCTAssertNil(registry.explicitURL(ownerID: unknownOwner, forPlaceholderIndex: 1))
+        }
+    }
+
+    func testPasteFileURLImportsToManagedStoreBeforeTextFallback() throws {
+        try withTemporaryPtermConfig { _ in
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+
+            let sourceImage = tempDir.appendingPathComponent("photo.png")
+            try makePNGImageData(size: NSSize(width: 2, height: 2)).write(to: sourceImage)
+
+            let store = ClipboardFileStore(rootDirectory: PtermDirectories.files)
+            let result = try XCTUnwrap(store.importFileURLs([sourceImage]))
+
+            // Imported file should be under the managed directory, not the original path.
+            XCTAssertEqual(result.createdFiles.count, 1)
+            let imported = try XCTUnwrap(result.createdFiles.first)
+            XCTAssertTrue(imported.path.hasPrefix(PtermDirectories.files.path))
+            XCTAssertNotEqual(imported.path, sourceImage.path)
+
+            // The pasted text should reference the managed path.
+            XCTAssertTrue(result.textToPaste.contains(PtermDirectories.files.path))
+            XCTAssertFalse(result.textToPaste.contains(tempDir.path))
+        }
+    }
+
+    func testDetectedTextImagePlaceholderReturnsCorrectIndex() {
+        let controller = TerminalController(
+            rows: 4, cols: 30,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let text = "output: [Image #3] done"
+        controller.withModel { model in
+            for (i, scalar) in text.unicodeScalars.enumerated() {
+                model.grid.setCell(
+                    Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false),
+                    at: 0, col: i
+                )
+            }
+        }
+
+        // Hovering inside "[Image #3]" should return index 3.
+        let detected = controller.detectedTextImagePlaceholder(at: GridPosition(row: 0, col: 12))
+        XCTAssertEqual(detected?.index, 3)
+        XCTAssertEqual(detected?.originalText, "[Image #3]")
+
+        // Hovering outside should return nil.
+        XCTAssertNil(controller.detectedTextImagePlaceholder(at: GridPosition(row: 0, col: 0)))
+        XCTAssertNil(controller.detectedTextImagePlaceholder(at: GridPosition(row: 0, col: 22)))
+    }
+
+    func testManagedFileImportTouchesMtimeToPreventPrematureCleanup() throws {
+        try withTemporaryPtermConfig { _ in
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+
+            // Create a source file with old mtime (2 days ago).
+            let sourceImage = tempDir.appendingPathComponent("old.png")
+            try makePNGImageData(size: NSSize(width: 1, height: 1)).write(to: sourceImage)
+            let twoDaysAgo = Date().addingTimeInterval(-48 * 60 * 60)
+            try FileManager.default.setAttributes([.modificationDate: twoDaysAgo], ofItemAtPath: sourceImage.path)
+
+            let store = ClipboardFileStore(rootDirectory: PtermDirectories.files)
+            let result = try XCTUnwrap(store.importFileURLs([sourceImage]))
+            let imported = try XCTUnwrap(result.createdFiles.first)
+
+            // The imported file's mtime should be recent (not 2 days ago).
+            let attrs = try FileManager.default.attributesOfItem(atPath: imported.path)
+            let mtime = try XCTUnwrap(attrs[.modificationDate] as? Date)
+            XCTAssertTrue(mtime.timeIntervalSinceNow > -10, "Imported file mtime should be within last 10 seconds, got \(mtime)")
+
+            // Running cleanup should NOT delete the freshly imported file.
+            try store.cleanupExpiredFiles()
+            XCTAssertTrue(FileManager.default.fileExists(atPath: imported.path), "Freshly imported file should survive cleanup")
+        }
+    }
+
     func testRendererBuildsInlineImageDrawCommandsForKittyImageCells() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(

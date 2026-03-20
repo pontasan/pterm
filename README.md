@@ -39,8 +39,10 @@ Most terminals are good at opening one shell. pterm is built to help you manage 
 
 ### AI Agent Integration
 - **MCP server** — Built-in Model Context Protocol server with 20+ tools. AI agents can list terminals, send input, read output (plain text, ANSI, or rendered PNG), and manage workspaces programmatically.
-- **Clipboard-to-file-path** — Paste an image and pterm saves it as a file, inserting the path inline — ready for AI tools that accept file references.
+- **Clipboard-to-file-path** — Paste or drop an image and pterm saves it to a managed store, inserting the path inline — ready for AI tools that accept file references. Hover over the pasted path or `[Image #N]` placeholder to see a floating preview.
 - **Transient terminals** — Launch one-off commands via `--command` that auto-clean and stay out of your session history.
+
+![Paste and preview images in the terminal](Resources/pterm3.gif)
 
 ### CLI Modes
 - `--cli` — Run headless, bridging stdin/stdout to a PTY session without opening a window
