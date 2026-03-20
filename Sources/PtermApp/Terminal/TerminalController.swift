@@ -26,6 +26,13 @@ final class TerminalController {
     private static let kittyImageProcessingSemaphore = DispatchSemaphore(
         value: kittyImageProcessingConcurrency
     )
+    /// Matches a single-quoted absolute path with an image file extension.
+    /// Group 1 captures the unquoted path.
+    private static let quotedImagePathRegex: NSRegularExpression = {
+        // '/<path>.<ext>' where ext is a common image format.
+        let pattern = #"'(/[^']+\.(?:png|jpg|jpeg|gif|bmp|tiff|tif|webp|heic|heif|svg|ico))'"#
+        return try! NSRegularExpression(pattern: pattern, options: .caseInsensitive)
+    }()
 
     private struct ViewportRow {
         let cells: [Cell]
@@ -43,6 +50,13 @@ final class TerminalController {
     struct DetectedImagePlaceholder: Equatable {
         let ownerID: UUID?
         let index: Int
+        let originalText: String
+        let startCol: Int
+        let endCol: Int
+    }
+
+    struct DetectedManagedImageFile: Equatable {
+        let url: URL
         let originalText: String
         let startCol: Int
         let endCol: Int
@@ -1811,6 +1825,72 @@ final class TerminalController {
                     originalText: placement.originalText,
                     startCol: placement.startCol,
                     endCol: placement.endCol
+                )
+            }
+            return nil
+        }
+    }
+
+    func detectedManagedImageFile(at position: GridPosition) -> DetectedManagedImageFile? {
+        lock.withReadLock {
+            let rows = visibleRowsLocked()
+            guard position.row >= 0, position.row < rows.count else { return nil }
+
+            // Find the logical line spanning wrapped rows that contains position.row.
+            // isWrapped means "this row is a continuation of the previous row".
+            var lineStartRow = position.row
+            while lineStartRow > 0 && rows[lineStartRow].isWrapped {
+                lineStartRow -= 1
+            }
+            var lineEndRow = position.row
+            while lineEndRow < rows.count - 1 && rows[lineEndRow + 1].isWrapped {
+                lineEndRow += 1
+            }
+
+            // Concatenate cells across wrapped rows and build a unified projection.
+            let cols = rows[position.row].cells.count
+            var allCells: [Cell] = []
+            allCells.reserveCapacity((lineEndRow - lineStartRow + 1) * cols)
+            for r in lineStartRow...lineEndRow {
+                allCells.append(contentsOf: rows[r].cells)
+            }
+            let projection = Self.projectVisibleText(from: allCells)
+            guard !projection.text.isEmpty else { return nil }
+
+            // The hovered column in the unified cell array.
+            let unifiedCol = (position.row - lineStartRow) * cols + position.col
+            guard unifiedCol >= 0,
+                  let characterIndex = projection.characterIndexByColumn[unifiedCol] else {
+                return nil
+            }
+
+            let text = projection.text as NSString
+            let searchRange = NSRange(location: 0, length: text.length)
+            for match in Self.quotedImagePathRegex.matches(in: projection.text, options: [], range: searchRange) {
+                guard match.numberOfRanges >= 2,
+                      NSLocationInRange(characterIndex, match.range),
+                      let pathRange = Range(match.range(at: 1), in: projection.text) else {
+                    continue
+                }
+
+                let candidatePath = String(projection.text[pathRange])
+                let url = URL(fileURLWithPath: candidatePath).standardizedFileURL
+                guard FileManager.default.fileExists(atPath: url.path) else {
+                    continue
+                }
+
+                let matchStart = match.range.location
+                let matchEnd = matchStart + match.range.length - 1
+                guard let startCol = projection.columnByCharacterIndex[matchStart],
+                      let endCol = projection.columnByCharacterIndex[matchEnd] else {
+                    continue
+                }
+
+                return DetectedManagedImageFile(
+                    url: url,
+                    originalText: text.substring(with: match.range),
+                    startCol: startCol,
+                    endCol: endCol
                 )
             }
             return nil

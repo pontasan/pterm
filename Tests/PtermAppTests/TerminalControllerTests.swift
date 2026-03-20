@@ -545,6 +545,55 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertNil(controller.detectedImagePlaceholder(at: .init(row: 0, col: 3)))
     }
 
+    func testDetectedManagedImageFileReturnsQuotedManagedImagePathUnderCursor() throws {
+        try withTemporaryPtermConfig { _ in
+            let imageURL = PtermDirectories.files.appendingPathComponent("\(UUID().uuidString).png")
+            try FileManager.default.createDirectory(at: PtermDirectories.files, withIntermediateDirectories: true)
+            try Data([0x89, 0x50, 0x4E, 0x47]).write(to: imageURL)
+
+            let quotedPath = ClipboardFileStore(rootDirectory: PtermDirectories.files).shellQuotedPath(imageURL.path)
+            let controller = makeController(rows: 2, cols: quotedPath.unicodeScalars.count + 8)
+            controller.withModel { model in
+                for (index, scalar) in quotedPath.unicodeScalars.enumerated() {
+                    model.grid.setCell(
+                        Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false),
+                        at: 0,
+                        col: index
+                    )
+                }
+            }
+
+            let detected = controller.detectedManagedImageFile(at: .init(row: 0, col: 8))
+
+            XCTAssertEqual(detected?.url, imageURL.standardizedFileURL)
+            XCTAssertEqual(detected?.originalText, quotedPath)
+            XCTAssertEqual(detected?.startCol, 0)
+            XCTAssertEqual(detected?.endCol, quotedPath.unicodeScalars.count - 1)
+        }
+    }
+
+    func testDetectedManagedImageFileIgnoresManagedNonImagePaths() throws {
+        try withTemporaryPtermConfig { _ in
+            let fileURL = PtermDirectories.files.appendingPathComponent("\(UUID().uuidString).txt")
+            try FileManager.default.createDirectory(at: PtermDirectories.files, withIntermediateDirectories: true)
+            try Data("not-image".utf8).write(to: fileURL)
+
+            let quotedPath = ClipboardFileStore(rootDirectory: PtermDirectories.files).shellQuotedPath(fileURL.path)
+            let controller = makeController(rows: 2, cols: quotedPath.unicodeScalars.count + 8)
+            controller.withModel { model in
+                for (index, scalar) in quotedPath.unicodeScalars.enumerated() {
+                    model.grid.setCell(
+                        Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false),
+                        at: 0,
+                        col: index
+                    )
+                }
+            }
+
+            XCTAssertNil(controller.detectedManagedImageFile(at: .init(row: 0, col: 8)))
+        }
+    }
+
     func testAllTextSelectedTextAndFindMatchesIncludeScrollbackAndVisibleGrid() {
         let controller = makeController(rows: 3, cols: 4)
         controller.scrollback.appendRow(ArraySlice([

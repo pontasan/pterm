@@ -1709,6 +1709,26 @@ final class AppInfrastructureTests: XCTestCase {
         }
     }
 
+    func testClipboardFileStoreImportFileURLsMatchesPasteboardFileImportBehavior() throws {
+        try withTemporaryDirectory { directory in
+            let externalRoot = directory.appendingPathComponent("external")
+            try FileManager.default.createDirectory(at: externalRoot, withIntermediateDirectories: true)
+            let source = externalRoot.appendingPathComponent("drop file.txt")
+            try Data("payload".utf8).write(to: source)
+
+            let managedRoot = directory.appendingPathComponent("managed")
+            let store = ClipboardFileStore(rootDirectory: managedRoot)
+
+            let result = try XCTUnwrap(store.importFileURLs([source]))
+            XCTAssertEqual(result.createdFiles.count, 1)
+
+            let imported = try XCTUnwrap(result.createdFiles.first)
+            XCTAssertTrue(imported.path.hasPrefix(managedRoot.path))
+            XCTAssertEqual(result.textToPaste, store.shellQuotedPath(imported.path))
+            XCTAssertEqual(try String(contentsOf: imported), "payload")
+        }
+    }
+
     func testClipboardFileStoreCleanupCreatesManagedDirectoryWithSecurePermissions() throws {
         try withTemporaryDirectory { directory in
             let managed = directory.appendingPathComponent("managed")

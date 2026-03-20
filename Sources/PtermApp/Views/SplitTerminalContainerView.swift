@@ -61,6 +61,11 @@ final class SplitTerminalContainerView: NSView {
             scrollViews.forEach { $0.terminalView.imagePreviewURLProvider = imagePreviewURLProvider }
         }
     }
+    var onFileDropURLs: ((TerminalController, [URL]) -> Bool)? {
+        didSet {
+            scrollViews.forEach { $0.terminalView.onFileDropURLs = onFileDropURLs }
+        }
+    }
     var commandClickTooltip: String = "⌘+Click to maximize this terminal" {
         didSet {
             scrollViews.forEach { $0.toolTip = commandClickTooltip }
@@ -194,6 +199,7 @@ final class SplitTerminalContainerView: NSView {
             scrollView.terminalView.outputFrameThrottlingMode = outputFrameThrottlingMode
             scrollView.terminalView.typewriterSoundEnabled = typewriterSoundEnabled
             scrollView.terminalView.imagePreviewURLProvider = imagePreviewURLProvider
+            scrollView.terminalView.onFileDropURLs = onFileDropURLs
             scrollView.terminalView.terminalController = controller
             // Suppress individual rendering after the controller is attached.
             // Split overlay suppression must remain independent from temporary

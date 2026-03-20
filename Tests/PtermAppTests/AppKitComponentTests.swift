@@ -985,6 +985,120 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertFalse(view.hasActiveImagePreviewWindow)
     }
 
+    func testTerminalViewHoveringManagedImagePathShowsPreviewWindow() throws {
+        try withTemporaryPtermConfig { _ in
+            let renderer = try makeRendererOrSkip()
+            let imageURL = PtermDirectories.files.appendingPathComponent("\(UUID().uuidString).png")
+            try FileManager.default.createDirectory(at: PtermDirectories.files, withIntermediateDirectories: true)
+            try makePNGImageData(size: NSSize(width: 2, height: 2)).write(to: imageURL)
+
+            let quotedPath = ClipboardFileStore(rootDirectory: PtermDirectories.files).shellQuotedPath(imageURL.path)
+            let controller = TerminalController(
+                rows: 4,
+                cols: quotedPath.unicodeScalars.count + 8,
+                termEnv: "xterm-256color",
+                textEncoding: .utf8,
+                scrollbackInitialCapacity: 4096,
+                scrollbackMaxCapacity: 4096,
+                fontName: "Menlo",
+                fontSize: 13,
+                initialDirectory: "/tmp/managed-image-hover"
+            )
+            defer { controller.stop(waitForExit: true) }
+            controller.withModel { model in
+                for (index, scalar) in quotedPath.unicodeScalars.enumerated() {
+                    model.grid.setCell(
+                        Cell(codepoint: scalar.value, attributes: .default, width: 1, isWideContinuation: false),
+                        at: 0,
+                        col: index
+                    )
+                }
+            }
+
+            let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 1200, height: 200), renderer: renderer)
+            view.terminalController = controller
+
+            let window = NSWindow(
+                contentRect: NSRect(
+                    x: 0,
+                    y: 0,
+                    width: max(1200, CGFloat(quotedPath.unicodeScalars.count + 8) * renderer.glyphAtlas.cellWidth + renderer.gridPadding * 2),
+                    height: 200
+                ),
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            window.contentView = view
+            window.layoutIfNeeded()
+            renderFrame(for: view)
+
+            let hoverPoint = NSPoint(
+                x: renderer.gridPadding + renderer.glyphAtlas.cellWidth * 8.5,
+                y: view.bounds.height - renderer.gridPadding - renderer.glyphAtlas.cellHeight * 0.5
+            )
+            let event = try XCTUnwrap(makeMouseEvent(type: .mouseMoved, point: hoverPoint, in: view, window: window))
+            view.mouseMoved(with: event)
+
+            XCTAssertTrue(view.hasActiveImagePreviewWindow)
+            view.debugReleaseImagePreviewWindowNow()
+        }
+    }
+
+    func testTerminalViewHoveringManagedImagePathInTransientPreviewShowsPreviewWindow() throws {
+        try withTemporaryPtermConfig { _ in
+            let renderer = try makeRendererOrSkip()
+            let imageURL = PtermDirectories.files.appendingPathComponent("\(UUID().uuidString).png")
+            try FileManager.default.createDirectory(at: PtermDirectories.files, withIntermediateDirectories: true)
+            try makePNGImageData(size: NSSize(width: 2, height: 2)).write(to: imageURL)
+
+            let quotedPath = ClipboardFileStore(rootDirectory: PtermDirectories.files).shellQuotedPath(imageURL.path)
+            let controller = TerminalController(
+                rows: 4,
+                cols: quotedPath.unicodeScalars.count + 8,
+                termEnv: "xterm-256color",
+                textEncoding: .utf8,
+                scrollbackInitialCapacity: 4096,
+                scrollbackMaxCapacity: 4096,
+                fontName: "Menlo",
+                fontSize: 13,
+                initialDirectory: "/tmp/managed-image-hover-transient"
+            )
+            defer { controller.stop(waitForExit: true) }
+
+            let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 1600, height: 200), renderer: renderer)
+            view.terminalController = controller
+            view.outputConfirmedInputAnimationsEnabled = false
+
+            let window = NSWindow(
+                contentRect: NSRect(
+                    x: 0,
+                    y: 0,
+                    width: max(1600, CGFloat(quotedPath.unicodeScalars.count + 8) * renderer.glyphAtlas.cellWidth + renderer.gridPadding * 2),
+                    height: 200
+                ),
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            window.contentView = view
+            window.layoutIfNeeded()
+
+            view.insertText(quotedPath, replacementRange: NSRange(location: NSNotFound, length: 0))
+            renderFrame(for: view)
+
+            let hoverPoint = NSPoint(
+                x: renderer.gridPadding + renderer.glyphAtlas.cellWidth * 8.5,
+                y: view.bounds.height - renderer.gridPadding - renderer.glyphAtlas.cellHeight * 0.5
+            )
+            let event = try XCTUnwrap(makeMouseEvent(type: .mouseMoved, point: hoverPoint, in: view, window: window))
+            view.mouseMoved(with: event)
+
+            XCTAssertTrue(view.hasActiveImagePreviewWindow)
+            view.debugReleaseImagePreviewWindowNow()
+        }
+    }
+
     func testTerminalViewInlineKittyImageLayerAppearsForVisiblePlaceholder() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(
@@ -1089,6 +1203,50 @@ final class AppKitComponentTests: XCTestCase {
 
         view.pruneInlineImageResources(ownerID: controller.id, retaining: [])
         XCTAssertEqual(view.debugInlineImageLayerCount, 0)
+    }
+
+    func testTerminalViewFileDropRoutesURLsThroughManagedDropHandler() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 20,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            initialDirectory: "/tmp/file-drop-terminal-view"
+        )
+        defer { controller.stop(waitForExit: true) }
+
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+
+        let temporaryDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let droppedFile = temporaryDirectory.appendingPathComponent("drop.txt")
+        try Data("drop-me".utf8).write(to: droppedFile)
+
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name(UUID().uuidString))
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.writeObjects([droppedFile as NSURL]))
+
+        var receivedController: TerminalController?
+        var receivedURLs: [URL] = []
+        view.onFileDropURLs = { droppedController, urls in
+            receivedController = droppedController
+            receivedURLs = urls
+            return true
+        }
+
+        let draggingInfo = TestDraggingInfo(pasteboard: pasteboard, location: NSPoint(x: 8, y: 8))
+        XCTAssertTrue(view.performDragOperation(draggingInfo))
+        XCTAssertTrue(receivedController === controller)
+        XCTAssertEqual(receivedURLs.map(\.path), [droppedFile.path])
     }
 
     func testRendererBuildsInlineImageDrawCommandsForKittyImageCells() throws {

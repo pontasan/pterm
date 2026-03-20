@@ -58,6 +58,11 @@ final class TerminalView: MTKView, NSTextInputClient {
         let columnWidth: Int
     }
 
+    private static let quotedImagePathRegex: NSRegularExpression = {
+        let pattern = #"'(/[^']+\.(?:png|jpg|jpeg|gif|bmp|tiff|tif|webp|heic|heif|svg|ico))'"#
+        return try! NSRegularExpression(pattern: pattern, options: .caseInsensitive)
+    }()
+
     /// Terminal controller for this view
     var terminalController: TerminalController? {
         willSet {
@@ -114,6 +119,8 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
     /// Resolves terminal `[Image #x]` placeholders to locally stored pasted images.
     var imagePreviewURLProvider: ((UUID, Int) -> URL?)?
+    /// Routes dropped files through the same managed-file pipeline as paste.
+    var onFileDropURLs: ((TerminalController, [URL]) -> Bool)?
 
     /// When true, rendering is demand-driven (only on model changes) instead of 60fps continuous.
     /// Used in split view to avoid overwhelming GPU with many independent display links.
@@ -228,6 +235,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     /// URL hover state for Cmd+mouseover visual feedback
     private var hoveredLinkRange: (row: Int, startCol: Int, endCol: Int)?
     private var hoveredImagePlaceholder: TerminalController.DetectedImagePlaceholder?
+    private var hoveredManagedImageFile: TerminalController.DetectedManagedImageFile?
     private var imagePreviewWindow: NSWindow?
     private var imagePreviewView: NSImageView?
     private var inlineImageLayers: [Int: CALayer] = [:]
@@ -1248,26 +1256,113 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     private func updateImagePreviewHover(with event: NSEvent) {
         guard let controller = terminalController,
-              let position = gridPosition(from: event),
-              let placeholder = controller.detectedImagePlaceholder(at: position),
-              let ownerID = placeholder.ownerID,
-              let imageURL = imagePreviewURLProvider?(ownerID, placeholder.index) else {
-            hoveredImagePlaceholder = nil
+              let position = gridPosition(from: event) else {
             hideImagePreview()
             return
         }
 
-        let hoverChanged = hoveredImagePlaceholder != placeholder
-        hoveredImagePlaceholder = placeholder
-        if hoverChanged || imagePreviewWindow == nil {
-            guard let image = NSImage(contentsOf: imageURL) else {
-                hideImagePreview()
-                return
+        if let placeholder = controller.detectedImagePlaceholder(at: position),
+           let ownerID = placeholder.ownerID,
+           let imageURL = imagePreviewURLProvider?(ownerID, placeholder.index) {
+            let hoverChanged = hoveredImagePlaceholder != placeholder || hoveredManagedImageFile != nil
+            hoveredManagedImageFile = nil
+            hoveredImagePlaceholder = placeholder
+            if hoverChanged || imagePreviewWindow == nil {
+                guard let image = NSImage(contentsOf: imageURL) else {
+                    hideImagePreview()
+                    return
+                }
+                showImagePreview(image, for: event)
+            } else {
+                positionImagePreview(near: event)
             }
-            showImagePreview(image, for: event)
-        } else {
-            positionImagePreview(near: event)
+            return
         }
+
+        if let managedImageFile = controller.detectedManagedImageFile(at: position) {
+            let hoverChanged = hoveredManagedImageFile != managedImageFile || hoveredImagePlaceholder != nil
+            hoveredImagePlaceholder = nil
+            hoveredManagedImageFile = managedImageFile
+            if hoverChanged || imagePreviewWindow == nil {
+                guard let image = NSImage(contentsOf: managedImageFile.url) else {
+                    hideImagePreview()
+                    return
+                }
+                showImagePreview(image, for: event)
+            } else {
+                positionImagePreview(near: event)
+            }
+            return
+        }
+
+        if let managedImageFile = detectedManagedImageFileInTransientOverlays(at: position) {
+            let hoverChanged = hoveredManagedImageFile != managedImageFile || hoveredImagePlaceholder != nil
+            hoveredImagePlaceholder = nil
+            hoveredManagedImageFile = managedImageFile
+            if hoverChanged || imagePreviewWindow == nil {
+                guard let image = NSImage(contentsOf: managedImageFile.url) else {
+                    hideImagePreview()
+                    return
+                }
+                showImagePreview(image, for: event)
+            } else {
+                positionImagePreview(near: event)
+            }
+            return
+        }
+
+        hideImagePreview()
+    }
+
+    private func detectedManagedImageFileInTransientOverlays(at position: GridPosition) -> TerminalController.DetectedManagedImageFile? {
+        for overlay in activeTransientTextOverlaysForRendering() where overlay.row == position.row {
+            if let detected = detectedManagedImageFile(
+                in: overlay.text,
+                row: overlay.row,
+                baseCol: overlay.col,
+                hoveredCol: position.col
+            ) {
+                return detected
+            }
+        }
+        return nil
+    }
+
+    private func detectedManagedImageFile(
+        in text: String,
+        row: Int,
+        baseCol: Int,
+        hoveredCol: Int
+    ) -> TerminalController.DetectedManagedImageFile? {
+        let nsText = text as NSString
+        let searchRange = NSRange(location: 0, length: nsText.length)
+        for match in Self.quotedImagePathRegex.matches(in: text, options: [], range: searchRange) {
+            guard match.numberOfRanges >= 2,
+                  let pathRange = Range(match.range(at: 1), in: text),
+                  let fullRange = Range(match.range, in: text) else {
+                continue
+            }
+
+            let candidatePath = String(text[pathRange])
+            let url = URL(fileURLWithPath: candidatePath).standardizedFileURL
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                continue
+            }
+
+            let prefix = String(text[..<fullRange.lowerBound])
+            let matched = String(text[fullRange])
+            let startCol = baseCol + columnWidth(for: prefix)
+            let endCol = startCol + columnWidth(for: matched) - 1
+            guard hoveredCol >= startCol, hoveredCol <= endCol else { continue }
+
+            return TerminalController.DetectedManagedImageFile(
+                url: url,
+                originalText: matched,
+                startCol: startCol,
+                endCol: endCol
+            )
+        }
+        return nil
     }
 
     private func updateLinkHover(with event: NSEvent) {
@@ -1308,6 +1403,10 @@ final class TerminalView: MTKView, NSTextInputClient {
               ) as? [URL],
               !urls.isEmpty else {
             return false
+        }
+
+        if let onFileDropURLs {
+            return onFileDropURLs(controller, urls)
         }
 
         let quotedPaths = urls.map { "'" + $0.path.replacingOccurrences(of: "'", with: "'\\''") + "'" }
@@ -1952,10 +2051,11 @@ final class TerminalView: MTKView, NSTextInputClient {
         guard let previewWindow = imagePreviewWindow,
               let hostWindow = window else { return }
 
-        let pointInView = convert(event.locationInWindow, from: nil)
+        // Use window coordinates directly — view-local coords are offset
+        // in split view and must not be passed to convertToScreen.
         var screenPoint = hostWindow.convertToScreen(NSRect(
-            x: pointInView.x + 16,
-            y: pointInView.y - 16,
+            x: event.locationInWindow.x + 16,
+            y: event.locationInWindow.y - 16,
             width: 0,
             height: 0
         )).origin
@@ -1977,6 +2077,7 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     private func hideImagePreview() {
         hoveredImagePlaceholder = nil
+        hoveredManagedImageFile = nil
         imagePreviewWindow?.orderOut(nil)
         imagePreviewView = nil
         imagePreviewWindow = nil

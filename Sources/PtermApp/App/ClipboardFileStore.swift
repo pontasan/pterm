@@ -23,11 +23,7 @@ final class ClipboardFileStore {
     func importFromPasteboard(_ pasteboard: NSPasteboard) throws -> ClipboardPasteResult? {
         try cleanupExpiredFiles()
         if let fileURLs = readFileURLs(from: pasteboard), !fileURLs.isEmpty {
-            let storedFiles = try fileURLs.map(copyExternalFile)
-            return ClipboardPasteResult(
-                textToPaste: storedFiles.map { shellQuotedPath($0.path) }.joined(separator: " "),
-                createdFiles: storedFiles
-            )
+            return try importFileURLs(fileURLs)
         }
 
         if let storedImage = try importImageData(from: pasteboard) {
@@ -45,6 +41,17 @@ final class ClipboardFileStore {
         }
 
         return nil
+    }
+
+    func importFileURLs(_ fileURLs: [URL]) throws -> ClipboardPasteResult? {
+        try cleanupExpiredFiles()
+        guard !fileURLs.isEmpty else { return nil }
+
+        let storedFiles = try fileURLs.map(copyExternalFile)
+        return ClipboardPasteResult(
+            textToPaste: storedFiles.map { shellQuotedPath($0.path) }.joined(separator: " "),
+            createdFiles: storedFiles
+        )
     }
 
     func cleanupExpiredFiles() throws {

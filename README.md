@@ -93,6 +93,8 @@ time seq 1 1000000
 
 ### Video: Six Terminals Benchmarked Side by Side
 
+[Watch the benchmark video on YouTube](https://www.youtube.com/watch?v=CV9ufPY-54A)
+
 [![Benchmark video](https://img.youtube.com/vi/CV9ufPY-54A/maxresdefault.jpg)](https://www.youtube.com/watch?v=CV9ufPY-54A)
 
 ## Requirements

@@ -1004,6 +1004,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sv.terminalView.imagePreviewURLProvider = { [weak self] ownerID, index in
             self?.pastedImageRegistry.url(ownerID: ownerID, forPlaceholderIndex: index)
         }
+        sv.terminalView.onFileDropURLs = { [weak self] controller, urls in
+            guard let self else { return false }
+            return self.handleTerminalFileDrop(controller: controller, urls: urls)
+        }
         sv.terminalView.onBackToIntegrated = { [weak self] in
             self?.switchToIntegrated()
         }
@@ -1092,6 +1096,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         splitView.typewriterSoundEnabled = config.textInteraction.typewriterSoundEnabled
         splitView.imagePreviewURLProvider = { [weak self] ownerID, index in
             self?.pastedImageRegistry.url(ownerID: ownerID, forPlaceholderIndex: index)
+        }
+        splitView.onFileDropURLs = { [weak self] controller, urls in
+            guard let self else { return false }
+            return self.handleTerminalFileDrop(controller: controller, urls: urls)
         }
         splitView.onActiveControllerChange = { [weak self] controller in
             self?.applyRendererSettings(for: controller)
@@ -1986,6 +1994,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             let alert = NSAlert(error: error)
             alert.runModal()
+        }
+    }
+
+    private func handleTerminalFileDrop(controller: TerminalController, urls: [URL]) -> Bool {
+        do {
+            guard let result = try clipboardFileStore.importFileURLs(urls) else { return false }
+            pastedImageRegistry.register(createdFiles: result.createdFiles)
+            controller.sendInput(result.textToPaste)
+            return true
+        } catch {
+            NSAlert(error: error).runModal()
+            return false
         }
     }
 
