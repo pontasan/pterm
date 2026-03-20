@@ -61,6 +61,11 @@ final class SplitTerminalContainerView: NSView {
             scrollViews.forEach { $0.terminalView.imagePreviewURLProvider = imagePreviewURLProvider }
         }
     }
+    var textImagePlaceholderURLProvider: ((UUID, Int) -> URL?)? {
+        didSet {
+            scrollViews.forEach { $0.terminalView.textImagePlaceholderURLProvider = textImagePlaceholderURLProvider }
+        }
+    }
     var onFileDropURLs: ((TerminalController, [URL]) -> Bool)? {
         didSet {
             scrollViews.forEach { $0.terminalView.onFileDropURLs = onFileDropURLs }
@@ -199,6 +204,7 @@ final class SplitTerminalContainerView: NSView {
             scrollView.terminalView.outputFrameThrottlingMode = outputFrameThrottlingMode
             scrollView.terminalView.typewriterSoundEnabled = typewriterSoundEnabled
             scrollView.terminalView.imagePreviewURLProvider = imagePreviewURLProvider
+            scrollView.terminalView.textImagePlaceholderURLProvider = textImagePlaceholderURLProvider
             scrollView.terminalView.onFileDropURLs = onFileDropURLs
             scrollView.terminalView.terminalController = controller
             // Suppress individual rendering after the controller is attached.

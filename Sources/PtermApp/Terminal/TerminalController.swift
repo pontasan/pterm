@@ -29,9 +29,15 @@ final class TerminalController {
     /// Matches a single-quoted absolute path with an image file extension.
     /// Group 1 captures the unquoted path.
     private static let quotedImagePathRegex: NSRegularExpression = {
-        // '/<path>.<ext>' where ext is a common image format.
         let pattern = #"'(/[^']+\.(?:png|jpg|jpeg|gif|bmp|tiff|tif|webp|heic|heif|svg|ico))'"#
         return try! NSRegularExpression(pattern: pattern, options: .caseInsensitive)
+    }()
+
+    /// Matches `[Image #N]` text placeholders emitted by CLI tools (e.g. Claude Code).
+    /// Group 1 captures the numeric index.
+    private static let textImagePlaceholderRegex: NSRegularExpression = {
+        let pattern = #"\[Image #(\d+)\]"#
+        return try! NSRegularExpression(pattern: pattern)
     }()
 
     private struct ViewportRow {
@@ -57,6 +63,13 @@ final class TerminalController {
 
     struct DetectedManagedImageFile: Equatable {
         let url: URL
+        let originalText: String
+        let startCol: Int
+        let endCol: Int
+    }
+
+    struct DetectedTextImagePlaceholder: Equatable {
+        let index: Int
         let originalText: String
         let startCol: Int
         let endCol: Int
@@ -1888,6 +1901,51 @@ final class TerminalController {
 
                 return DetectedManagedImageFile(
                     url: url,
+                    originalText: text.substring(with: match.range),
+                    startCol: startCol,
+                    endCol: endCol
+                )
+            }
+            return nil
+        }
+    }
+
+    /// Detect `[Image #N]` text placeholders in visible terminal output.
+    func detectedTextImagePlaceholder(at position: GridPosition) -> DetectedTextImagePlaceholder? {
+        lock.withReadLock {
+            let rows = visibleRowsLocked()
+            guard position.row >= 0, position.row < rows.count else { return nil }
+
+            let row = rows[position.row]
+            let projection = Self.projectVisibleText(from: row.cells)
+            guard !projection.text.isEmpty,
+                  position.col >= 0,
+                  let characterIndex = projection.characterIndexByColumn[position.col] else {
+                return nil
+            }
+
+            let text = projection.text as NSString
+            let searchRange = NSRange(location: 0, length: text.length)
+            for match in Self.textImagePlaceholderRegex.matches(in: projection.text, options: [], range: searchRange) {
+                guard match.numberOfRanges >= 2,
+                      NSLocationInRange(characterIndex, match.range),
+                      let indexRange = Range(match.range(at: 1), in: projection.text) else {
+                    continue
+                }
+
+                guard let index = Int(projection.text[indexRange]), index > 0 else {
+                    continue
+                }
+
+                let matchStart = match.range.location
+                let matchEnd = matchStart + match.range.length - 1
+                guard let startCol = projection.columnByCharacterIndex[matchStart],
+                      let endCol = projection.columnByCharacterIndex[matchEnd] else {
+                    continue
+                }
+
+                return DetectedTextImagePlaceholder(
+                    index: index,
                     originalText: text.substring(with: match.range),
                     startCol: startCol,
                     endCol: endCol

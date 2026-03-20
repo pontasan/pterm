@@ -117,8 +117,10 @@ final class TerminalView: MTKView, NSTextInputClient {
     var cmdClickTooltip: String? {
         didSet { toolTip = cmdClickTooltip }
     }
-    /// Resolves terminal `[Image #x]` placeholders to locally stored pasted images.
+    /// Resolves Kitty graphics protocol `[Image #x]` placeholders to locally stored images.
     var imagePreviewURLProvider: ((UUID, Int) -> URL?)?
+    /// Resolves text-based `[Image #N]` placeholders to pasted image URLs.
+    var textImagePlaceholderURLProvider: ((UUID, Int) -> URL?)?
     /// Routes dropped files through the same managed-file pipeline as paste.
     var onFileDropURLs: ((TerminalController, [URL]) -> Bool)?
 
@@ -1301,6 +1303,31 @@ final class TerminalView: MTKView, NSTextInputClient {
             hoveredManagedImageFile = managedImageFile
             if hoverChanged || imagePreviewWindow == nil {
                 guard let image = NSImage(contentsOf: managedImageFile.url) else {
+                    hideImagePreview()
+                    return
+                }
+                showImagePreview(image, for: event)
+            } else {
+                positionImagePreview(near: event)
+            }
+            return
+        }
+
+        // Detect [Image #N] text placeholders (e.g. from Claude Code CLI).
+        if let textPlaceholder = controller.detectedTextImagePlaceholder(at: position),
+           let imageURL = textImagePlaceholderURLProvider?(controller.id, textPlaceholder.index) {
+            let equivalent = TerminalController.DetectedImagePlaceholder(
+                ownerID: controller.id,
+                index: textPlaceholder.index,
+                originalText: textPlaceholder.originalText,
+                startCol: textPlaceholder.startCol,
+                endCol: textPlaceholder.endCol
+            )
+            let hoverChanged = hoveredImagePlaceholder != equivalent || hoveredManagedImageFile != nil
+            hoveredManagedImageFile = nil
+            hoveredImagePlaceholder = equivalent
+            if hoverChanged || imagePreviewWindow == nil {
+                guard let image = NSImage(contentsOf: imageURL) else {
                     hideImagePreview()
                     return
                 }

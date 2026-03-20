@@ -59,11 +59,13 @@ final class ClipboardFileStore {
                                         attributes: [.posixPermissions: 0o700])
         let expirationDate = nowProvider().addingTimeInterval(-24 * 60 * 60)
         let urls = try fileManager.contentsOfDirectory(at: rootDirectory,
-                                                       includingPropertiesForKeys: [.contentModificationDateKey],
+                                                       includingPropertiesForKeys: nil,
                                                        options: [.skipsHiddenFiles])
         for url in urls {
-            let values = try url.resourceValues(forKeys: [.contentModificationDateKey])
-            let modified = values.contentModificationDate ?? .distantPast
+            // Use FileManager.attributesOfItem instead of URL.resourceValues
+            // to avoid stale cached modification dates.
+            let attrs = try fileManager.attributesOfItem(atPath: url.path)
+            let modified = attrs[.modificationDate] as? Date ?? .distantPast
             if modified < expirationDate {
                 try unlinkFile(at: url)
             }
@@ -139,7 +141,12 @@ final class ClipboardFileStore {
         let ext = sourceURL.pathExtension
         let destination = try uniqueDestinationURL(preferredExtension: ext)
         try fileManager.copyItem(at: sourceURL, to: destination)
-        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+        // Touch mtime so the 24-hour expiry counts from import time,
+        // not from the source file's original modification date.
+        try fileManager.setAttributes([
+            .posixPermissions: 0o600,
+            .modificationDate: nowProvider()
+        ], ofItemAtPath: destination.path)
         return destination
     }
 
