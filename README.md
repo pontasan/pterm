@@ -50,7 +50,7 @@ See all running terminals at a glance in the overview grid. Click to focus, Shif
 
 ## Bounded Memory — Stay Stable Under Heavy Output
 
-Most terminals eat memory without limit when streaming logs. pterm caps scrollback automatically — run `tail -F` on a busy log for hours and memory stays flat. No bloat, no slowdown, no OOM surprises.
+pterm caps scrollback automatically — run `tail -F` for hours and memory stays flat. No bloat, no slowdown, no OOM surprises.
 
 ![Stable memory under tail -F](Resources/pterm7.gif)
 
