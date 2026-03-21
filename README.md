@@ -1,6 +1,6 @@
 # pterm
 
-**The ultimate terminal for the AI era — seamlessly integrated with AI, built entirely by AI.**
+**A terminal built for the AI era — seamlessly integrated with AI, built entirely by AI.**
 
 Analyze logs, get instant explanations, ask questions — all without leaving the terminal. pterm integrates with Claude Code, Codex, and Gemini so that AI assistance is always one right-click away.
 
