@@ -167,6 +167,47 @@ struct MCPServerConfiguration: Equatable {
     }
 }
 
+enum AIModelType: String, Equatable, CaseIterable {
+    case claudeCode = "claude_code"
+    case codex = "codex"
+    case gemini = "gemini"
+
+    var displayName: String {
+        switch self {
+        case .claudeCode: return "Claude Code"
+        case .codex: return "Codex"
+        case .gemini: return "Gemini"
+        }
+    }
+
+    init?(configuredValue: String) {
+        self.init(rawValue: configuredValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
+    var configuredValue: String { rawValue }
+}
+
+struct AIConfiguration: Equatable {
+    let enabled: Bool
+    let language: String
+    let model: AIModelType
+
+    /// Resolve the user's actual system language, bypassing the app bundle's
+    /// localization table which can override `Locale.current` in GUI apps.
+    static var defaultLanguage: String {
+        if let preferred = Locale.preferredLanguages.first {
+            return Locale(identifier: preferred).identifier
+        }
+        return Locale.current.identifier
+    }
+
+    static let `default` = AIConfiguration(
+        enabled: true,
+        language: defaultLanguage,
+        model: .claudeCode
+    )
+}
+
 struct PtermConfig {
     let term: String
     let textEncoding: TerminalTextEncoding
@@ -181,6 +222,7 @@ struct PtermConfig {
     let audit: AuditConfiguration
     let security: SecurityConfiguration
     let mcpServer: MCPServerConfiguration
+    let ai: AIConfiguration
     let shortcuts: ShortcutConfiguration
     let workspaces: [ConfiguredWorkspace]
 
@@ -198,6 +240,7 @@ struct PtermConfig {
         audit: .disabled,
         security: .default,
         mcpServer: .default,
+        ai: .default,
         shortcuts: .default,
         workspaces: []
     )
@@ -302,6 +345,7 @@ enum PtermConfigStore {
         let audit = dictionaryValue(root["audit"])
         let security = dictionaryValue(root["security"])
         let mcpServer = dictionaryValue(root["mcp_server"])
+        let aiSection = dictionaryValue(root["ai"])
         let shortcuts = dictionaryValue(root["shortcuts"])
         let shells = dictionaryValue(root["shells"])
         let textInteraction = dictionaryValue(root["text_interaction"])
@@ -352,6 +396,11 @@ enum PtermConfigStore {
             mcpServer: MCPServerConfiguration(
                 enabled: boolValue(mcpServer?["enabled"]) ?? defaults.mcpServer.enabled,
                 port: MCPServerConfiguration.normalizedPort(intValue(mcpServer?["port"]) ?? defaults.mcpServer.port)
+            ),
+            ai: AIConfiguration(
+                enabled: boolValue(aiSection?["enabled"]) ?? defaults.ai.enabled,
+                language: stringValue(aiSection?["language"]) ?? defaults.ai.language,
+                model: stringValue(aiSection?["model"]).flatMap(AIModelType.init(configuredValue:)) ?? defaults.ai.model
             ),
             shortcuts: ShortcutParser.parseMap(shortcuts?.compactMapValues(stringValue)),
             workspaces: workspaces

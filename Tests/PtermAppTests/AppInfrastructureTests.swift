@@ -2581,6 +2581,335 @@ final class AppInfrastructureTests: XCTestCase {
         pty.debugPrimeReadBufferCapacity(128)
         XCTAssertEqual(pty.debugReadBufferCapacity, 4096)
     }
+
+    // MARK: - AI Configuration
+
+    func testAIModelTypeRawValueRoundTrips() {
+        for model in AIModelType.allCases {
+            XCTAssertEqual(AIModelType(rawValue: model.rawValue), model)
+        }
+    }
+
+    func testAIModelTypeConfiguredValueRoundTrips() {
+        for model in AIModelType.allCases {
+            XCTAssertEqual(AIModelType(configuredValue: model.configuredValue), model)
+        }
+    }
+
+    func testAIModelTypeConfiguredValueIsCaseInsensitive() {
+        XCTAssertEqual(AIModelType(configuredValue: "CLAUDE_CODE"), .claudeCode)
+        XCTAssertEqual(AIModelType(configuredValue: "Codex"), .codex)
+        XCTAssertEqual(AIModelType(configuredValue: " GEMINI "), .gemini)
+    }
+
+    func testAIModelTypeRejectsInvalidConfiguredValue() {
+        XCTAssertNil(AIModelType(configuredValue: "cursor"))
+        XCTAssertNil(AIModelType(configuredValue: ""))
+        XCTAssertNil(AIModelType(configuredValue: "gpt4"))
+    }
+
+    func testAIModelTypeAllCasesContainsExactlyThreeModels() {
+        XCTAssertEqual(AIModelType.allCases.count, 3)
+        XCTAssertTrue(AIModelType.allCases.contains(.claudeCode))
+        XCTAssertTrue(AIModelType.allCases.contains(.codex))
+        XCTAssertTrue(AIModelType.allCases.contains(.gemini))
+    }
+
+    func testAIModelTypeDisplayNames() {
+        XCTAssertEqual(AIModelType.claudeCode.displayName, "Claude Code")
+        XCTAssertEqual(AIModelType.codex.displayName, "Codex")
+        XCTAssertEqual(AIModelType.gemini.displayName, "Gemini")
+    }
+
+    func testAIConfigurationDefaultsEnabledWithClaudeCode() {
+        let config = AIConfiguration.default
+        XCTAssertTrue(config.enabled)
+        XCTAssertEqual(config.model, .claudeCode)
+    }
+
+    func testAIConfigurationDefaultLanguageUsesPreferredLanguages() {
+        let defaultLang = AIConfiguration.defaultLanguage
+        XCTAssertFalse(defaultLang.isEmpty)
+        // It should derive from preferredLanguages, not Locale.current (which is bundle-dependent)
+        let preferred = Locale.preferredLanguages.first ?? "en"
+        let expected = Locale(identifier: preferred).identifier
+        XCTAssertEqual(defaultLang, expected)
+    }
+
+    func testPtermConfigStoreDefaultsAIToEnabledClaudeCode() {
+        let loaded = PtermConfigStore.load(from: URL(fileURLWithPath: "/nonexistent/config.json"))
+        XCTAssertEqual(loaded.ai, .default)
+        XCTAssertTrue(loaded.ai.enabled)
+        XCTAssertEqual(loaded.ai.model, .claudeCode)
+    }
+
+    func testPtermConfigStoreLoadsAISettings() throws {
+        try withTemporaryPtermConfig { configURL in
+            let json: [String: Any] = [
+                "ai": [
+                    "enabled": false,
+                    "language": "fr",
+                    "model": "gemini"
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try AtomicFileWriter.write(data, to: configURL, permissions: 0o600)
+
+            let loaded = PtermConfigStore.load(from: configURL)
+            XCTAssertFalse(loaded.ai.enabled)
+            XCTAssertEqual(loaded.ai.language, "fr")
+            XCTAssertEqual(loaded.ai.model, .gemini)
+        }
+    }
+
+    func testPtermConfigStoreLoadsAIModelCodex() throws {
+        try withTemporaryPtermConfig { configURL in
+            let json: [String: Any] = [
+                "ai": ["model": "codex"]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try AtomicFileWriter.write(data, to: configURL, permissions: 0o600)
+
+            let loaded = PtermConfigStore.load(from: configURL)
+            XCTAssertEqual(loaded.ai.model, .codex)
+        }
+    }
+
+    func testPtermConfigStoreDefaultsAIOnInvalidModel() throws {
+        try withTemporaryPtermConfig { configURL in
+            let json: [String: Any] = [
+                "ai": ["model": "invalid_model"]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try AtomicFileWriter.write(data, to: configURL, permissions: 0o600)
+
+            let loaded = PtermConfigStore.load(from: configURL)
+            XCTAssertEqual(loaded.ai.model, .claudeCode)
+        }
+    }
+
+    func testPtermConfigStoreDefaultsAIOnMissingSection() throws {
+        try withTemporaryPtermConfig { configURL in
+            let json: [String: Any] = ["term": "xterm-256color"]
+            let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try AtomicFileWriter.write(data, to: configURL, permissions: 0o600)
+
+            let loaded = PtermConfigStore.load(from: configURL)
+            XCTAssertTrue(loaded.ai.enabled)
+            XCTAssertEqual(loaded.ai.model, .claudeCode)
+        }
+    }
+
+    func testPtermConfigStoreLoadsPartialAISection() throws {
+        try withTemporaryPtermConfig { configURL in
+            let json: [String: Any] = [
+                "ai": ["language": "ko"]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try AtomicFileWriter.write(data, to: configURL, permissions: 0o600)
+
+            let loaded = PtermConfigStore.load(from: configURL)
+            XCTAssertTrue(loaded.ai.enabled)
+            XCTAssertEqual(loaded.ai.language, "ko")
+            XCTAssertEqual(loaded.ai.model, .claudeCode)
+        }
+    }
+
+    // MARK: - AIService Prompt Building
+
+    func testAIServiceBuildPromptIncludesLanguageInstructionAndQuestion() {
+        let prompt = AIService.buildPrompt(
+            question: "What is this?",
+            language: "ja",
+            context: nil,
+            chatHistory: []
+        )
+        XCTAssertTrue(prompt.contains("MUST respond entirely in"))
+        XCTAssertTrue(prompt.contains("User question: What is this?"))
+        XCTAssertTrue(prompt.contains("REMINDER"))
+    }
+
+    func testAIServiceBuildPromptUsesNSLocaleForSelfLocalizedName() {
+        let prompt = AIService.buildPrompt(
+            question: "test",
+            language: "ja",
+            context: nil,
+            chatHistory: []
+        )
+        // Must contain the self-localized name "日本語" (not "Japanese" alone)
+        XCTAssertTrue(prompt.contains("日本語"), "Prompt must contain self-localized language name via NSLocale, got: \(prompt.prefix(200))")
+    }
+
+    func testAIServiceBuildPromptIncludesEnglishLanguageNameForClarity() {
+        let prompt = AIService.buildPrompt(
+            question: "test",
+            language: "ja",
+            context: nil,
+            chatHistory: []
+        )
+        XCTAssertTrue(prompt.contains("Japanese"), "Prompt must include English name for unambiguous identification")
+    }
+
+    func testAIServiceBuildPromptForEnglishDoesNotDuplicateLanguageName() {
+        let prompt = AIService.buildPrompt(
+            question: "test",
+            language: "en",
+            context: nil,
+            chatHistory: []
+        )
+        // For English, self name == english name, so no parenthesized duplicate
+        XCTAssertTrue(prompt.contains("English"))
+        XCTAssertFalse(prompt.contains("English (English)"))
+    }
+
+    func testAIServiceBuildPromptIncludesTerminalContext() {
+        let context = AIService.TerminalContext(
+            workingDirectory: "/Users/test/project",
+            foregroundProcess: "vim",
+            viewportText: "hello world"
+        )
+        let prompt = AIService.buildPrompt(
+            question: "help",
+            language: "en",
+            context: context,
+            chatHistory: []
+        )
+        XCTAssertTrue(prompt.contains("/Users/test/project"))
+        XCTAssertTrue(prompt.contains("vim"))
+        XCTAssertTrue(prompt.contains("hello world"))
+    }
+
+    func testAIServiceBuildPromptOmitsEmptyForegroundProcess() {
+        let context = AIService.TerminalContext(
+            workingDirectory: "/tmp",
+            foregroundProcess: "",
+            viewportText: ""
+        )
+        let prompt = AIService.buildPrompt(
+            question: "test",
+            language: "en",
+            context: context,
+            chatHistory: []
+        )
+        XCTAssertFalse(prompt.contains("Running process"))
+    }
+
+    func testAIServiceBuildPromptIncludesChatHistory() {
+        let history: [(role: String, content: String)] = [
+            (role: "user", content: "previous question"),
+            (role: "assistant", content: "previous answer")
+        ]
+        let prompt = AIService.buildPrompt(
+            question: "follow up",
+            language: "en",
+            context: nil,
+            chatHistory: history
+        )
+        XCTAssertTrue(prompt.contains("Conversation history"))
+        XCTAssertTrue(prompt.contains("User: previous question"))
+        XCTAssertTrue(prompt.contains("Assistant: previous answer"))
+        XCTAssertTrue(prompt.contains("User question: follow up"))
+    }
+
+    func testAIServiceBuildSummarizePromptIncludesSelectedText() {
+        let prompt = AIService.buildSummarizePrompt(
+            selectedText: "error: segfault at 0x0",
+            language: "ja",
+            context: nil
+        )
+        XCTAssertTrue(prompt.contains("error: segfault at 0x0"))
+        XCTAssertTrue(prompt.contains("Analyze and summarize"))
+        XCTAssertTrue(prompt.contains("日本語"))
+    }
+
+    func testAIServiceBuildSummarizePromptLanguageEnforced() {
+        let prompt = AIService.buildSummarizePrompt(
+            selectedText: "test output",
+            language: "zh_CN",
+            context: nil
+        )
+        // Must contain Chinese self-name
+        XCTAssertTrue(prompt.contains("中文"), "Prompt must contain self-localized Chinese name")
+        // Language instruction appears at top AND bottom
+        let reminderCount = prompt.components(separatedBy: "MUST").count - 1
+        XCTAssertGreaterThanOrEqual(reminderCount, 2, "Language instruction must appear at top and bottom")
+    }
+
+    func testAIServiceBuildPromptLanguageEnforcedAtTopAndBottom() {
+        let prompt = AIService.buildPrompt(
+            question: "help",
+            language: "ko",
+            context: nil,
+            chatHistory: []
+        )
+        // Check "MUST" appears in both IMPORTANT and REMINDER lines
+        XCTAssertTrue(prompt.hasPrefix("IMPORTANT:"))
+        XCTAssertTrue(prompt.contains("REMINDER:"))
+        XCTAssertTrue(prompt.contains("한국어"), "Prompt must contain self-localized Korean name")
+    }
+
+    // MARK: - AIService Error Descriptions
+
+    func testAIErrorCLINotFoundIncludesModelName() {
+        let error = AIService.AIError.cliNotFound(.claudeCode)
+        XCTAssertTrue(error.description.contains("Claude Code"))
+
+        let error2 = AIService.AIError.cliNotFound(.gemini)
+        XCTAssertTrue(error2.description.contains("Gemini"))
+    }
+
+    func testAIErrorDisabledSuggestsSettings() {
+        let error = AIService.AIError.aiDisabled
+        XCTAssertTrue(error.description.contains("Settings"))
+    }
+
+    func testAIErrorProcessTerminatedIncludesExitCode() {
+        let error = AIService.AIError.processTerminated(42)
+        XCTAssertTrue(error.description.contains("42"))
+    }
+
+    // MARK: - TerminalController Viewport Text
+
+    func testTerminalControllerViewportTextReturnsStringWithinMaxLines() {
+        let controller = TerminalController(
+            rows: 10, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+
+        let text = controller.viewportText(maxLines: 3)
+        let lineCount = text.components(separatedBy: "\n").count
+        XCTAssertLessThanOrEqual(lineCount, 3)
+    }
+
+    func testTerminalControllerViewportTextDefaultMaxIs100() {
+        let controller = TerminalController(
+            rows: 4, cols: 10,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        // Default maxLines=100, with only 4 rows, should return at most 4 lines
+        let text = controller.viewportText()
+        let lineCount = text.components(separatedBy: "\n").count
+        XCTAssertLessThanOrEqual(lineCount, 4)
+    }
+
+    func testTerminalControllerWorkingDirectoryPathExposesExpandedPath() {
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13,
+            initialDirectory: "~"
+        )
+        let path = controller.workingDirectoryPath
+        XCTAssertFalse(path.isEmpty)
+        // Expanded path should not contain tilde
+        XCTAssertFalse(path.hasPrefix("~"))
+        XCTAssertTrue(path.hasPrefix("/"))
+    }
 }
 
 private func encryptedNotePayloadForTest(plaintext: Data, key: Data) throws -> Data {

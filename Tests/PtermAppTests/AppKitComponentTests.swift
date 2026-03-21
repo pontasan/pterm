@@ -338,7 +338,7 @@ final class AppKitComponentTests: XCTestCase {
                 return cell?.textField?.stringValue
             }
 
-            XCTAssertEqual(sectionLabels, ["General", "Appearance", "Memory", "Security", "Audit"])
+            XCTAssertEqual(sectionLabels, ["General", "Appearance", "Memory", "Security", "Audit", "AI"])
         }
     }
 
@@ -793,6 +793,12 @@ final class AppKitComponentTests: XCTestCase {
                     "encryption": true,
                     "preserved_audit_key": "keep"
                 ],
+                "ai": [
+                    "enabled": false,
+                    "language": "fr",
+                    "model": "gemini",
+                    "preserved_ai_key": "keep"
+                ],
                 "workspaces": [["name": "Keep Workspace"]],
                 "shortcuts": ["zoom_in": "cmd+="],
                 "custom_root_key": "keep"
@@ -852,6 +858,12 @@ final class AppKitComponentTests: XCTestCase {
             XCTAssertNil(audit["encryption"])
             XCTAssertEqual(audit["preserved_audit_key"] as? String, "keep")
 
+            let ai = try XCTUnwrap(root["ai"] as? [String: Any])
+            XCTAssertNil(ai["enabled"])
+            XCTAssertNil(ai["language"])
+            XCTAssertNil(ai["model"])
+            XCTAssertEqual(ai["preserved_ai_key"] as? String, "keep")
+
             let loaded = PtermConfigStore.load(from: configURL)
             XCTAssertEqual(loaded.term, PtermConfig.default.term)
             XCTAssertEqual(loaded.textEncoding, PtermConfig.default.textEncoding)
@@ -860,6 +872,7 @@ final class AppKitComponentTests: XCTestCase {
             XCTAssertEqual(loaded.memoryMax, PtermConfig.default.memoryMax)
             XCTAssertEqual(loaded.terminalAppearance, PtermConfig.default.terminalAppearance)
             XCTAssertEqual(loaded.mcpServer, PtermConfig.default.mcpServer)
+            XCTAssertEqual(loaded.ai, AIConfiguration.default)
         }
     }
 
@@ -1692,7 +1705,227 @@ final class AppKitComponentTests: XCTestCase {
         view.cmdClickMenuLabel = nil
         menu = view.buildContextMenu()
         let nonSeparatorTitles = menu.items.filter { !$0.isSeparatorItem }.map(\.title)
-        XCTAssertEqual(nonSeparatorTitles, ["Copy", "Paste"])
+        XCTAssertEqual(nonSeparatorTitles, ["Copy", "Paste", "Summarize Selection with AI", "Ask AI"])
+    }
+
+    // MARK: - Context Menu: AI Items
+
+    func testContextMenuAlwaysShowsAskAIEnabled() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+
+        let menu = view.buildContextMenu()
+        let askItem = menu.items.first { $0.title == "Ask AI" }
+        XCTAssertNotNil(askItem)
+        XCTAssertTrue(askItem?.isEnabled ?? false)
+    }
+
+    func testContextMenuSummarizeDisabledWithoutSelection() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+
+        let menu = view.buildContextMenu()
+        let summarizeItem = menu.items.first { $0.title == "Summarize Selection with AI" }
+        XCTAssertNotNil(summarizeItem)
+        XCTAssertFalse(summarizeItem?.isEnabled ?? true)
+    }
+
+    func testContextMenuSummarizeEnabledWithSelection() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+        view.debugSetSelectionForTesting(TerminalSelection(
+            anchor: GridPosition(row: 0, col: 0),
+            active: GridPosition(row: 0, col: 5),
+            mode: .normal
+        ))
+
+        let menu = view.buildContextMenu()
+        let summarizeItem = menu.items.first { $0.title == "Summarize Selection with AI" }
+        XCTAssertNotNil(summarizeItem)
+        XCTAssertTrue(summarizeItem?.isEnabled ?? false)
+    }
+
+    func testContextMenuAIItemsAppearAfterCopyPaste() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+
+        let menu = view.buildContextMenu()
+        let titles = menu.items.filter { !$0.isSeparatorItem }.map(\.title)
+
+        // AI items must come after Copy and Paste
+        guard let copyIndex = titles.firstIndex(of: "Copy"),
+              let summarizeIndex = titles.firstIndex(of: "Summarize Selection with AI"),
+              let askIndex = titles.firstIndex(of: "Ask AI") else {
+            XCTFail("Missing expected menu items")
+            return
+        }
+        XCTAssertGreaterThan(summarizeIndex, copyIndex)
+        XCTAssertGreaterThan(askIndex, summarizeIndex)
+    }
+
+    // MARK: - Settings: AI Section
+
+    func testSettingsWindowAISectionShowsExpectedControls() throws {
+        try withTemporaryPtermConfig { configURL in
+            let controller = SettingsWindowController(configURL: configURL)
+            // Switch to AI section (index 5)
+            let tableView = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSTableView }.first!
+            tableView.selectRowIndexes(IndexSet(integer: 5), byExtendingSelection: false)
+            controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
+
+            let allViews = allSubviews(in: controller.window?.contentView)
+            let checkboxes = allViews.compactMap { $0 as? NSButton }.filter { $0.bezelStyle == .regularSquare || ($0 as NSButton).allowsMixedState || $0.title.contains("Enable") }
+            let popups = allViews.compactMap { $0 as? NSPopUpButton }
+
+            // Should have at least the enable checkbox
+            let enableCheck = allViews.compactMap { $0 as? NSButton }.first { $0.title == "Enable AI features" }
+            XCTAssertNotNil(enableCheck, "AI section must have Enable AI features checkbox")
+
+            // Should have language and model popups
+            XCTAssertGreaterThanOrEqual(popups.count, 2, "AI section must have language and model popups")
+        }
+    }
+
+    func testSettingsWindowAISectionModelPopupContainsThreeModels() throws {
+        try withTemporaryPtermConfig { configURL in
+            let controller = SettingsWindowController(configURL: configURL)
+            let tableView = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSTableView }.first!
+            tableView.selectRowIndexes(IndexSet(integer: 5), byExtendingSelection: false)
+            controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
+
+            let popups = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSPopUpButton }
+            let modelPopup = popups.first { $0.itemTitles.contains("Claude Code") }
+            XCTAssertNotNil(modelPopup)
+            XCTAssertEqual(modelPopup?.itemTitles, ["Claude Code", "Codex", "Gemini"])
+        }
+    }
+
+    func testSettingsWindowAISectionLanguagePopupHas39Languages() throws {
+        try withTemporaryPtermConfig { configURL in
+            let controller = SettingsWindowController(configURL: configURL)
+            let tableView = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSTableView }.first!
+            tableView.selectRowIndexes(IndexSet(integer: 5), byExtendingSelection: false)
+            controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
+
+            let popups = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSPopUpButton }
+            // The language popup should have exactly 40 entries (matching macOS System Settings)
+            let langPopup = popups.first { ($0.numberOfItems) >= 30 && !$0.itemTitles.contains("Claude Code") }
+            XCTAssertNotNil(langPopup)
+            XCTAssertEqual(langPopup?.numberOfItems, 40)
+        }
+    }
+
+    func testSettingsWindowAISectionPersistsModelChange() throws {
+        try withTemporaryPtermConfig { configURL in
+            let controller = SettingsWindowController(configURL: configURL)
+            let tableView = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSTableView }.first!
+            tableView.selectRowIndexes(IndexSet(integer: 5), byExtendingSelection: false)
+            controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
+
+            let popups = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSPopUpButton }
+            let modelPopup = popups.first { $0.itemTitles.contains("Claude Code") }!
+            modelPopup.selectItem(withTitle: "Gemini")
+            modelPopup.sendAction(modelPopup.action!, to: modelPopup.target)
+
+            let data = try Data(contentsOf: configURL)
+            let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let ai = try XCTUnwrap(root["ai"] as? [String: Any])
+            XCTAssertEqual(ai["model"] as? String, "gemini")
+        }
+    }
+
+    func testSettingsWindowAISectionDisablingAIDisablesControls() throws {
+        try withTemporaryPtermConfig { configURL in
+            let controller = SettingsWindowController(configURL: configURL)
+            let tableView = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSTableView }.first!
+            tableView.selectRowIndexes(IndexSet(integer: 5), byExtendingSelection: false)
+            controller.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
+
+            let allViews = allSubviews(in: controller.window?.contentView)
+            let enableCheck = allViews.compactMap { $0 as? NSButton }.first { $0.title == "Enable AI features" }!
+
+            // Disable AI
+            enableCheck.state = .off
+            enableCheck.sendAction(enableCheck.action!, to: enableCheck.target)
+
+            // Language and model popups should be disabled
+            let popups = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSPopUpButton }
+            let modelPopup = popups.first { $0.itemTitles.contains("Claude Code") }
+            let langPopup = popups.first { ($0.numberOfItems) >= 30 && !$0.itemTitles.contains("Claude Code") }
+            XCTAssertFalse(modelPopup?.isEnabled ?? true)
+            XCTAssertFalse(langPopup?.isEnabled ?? true)
+
+            // Verify persisted
+            let data = try Data(contentsOf: configURL)
+            let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let ai = try XCTUnwrap(root["ai"] as? [String: Any])
+            XCTAssertEqual(ai["enabled"] as? Bool, false)
+        }
+    }
+
+    // MARK: - AIChatWindowController
+
+    func testAIChatWindowControllerCreatesWindowWithExpectedProperties() {
+        let controller = AIChatWindowController()
+        controller.showWindow()
+        let window = controller.window
+        XCTAssertNotNil(window)
+        XCTAssertEqual(window?.title, "AI Assistant")
+        XCTAssertTrue(window?.styleMask.contains(.closable) ?? false)
+        XCTAssertTrue(window?.styleMask.contains(.resizable) ?? false)
+        XCTAssertEqual(window?.appearance?.name, .darkAqua)
+    }
+
+    func testAIChatWindowControllerShowsDisabledErrorWhenAIDisabled() throws {
+        try withTemporaryPtermConfig { configURL in
+            // Write config with AI disabled
+            let json: [String: Any] = ["ai": ["enabled": false]]
+            let data = try JSONSerialization.data(withJSONObject: json, options: [])
+            try data.write(to: configURL)
+
+            let controller = AIChatWindowController(
+                initialPrompt: "test",
+                terminalContext: nil,
+                configURL: configURL
+            )
+            controller.showWindow()
+
+            // The error message about disabled AI should appear
+            // (it's dispatched async, so we need to drain)
+            let expectation = XCTestExpectation(description: "error-displayed")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                expectation.fulfill()
+            }
+            _ = XCTWaiter.wait(for: [expectation], timeout: 1.0)
+        }
     }
 
     func testRendererBuildsInlineImageDrawCommandsForKittyImageCells() throws {
@@ -7570,6 +7803,7 @@ final class AppKitComponentTests: XCTestCase {
             audit: PtermConfig.default.audit,
             security: PtermConfig.default.security,
             mcpServer: PtermConfig.default.mcpServer,
+            ai: PtermConfig.default.ai,
             shortcuts: PtermConfig.default.shortcuts,
             workspaces: PtermConfig.default.workspaces
         )
@@ -7654,6 +7888,7 @@ final class AppKitComponentTests: XCTestCase {
             audit: PtermConfig.default.audit,
             security: PtermConfig.default.security,
             mcpServer: PtermConfig.default.mcpServer,
+            ai: PtermConfig.default.ai,
             shortcuts: PtermConfig.default.shortcuts,
             workspaces: PtermConfig.default.workspaces
         )

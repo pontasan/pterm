@@ -178,9 +178,14 @@ final class TerminalController {
     /// Whether this terminal is transient and must never be restored from session persistence.
     let isTransient: Bool
 
-    /// Current working directory
+    /// Current working directory display name
     private(set) var currentDirectory: String = "~"
     private var currentDirectoryPath: String
+
+    /// Full path to the current working directory
+    var workingDirectoryPath: String {
+        lock.withReadLock { currentDirectoryPath }
+    }
 
     /// Whether this terminal is still alive
     var isAlive: Bool { pty.isRunning }
@@ -1809,6 +1814,54 @@ final class TerminalController {
                         }
                     } else {
                         Self.appendCells(in: cells, from: 0, through: maxColumn, to: &result)
+                    }
+                }
+
+                return result
+            }
+        }
+    }
+
+    /// Extract visible viewport text, limited to the specified maximum number of lines.
+    func viewportText(maxLines: Int = 100) -> String {
+        lock.withReadLock {
+            let dimensions = visibleGridDimensionsLocked()
+            let rows = dimensions.rows
+            let cols = dimensions.cols
+            guard rows > 0, cols > 0 else { return "" }
+
+            let linesToExtract = min(maxLines, rows)
+            let scrollbackCount = scrollback.rowCount
+            let offset = scrollOffset
+            let firstVisibleAbsoluteRow = offset > 0
+                ? max(0, scrollbackCount - offset)
+                : scrollbackCount
+
+            return extractionScratchLock.withLock {
+                var result = ""
+                result.reserveCapacity(linesToExtract * cols)
+                textExtractionGridRowBuffer.reserveCapacity(cols)
+                textExtractionScrollbackRowBuffer.reserveCapacity(cols)
+
+                for i in 0..<linesToExtract {
+                    let absoluteRow = firstVisibleAbsoluteRow + i
+                    let cells: [Cell]
+                    if absoluteRow < scrollbackCount {
+                        _ = scrollback.getRow(at: absoluteRow, into: &textExtractionScrollbackRowBuffer)
+                        cells = textExtractionScrollbackRowBuffer
+                    } else {
+                        let gridRow = absoluteRow - scrollbackCount
+                        textExtractionGridRowBuffer.removeAll(keepingCapacity: true)
+                        textExtractionGridRowBuffer.append(contentsOf: model.grid.rowCells(gridRow))
+                        cells = textExtractionGridRowBuffer
+                    }
+
+                    let maxColumn = max(cols - 1, 0)
+                    if let textEndColumn = Self.lastNonSpaceColumn(in: cells, through: maxColumn) {
+                        Self.appendCells(in: cells, from: 0, through: textEndColumn, to: &result)
+                    }
+                    if i < linesToExtract - 1 {
+                        result.append("\n")
                     }
                 }
 

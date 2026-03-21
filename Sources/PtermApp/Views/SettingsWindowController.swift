@@ -32,6 +32,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         case memory
         case security
         case audit
+        case ai
 
         var title: String {
             switch self {
@@ -40,6 +41,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             case .memory: return "Memory"
             case .security: return "Security"
             case .audit: return "Audit"
+            case .ai: return "AI"
             }
         }
 
@@ -50,6 +52,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             case .memory: return "memorychip"
             case .security: return "lock.shield"
             case .audit: return "doc.text.magnifyingglass"
+            case .ai: return "brain"
             }
         }
     }
@@ -96,6 +99,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var retentionField: NSTextField?
     private var encryptCheck: NSButton?
     private var factoryResetButton: NSButton?
+    private var aiEnabledCheck: NSButton?
+    private var aiLanguagePopup: NSPopUpButton?
+    private var aiModelPopup: NSPopUpButton?
 
     init(configURL: URL = PtermDirectories.config) {
         self.configURL = configURL
@@ -210,6 +216,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             "retention_days",
             "encryption"
         ])
+        resetSection("ai", removing: [
+            "enabled",
+            "language",
+            "model"
+        ])
 
         return reset
     }
@@ -308,6 +319,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         case .memory: buildMemory(addView: addView, addSpacing: addSpacing, width: contentWidth)
         case .security: buildSecurity(addView: addView, addSpacing: addSpacing, width: contentWidth)
         case .audit: buildAudit(addView: addView, addSpacing: addSpacing, width: contentWidth)
+        case .ai: buildAI(addView: addView, addSpacing: addSpacing, width: contentWidth)
         }
 
         y += contentPadding
@@ -747,6 +759,129 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         addView(encrypt, 22)
     }
 
+    // MARK: - Section: AI
+
+    private static let sortedLocaleIdentifiers: [(identifier: String, displayName: String)] = {
+        // Matches the exact language list from macOS System Settings
+        // (derived from System Settings.app/Contents/Resources/*.lproj).
+        let languages = [
+            "ar", "ca", "cs", "da", "de", "el",
+            "en", "en_AU", "en_GB",
+            "es", "es_419", "fi", "fr", "fr_CA",
+            "he", "hi", "hr", "hu", "id", "it", "ja", "ko", "ms",
+            "nl", "no", "pl", "pt_BR", "pt_PT",
+            "ro", "ru", "sk", "sl", "sv", "th", "tr", "uk", "vi",
+            "zh_CN", "zh_HK", "zh_TW"
+        ]
+        let englishLocale = NSLocale(localeIdentifier: "en_US")
+        var entries: [(identifier: String, displayName: String)] = languages.map { id in
+            let selfLocale = NSLocale(localeIdentifier: id)
+            let selfName = selfLocale.displayName(forKey: .identifier, value: id) ?? id
+            let engName = englishLocale.displayName(forKey: .identifier, value: id) ?? id
+            let display = (selfName == engName) ? engName : "\(selfName) (\(engName))"
+            return (identifier: id, displayName: display)
+        }
+        entries.sort { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+        return entries
+    }()
+
+    private func buildAI(addView: (NSView, CGFloat) -> Void, addSpacing: (CGFloat) -> Void, width: CGFloat) {
+        addView(makeSectionTitle("AI"), 28)
+        addSpacing(12)
+
+        let aiSection = (configData["ai"] as? [String: Any]) ?? [:]
+        let enabled = (aiSection["enabled"] as? Bool) ?? AIConfiguration.default.enabled
+
+        let enabledCheck = makeCheckbox("Enable AI features", checked: enabled)
+        enabledCheck.target = self
+        enabledCheck.action = #selector(aiEnabledChanged(_:))
+        aiEnabledCheck = enabledCheck
+        addView(enabledCheck, 22)
+        addSpacing(2)
+        addView(
+            makeDescriptionLabel(
+                "Enable AI-powered features such as text summarization and chat assistance via CLI tools.",
+                width: width
+            ),
+            28
+        )
+        addSpacing(4)
+        addView(
+            makeDescriptionLabel(
+                "AI features require a pre-installed CLI tool (e.g. claude, codex, or gemini). Install the CLI for your chosen model before enabling.",
+                width: width
+            ),
+            32
+        )
+        addSpacing(16)
+
+        // Language selection
+        let locales = Self.sortedLocaleIdentifiers
+        let configuredLanguage = (aiSection["language"] as? String) ?? AIConfiguration.defaultLanguage
+        let languageDisplayNames = locales.map(\.displayName)
+
+        let languageRow = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 28))
+        let langLabel = makeLabel("Language:")
+        langLabel.frame = NSRect(x: 0, y: 4, width: settingsLabelColumnWidth, height: 20)
+        languageRow.addSubview(langLabel)
+
+        let popupX = settingsLabelColumnWidth + settingsControlSpacing
+        let popupWidth = max(200, min(260, width - popupX))
+        let langPopup = NSPopUpButton(frame: NSRect(x: popupX, y: 0, width: popupWidth, height: 28))
+        langPopup.addItems(withTitles: languageDisplayNames)
+
+        // Select the configured language — try exact match, then base language code
+        if let index = locales.firstIndex(where: { $0.identifier == configuredLanguage }) {
+            langPopup.selectItem(at: index)
+        } else {
+            let baseCode = configuredLanguage
+                .replacingOccurrences(of: "_", with: "-")
+                .components(separatedBy: "-").first ?? configuredLanguage
+            if let index = locales.firstIndex(where: { $0.identifier == baseCode }) {
+                langPopup.selectItem(at: index)
+            }
+        }
+        langPopup.target = self
+        langPopup.action = #selector(aiLanguageChanged(_:))
+        langPopup.isEnabled = enabled
+        aiLanguagePopup = langPopup
+        languageRow.addSubview(langPopup)
+        addView(languageRow, 28)
+        addSpacing(2)
+        addView(
+            makeDescriptionLabel(
+                "AI responses will be in this language. Defaults to your system language.",
+                width: width
+            ),
+            16
+        )
+        addSpacing(16)
+
+        // AI Model selection
+        let modelDisplayNames = AIModelType.allCases.map(\.displayName)
+        let configuredModel = (aiSection["model"] as? String)
+            .flatMap(AIModelType.init(configuredValue:)) ?? AIConfiguration.default.model
+        let (modelRow, modelPopup) = makePopupRow(
+            label: "AI Model:",
+            values: modelDisplayNames,
+            current: configuredModel.displayName,
+            width: width
+        )
+        modelPopup.target = self
+        modelPopup.action = #selector(aiModelChanged(_:))
+        modelPopup.isEnabled = enabled
+        aiModelPopup = modelPopup
+        addView(modelRow, 28)
+        addSpacing(2)
+        addView(
+            makeDescriptionLabel(
+                "Select the AI CLI tool to use. The corresponding CLI must be installed on your system.",
+                width: width
+            ),
+            28
+        )
+    }
+
     // MARK: - Actions
 
     @objc private func termChanged(_ sender: NSPopUpButton) {
@@ -983,6 +1118,36 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         }
         audit["encryption"] = (encryptCheck?.state == .on)
         configData["audit"] = audit
+        commitConfigChange()
+    }
+
+    @objc private func aiEnabledChanged(_ sender: NSButton) {
+        let enabled = (sender.state == .on)
+        var ai = (configData["ai"] as? [String: Any]) ?? [:]
+        ai["enabled"] = enabled
+        configData["ai"] = ai
+        aiLanguagePopup?.isEnabled = enabled
+        aiModelPopup?.isEnabled = enabled
+        commitConfigChange()
+    }
+
+    @objc private func aiLanguageChanged(_ sender: NSPopUpButton) {
+        let locales = Self.sortedLocaleIdentifiers
+        let index = sender.indexOfSelectedItem
+        guard locales.indices.contains(index) else { return }
+        var ai = (configData["ai"] as? [String: Any]) ?? [:]
+        ai["language"] = locales[index].identifier
+        configData["ai"] = ai
+        commitConfigChange()
+    }
+
+    @objc private func aiModelChanged(_ sender: NSPopUpButton) {
+        let allModels = AIModelType.allCases
+        let index = sender.indexOfSelectedItem
+        guard allModels.indices.contains(index) else { return }
+        var ai = (configData["ai"] as? [String: Any]) ?? [:]
+        ai["model"] = allModels[index].configuredValue
+        configData["ai"] = ai
         commitConfigChange()
     }
 

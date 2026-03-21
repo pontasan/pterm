@@ -1556,6 +1556,8 @@ final class TerminalView: MTKView, NSTextInputClient {
         NSMenu.popUpContextMenu(buildContextMenu(), with: event, for: self)
     }
 
+    private var aiChatWindowController: AIChatWindowController?
+
     func buildContextMenu() -> NSMenu {
         let menu = NSMenu()
 
@@ -1578,6 +1580,17 @@ final class TerminalView: MTKView, NSTextInputClient {
             menu.addItem(item)
         }
 
+        menu.addItem(.separator())
+
+        let summarizeItem = NSMenuItem(title: "Summarize Selection with AI", action: #selector(performAISummarize(_:)), keyEquivalent: "")
+        summarizeItem.target = self
+        summarizeItem.isEnabled = selection != nil && selection?.isEmpty == false
+        menu.addItem(summarizeItem)
+
+        let askItem = NSMenuItem(title: "Ask AI", action: #selector(performAIAsk(_:)), keyEquivalent: "")
+        askItem.target = self
+        menu.addItem(askItem)
+
         return menu
     }
 
@@ -1591,6 +1604,31 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     @objc private func performContextToggleView(_ sender: Any?) {
         onCmdClick?()
+    }
+
+    private func buildTerminalContext() -> AIService.TerminalContext? {
+        guard let controller = terminalController else { return nil }
+        return AIService.TerminalContext(
+            workingDirectory: controller.workingDirectoryPath,
+            foregroundProcess: controller.foregroundProcessName,
+            viewportText: controller.viewportText(maxLines: 100)
+        )
+    }
+
+    @objc private func performAISummarize(_ sender: Any?) {
+        guard let text = selectedText(), !text.isEmpty else { return }
+        let context = buildTerminalContext()
+        let chatController = AIChatWindowController(terminalContext: context)
+        chatController.showWindow()
+        chatController.sendSummarizeRequest(text)
+        aiChatWindowController = chatController
+    }
+
+    @objc private func performAIAsk(_ sender: Any?) {
+        let context = buildTerminalContext()
+        let chatController = AIChatWindowController(terminalContext: context)
+        chatController.showWindow()
+        aiChatWindowController = chatController
     }
 
     override func otherMouseDown(with event: NSEvent) {
