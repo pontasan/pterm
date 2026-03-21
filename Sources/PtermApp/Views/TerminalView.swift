@@ -3333,11 +3333,9 @@ final class TerminalScrollView: NSScrollView {
 
     func showSearchMatchMap() {
         guard searchMatchMapView == nil else { return }
-        // Add to the scroll view's superview (presentationHostView) to avoid
-        // interfering with either NSScrollView layout or MTKView/CAMetalLayer rendering.
-        guard let host = self.superview else { return }
-        let map = SearchMatchMapView(frame: self.frame)
-        host.addSubview(map, positioned: .above, relativeTo: self)
+        let map = SearchMatchMapView(frame: bounds)
+        map.autoresizingMask = [.width, .height]
+        addSubview(map)
         searchMatchMapView = map
     }
 
@@ -3347,7 +3345,7 @@ final class TerminalScrollView: NSScrollView {
     }
 
     func updateSearchMatchMap(state: SearchMatchMapView.State) {
-        searchMatchMapView?.frame = self.frame
+        searchMatchMapView?.frame = bounds
         searchMatchMapView?.update(state: state)
     }
 
