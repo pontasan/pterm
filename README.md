@@ -1,6 +1,6 @@
 # pterm
 
-**Your terminal, with AI built in.**
+**The ultimate terminal for the AI era — seamlessly integrated with AI, built entirely by AI.**
 
 Analyze logs, get instant explanations, ask questions — all without leaving the terminal. pterm integrates with Claude Code, Codex, and Gemini so that AI assistance is always one right-click away.
 
@@ -32,6 +32,10 @@ Paste or drop an image and pterm saves it to a managed store, inserting the file
 - Responses in **40 languages** matching your macOS language
 - All processing runs through your locally installed CLI — **no data leaves your machine through pterm**
 
+### MCP Server
+
+Built-in [Model Context Protocol](https://modelcontextprotocol.io/) server with 20+ tools. AI agents can list, read, and control terminals programmatically — enabling fully autonomous workflows.
+
 ## One Window, Every Session
 
 See all running terminals at a glance in the overview grid. Click to focus, Shift-select to split. No more window juggling.
@@ -42,8 +46,13 @@ See all running terminals at a glance in the overview grid. Click to focus, Shif
 
 - **Overview grid** — every session, live-updating, in a single view
 - **Split view** — Shift-click to select multiple terminals and work side by side
-- **Bounded memory** — scrollback rolls automatically. `tail -F` all day without watching memory climb
 - **Auto-cleanup** — terminals disappear on exit. Close button to stop a process and remove it
+
+## Bounded Memory — Stay Stable Under Heavy Output
+
+Most terminals eat memory without limit when streaming logs. pterm caps scrollback automatically — run `tail -F` on a busy log for hours and memory stays flat. No bloat, no slowdown, no OOM surprises.
+
+![Stable memory under tail -F](Resources/pterm7.gif)
 
 ## Full IME Support
 
@@ -89,15 +98,23 @@ kitten __benchmark__ --render --repetitions 100
 
 [![Benchmark video](https://img.youtube.com/vi/CV9ufPY-54A/maxresdefault.jpg)](https://www.youtube.com/watch?v=CV9ufPY-54A)
 
+## Terminal Search
 
-## More
+Cmd+F with match highlighting, VS Code-style scrollbar minimap, and circular navigation. Find what you need in thousands of lines of output instantly.
 
-- **Terminal search** — Cmd+F with match highlighting, VS Code-style scrollbar minimap, circular navigation
-- **MCP server** — built-in Model Context Protocol server with 20+ tools for AI agents to list, read, and control terminals programmatically
-- **Terminal compatibility** — VT escape sequences, synchronized updates, double-width/height lines, grapheme clusters, color emoji, inline images, ANSI/256/truecolor
-- **Full IME support** — Japanese and CJK input with correct cursor positioning
-- **CLI modes** — `--cli` for headless bridging, `--command` for transient terminals, `--user-data-dir` for isolated profiles
-- **Security** — zero third-party dependencies, code signed and notarized
+## Terminal Compatibility
+
+Full VT escape sequence support — synchronized updates, double-width/height lines, grapheme clusters, color emoji, inline images, ANSI/256/truecolor. Drop-in replacement for your current terminal.
+
+## CLI Modes
+
+- `--cli` — headless bridging for scripting and automation
+- `--command` — launch a transient terminal that runs a single command
+- `--user-data-dir` — isolated profiles for separate environments
+
+## Security
+
+Zero third-party dependencies. Every line of code is auditable. Code signed and notarized by Apple.
 
 ## Requirements
 
