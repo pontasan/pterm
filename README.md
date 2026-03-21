@@ -1,128 +1,103 @@
 # pterm
 
-**The AI-first terminal emulator for macOS.** Fast, secure, bounded-memory — with built-in AI assistance.
+**Your terminal, with AI built in.**
 
-Built for engineers who keep multiple long-running CLI sessions open at once — agent workflows, log watchers, builds, and interactive shells — all in a single window. With native AI integration, your terminal understands context and speaks your language.
+Analyze logs, get instant explanations, ask questions — all without leaving the terminal. pterm integrates with Claude Code, Codex, and Gemini so that AI assistance is always one right-click away.
 
-![pterm split view](Resources/screenshot.jpg)
+![AI agents running in parallel](Resources/demo2.gif)
 
-![pterm overview](Resources/demo.gif)
+## AI Integration
 
-![pterm focused](Resources/demo2.gif)
+### Summarize Anything
 
-## Why pterm
-
-Most terminals are good at opening one shell. pterm is built to help you manage **ongoing terminal work** — and to bring AI into your workflow without leaving the terminal.
-
-- **AI-first** — Summarize output, ask questions, get explanations — all from a right-click. AI sees your terminal context and responds in your language.
-- **One window, many terminals** — See every running session at a glance in the overview grid. Click to focus, Shift-select to split.
-- **Memory stays bounded** — Scrollback is capped and rolls automatically. `tail -F` all day without watching memory climb.
-- **Fast** — Metal-accelerated rendering with Apple Silicon optimizations. Designed for high-volume output.
-- **macOS-native** — Liquid Glass on macOS 26, full IME support, zero external dependencies. Code signed and notarized.
-
-## Features
-
-### AI-Powered Terminal
-
-Right-click in any terminal to access AI features powered by your locally installed CLI tools (Claude Code, Codex, or Gemini).
-
-**Summarize Selection** — Select any text and let AI analyze it. Error messages, log output, command results — get instant explanations in your configured language.
+Select any output — error logs, stack traces, command results — and let AI break it down instantly. Right-click, summarize, done.
 
 ![AI Summarize](Resources/pterm4.gif)
 
-**Ask AI** — Open a chat dialog with full terminal context. AI sees your working directory, running process, and recent output. Have a multi-turn conversation without leaving the terminal.
+### Ask AI with Full Context
+
+Open a chat dialog and AI sees everything: your working directory, running process, and recent output. No copy-pasting into a separate window. Multi-turn conversation, right where you work.
 
 ![AI Chat](Resources/pterm5.gif)
 
-- Responses in **40 languages** matching macOS System Settings
-- Choose your model: Claude Code, Codex, or Gemini
-- All processing runs locally through your installed CLI — no data leaves your machine through pterm
-- Configure in Settings > AI
+### Clipboard File Pipeline
 
-### Multi-Session Workflow
-- Overview grid showing all terminals with real-time thumbnails
-- Focus any terminal with a click, or Shift-select multiple for split view
-- Nested split navigation — drill into a subset, then Cmd+Click to return
-- Named workspaces with persistent notes to organize your sessions
-- Hold Cmd to reveal workspace/title identity overlays across all views
+Paste or drop an image and pterm saves it to a managed store, inserting the file path inline — ready for AI tools that accept file references. Hover over the path to see a floating preview.
 
-### Terminal Search
-- Cmd+F to search with match highlighting and a VS Code-style scrollbar minimap
-- Navigate with Enter/buttons or Cmd+G / Shift+Cmd+G — wraps circularly
-- Works correctly in split view — search follows the active terminal
+[![Paste and preview images](Resources/pterm3.gif)](https://youtu.be/hHrQJYsN0gc)
 
-### Terminal Compatibility
-- VT escape sequence support validated against vttest replay coverage and high-risk parity scenarios
-- Synchronized updates for flicker-free rendering
-- Double-width/double-height lines, reverse video, application cursor/keypad
-- Grapheme clusters and color emoji rendered natively
-- Graphics protocol for inline image display
-- Full Japanese and CJK input via macOS IME
-- ANSI 16, 256-color, and 24-bit truecolor
+### Works with Your AI Tools
 
-### AI Agent Integration
-- **MCP server** — Built-in Model Context Protocol server with 20+ tools. AI agents can list terminals, send input, read output (plain text, ANSI, or rendered PNG), and manage workspaces programmatically.
-- **Clipboard-to-file-path** — Paste or drop an image and pterm saves it to a managed store, inserting the path inline — ready for AI tools that accept file references. Hover over the pasted path or `[Image #N]` placeholder to see a floating preview.
-- **Transient terminals** — Launch one-off commands via `--command` that auto-clean and stay out of your session history.
+- **Claude Code, Codex, Gemini** — choose your model in Settings > AI
+- Responses in **40 languages** matching your macOS language
+- All processing runs through your locally installed CLI — **no data leaves your machine through pterm**
 
-[Watch the demo on YouTube](https://youtu.be/hHrQJYsN0gc)
+## One Window, Every Session
 
-[![Paste and preview images in the terminal](Resources/pterm3.gif)](https://youtu.be/hHrQJYsN0gc)
+See all running terminals at a glance in the overview grid. Click to focus, Shift-select to split. No more window juggling.
 
-### CLI Modes
-- `--cli` — Run headless, bridging stdin/stdout to a PTY session without opening a window
-- `--command <path>` — Launch an executable directly in a focused transient terminal
-- `--user-data-dir <path>` — Isolated profile for testing or parallel environments
-- `--restore-session <mode>` — Control session restore (attempt / force / never)
+![Overview grid](Resources/demo.gif)
 
-### Security
-- Zero third-party runtime dependencies — built entirely on macOS system frameworks
-- Code signed and notarized for Gatekeeper compatibility
-- Secure file permissions on all persistent state
+![Split view](Resources/screenshot.jpg)
 
-## Benchmarks
+- **Overview grid** — every session, live-updating, in a single view
+- **Split view** — Shift-click to select multiple terminals and work side by side
+- **Bounded memory** — scrollback rolls automatically. `tail -F` all day without watching memory climb
+- **Auto-cleanup** — terminals disappear on exit. Close button to stop a process and remove it
 
-All benchmarks were run on an **Apple MacBook Pro M1 Max (2021, 16-inch), 64 GB RAM, macOS 26 Tahoe**.
+## Full IME Support
 
-### Throughput Measured by the [kitten Benchmark](https://sw.kovidgoyal.net/kitty/performance/)
+Native input method support for Japanese, Chinese, Korean, and other CJK languages. Inline composition, candidate windows, and cursor positioning all work correctly — even in split view.
 
-Measurement command:
+![IME input demo](Resources/pterm6.gif)
+
+## Performance
+
+Metal-accelerated rendering. Apple Silicon optimizations. Zero external dependencies. Built to handle high-volume output without dropping frames.
+
+All benchmarks on **Apple MacBook Pro M1 Max (2021, 16-inch), 64 GB RAM, macOS 26 Tahoe**.
+
+#### Throughput — [kitten Benchmark](https://sw.kovidgoyal.net/kitty/performance/)
 
 ```bash
 kitten __benchmark__ --render --repetitions 100
 ```
 
-| Terminal | Only ASCII chars | Unicode chars | CSI codes with few chars | Long escape codes | Images | Average |
+| Terminal | ASCII | Unicode | CSI codes | Long escapes | Images | Average |
 |---|---:|---:|---:|---:|---:|---:|
-| pterm<br>(0.3.2) | **🥇 126.0 MB/s**<br>**(1.59s)** | **🥇 143.1 MB/s**<br>**(1.26s)** | **🥇 114.8 MB/s**<br>**(870.78ms)** | **🥇 527.4 MB/s**<br>**(1.49s)** | **🥇 354.2 MB/s**<br>**(1.51s)** | **🥇 253.1 MB/s** |
-| kitty<br>(0.46.0) | 🥉 89.9 MB/s<br>(2.23s) | 🥉 123.1 MB/s<br>(1.47s) | 🥉 56.2 MB/s<br>(1.78s) | 🥈 270.6 MB/s<br>(2.9s) | 243.8 MB/s<br>(2.19s) | 🥉 156.7 MB/s |
-| WezTerm<br>(20240203-110809-5046fc22) | 25.5 MB/s<br>(7.86s) | 38.4 MB/s<br>(4.71s) | 17.9 MB/s<br>(5.59s) | 🥉 238.9 MB/s<br>(3.28s) | 🥉 295.1 MB/s<br>(1.81s) | 123.2 MB/s |
-| Alacritty<br>(0.16.1) | 🥈 113.2 MB/s<br>(1.77s) | 🥈 142.2 MB/s<br>(1.27s) | 🥈 72.1 MB/s<br>(1.39s) | 171.1 MB/s<br>(4.58s) | 🥈 315.1 MB/s<br>(1.69s) | 🥈 162.7 MB/s |
-| macOS Terminal<br>(2.15) | 27.5 MB/s<br>(7.26s) | 41.1 MB/s<br>(4.41s) | 30.4 MB/s<br>(3.29s) | 93.5 MB/s<br>(8.39s) | 62.3 MB/s<br>(8.56s) | 50.9 MB/s |
-| iTerm2<br>(3.6.9) | 11.6 MB/s<br>(17.2s) | 6.6 MB/s<br>(27.29s) | 1.4 MB/s<br>(1m10.05s) | 22.5 MB/s<br>(34.83s) | 9.8 MB/s<br>(54.23s) | 10.4 MB/s |
+| **pterm (0.3.2)** | 🥇 **126.0 MB/s** | 🥇 **143.1 MB/s** | 🥇 **114.8 MB/s** | 🥇 **527.4 MB/s** | 🥇 **354.2 MB/s** | 🥇 **253.1 MB/s** |
+| kitty (0.46.0) | 89.9 MB/s | 🥉 123.1 MB/s | 🥉 56.2 MB/s | 🥈 270.6 MB/s | 243.8 MB/s | 🥉 156.7 MB/s |
+| Alacritty (0.16.1) | 🥈 113.2 MB/s | 🥈 142.2 MB/s | 🥈 72.1 MB/s | 171.1 MB/s | 🥈 315.1 MB/s | 🥈 162.7 MB/s |
+| Ghostty (1.3.1) | 🥉 86.7 MB/s | 99.9 MB/s | 38.2 MB/s | 68.7 MB/s | 52.3 MB/s | 69.2 MB/s |
+| WezTerm (20240203-110809-5046fc22) | 25.5 MB/s | 38.4 MB/s | 17.9 MB/s | 🥉 238.9 MB/s | 🥉 295.1 MB/s | 123.2 MB/s |
+| macOS Terminal (2.15) | 27.5 MB/s | 41.1 MB/s | 30.4 MB/s | 93.5 MB/s | 62.3 MB/s | 50.9 MB/s |
+| iTerm2 (3.6.9) | 11.6 MB/s | 6.6 MB/s | 1.4 MB/s | 22.5 MB/s | 9.8 MB/s | 10.4 MB/s |
 
-### `time seq 1 1000000`
+#### `time seq 1 1000000`
 
-Measurement command:
-
-```bash
-time seq 1 1000000
-```
-
-| Terminal | total |
+| Terminal | Time |
 |---|---:|
-| pterm<br>(0.3.2) | **🥇 0.799s** |
-| kitty<br>(0.46.0) | 🥉 0.886s |
-| WezTerm<br>(20240203-110809-5046fc22) | 🥈 0.839s |
-| Alacritty<br>(0.16.1) | 1.016s |
-| macOS Terminal<br>(2.15) | 1.158s |
-| iTerm2<br>(3.6.9) | 1.212s |
-
-### Video: Six Terminals Benchmarked Side by Side
+| **pterm (0.3.2)** | 🥇 **0.799s** |
+| WezTerm (20240203-110809-5046fc22) | 🥈 0.839s |
+| kitty (0.46.0) | 🥉 0.886s |
+| Alacritty (0.16.1) | 1.016s |
+| Ghostty (1.3.1) | 1.021s |
+| macOS Terminal (2.15) | 1.158s |
+| iTerm2 (3.6.9) | 1.212s |
 
 [Watch the benchmark video on YouTube](https://www.youtube.com/watch?v=CV9ufPY-54A)
 
 [![Benchmark video](https://img.youtube.com/vi/CV9ufPY-54A/maxresdefault.jpg)](https://www.youtube.com/watch?v=CV9ufPY-54A)
+
+
+## More
+
+- **Terminal search** — Cmd+F with match highlighting, VS Code-style scrollbar minimap, circular navigation
+- **MCP server** — built-in Model Context Protocol server with 20+ tools for AI agents to list, read, and control terminals programmatically
+- **Terminal compatibility** — VT escape sequences, synchronized updates, double-width/height lines, grapheme clusters, color emoji, inline images, ANSI/256/truecolor
+- **Full IME support** — Japanese and CJK input with correct cursor positioning
+- **CLI modes** — `--cli` for headless bridging, `--command` for transient terminals, `--user-data-dir` for isolated profiles
+- **Security** — zero third-party dependencies, code signed and notarized
 
 ## Requirements
 
@@ -130,25 +105,11 @@ time seq 1 1000000
 
 ## Install
 
-Download the latest `pterm.zip` from [Releases](https://github.com/pontasan/pterm/releases), unzip, and move `pterm.app` to `/Applications`.
-
-## Build from Source
-
-```bash
-# Debug build
-make debug
-open .build/pterm.app
-
-# Release build (runs full regression suite)
-make build
-
-# Run tests
-make test
-```
+Download the latest `pterm-darwin-arm64.zip` from [Releases](https://github.com/pontasan/pterm/releases), unzip, and move `pterm.app` to `/Applications`.
 
 ## Development
 
-This application was built with [Claude Code](https://claude.com/claude-code) and [Codex](https://openai.com/index/codex/).
+100% AI-coded. Not a single line was written by hand. Every feature, every optimization, every Metal shader — generated entirely by [Claude Code](https://claude.com/claude-code) and [Codex](https://openai.com/index/codex/). A terminal built by AI, for the AI era — pushing beyond what manual engineering can achieve.
 
 ## License
 
