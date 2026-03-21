@@ -190,4 +190,42 @@ struct TerminalSelection {
             mode: .normal
         )
     }
+
+    /// Return a new selection with all row values shifted by the given delta.
+    func offsetRows(by delta: Int) -> TerminalSelection {
+        var result = self
+        result.anchor.row += delta
+        result.active.row += delta
+        return result
+    }
+
+    /// Clamp the selection rows to the given range, returning a potentially empty selection.
+    func clampedToRowRange(_ range: Range<Int>) -> TerminalSelection {
+        guard !range.isEmpty else {
+            return TerminalSelection(anchor: GridPosition(row: 0, col: 0),
+                                     active: GridPosition(row: 0, col: 0),
+                                     mode: mode)
+        }
+        let s = start
+        let e = end
+        // If the selection is entirely outside the range, return empty
+        if e.row < range.lowerBound || s.row >= range.upperBound {
+            return TerminalSelection(anchor: GridPosition(row: 0, col: 0),
+                                     active: GridPosition(row: 0, col: 0),
+                                     mode: mode)
+        }
+        var result = self
+        // Clamp anchor and active row values
+        result.anchor.row = max(range.lowerBound, min(range.upperBound - 1, result.anchor.row))
+        result.active.row = max(range.lowerBound, min(range.upperBound - 1, result.active.row))
+        // If the clamped start row is after the original, reset start col to 0
+        if result.start.row > s.row {
+            if result.anchor.row == result.start.row && anchor.row < active.row {
+                result.anchor.col = 0
+            } else if result.active.row == result.start.row && active.row < anchor.row {
+                result.active.col = 0
+            }
+        }
+        return result
+    }
 }

@@ -1239,6 +1239,12 @@ final class MetalRenderer {
         }
 
         let firstAbsolute = scrollOffset > 0 ? max(0, sbCount - scrollOffset) : sbCount
+        let firstVisibleGlobalRow = scrollback.totalEvictedRows + firstAbsolute
+        // Convert selection from global absolute rows to viewport-relative for rendering
+        let viewportSelection: TerminalSelection? = {
+            guard let selection else { return nil }
+            return selection.offsetRows(by: -firstVisibleGlobalRow)
+        }()
         var cachedGlyphs: [UInt32: GlyphAtlas.GlyphInfo] = [:]
         var missingGlyphs: Set<UInt32> = []
 
@@ -1278,7 +1284,7 @@ final class MetalRenderer {
                 )
             }
         }
-        let hasSelection = selection != nil
+        let hasSelection = viewportSelection != nil
         let hasTransientTextOverlays = !transientTextOverlays.isEmpty
         let hasLinkUnderline = linkUnderline != nil
         let canUseCommonTextCellFastPath = !hasSelection && !hasTransientTextOverlays && !hasLinkUnderline && !model.reverseVideoEnabled
@@ -1456,10 +1462,10 @@ final class MetalRenderer {
             let rowHasMatches = !rowMatches.isEmpty
             var currentMatchIndex = 0
             let selectedColumnRange: ClosedRange<Int>? = {
-                guard hasSelection, let selection else { return nil }
-                let start = selection.start
-                let end = selection.end
-                switch selection.mode {
+                guard hasSelection, let vpSel = viewportSelection else { return nil }
+                let start = vpSel.start
+                let end = vpSel.end
+                switch vpSel.mode {
                 case .normal:
                     guard row >= start.row, row <= end.row else { return nil }
                     if start.row == end.row {
@@ -1793,7 +1799,12 @@ final class MetalRenderer {
                 )
             }
         }
-        let hasSelection = selection != nil
+        // Convert selection from global absolute rows to viewport-relative for rendering
+        let viewportSelection: TerminalSelection? = {
+            guard let selection else { return nil }
+            return selection.offsetRows(by: -snapshot.firstVisibleGlobalRow)
+        }()
+        let hasSelection = viewportSelection != nil
         let hasTransientTextOverlays = !transientTextOverlays.isEmpty
         let hasLinkUnderline = linkUnderline != nil
         let canUseCommonTextCellFastPath = !hasSelection && !hasTransientTextOverlays && !hasLinkUnderline && !snapshot.reverseVideo
@@ -1948,10 +1959,10 @@ final class MetalRenderer {
             let rowHasMatches = !rowMatches.isEmpty
             var currentMatchIndex = 0
             let selectedColumnRange: ClosedRange<Int>? = {
-                guard hasSelection, let selection else { return nil }
-                let start = selection.start
-                let end = selection.end
-                switch selection.mode {
+                guard hasSelection, let vpSel = viewportSelection else { return nil }
+                let start = vpSel.start
+                let end = vpSel.end
+                switch vpSel.mode {
                 case .normal:
                     guard row >= start.row, row <= end.row else { return nil }
                     if start.row == end.row {

@@ -1824,6 +1824,7 @@ final class AppKitComponentTests: XCTestCase {
             scrollOffset: snapshot.scrollOffset,
             scrollbackRowCount: snapshot.scrollbackRowCount,
             firstVisibleAbsoluteRow: snapshot.firstVisibleAbsoluteRow,
+            firstVisibleGlobalRow: snapshot.firstVisibleGlobalRow,
             ownerID: snapshot.ownerID,
             hasInlineImages: snapshot.hasInlineImages,
             inlineImagePlacements: snapshot.inlineImagePlacements,

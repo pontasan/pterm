@@ -648,8 +648,9 @@ final class TerminalControllerTests: XCTestCase {
         let selection = controller.revealSearchMatch(.init(absoluteRow: 1, startCol: 0, endCol: 0))
 
         XCTAssertEqual(controller.withViewport { _, _, offset in offset }, 3)
-        XCTAssertEqual(selection.start, .init(row: 0, col: 0))
-        XCTAssertEqual(selection.end, .init(row: 0, col: 0))
+        // Selection now uses global absolute rows (evicted=0 + absoluteRow=1 = 1)
+        XCTAssertEqual(selection.start, .init(row: 1, col: 0))
+        XCTAssertEqual(selection.end, .init(row: 1, col: 0))
     }
 
     func testRevealSearchMatchForVisibleRowReturnsZeroScrollOffset() {
@@ -667,8 +668,9 @@ final class TerminalControllerTests: XCTestCase {
         let selection = controller.revealSearchMatch(.init(absoluteRow: 99, startCol: 1, endCol: 2))
 
         XCTAssertEqual(controller.withViewport { _, _, offset in offset }, 0)
-        XCTAssertEqual(selection.start, .init(row: 2, col: 1))
-        XCTAssertEqual(selection.end, .init(row: 2, col: 2))
+        // Selection now uses global absolute rows (evicted=0 + absoluteRow=99 = 99)
+        XCTAssertEqual(selection.start, .init(row: 99, col: 1))
+        XCTAssertEqual(selection.end, .init(row: 99, col: 2))
     }
 
     func testRevealSearchMatchForFirstScrollbackRowShowsTopOfHistory() {

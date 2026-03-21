@@ -1480,8 +1480,8 @@ final class TerminalView: MTKView, NSTextInputClient {
         if clickCount == 2 {
             // Double-click: word selection
             guard let controller = terminalController else { return }
-            controller.withModel { model in
-                selection = TerminalSelection.wordSelection(at: pos, in: model.grid)
+            if let sel = controller.wordSelectionAtViewportPosition(pos) {
+                selection = sel
             }
             return
         }
@@ -1489,22 +1489,26 @@ final class TerminalView: MTKView, NSTextInputClient {
         if clickCount >= 3 {
             // Triple-click: line selection
             guard let controller = terminalController else { return }
+            let globalRow = controller.viewportRowToGlobalRow(pos.row)
             controller.withModel { model in
-                selection = TerminalSelection.lineSelection(row: pos.row, cols: model.cols)
+                selection = TerminalSelection.lineSelection(row: globalRow, cols: model.cols)
             }
             clickCount = 3 // cap
             return
         }
 
         // Single click
+        guard let controller = terminalController else { return }
+        let globalRow = controller.viewportRowToGlobalRow(pos.row)
+        let globalPos = GridPosition(row: globalRow, col: pos.col)
         if event.modifierFlags.contains(.shift), var sel = selection {
             // Shift+click: extend selection
-            sel.active = pos
+            sel.active = globalPos
             selection = sel
         } else {
             // Start new selection
             let mode: SelectionMode = event.modifierFlags.contains(.option) ? .rectangular : .normal
-            var newSelection = TerminalSelection(anchor: pos, active: pos, mode: mode)
+            var newSelection = TerminalSelection(anchor: globalPos, active: globalPos, mode: mode)
             newSelection.isDragging = true
             selection = newSelection
         }
@@ -1601,11 +1605,13 @@ final class TerminalView: MTKView, NSTextInputClient {
         if sendMouseEventIfNeeded(event, phase: .dragged) {
             return
         }
-        guard var sel = selection, sel.isDragging else { return }
+        guard var sel = selection, sel.isDragging,
+              let controller = terminalController else { return }
         autoScrollSelectionIfNeeded(for: event)
         guard let pos = clampedGridPosition(from: event) else { return }
 
-        sel.active = pos
+        let globalRow = controller.viewportRowToGlobalRow(pos.row)
+        sel.active = GridPosition(row: globalRow, col: pos.col)
         selection = sel
     }
 
@@ -1650,8 +1656,10 @@ final class TerminalView: MTKView, NSTextInputClient {
         guard var sel = selection else { return }
 
         if sel.isDragging {
-            if let pos = gridPosition(from: event) {
-                sel.active = pos
+            if let pos = gridPosition(from: event),
+               let controller = terminalController {
+                let globalRow = controller.viewportRowToGlobalRow(pos.row)
+                sel.active = GridPosition(row: globalRow, col: pos.col)
             }
             sel.isDragging = false
 
@@ -1906,10 +1914,14 @@ final class TerminalView: MTKView, NSTextInputClient {
     func selectAll() {
         guard let controller = terminalController else { return }
         selectAllActive = true
+        // selectAll uses selectAllActive flag with controller.allText(),
+        // so the selection coordinates are just visual indicators.
+        // Use global absolute rows for consistency.
+        let globalRowStart = controller.viewportRowToGlobalRow(0)
         controller.withModel { model in
             selection = TerminalSelection(
-                anchor: GridPosition(row: 0, col: 0),
-                active: GridPosition(row: model.rows - 1, col: model.cols - 1),
+                anchor: GridPosition(row: globalRowStart, col: 0),
+                active: GridPosition(row: globalRowStart + model.rows - 1, col: model.cols - 1),
                 mode: .normal
             )
         }

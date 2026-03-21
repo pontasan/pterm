@@ -129,6 +129,9 @@ final class TerminalController {
         let scrollOffset: Int
         let scrollbackRowCount: Int
         let firstVisibleAbsoluteRow: Int
+        /// Global row index of the first visible row, accounting for evicted rows.
+        /// This value is monotonically increasing and stable across buffer evictions.
+        let firstVisibleGlobalRow: Int
         let ownerID: UUID
         let hasInlineImages: Bool
         let inlineImagePlacements: [TerminalInlineImagePlacement]
@@ -1495,6 +1498,85 @@ final class TerminalController {
         }
     }
 
+    // MARK: - Selection Coordinate Conversion
+
+    /// Create a word selection at the given viewport position, returning global absolute rows.
+    /// Works correctly for both scrollback and live grid rows.
+    func wordSelectionAtViewportPosition(_ pos: GridPosition) -> TerminalSelection? {
+        lock.withReadLock {
+            let scrollbackCount = scrollback.rowCount
+            let evicted = scrollback.totalEvictedRows
+            let dimensions = visibleGridDimensionsLocked()
+            let firstVisibleAbsoluteRow = scrollOffset > 0
+                ? max(0, scrollbackCount - scrollOffset)
+                : scrollbackCount
+            let absoluteRow = firstVisibleAbsoluteRow + pos.row
+
+            // Get the cells for this row
+            let cells: [Cell]
+            if absoluteRow < scrollbackCount {
+                cells = scrollback.getRow(at: absoluteRow) ?? []
+            } else {
+                let gridRow = absoluteRow - scrollbackCount
+                guard gridRow >= 0, gridRow < dimensions.rows else { return nil }
+                var rowCells: [Cell] = []
+                rowCells.reserveCapacity(dimensions.cols)
+                for col in 0..<dimensions.cols {
+                    rowCells.append(model.grid.cell(at: gridRow, col: col))
+                }
+                cells = rowCells
+            }
+            guard !cells.isEmpty else { return nil }
+
+            // Find word boundaries
+            var colStart = pos.col
+            while colStart > 0, colStart - 1 < cells.count {
+                if TerminalSelection.isWordDelimiter(cells[colStart - 1].codepoint) { break }
+                colStart -= 1
+            }
+            var colEnd = pos.col
+            while colEnd < cells.count - 1 {
+                if TerminalSelection.isWordDelimiter(cells[colEnd + 1].codepoint) { break }
+                colEnd += 1
+            }
+
+            let globalRow = evicted + absoluteRow
+            return TerminalSelection(
+                anchor: GridPosition(row: globalRow, col: colStart),
+                active: GridPosition(row: globalRow, col: colEnd),
+                mode: .normal
+            )
+        }
+    }
+
+    /// Convert a viewport row to a global absolute row that is stable across scrolling and buffer eviction.
+    func viewportRowToGlobalRow(_ viewportRow: Int) -> Int {
+        lock.withReadLock {
+            let scrollbackCount = scrollback.rowCount
+            let evicted = scrollback.totalEvictedRows
+            let firstVisibleAbsoluteRow = scrollOffset > 0
+                ? max(0, scrollbackCount - scrollOffset)
+                : scrollbackCount
+            return evicted + firstVisibleAbsoluteRow + viewportRow
+        }
+    }
+
+    /// Convert a global absolute row back to a viewport row, or nil if not visible.
+    func globalRowToViewportRow(_ globalRow: Int) -> Int? {
+        lock.withReadLock {
+            let scrollbackCount = scrollback.rowCount
+            let evicted = scrollback.totalEvictedRows
+            let dimensions = visibleGridDimensionsLocked()
+            let firstVisibleAbsoluteRow = scrollOffset > 0
+                ? max(0, scrollbackCount - scrollOffset)
+                : scrollbackCount
+            let firstVisibleGlobal = evicted + firstVisibleAbsoluteRow
+            let viewportRow = globalRow - firstVisibleGlobal
+            guard viewportRow >= 0, viewportRow < dimensions.rows else { return nil }
+            return viewportRow
+        }
+    }
+
     // MARK: - Thread-Safe Model Access
 
     /// Execute a block with read access to the terminal model.
@@ -1580,9 +1662,11 @@ final class TerminalController {
         let reverseVideo = model.reverseVideoEnabled
         let offset = scrollOffset
         let scrollbackCount = scrollback.rowCount
+        let evicted = scrollback.totalEvictedRows
         let firstVisibleAbsoluteRow = offset > 0
             ? max(0, scrollbackCount - offset)
             : scrollbackCount
+        let firstVisibleGlobalRow = evicted + firstVisibleAbsoluteRow
 
         var renderRows: [RenderRowSnapshot] = []
         renderRows.reserveCapacity(rows)
@@ -1631,6 +1715,7 @@ final class TerminalController {
             scrollOffset: offset,
             scrollbackRowCount: scrollbackCount,
             firstVisibleAbsoluteRow: firstVisibleAbsoluteRow,
+            firstVisibleGlobalRow: firstVisibleGlobalRow,
             ownerID: id,
             hasInlineImages: hasInlineImages,
             inlineImagePlacements: inlineImagePlacements,
@@ -1662,8 +1747,21 @@ final class TerminalController {
     func selectedText(for selection: TerminalSelection) -> String {
         lock.withReadLock {
             let dimensions = visibleGridDimensionsLocked()
-            let rows = visibleRowsLocked()
-            return Self.extractText(selection: selection, rows: rows, cols: dimensions.cols)
+            let scrollbackCount = scrollback.rowCount
+            let evicted = scrollback.totalEvictedRows
+            let totalBufferRows = scrollbackCount + dimensions.rows
+            // Convert global absolute selection to buffer-relative for text extraction
+            let bufferSelection = selection.offsetRows(by: -evicted)
+                .clampedToRowRange(0..<totalBufferRows)
+            guard !bufferSelection.isEmpty else { return "" }
+            return Self.extractTextFromBuffer(
+                selection: bufferSelection,
+                scrollback: scrollback,
+                scrollbackCount: scrollbackCount,
+                gridRows: dimensions.rows,
+                cols: dimensions.cols,
+                grid: model.grid
+            )
         }
     }
 
@@ -1763,23 +1861,20 @@ final class TerminalController {
     }
 
     func revealSearchMatch(_ match: SearchMatch) -> TerminalSelection {
-        let relativeRow = lock.withWriteLock { () -> Int in
-            let dimensions = visibleGridDimensionsLocked()
+        let globalRow = lock.withWriteLock { () -> Int in
             let scrollbackCount = scrollback.rowCount
-            let visibleTop: Int
+            let evicted = scrollback.totalEvictedRows
             if match.absoluteRow < scrollbackCount {
-                visibleTop = match.absoluteRow
-                scrollOffset = scrollbackCount - visibleTop
+                scrollOffset = scrollbackCount - match.absoluteRow
             } else {
-                visibleTop = scrollbackCount
                 scrollOffset = 0
             }
-            return max(0, min(dimensions.rows - 1, match.absoluteRow - visibleTop))
+            return evicted + match.absoluteRow
         }
 
         return TerminalSelection(
-            anchor: GridPosition(row: relativeRow, col: match.startCol),
-            active: GridPosition(row: relativeRow, col: match.endCol),
+            anchor: GridPosition(row: globalRow, col: match.startCol),
+            active: GridPosition(row: globalRow, col: match.endCol),
             mode: .normal
         )
     }
@@ -2300,6 +2395,79 @@ final class TerminalController {
     private func releaseScratchStorageNow() {
         codepointBuffer.removeAll(keepingCapacity: false)
         shrinkIdleExtractionScratchIfNeeded()
+    }
+
+    /// Extract text from scrollback + grid using buffer-relative absolute row indices.
+    private static func extractTextFromBuffer(
+        selection: TerminalSelection,
+        scrollback: ScrollbackBuffer,
+        scrollbackCount: Int,
+        gridRows: Int,
+        cols: Int,
+        grid: TerminalGrid
+    ) -> String {
+        guard !selection.isEmpty else { return "" }
+        let start = selection.start
+        let end = selection.end
+        let totalRows = scrollbackCount + gridRows
+        guard start.row < totalRows else { return "" }
+
+        var result = ""
+        var rowBuffer: [Cell] = []
+        rowBuffer.reserveCapacity(cols)
+
+        func getCells(at absoluteRow: Int) -> [Cell] {
+            if absoluteRow < scrollbackCount {
+                rowBuffer.removeAll(keepingCapacity: true)
+                _ = scrollback.getRow(at: absoluteRow, into: &rowBuffer)
+                return rowBuffer
+            } else {
+                let gridRow = absoluteRow - scrollbackCount
+                var cells: [Cell] = []
+                cells.reserveCapacity(cols)
+                for col in 0..<cols {
+                    cells.append(grid.cell(at: gridRow, col: col))
+                }
+                return cells
+            }
+        }
+
+        func isNextRowWrapped(at absoluteRow: Int) -> Bool {
+            let next = absoluteRow + 1
+            if next < scrollbackCount {
+                return scrollback.isRowWrapped(at: next)
+            } else if next < totalRows {
+                return grid.isWrapped(next - scrollbackCount)
+            }
+            return false
+        }
+
+        let lastRow = min(end.row, totalRows - 1)
+        switch selection.mode {
+        case .normal:
+            for rowIndex in start.row...lastRow {
+                let cells = getCells(at: rowIndex)
+                let columnStart = rowIndex == start.row ? start.col : 0
+                let columnEnd = rowIndex == end.row ? end.col : max(cols - 1, 0)
+                appendCells(in: cells, from: columnStart, through: columnEnd, to: &result)
+                if rowIndex < lastRow {
+                    trimTrailingSpaces(from: &result)
+                    if !isNextRowWrapped(at: rowIndex) {
+                        result.append("\n")
+                    }
+                }
+            }
+        case .rectangular:
+            for rowIndex in start.row...lastRow {
+                let cells = getCells(at: rowIndex)
+                appendCells(in: cells, from: start.col, through: min(end.col, cols - 1), to: &result)
+                if rowIndex < lastRow {
+                    trimTrailingSpaces(from: &result)
+                    result.append("\n")
+                }
+            }
+        }
+        return result
     }
 
     private static func extractText(selection: TerminalSelection, rows: [ViewportRow], cols: Int) -> String {

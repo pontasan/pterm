@@ -138,6 +138,9 @@ bool ring_buffer_get_row(RingBuffer *rb, uint32_t row_index,
 /* Get the number of rows currently stored. */
 uint32_t ring_buffer_row_count(const RingBuffer *rb);
 
+/* Get the cumulative number of rows evicted since creation (monotonically increasing). */
+uint64_t ring_buffer_evicted_rows(const RingBuffer *rb);
+
 /* Get the current row-index capacity. */
 uint32_t ring_buffer_row_index_capacity(const RingBuffer *rb);
 

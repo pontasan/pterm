@@ -993,6 +993,10 @@ uint32_t ring_buffer_row_count(const RingBuffer *rb) {
     return rb ? rb->row_count : 0;
 }
 
+uint64_t ring_buffer_evicted_rows(const RingBuffer *rb) {
+    return rb ? rb->row_head : 0;
+}
+
 uint32_t ring_buffer_row_index_capacity(const RingBuffer *rb) {
     return rb ? rb->row_capacity : 0;
 }

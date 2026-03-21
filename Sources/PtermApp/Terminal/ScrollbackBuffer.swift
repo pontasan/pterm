@@ -105,6 +105,13 @@ final class ScrollbackBuffer {
         archivedRowCount + recentRows.count
     }
 
+    /// Cumulative number of rows evicted since creation (monotonically increasing).
+    /// Used to create stable global absolute row addresses that survive buffer eviction.
+    var totalEvictedRows: Int {
+        guard let rb = ringBuffer else { return 0 }
+        return Int(ring_buffer_evicted_rows(rb))
+    }
+
     /// Total allocated capacity in bytes
     var capacity: Int {
         guard let rb = ringBuffer else { return 0 }
