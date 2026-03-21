@@ -226,6 +226,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Focused terminal view (single terminal occupying the window)
     private var terminalView: TerminalView?
     private var searchBarView: SearchBarView?
+    /// The terminal view that was active when search started.
+    /// Kept stable during search so switching focus to the search field
+    /// does not redirect queries to a different terminal in split view.
+    private weak var searchTargetTerminalView: TerminalView?
     private var splitContainerView: SplitTerminalContainerView?
     private var appNoteEditor: MarkdownEditorWindowController?
     private var settingsController: SettingsWindowController?
@@ -1112,6 +1116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         splitView.onActiveControllerChange = { [weak self] controller in
             self?.applyRendererSettings(for: controller)
+            self?.switchSearchTargetIfNeeded()
         }
         splitView.onBackToIntegrated = { [weak self] in
             self?.switchToIntegrated()
@@ -2741,16 +2746,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func findNextMatch(_ sender: Any?) {
-        guard let terminalView = activeSearchTerminalView(),
+        guard let target = searchTargetTerminalView,
               let searchBarView else { return }
-        let state = terminalView.navigateSearch(forward: true)
+        let state = target.navigateSearch(forward: true)
         searchBarView.updateCount(current: state.current, total: state.total)
     }
 
     @objc func findPreviousMatch(_ sender: Any?) {
-        guard let terminalView = activeSearchTerminalView(),
+        guard let target = searchTargetTerminalView,
               let searchBarView else { return }
-        let state = terminalView.navigateSearch(forward: false)
+        let state = target.navigateSearch(forward: false)
         searchBarView.updateCount(current: state.current, total: state.total)
     }
 
@@ -2759,18 +2764,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             searchBarView.focus()
             return
         }
-        guard let terminalView = activeSearchTerminalView() else { return }
+        guard let target = activeSearchTerminalView() else { return }
 
-        terminalView.beginSearch()
+        searchTargetTerminalView = target
+        target.beginSearch()
         let bar = SearchBarView(frame: searchBarFrame())
         bar.autoresizingMask = [.width, .minYMargin]
         bar.onQueryChange = { [weak self, weak bar] query in
-            guard let self, let terminalView = self.activeSearchTerminalView(),
+            guard let self, let target = self.searchTargetTerminalView,
                   let bar else { return }
-            let state = terminalView.updateSearch(query: query)
+            let state = target.updateSearch(query: query)
             bar.updateCount(current: state.current, total: state.total)
         }
         bar.onNavigateNext = { [weak self] in self?.findNextMatch(nil) }
+        bar.onNavigatePrevious = { [weak self] in self?.findPreviousMatch(nil) }
         bar.onClose = { [weak self] in self?.hideSearchBar() }
         searchBarView = bar
         contentHostView().addSubview(bar)
@@ -2781,18 +2788,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func hideSearchBar() {
         // Save scroll offset before ending search — the terminal resize
         // triggered by removing the search bar would otherwise reset it to 0.
-        let savedOffset = terminalView?.terminalController?.scrollOffset
-            ?? splitContainerView?.activeTerminalView?.terminalController?.scrollOffset
-        terminalView?.endSearch()
-        splitContainerView?.activeTerminalView?.endSearch()
+        let target = searchTargetTerminalView
+        let savedOffset = target?.terminalController?.scrollOffset
+        target?.endSearch()
+        searchTargetTerminalView = nil
         searchBarView?.removeFromSuperview()
         searchBarView = nil
         terminalScrollView?.frame = availableContentFrame()
         // Restore scroll offset after the resize completes.
         if let offset = savedOffset, offset > 0 {
-            let controller = terminalView?.terminalController
-                ?? splitContainerView?.activeTerminalView?.terminalController
-            controller?.setScrollOffset(offset)
+            target?.terminalController?.setScrollOffset(offset)
         }
     }
 
@@ -2805,6 +2810,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .integrated:
             return nil
         }
+    }
+
+    /// When the user clicks a different terminal in split view while the search bar
+    /// is open, end search on the previous terminal and begin on the new one.
+    private func switchSearchTargetIfNeeded() {
+        guard let searchBarView,
+              let newTarget = activeSearchTerminalView(),
+              newTarget !== searchTargetTerminalView else { return }
+
+        // End search on previous target
+        searchTargetTerminalView?.endSearch()
+
+        // Switch to new target
+        searchTargetTerminalView = newTarget
+        newTarget.beginSearch()
+
+        // Reset search bar content and re-run query if non-empty
+        searchBarView.resetQuery()
+        searchBarView.updateCount(current: nil, total: 0)
+        searchBarView.focus()
     }
 
     private func setupWindowContentHierarchy() {

@@ -1901,6 +1901,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         if selectionBeforeSearch == nil {
             selectionBeforeSearch = selection
         }
+        (enclosingScrollView as? TerminalScrollView)?.showSearchMatchMap()
     }
 
     func updateSearch(query: String) -> (current: Int?, total: Int) {
@@ -1908,12 +1909,14 @@ final class TerminalView: MTKView, NSTextInputClient {
             searchMatches = []
             currentSearchIndex = nil
             selection = nil
+            syncSearchMatchMap()
             return (nil, 0)
         }
         if query.isEmpty {
             searchMatches = []
             currentSearchIndex = nil
             selection = selectionBeforeSearch
+            syncSearchMatchMap()
             return (nil, 0)
         }
 
@@ -1921,11 +1924,13 @@ final class TerminalView: MTKView, NSTextInputClient {
         if searchMatches.isEmpty {
             currentSearchIndex = nil
             selection = nil
+            syncSearchMatchMap()
             return (nil, 0)
         }
 
         currentSearchIndex = 0
         selection = controller.revealSearchMatch(searchMatches[0])
+        syncSearchMatchMap()
         return (1, searchMatches.count)
     }
 
@@ -1942,6 +1947,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         }
         currentSearchIndex = nextIndex
         selection = controller.revealSearchMatch(searchMatches[nextIndex])
+        syncSearchMatchMap()
         return (nextIndex + 1, searchMatches.count)
     }
 
@@ -1953,6 +1959,25 @@ final class TerminalView: MTKView, NSTextInputClient {
         // at the scroll position where they last navigated.
         selection = nil
         selectionBeforeSearch = nil
+        (enclosingScrollView as? TerminalScrollView)?.hideSearchMatchMap()
+    }
+
+    private func syncSearchMatchMap() {
+        guard let scrollView = enclosingScrollView as? TerminalScrollView,
+              let controller = terminalController else { return }
+
+        let (sbCount, viewRows, offset) = controller.withViewport { model, scrollback, scrollOffset in
+            (scrollback.rowCount, model.rows, scrollOffset)
+        }
+
+        let state = SearchMatchMapView.State(
+            totalRows: sbCount + viewRows,
+            viewportRows: viewRows,
+            scrollOffset: offset,
+            matches: searchMatches.map { .init(absoluteRow: $0.absoluteRow) },
+            currentMatchIndex: currentSearchIndex
+        )
+        scrollView.updateSearchMatchMap(state: state)
     }
 
     /// Select all text in the terminal.
@@ -2935,6 +2960,9 @@ extension TerminalView: MTKViewDelegate {
             cellHeight: renderer.glyphAtlas.cellHeight
         )
         scheduleScrollerSyncIfNeeded()
+        if !searchMatches.isEmpty {
+            syncSearchMatchMap()
+        }
         lastDrawnRenderContentVersion = snapshot.contentVersion
         scheduleIdleBufferRelease()
         displayUpdateScheduled = false
@@ -3196,6 +3224,7 @@ final class TerminalScrollView: NSScrollView {
     /// The terminal view inside this scroll view.
     private(set) var terminalView: TerminalView!
     private let backButton = NSButton(title: "▦", target: nil, action: nil)
+    private(set) var searchMatchMapView: SearchMatchMapView?
     var shortcutConfiguration: ShortcutConfiguration = .default {
         didSet {
             terminalView.shortcutConfiguration = shortcutConfiguration
@@ -3300,6 +3329,24 @@ final class TerminalScrollView: NSScrollView {
         lastScrollSyncSignature = nil
         terminalView.refreshTerminalLayoutForCurrentBounds()
         syncScroller()
+    }
+
+    func showSearchMatchMap() {
+        guard searchMatchMapView == nil else { return }
+        let map = SearchMatchMapView(frame: bounds)
+        map.autoresizingMask = [.width, .height]
+        addSubview(map)
+        searchMatchMapView = map
+    }
+
+    func hideSearchMatchMap() {
+        searchMatchMapView?.removeFromSuperview()
+        searchMatchMapView = nil
+    }
+
+    func updateSearchMatchMap(state: SearchMatchMapView.State) {
+        searchMatchMapView?.frame = bounds
+        searchMatchMapView?.update(state: state)
     }
 
     private func layoutBackButton() {

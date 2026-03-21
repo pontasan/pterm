@@ -13,9 +13,9 @@
     <key>CFBundleDisplayName</key>
     <string>pterm</string>
     <key>CFBundleVersion</key>
-    <string>0.3.8</string>
+    <string>0.3.9</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.3.8</string>
+    <string>0.3.9</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key>

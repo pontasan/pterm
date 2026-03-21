@@ -1,8 +1,8 @@
 # pterm
 
-**A fast, secure, bounded-memory terminal emulator for macOS.**
+**The AI-first terminal emulator for macOS.** Fast, secure, bounded-memory — with built-in AI assistance.
 
-Built for engineers who keep multiple long-running CLI sessions open at once — agent workflows, log watchers, builds, and interactive shells — all in a single window.
+Built for engineers who keep multiple long-running CLI sessions open at once — agent workflows, log watchers, builds, and interactive shells — all in a single window. With native AI integration, your terminal understands context and speaks your language.
 
 ![pterm split view](Resources/screenshot.jpg)
 
@@ -12,8 +12,9 @@ Built for engineers who keep multiple long-running CLI sessions open at once —
 
 ## Why pterm
 
-Most terminals are good at opening one shell. pterm is built to help you manage **ongoing terminal work**.
+Most terminals are good at opening one shell. pterm is built to help you manage **ongoing terminal work** — and to bring AI into your workflow without leaving the terminal.
 
+- **AI-first** — Summarize output, ask questions, get explanations — all from a right-click. AI sees your terminal context and responds in your language.
 - **One window, many terminals** — See every running session at a glance in the overview grid. Click to focus, Shift-select to split.
 - **Memory stays bounded** — Scrollback is capped and rolls automatically. `tail -F` all day without watching memory climb.
 - **Fast** — Metal-accelerated rendering with Apple Silicon optimizations. Designed for high-volume output.
@@ -21,12 +22,34 @@ Most terminals are good at opening one shell. pterm is built to help you manage 
 
 ## Features
 
+### AI-Powered Terminal
+
+Right-click in any terminal to access AI features powered by your locally installed CLI tools (Claude Code, Codex, or Gemini).
+
+**Summarize Selection** — Select any text and let AI analyze it. Error messages, log output, command results — get instant explanations in your configured language.
+
+![AI Summarize](Resources/pterm4.gif)
+
+**Ask AI** — Open a chat dialog with full terminal context. AI sees your working directory, running process, and recent output. Have a multi-turn conversation without leaving the terminal.
+
+![AI Chat](Resources/pterm5.gif)
+
+- Responses in **40 languages** matching macOS System Settings
+- Choose your model: Claude Code, Codex, or Gemini
+- All processing runs locally through your installed CLI — no data leaves your machine through pterm
+- Configure in Settings > AI
+
 ### Multi-Session Workflow
 - Overview grid showing all terminals with real-time thumbnails
 - Focus any terminal with a click, or Shift-select multiple for split view
 - Nested split navigation — drill into a subset, then Cmd+Click to return
 - Named workspaces with persistent notes to organize your sessions
 - Hold Cmd to reveal workspace/title identity overlays across all views
+
+### Terminal Search
+- Cmd+F to search with match highlighting and a VS Code-style scrollbar minimap
+- Navigate with Enter/buttons or Cmd+G / Shift+Cmd+G — wraps circularly
+- Works correctly in split view — search follows the active terminal
 
 ### Terminal Compatibility
 - VT escape sequence support validated against vttest replay coverage and high-risk parity scenarios

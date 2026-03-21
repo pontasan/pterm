@@ -3,9 +3,12 @@ import AppKit
 final class SearchBarView: NSView, NSSearchFieldDelegate {
     private let searchField = NSSearchField()
     private let countLabel = NSTextField(labelWithString: "0")
+    private let prevButton = NSButton()
+    private let nextButton = NSButton()
 
     var onQueryChange: ((String) -> Void)?
     var onNavigateNext: (() -> Void)?
+    var onNavigatePrevious: (() -> Void)?
     var onClose: (() -> Void)?
 
     override init(frame frameRect: NSRect) {
@@ -20,6 +23,32 @@ final class SearchBarView: NSView, NSSearchFieldDelegate {
         searchField.action = #selector(submitSearch(_:))
         addSubview(searchField)
 
+        prevButton.bezelStyle = .inline
+        prevButton.isBordered = false
+        prevButton.target = self
+        prevButton.action = #selector(prevClicked(_:))
+        prevButton.toolTip = "Previous match (Shift+Cmd+G)"
+        if #available(macOS 11.0, *) {
+            prevButton.image = NSImage(systemSymbolName: "chevron.up", accessibilityDescription: "Previous")
+        } else {
+            prevButton.title = "▲"
+        }
+        prevButton.contentTintColor = NSColor(calibratedWhite: 0.8, alpha: 1)
+        addSubview(prevButton)
+
+        nextButton.bezelStyle = .inline
+        nextButton.isBordered = false
+        nextButton.target = self
+        nextButton.action = #selector(nextClicked(_:))
+        nextButton.toolTip = "Next match (Cmd+G)"
+        if #available(macOS 11.0, *) {
+            nextButton.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "Next")
+        } else {
+            nextButton.title = "▼"
+        }
+        nextButton.contentTintColor = NSColor(calibratedWhite: 0.8, alpha: 1)
+        addSubview(nextButton)
+
         countLabel.textColor = .secondaryLabelColor
         countLabel.alignment = .right
         addSubview(countLabel)
@@ -33,14 +62,29 @@ final class SearchBarView: NSView, NSSearchFieldDelegate {
     override func layout() {
         super.layout()
         let inset: CGFloat = 8
-        let labelWidth: CGFloat = 64
-        countLabel.frame = NSRect(x: bounds.width - inset - labelWidth,
+        let buttonSize: CGFloat = 24
+        let buttonSpacing: CGFloat = 2
+        let labelWidth: CGFloat = 56
+
+        // Right side: [count] [▲] [▼]
+        let buttonsWidth = buttonSize * 2 + buttonSpacing
+        let rightWidth = labelWidth + buttonsWidth + inset
+
+        let nextX = bounds.width - inset - buttonSize
+        let prevX = nextX - buttonSize - buttonSpacing
+        let buttonY = (bounds.height - buttonSize) / 2
+
+        nextButton.frame = NSRect(x: nextX, y: buttonY, width: buttonSize, height: buttonSize)
+        prevButton.frame = NSRect(x: prevX, y: buttonY, width: buttonSize, height: buttonSize)
+
+        countLabel.frame = NSRect(x: prevX - labelWidth - 4,
                                   y: 8,
                                   width: labelWidth,
                                   height: bounds.height - 16)
+
         searchField.frame = NSRect(x: inset,
                                    y: 6,
-                                   width: bounds.width - labelWidth - inset * 3,
+                                   width: bounds.width - rightWidth - inset * 2,
                                    height: bounds.height - 12)
     }
 
@@ -64,8 +108,20 @@ final class SearchBarView: NSView, NSSearchFieldDelegate {
         onNavigateNext?()
     }
 
+    @objc private func prevClicked(_ sender: Any?) {
+        onNavigatePrevious?()
+    }
+
+    @objc private func nextClicked(_ sender: Any?) {
+        onNavigateNext?()
+    }
+
     func focus() {
         window?.makeFirstResponder(searchField)
+    }
+
+    func resetQuery() {
+        searchField.stringValue = ""
     }
 
     func updateCount(current: Int?, total: Int) {
