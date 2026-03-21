@@ -1917,13 +1917,26 @@ final class TerminalController {
         let globalRow = lock.withWriteLock { () -> Int in
             let scrollbackCount = scrollback.rowCount
             let evicted = scrollback.totalEvictedRows
+            let visibleRows = visibleGridDimensionsLocked().rows
+
+            // Calculate scroll offset to center the match in the viewport
             if match.absoluteRow < scrollbackCount {
-                scrollOffset = scrollbackCount - match.absoluteRow
+                let idealOffset = scrollbackCount - match.absoluteRow + visibleRows / 2
+                scrollOffset = max(0, min(scrollbackCount, idealOffset))
             } else {
-                scrollOffset = 0
+                // Match is in the live grid area
+                let gridRow = match.absoluteRow - scrollbackCount
+                if gridRow < visibleRows {
+                    // Already visible when scrolled to bottom
+                    scrollOffset = 0
+                } else {
+                    scrollOffset = 0
+                }
             }
             return evicted + match.absoluteRow
         }
+
+        scheduleMainCallbacks(needsDisplay: true)
 
         return TerminalSelection(
             anchor: GridPosition(row: globalRow, col: match.startCol),

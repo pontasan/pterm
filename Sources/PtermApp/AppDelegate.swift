@@ -2779,11 +2779,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func hideSearchBar() {
+        // Save scroll offset before ending search — the terminal resize
+        // triggered by removing the search bar would otherwise reset it to 0.
+        let savedOffset = terminalView?.terminalController?.scrollOffset
+            ?? splitContainerView?.activeTerminalView?.terminalController?.scrollOffset
         terminalView?.endSearch()
         splitContainerView?.activeTerminalView?.endSearch()
         searchBarView?.removeFromSuperview()
         searchBarView = nil
         terminalScrollView?.frame = availableContentFrame()
+        // Restore scroll offset after the resize completes.
+        if let offset = savedOffset, offset > 0 {
+            let controller = terminalView?.terminalController
+                ?? splitContainerView?.activeTerminalView?.terminalController
+            controller?.setScrollOffset(offset)
+        }
     }
 
     private func activeSearchTerminalView() -> TerminalView? {

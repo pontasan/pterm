@@ -315,6 +315,10 @@ final class TerminalView: MTKView, NSTextInputClient {
         selection = sel
     }
 
+    func debugGetSelectionForTesting() -> TerminalSelection? {
+        selection
+    }
+
     func debugSetSuppressInterpretKeyEvents(_ suppressed: Bool) {
         debugSuppressInterpretKeyEvents = suppressed
     }
@@ -1944,7 +1948,10 @@ final class TerminalView: MTKView, NSTextInputClient {
     func endSearch() {
         searchMatches = []
         currentSearchIndex = nil
-        selection = selectionBeforeSearch
+        // Clear search selection but preserve current scroll position.
+        // Do NOT restore selectionBeforeSearch — the user expects to stay
+        // at the scroll position where they last navigated.
+        selection = nil
         selectionBeforeSearch = nil
     }
 

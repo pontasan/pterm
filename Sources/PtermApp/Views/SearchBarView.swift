@@ -48,6 +48,14 @@ final class SearchBarView: NSView, NSSearchFieldDelegate {
         onQueryChange?(searchField.stringValue)
     }
 
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            onClose?()
+            return true
+        }
+        return false
+    }
+
     override func cancelOperation(_ sender: Any?) {
         onClose?()
     }

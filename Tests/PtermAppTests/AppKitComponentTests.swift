@@ -6853,6 +6853,140 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(countLabel?.stringValue, "7")
     }
 
+    // MARK: - Search: ESC closes search bar via text field delegate
+
+    func testSearchBarEscInSearchFieldInvokesOnClose() {
+        let view = SearchBarView(frame: NSRect(x: 0, y: 0, width: 300, height: 32))
+        var didClose = false
+        view.onClose = { didClose = true }
+
+        guard let searchField = allSubviews(in: view).compactMap({ $0 as? NSSearchField }).first else {
+            XCTFail("Search field missing")
+            return
+        }
+
+        // Simulate ESC via the NSControl delegate method (as NSSearchField would call it)
+        let fieldEditor = NSTextView()
+        let handled = view.control(searchField, textView: fieldEditor, doCommandBy: #selector(NSResponder.cancelOperation(_:)))
+
+        XCTAssertTrue(handled, "ESC command should be handled by the delegate")
+        XCTAssertTrue(didClose, "ESC must invoke onClose to dismiss the search bar")
+    }
+
+    func testSearchBarEscDoesNotHandleNonCancelCommands() {
+        let view = SearchBarView(frame: NSRect(x: 0, y: 0, width: 300, height: 32))
+        var didClose = false
+        view.onClose = { didClose = true }
+
+        guard let searchField = allSubviews(in: view).compactMap({ $0 as? NSSearchField }).first else {
+            XCTFail("Search field missing")
+            return
+        }
+
+        let fieldEditor = NSTextView()
+        let handled = view.control(searchField, textView: fieldEditor, doCommandBy: #selector(NSResponder.moveUp(_:)))
+
+        XCTAssertFalse(handled, "Non-ESC commands should not be handled")
+        XCTAssertFalse(didClose)
+    }
+
+    // MARK: - Search: Navigation wraps circularly
+
+    func testSearchNavigateForwardWrapsFromLastToFirst() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+
+        // Place "A" at two positions on the grid
+        let cellA = Cell(codepoint: 65, attributes: .default, width: 1, isWideContinuation: false)
+        controller.withModel { model in
+            model.grid.setCell(cellA, at: 0, col: 0)
+            model.grid.setCell(cellA, at: 1, col: 0)
+        }
+
+        let state = view.updateSearch(query: "A")
+        guard state.total >= 2 else { return }
+
+        // Navigate to last match
+        var lastState = state
+        for _ in 1..<state.total {
+            lastState = view.navigateSearch(forward: true)
+        }
+        XCTAssertEqual(lastState.current, state.total)
+
+        // Next forward should wrap to first
+        let wrapped = view.navigateSearch(forward: true)
+        XCTAssertEqual(wrapped.current, 1, "Forward navigation must wrap from last to first")
+    }
+
+    func testSearchNavigateBackwardWrapsFromFirstToLast() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+
+        let cellA = Cell(codepoint: 65, attributes: .default, width: 1, isWideContinuation: false)
+        controller.withModel { model in
+            model.grid.setCell(cellA, at: 0, col: 0)
+            model.grid.setCell(cellA, at: 1, col: 0)
+        }
+
+        let state = view.updateSearch(query: "A")
+        guard state.total >= 2 else { return }
+
+        // At first match, navigate backward should wrap to last
+        let wrapped = view.navigateSearch(forward: false)
+        XCTAssertEqual(wrapped.current, state.total, "Backward navigation must wrap from first to last")
+    }
+
+    // MARK: - Search: endSearch preserves scroll position
+
+    func testEndSearchClearsSearchStateButDoesNotRestoreOldSelection() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        view.terminalController = controller
+
+        // Set a selection before search
+        let priorSelection = TerminalSelection(
+            anchor: GridPosition(row: 0, col: 0),
+            active: GridPosition(row: 0, col: 3),
+            mode: .normal
+        )
+        view.debugSetSelectionForTesting(priorSelection)
+
+        view.beginSearch()
+
+        let cellH = Cell(codepoint: 72, attributes: .default, width: 1, isWideContinuation: false) // 'H'
+        controller.withModel { model in
+            model.grid.setCell(cellH, at: 0, col: 0)
+        }
+        _ = view.updateSearch(query: "H")
+
+        view.endSearch()
+
+        // After ending search, selection should be cleared (nil), NOT restored to priorSelection.
+        // This ensures the user stays at the scroll position they navigated to.
+        let currentSelection = view.debugGetSelectionForTesting()
+        XCTAssertNil(currentSelection, "endSearch must clear selection to preserve scroll position, not restore old selection")
+    }
+
     func testStatusBarKeepsNoteButtonAtLeftInsetWhenOverviewHidden() {
         let view = StatusBarView(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
         view.setBackButtonVisible(false)
