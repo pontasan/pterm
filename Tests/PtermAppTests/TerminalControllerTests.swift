@@ -647,7 +647,8 @@ final class TerminalControllerTests: XCTestCase {
 
         let selection = controller.revealSearchMatch(.init(absoluteRow: 1, startCol: 0, endCol: 0))
 
-        XCTAssertEqual(controller.withViewport { _, _, offset in offset }, 3)
+        // scrollOffset centers the match: scrollbackCount(4) - absoluteRow(1) + visibleRows(3)/2 = 4
+        XCTAssertEqual(controller.withViewport { _, _, offset in offset }, 4)
         // Selection now uses global absolute rows (evicted=0 + absoluteRow=1 = 1)
         XCTAssertEqual(selection.start, .init(row: 1, col: 0))
         XCTAssertEqual(selection.end, .init(row: 1, col: 0))
