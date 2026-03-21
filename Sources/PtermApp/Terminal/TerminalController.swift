@@ -1395,6 +1395,12 @@ final class TerminalController {
                 // resize operates on a stable history boundary instead of mixing
                 // transient recent rows with newly trimmed rows from the resize.
                 scrollback.flushPendingRows()
+                // Re-wrap scrollback content when column width changes so that
+                // previously soft-wrapped lines are joined and re-wrapped at the
+                // new width instead of being displayed at the old width.
+                if cols != oldCols {
+                    scrollback.reflow(oldCols: oldCols, newCols: cols)
+                }
                 model.resize(newRows: rows, newCols: cols)
                 // After resize, snap to the latest content so the user sees
                 // the current terminal output, not stale scrollback.
@@ -1682,6 +1688,14 @@ final class TerminalController {
             if absoluteRow < scrollbackCount {
                 scrollbackRowBuffer.removeAll(keepingCapacity: true)
                 _ = scrollback.getRow(at: absoluteRow, into: &scrollbackRowBuffer)
+                // Pad scrollback rows to the current column count.
+                // Scrollback rows may have fewer cells than the current viewport
+                // if the terminal was resized wider after the row was stored
+                // (e.g., transitioning from split view to focused view).
+                if scrollbackRowBuffer.count < cols {
+                    scrollbackRowBuffer.append(contentsOf:
+                        repeatElement(.empty, count: cols - scrollbackRowBuffer.count))
+                }
                 renderRows.append(
                     RenderRowSnapshot(
                         cells: scrollbackRowBuffer,
@@ -1693,8 +1707,12 @@ final class TerminalController {
             }
 
             let gridRow = absoluteRow - scrollbackCount
-            let compactCells = Array(model.grid.rowCells(gridRow))
-            let cells = compactCells.isEmpty ? Array(repeating: .empty, count: cols) : compactCells
+            var cells = Array(model.grid.rowCells(gridRow))
+            if cells.isEmpty {
+                cells = Array(repeating: .empty, count: cols)
+            } else if cells.count < cols {
+                cells.append(contentsOf: repeatElement(.empty, count: cols - cells.count))
+            }
             renderRows.append(
                 RenderRowSnapshot(
                     cells: cells,

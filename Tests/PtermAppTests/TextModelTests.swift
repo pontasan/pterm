@@ -1290,4 +1290,118 @@ final class TextModelTests: XCTestCase {
         XCTAssertEqual(buffer.rowCount, 2)
         XCTAssertEqual(buffer.getRow(at: 1)?.map(\.codepoint), [0x6F, 0x6B])
     }
+
+    // MARK: - Scrollback Reflow Tests
+
+    func testScrollbackReflowJoinsSoftWrappedRowsAtNewWidth() {
+        let buffer = ScrollbackBuffer(initialCapacity: 8192, maxCapacity: 8192)
+
+        // Simulate text "abcdefghij" wrapped at 5 columns → 2 rows
+        let cells: [Cell] = "abcdefghij".unicodeScalars.map {
+            Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+        }
+        buffer.appendRow(ArraySlice(cells[0..<5]), isWrapped: false)   // "abcde"
+        buffer.appendRow(ArraySlice(cells[5..<10]), isWrapped: true)   // "fghij" (soft wrap)
+
+        XCTAssertEqual(buffer.rowCount, 2)
+
+        // Reflow from 5 cols → 10 cols: two rows should merge into one
+        buffer.reflow(oldCols: 5, newCols: 10)
+
+        XCTAssertEqual(buffer.rowCount, 1)
+        let row = buffer.getRow(at: 0)!
+        XCTAssertEqual(row.map(\.codepoint), cells.map(\.codepoint))
+        XCTAssertFalse(buffer.isRowWrapped(at: 0))
+    }
+
+    func testScrollbackReflowSplitsLongLineAtSmallerWidth() {
+        let buffer = ScrollbackBuffer(initialCapacity: 8192, maxCapacity: 8192)
+
+        // Single row of 10 cells
+        let cells: [Cell] = "abcdefghij".unicodeScalars.map {
+            Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+        }
+        buffer.appendRow(ArraySlice(cells), isWrapped: false)
+
+        XCTAssertEqual(buffer.rowCount, 1)
+
+        // Reflow from 10 cols → 5 cols: one row should become two
+        buffer.reflow(oldCols: 10, newCols: 5)
+
+        XCTAssertEqual(buffer.rowCount, 2)
+        XCTAssertEqual(buffer.getRow(at: 0)!.map(\.codepoint),
+                       cells[0..<5].map(\.codepoint))
+        XCTAssertEqual(buffer.getRow(at: 1)!.map(\.codepoint),
+                       cells[5..<10].map(\.codepoint))
+        XCTAssertFalse(buffer.isRowWrapped(at: 0))
+        XCTAssertTrue(buffer.isRowWrapped(at: 1))
+    }
+
+    func testScrollbackReflowPreservesHardLineBreaks() {
+        let buffer = ScrollbackBuffer(initialCapacity: 8192, maxCapacity: 8192)
+
+        // Two separate logical lines at 5 cols
+        let line1: [Cell] = "abc".unicodeScalars.map {
+            Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+        }
+        let line2: [Cell] = "xy".unicodeScalars.map {
+            Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+        }
+        buffer.appendRow(ArraySlice(line1), isWrapped: false)  // "abc" (hard break)
+        buffer.appendRow(ArraySlice(line2), isWrapped: false)  // "xy" (hard break)
+
+        // Reflow from 5 cols → 10 cols: should remain 2 rows (not merged)
+        buffer.reflow(oldCols: 5, newCols: 10)
+
+        XCTAssertEqual(buffer.rowCount, 2)
+        XCTAssertEqual(buffer.getRow(at: 0)!.map(\.codepoint), line1.map(\.codepoint))
+        XCTAssertEqual(buffer.getRow(at: 1)!.map(\.codepoint), line2.map(\.codepoint))
+        XCTAssertFalse(buffer.isRowWrapped(at: 0))
+        XCTAssertFalse(buffer.isRowWrapped(at: 1))
+    }
+
+    func testScrollbackReflowPreservesCellAttributes() {
+        let buffer = ScrollbackBuffer(initialCapacity: 8192, maxCapacity: 8192)
+
+        let boldAttr = CellAttributes(foreground: .rgb(255, 0, 0), background: .default,
+                                      bold: true, italic: false, underline: false,
+                                      strikethrough: false, inverse: false, hidden: false,
+                                      dim: false, blink: false)
+        let cells: [Cell] = "abcdef".unicodeScalars.map {
+            Cell(codepoint: $0.value, attributes: boldAttr, width: 1, isWideContinuation: false)
+        }
+        // Two soft-wrapped rows at 3 cols
+        buffer.appendRow(ArraySlice(cells[0..<3]), isWrapped: false)
+        buffer.appendRow(ArraySlice(cells[3..<6]), isWrapped: true)
+
+        // Reflow to 6 cols: merge into one row
+        buffer.reflow(oldCols: 3, newCols: 6)
+
+        XCTAssertEqual(buffer.rowCount, 1)
+        let row = buffer.getRow(at: 0)!
+        for cell in row {
+            XCTAssertTrue(cell.attributes.bold)
+            XCTAssertEqual(cell.attributes.foreground, .rgb(255, 0, 0))
+        }
+    }
+
+    func testScrollbackReflowNoopWhenSameColumnCount() {
+        let buffer = ScrollbackBuffer(initialCapacity: 8192, maxCapacity: 8192)
+        let cells: ArraySlice<Cell> = ArraySlice("hello".unicodeScalars.map {
+            Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+        })
+        buffer.appendRow(cells, isWrapped: false)
+
+        buffer.reflow(oldCols: 10, newCols: 10)
+
+        XCTAssertEqual(buffer.rowCount, 1)
+        XCTAssertEqual(buffer.getRow(at: 0)!.map(\.codepoint),
+                       "hello".unicodeScalars.map(\.value))
+    }
+
+    func testScrollbackReflowEmptyBufferIsNoop() {
+        let buffer = ScrollbackBuffer(initialCapacity: 8192, maxCapacity: 8192)
+        buffer.reflow(oldCols: 80, newCols: 120)
+        XCTAssertEqual(buffer.rowCount, 0)
+    }
 }

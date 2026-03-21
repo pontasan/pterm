@@ -501,6 +501,107 @@ final class ScrollbackBuffer {
         return continuation
     }
 
+    // MARK: - Reflow
+
+    /// Re-wrap all scrollback rows at a new column width.
+    ///
+    /// Reconstructs logical lines by joining soft-wrapped rows,
+    /// then re-wraps them at `newCols`. The ring buffer is rebuilt in place.
+    func reflow(oldCols: Int, newCols: Int) {
+        guard oldCols != newCols, newCols > 0 else { return }
+        let totalRows = rowCount
+        guard totalRows > 0 else { return }
+
+        // 1. Flush pending rows so everything is in the ring buffer
+        flushPendingRows()
+
+        // 2. Read all rows and their wrap flags
+        var allRows: [(cells: [Cell], isWrapped: Bool)] = []
+        allRows.reserveCapacity(totalRows)
+        var cellBuf: [Cell] = []
+        for i in 0..<totalRows {
+            cellBuf.removeAll(keepingCapacity: true)
+            _ = getRow(at: i, into: &cellBuf)
+            allRows.append((cells: cellBuf, isWrapped: isRowWrapped(at: i)))
+        }
+
+        // 3. Reconstruct logical lines by joining soft-wrapped rows
+        var logicalLines: [[Cell]] = []
+        var currentLine: [Cell] = []
+        for (index, row) in allRows.enumerated() {
+            if index == 0 || !row.isWrapped {
+                if index > 0 {
+                    logicalLines.append(currentLine)
+                }
+                currentLine = trimTrailingEmpty(row.cells)
+            } else {
+                // Soft-wrapped continuation: pad previous segment to oldCols, then append
+                currentLine = padToWidth(currentLine, width: oldCols) + trimTrailingEmpty(row.cells)
+            }
+        }
+        logicalLines.append(currentLine)
+
+        // 4. Clear the buffer
+        guard let rb = ringBuffer else { return }
+        ring_buffer_clear(rb)
+        recentRows.removeAll(keepingCapacity: true)
+        recentSerializedBytesUsed = 0
+
+        // 5. Re-wrap each logical line at newCols and append
+        var newRows: [BufferedRow] = []
+        newRows.reserveCapacity(totalRows)
+        for logicalLine in logicalLines {
+            let wrapped = wrapLogicalLine(logicalLine, cols: newCols)
+            for (rowInLine, rowCells) in wrapped.enumerated() {
+                let isWrapped = rowInLine > 0
+                newRows.append(BufferedRow(
+                    cells: rowCells,
+                    cellCount: rowCells.count,
+                    isWrapped: isWrapped
+                ))
+            }
+        }
+
+        // 6. Append all new rows
+        appendRows(newRows)
+        flushPendingRows()
+    }
+
+    /// Trim trailing empty (space with default attributes) cells.
+    private func trimTrailingEmpty(_ cells: [Cell]) -> [Cell] {
+        var end = cells.count
+        while end > 0
+                && cells[end - 1].codepoint == 0x20
+                && cells[end - 1].attributes == .default {
+            end -= 1
+        }
+        return Array(cells.prefix(end))
+    }
+
+    /// Pad a cell array to a given width with empty cells.
+    private func padToWidth(_ line: [Cell], width: Int) -> [Cell] {
+        if line.count >= width { return line }
+        return line + Array(repeating: Cell.empty, count: width - line.count)
+    }
+
+    /// Split a logical line into rows at a given column width.
+    private func wrapLogicalLine(_ line: [Cell], cols: Int) -> [[Cell]] {
+        if line.isEmpty {
+            return [[]]
+        }
+        var result: [[Cell]] = []
+        var idx = 0
+        while idx < line.count {
+            let end = min(idx + cols, line.count)
+            result.append(Array(line[idx..<end]))
+            idx = end
+        }
+        if result.isEmpty {
+            result.append([])
+        }
+        return result
+    }
+
     /// Clear all scrollback data.
     func clear() {
         guard let rb = ringBuffer else { return }
