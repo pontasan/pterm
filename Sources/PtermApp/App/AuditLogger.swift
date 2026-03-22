@@ -364,27 +364,108 @@ final class TerminalAuditLogger {
 }
 
 enum AuditKeyStore {
-    static func loadOrCreateKey(url: URL = PtermDirectories.audit.appendingPathComponent(".key")) throws -> SymmetricKey {
-        let fm = FileManager.default
-        try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
-                               attributes: [.posixPermissions: 0o700])
-        if fm.fileExists(atPath: url.path) {
-            try? fm.setAttributes([.posixPermissions: 0o400], ofItemAtPath: url.path)
-            let data = try Data(contentsOf: url)
-            guard data.count == 32 else {
-                throw CocoaError(.fileReadCorruptFile)
-            }
-            return SymmetricKey(data: data)
+    private static let keychainService = "com.pterm.audit"
+    private static let keychainAccount = "encryption-key"
+    private static let keyLength = 32
+
+    static func loadOrCreateKey() throws -> SymmetricKey {
+        // Migration: if the old .key file exists, import it into Keychain and securely delete the file
+        let legacyURL = PtermDirectories.audit.appendingPathComponent(".key")
+        if FileManager.default.fileExists(atPath: legacyURL.path) {
+            try migrateLegacyKeyFile(at: legacyURL)
         }
 
-        var bytes = [UInt8](repeating: 0, count: 32)
+        // Try to load from Keychain
+        if let existingKey = try loadKeyFromKeychain() {
+            return existingKey
+        }
+
+        // Generate a new key and store in Keychain
+        var bytes = [UInt8](repeating: 0, count: keyLength)
         let result = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
         guard result == errSecSuccess else {
             throw CocoaError(.fileWriteUnknown)
         }
-        let data = Data(bytes)
-        try AtomicFileWriter.write(data, to: url, permissions: 0o400)
+        let keyData = Data(bytes)
+        try storeKeyInKeychain(keyData)
+        return SymmetricKey(data: keyData)
+    }
+
+    private static func loadKeyFromKeychain() throws -> SymmetricKey? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        if status == errSecItemNotFound {
+            return nil
+        }
+        guard status == errSecSuccess, let data = result as? Data else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status),
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to read audit key from Keychain (status: \(status))"])
+        }
+        guard data.count == keyLength else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
         return SymmetricKey(data: data)
+    }
+
+    private static func storeKeyInKeychain(_ keyData: Data) throws {
+        let attributes: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            kSecValueData as String: keyData
+        ]
+
+        let status = SecItemAdd(attributes as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status),
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to store audit key in Keychain (status: \(status))"])
+        }
+    }
+
+    private static func migrateLegacyKeyFile(at url: URL) throws {
+        let fm = FileManager.default
+        try? fm.setAttributes([.posixPermissions: 0o400], ofItemAtPath: url.path)
+        let data = try Data(contentsOf: url)
+        guard data.count == keyLength else {
+            // Corrupt legacy file — remove it and let a new key be generated
+            try? fm.removeItem(at: url)
+            return
+        }
+
+        // Store in Keychain (skip if already present from a prior partial migration)
+        if try loadKeyFromKeychain() == nil {
+            try storeKeyInKeychain(data)
+        }
+
+        // Securely delete the legacy file: overwrite with random bytes, then remove
+        var overwrite = [UInt8](repeating: 0, count: keyLength)
+        _ = SecRandomCopyBytes(kSecRandomDefault, overwrite.count, &overwrite)
+        try? Data(overwrite).write(to: url)
+        try? fm.removeItem(at: url)
+    }
+
+    /// Delete the key from Keychain. Intended for testing teardown only.
+    static func deleteKeyFromKeychain() throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status),
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to delete audit key from Keychain (status: \(status))"])
+        }
     }
 }
 

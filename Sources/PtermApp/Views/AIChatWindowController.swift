@@ -314,7 +314,7 @@ final class AIChatWindowController: NSWindowController, NSWindowDelegate, NSText
             chatHistory: previousHistory
         )
 
-        currentProcess = AIService.invoke(model: aiConfig.model, prompt: prompt, workingDirectory: terminalContext?.workingDirectory) { [weak self] result in
+        currentProcess = AIService.invoke(model: aiConfig.model, prompt: prompt, workingDirectory: terminalContext?.workingDirectory, aiConfig: aiConfig) { [weak self] result in
             guard let self else { return }
             self.setProcessing(false)
             switch result {
@@ -361,7 +361,7 @@ final class AIChatWindowController: NSWindowController, NSWindowDelegate, NSText
         rebuildChatView()
         setProcessing(true)
 
-        currentProcess = AIService.invoke(model: aiConfig.model, prompt: prompt, workingDirectory: terminalContext?.workingDirectory) { [weak self] result in
+        currentProcess = AIService.invoke(model: aiConfig.model, prompt: prompt, workingDirectory: terminalContext?.workingDirectory, aiConfig: aiConfig) { [weak self] result in
             guard let self else { return }
             self.setProcessing(false)
             switch result {

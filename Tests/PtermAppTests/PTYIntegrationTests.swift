@@ -3682,6 +3682,466 @@ final class PTYIntegrationTests: XCTestCase {
         }
         return text
     }
+    // MARK: - forkpty() Equivalence Tests
+    //
+    // These tests verify every observable property established by forkpty(),
+    // which internally calls: openpty(), fork(), login_tty() (setsid + TIOCSCTTY
+    // + dup2 + close).  Each test targets a specific syscall's effect so that a
+    // future refactor from forkpty() to manual openpty()+fork() can be validated
+    // by running this exact suite.
+
+    // ── posix_openpt / grantpt / unlockpt / ptsname / open(slave) ─────────
+    // Verified indirectly: if the child can write to stdout (which is the slave
+    // side) and the parent can read from master, the pty pair was created and
+    // connected successfully.  testPTYExecutesResolvedShellAndExportsMatching-
+    // ShellEnvironment already covers this; the tests below add explicit checks
+    // for properties that test does NOT cover.
+
+    /// Verify the child process is a session leader (setsid succeeded) and has
+    /// a controlling terminal (TIOCSCTTY succeeded).
+    func testPTYChildIsSessionLeaderWithControllingTerminal() throws {
+        let pty = PTY()
+        defer { pty.stop(waitForExit: true) }
+
+        let marker = "__PTERM_SID_\(UUID().uuidString)__"
+        let outputExpectation = expectation(description: "pty-sid-output")
+        let exitExpectation = expectation(description: "pty-sid-exit")
+        let lock = NSLock()
+        var collectedOutput = ""
+        var matched = false
+        var exited = false
+
+        pty.onOutput = { data in
+            let chunk = String(decoding: data, as: UTF8.self)
+            lock.lock()
+            collectedOutput += chunk
+            if !matched, collectedOutput.contains(marker) {
+                matched = true
+                outputExpectation.fulfill()
+            }
+            lock.unlock()
+        }
+        pty.onExit = {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !exited else { return }
+            exited = true
+            exitExpectation.fulfill()
+        }
+
+        // Launch /bin/sh directly to avoid zsh's completion system interfering
+        // with ps option keywords.
+        try pty.start(
+            rows: 24, cols: 80,
+            initialDirectory: NSTemporaryDirectory(),
+            executablePath: "/bin/sh",
+            arguments: ["-c",
+                "pgid=$(/bin/ps -o pgid= -p $$); tty=$(/bin/ps -o tty= -p $$); " +
+                "printf '\(marker)%s|%s|%s__\\n' \"$$\" \"$pgid\" \"$tty\""]
+        )
+
+        wait(for: [outputExpectation, exitExpectation], timeout: 8.0)
+        // Use the LAST occurrence of the marker to skip the echo-back line.
+        // The echo-back contains the literal printf format (e.g. marker + "%s__"),
+        // while the actual output contains the expanded value.
+        guard let range = collectedOutput.range(of: marker, options: .backwards) else {
+            return XCTFail("Missing marker in output: \(collectedOutput)")
+        }
+        let suffix = collectedOutput[range.upperBound...]
+        guard let endRange = suffix.range(of: "__") else {
+            return XCTFail("Missing terminator in output: \(collectedOutput)")
+        }
+        let payload = String(suffix[..<endRange.lowerBound])
+        let parts = payload.split(separator: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+        XCTAssertEqual(parts.count, 3, "Expected pid|sid|tty, got: \(payload)")
+
+        let pid = parts[0]
+        let pgid = parts[1]
+        let tty = parts[2]
+
+        // setsid: process group ID must equal child PID (session + group leader)
+        XCTAssertEqual(pid, pgid, "Child PID (\(pid)) must equal PGID (\(pgid)) — setsid() verification")
+        // TIOCSCTTY: controlling terminal must be set (not "??" or empty)
+        XCTAssertFalse(tty.isEmpty || tty == "??", "Child must have a controlling terminal, got: \(tty)")
+    }
+
+    /// Verify that stdin/stdout/stderr in the child are connected to the slave
+    /// pty (dup2 succeeded) and that no extra file descriptors are open
+    /// (master fd was closed in child, slave fd was closed after dup2).
+    func testPTYChildHasOnlyStdioFileDescriptors() throws {
+        let pty = PTY()
+        defer { pty.stop(waitForExit: true) }
+
+        let marker = "__PTERM_FD_\(UUID().uuidString)__"
+        let outputExpectation = expectation(description: "pty-fd-output")
+        let exitExpectation = expectation(description: "pty-fd-exit")
+        let lock = NSLock()
+        var collectedOutput = ""
+        var matched = false
+        var exited = false
+
+        pty.onOutput = { data in
+            let chunk = String(decoding: data, as: UTF8.self)
+            lock.lock()
+            collectedOutput += chunk
+            if !matched, collectedOutput.contains(marker) {
+                matched = true
+                outputExpectation.fulfill()
+            }
+            lock.unlock()
+        }
+        pty.onExit = {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !exited else { return }
+            exited = true
+            exitExpectation.fulfill()
+        }
+
+        try pty.start(rows: 24, cols: 80, initialDirectory: NSTemporaryDirectory())
+        // List open fd numbers via /dev/fd.  printf collects them into a single line.
+        pty.write("printf '\(marker)%s__\\n' \"$(/bin/ls /dev/fd | /usr/bin/tr '\\n' ',')\"\nexit\n")
+
+        wait(for: [outputExpectation, exitExpectation], timeout: 8.0)
+        // Use the LAST occurrence of the marker to skip the echo-back line.
+        // The echo-back contains the literal printf format (e.g. marker + "%s__"),
+        // while the actual output contains the expanded value.
+        guard let range = collectedOutput.range(of: marker, options: .backwards) else {
+            return XCTFail("Missing marker in output: \(collectedOutput)")
+        }
+        let suffix = collectedOutput[range.upperBound...]
+        guard let endRange = suffix.range(of: "__") else {
+            return XCTFail("Missing terminator in output: \(collectedOutput)")
+        }
+        let fdList = String(suffix[..<endRange.lowerBound])
+        let fds = Set(fdList.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) })
+
+        // fd 0, 1, 2 must be present (stdin/stdout/stderr connected to slave)
+        XCTAssertTrue(fds.contains(0), "stdin (fd 0) must be open")
+        XCTAssertTrue(fds.contains(1), "stdout (fd 1) must be open")
+        XCTAssertTrue(fds.contains(2), "stderr (fd 2) must be open")
+        // No master fd or stale slave fd should leak.  The shell itself may open
+        // a few low fds for bookkeeping, but nothing >= 10 should be present.
+        let unexpectedFDs = fds.filter { $0 >= 10 }
+        XCTAssertTrue(unexpectedFDs.isEmpty, "Child has unexpected high file descriptors: \(unexpectedFDs). Full list: \(fdList)")
+    }
+
+    /// Verify that when multiple PTYs are active, a newly spawned child does not
+    /// inherit master fds from earlier PTY sessions (fd isolation).
+    func testPTYMultipleSessionsDoNotLeakMasterFDsToChildren() throws {
+        // Start a long-running first PTY (keeps its master fd open in parent)
+        let ptyA = PTY()
+        defer { ptyA.stop(waitForExit: true) }
+        try ptyA.start(rows: 24, cols: 80, initialDirectory: NSTemporaryDirectory())
+
+        // Start a second PTY and have it list its open fds
+        let ptyB = PTY()
+        defer { ptyB.stop(waitForExit: true) }
+
+        let marker = "__PTERM_MULTI_FD_\(UUID().uuidString)__"
+        let outputExpectation = expectation(description: "pty-multi-fd-output")
+        let exitExpectation = expectation(description: "pty-multi-fd-exit")
+        let lock = NSLock()
+        var collectedOutput = ""
+        var matched = false
+        var exited = false
+
+        ptyB.onOutput = { data in
+            let chunk = String(decoding: data, as: UTF8.self)
+            lock.lock()
+            collectedOutput += chunk
+            if !matched, collectedOutput.contains(marker) {
+                matched = true
+                outputExpectation.fulfill()
+            }
+            lock.unlock()
+        }
+        ptyB.onExit = {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !exited else { return }
+            exited = true
+            exitExpectation.fulfill()
+        }
+
+        try ptyB.start(rows: 24, cols: 80, initialDirectory: NSTemporaryDirectory())
+        ptyB.write("printf '\(marker)%s__\\n' \"$(/bin/ls /dev/fd | /usr/bin/tr '\\n' ',')\"\nexit\n")
+
+        wait(for: [outputExpectation, exitExpectation], timeout: 8.0)
+        // Use the LAST occurrence of the marker to skip the echo-back line.
+        // The echo-back contains the literal printf format (e.g. marker + "%s__"),
+        // while the actual output contains the expanded value.
+        guard let range = collectedOutput.range(of: marker, options: .backwards) else {
+            return XCTFail("Missing marker in output: \(collectedOutput)")
+        }
+        let suffix = collectedOutput[range.upperBound...]
+        guard let endRange = suffix.range(of: "__") else {
+            return XCTFail("Missing terminator in output: \(collectedOutput)")
+        }
+        let fdList = String(suffix[..<endRange.lowerBound])
+        let fds = Set(fdList.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) })
+
+        // If fd isolation works, ptyB's child should NOT have ptyA's master fd.
+        let highFDs = fds.filter { $0 >= 10 }
+        XCTAssertTrue(highFDs.isEmpty, "Child of PTY-B inherited leaked fds (likely master fds from PTY-A): \(highFDs). Full list: \(fdList)")
+    }
+
+    /// Verify that the child's stdin/stdout/stderr are connected to a pty slave
+    /// device (dup2 to slave succeeded) by checking the tty command output.
+    func testPTYChildStdioIsConnectedToSlavePTY() throws {
+        let pty = PTY()
+        defer { pty.stop(waitForExit: true) }
+
+        let marker = "__PTERM_TTY_\(UUID().uuidString)__"
+        let outputExpectation = expectation(description: "pty-tty-output")
+        let exitExpectation = expectation(description: "pty-tty-exit")
+        let lock = NSLock()
+        var collectedOutput = ""
+        var matched = false
+        var exited = false
+
+        pty.onOutput = { data in
+            let chunk = String(decoding: data, as: UTF8.self)
+            lock.lock()
+            collectedOutput += chunk
+            if !matched, collectedOutput.contains(marker) {
+                matched = true
+                outputExpectation.fulfill()
+            }
+            lock.unlock()
+        }
+        pty.onExit = {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !exited else { return }
+            exited = true
+            exitExpectation.fulfill()
+        }
+
+        try pty.start(rows: 24, cols: 80, initialDirectory: NSTemporaryDirectory())
+        pty.write("printf '\(marker)%s__\\n' \"$(tty)\"\nexit\n")
+
+        wait(for: [outputExpectation, exitExpectation], timeout: 8.0)
+        // Use the LAST occurrence of the marker to skip the echo-back line.
+        // The echo-back contains the literal printf format (e.g. marker + "%s__"),
+        // while the actual output contains the expanded value.
+        guard let range = collectedOutput.range(of: marker, options: .backwards) else {
+            return XCTFail("Missing marker in output: \(collectedOutput)")
+        }
+        let suffix = collectedOutput[range.upperBound...]
+        guard let endRange = suffix.range(of: "__") else {
+            return XCTFail("Missing terminator in output: \(collectedOutput)")
+        }
+        let ttyPath = String(suffix[..<endRange.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Must be a /dev/ttys* device (macOS pty slave naming convention)
+        XCTAssertTrue(ttyPath.hasPrefix("/dev/ttys"), "Child's tty should be a pty slave device, got: \(ttyPath)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: ttyPath), "Slave device \(ttyPath) must exist")
+    }
+
+    /// Verify the initial terminal window size matches what was requested
+    /// (ioctl TIOCSWINSZ in openpty succeeded).
+    func testPTYChildTerminalSizeMatchesRequested() throws {
+        let pty = PTY()
+        defer { pty.stop(waitForExit: true) }
+
+        let requestedRows: UInt16 = 37
+        let requestedCols: UInt16 = 142
+
+        let marker = "__PTERM_SIZE_\(UUID().uuidString)__"
+        let outputExpectation = expectation(description: "pty-size-output")
+        let exitExpectation = expectation(description: "pty-size-exit")
+        let lock = NSLock()
+        var collectedOutput = ""
+        var matched = false
+        var exited = false
+
+        pty.onOutput = { data in
+            let chunk = String(decoding: data, as: UTF8.self)
+            lock.lock()
+            collectedOutput += chunk
+            if !matched, collectedOutput.contains(marker) {
+                matched = true
+                outputExpectation.fulfill()
+            }
+            lock.unlock()
+        }
+        pty.onExit = {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !exited else { return }
+            exited = true
+            exitExpectation.fulfill()
+        }
+
+        try pty.start(rows: requestedRows, cols: requestedCols, initialDirectory: NSTemporaryDirectory())
+        pty.write("printf '\(marker)%s__\\n' \"$(stty size)\"\nexit\n")
+
+        wait(for: [outputExpectation, exitExpectation], timeout: 8.0)
+        // Use the LAST occurrence of the marker to skip the echo-back line.
+        // The echo-back contains the literal printf format (e.g. marker + "%s__"),
+        // while the actual output contains the expanded value.
+        guard let range = collectedOutput.range(of: marker, options: .backwards) else {
+            return XCTFail("Missing marker in output: \(collectedOutput)")
+        }
+        let suffix = collectedOutput[range.upperBound...]
+        guard let endRange = suffix.range(of: "__") else {
+            return XCTFail("Missing terminator in output: \(collectedOutput)")
+        }
+        let sizeStr = String(suffix[..<endRange.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = sizeStr.split(separator: " ").map(String.init)
+        XCTAssertEqual(parts.count, 2, "Expected 'rows cols', got: \(sizeStr)")
+        XCTAssertEqual(parts[0], "\(requestedRows)", "Rows mismatch: expected \(requestedRows), got \(parts[0])")
+        XCTAssertEqual(parts[1], "\(requestedCols)", "Cols mismatch: expected \(requestedCols), got \(parts[1])")
+    }
+
+    /// Verify that terminal attributes (tcsetattr) are applied to the slave.
+    func testPTYChildTerminalAttributesAreApplied() throws {
+        let pty = PTY()
+        defer { pty.stop(waitForExit: true) }
+
+        let marker = "__PTERM_ATTR_\(UUID().uuidString)__"
+        let outputExpectation = expectation(description: "pty-attr-output")
+        let exitExpectation = expectation(description: "pty-attr-exit")
+        let lock = NSLock()
+        var collectedOutput = ""
+        var matched = false
+        var exited = false
+
+        pty.onOutput = { data in
+            let chunk = String(decoding: data, as: UTF8.self)
+            lock.lock()
+            collectedOutput += chunk
+            if !matched, collectedOutput.contains(marker) {
+                matched = true
+                outputExpectation.fulfill()
+            }
+            lock.unlock()
+        }
+        pty.onExit = {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !exited else { return }
+            exited = true
+            exitExpectation.fulfill()
+        }
+
+        try pty.start(rows: 24, cols: 80, initialDirectory: NSTemporaryDirectory())
+        pty.write("printf '\(marker)%s__\\n' \"$(stty -a 2>&1)\"\nexit\n")
+
+        wait(for: [outputExpectation, exitExpectation], timeout: 8.0)
+        // Use the LAST occurrence of the marker to skip the echo-back line.
+        // The echo-back contains the literal printf format (e.g. marker + "%s__"),
+        // while the actual output contains the expanded value.
+        guard let range = collectedOutput.range(of: marker, options: .backwards) else {
+            return XCTFail("Missing marker in output: \(collectedOutput)")
+        }
+        let suffix = collectedOutput[range.upperBound...]
+        guard let endRange = suffix.range(of: "__") else {
+            return XCTFail("Missing terminator in output: \(collectedOutput)")
+        }
+        let sttyOutput = String(suffix[..<endRange.lowerBound])
+
+        XCTAssertTrue(sttyOutput.contains("cs8"), "Terminal should have 8-bit character size (cs8)")
+        XCTAssertTrue(sttyOutput.contains("opost"), "Terminal should have output post-processing (opost)")
+    }
+
+    /// Verify that the parent process does NOT hold the slave fd after start()
+    /// completes (parent-side close(slave) succeeded).
+    func testPTYParentDoesNotRetainSlaveFD() throws {
+        let pty = PTY()
+        defer { pty.stop(waitForExit: true) }
+
+        let exitExpectation = expectation(description: "pty-parent-slave-exit")
+        var exited = false
+        let lock = NSLock()
+
+        pty.onOutput = { _ in }
+        pty.onExit = {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !exited else { return }
+            exited = true
+            exitExpectation.fulfill()
+        }
+
+        // Record open fds before starting the PTY
+        let fdsBefore = Set(
+            (try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd"))?
+                .compactMap { Int($0) } ?? []
+        )
+
+        try pty.start(rows: 24, cols: 80, initialDirectory: NSTemporaryDirectory())
+
+        // Record open fds after starting — the master fd should appear, but NOT the slave
+        let fdsAfter = Set(
+            (try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd"))?
+                .compactMap { Int($0) } ?? []
+        )
+
+        let newFDs = fdsAfter.subtracting(fdsBefore)
+        // forkpty() opens two fds (master + slave) internally, then closes the
+        // slave in the parent.  After start(), the parent should have gained at
+        // most 1 new fd (the master).  The dispatch source may also add a kqueue
+        // fd, so allow up to 2 new fds.  If 3+ appear, something leaked (likely slave).
+        XCTAssertLessThanOrEqual(newFDs.count, 2,
+                       "Parent should gain at most 2 new fds (master + dispatch source), but found \(newFDs.count): \(newFDs)")
+
+        pty.write("exit\n")
+        wait(for: [exitExpectation], timeout: 8.0)
+    }
+
+    /// Measure terminal startup latency: time from start() to first output byte.
+    /// This serves as a performance baseline for the forkpty→openpty migration.
+    func testPTYStartupLatencyBaseline() throws {
+        // Run multiple iterations and take the median to reduce noise.
+        // Use DispatchSemaphore instead of XCTestExpectation because
+        // XCTest does not support wait(for:) inside loops.
+        var latencies: [TimeInterval] = []
+
+        for _ in 0..<5 {
+            let pty = PTY()
+            let sem = DispatchSemaphore(value: 0)
+            let lock = NSLock()
+            var firstOutputTime: Date?
+
+            pty.onOutput = { _ in
+                lock.lock()
+                defer { lock.unlock() }
+                if firstOutputTime == nil {
+                    firstOutputTime = Date()
+                    sem.signal()
+                }
+            }
+            pty.onExit = {}
+
+            let startTime = Date()
+            try pty.start(rows: 24, cols: 80, initialDirectory: NSTemporaryDirectory())
+
+            let result = sem.wait(timeout: .now() + 10.0)
+            XCTAssertEqual(result, .success, "Timed out waiting for first PTY output")
+
+            pty.write("exit\n")
+            pty.stop(waitForExit: true)
+
+            lock.lock()
+            if let outputTime = firstOutputTime {
+                latencies.append(outputTime.timeIntervalSince(startTime))
+            }
+            lock.unlock()
+        }
+
+        XCTAssertFalse(latencies.isEmpty, "Should have collected at least one latency measurement")
+        let sorted = latencies.sorted()
+        let median = sorted[sorted.count / 2]
+        // Startup should be fast — well under 1 second.  A reasonable upper bound
+        // for fork+exec of a shell on macOS/Apple Silicon is 500ms even under load.
+        XCTAssertLessThan(median, 1.0, "Median startup latency \(String(format: "%.3f", median))s exceeds 1.0s threshold")
+        NSLog("PTY startup latency: median=%.3fs, min=%.3fs, max=%.3fs (n=%d)",
+              median, sorted.first!, sorted.last!, sorted.count)
+    }
 }
 
 private extension PTYIntegrationTests {

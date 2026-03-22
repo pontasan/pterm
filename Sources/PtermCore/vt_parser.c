@@ -683,7 +683,11 @@ void vt_parser_feed_one(VtParser *parser, uint32_t cp) {
             if (!parser->osc_saw_separator) {
                 if (cp >= '0' && cp <= '9') {
                     parser->osc_command_has_digits = true;
-                    parser->osc_command = parser->osc_command * 10 + (uint32_t)(cp - '0');
+                    if (parser->osc_command > (UINT32_MAX - 9) / 10) {
+                        parser->osc_command = UINT32_MAX;
+                    } else {
+                        parser->osc_command = parser->osc_command * 10 + (uint32_t)(cp - '0');
+                    }
                 } else if (cp == ';') {
                     parser->osc_saw_separator = true;
                     parser->osc_ignore_payload = !osc_command_should_capture(
@@ -771,7 +775,11 @@ size_t vt_parser_consume_ascii_ignored_string_fast_path(
                 const uint8_t byte = bytes[index];
                 if (byte >= '0' && byte <= '9') {
                     has_digits = true;
-                    command = command * 10 + (uint32_t)(byte - '0');
+                    if (command > (UINT32_MAX - 9) / 10) {
+                        command = UINT32_MAX;
+                    } else {
+                        command = command * 10 + (uint32_t)(byte - '0');
+                    }
                     index++;
                     continue;
                 }

@@ -184,22 +184,49 @@ final class PTY {
             resolvedExecutablePath = nil
         }
 
+        // ── Create PTY pair ──────────────────────────────────────────────
+        // Use openpty() instead of forkpty() so we can set FD_CLOEXEC on the
+        // master fd *before* fork().  This is the industry-standard approach
+        // (Alacritty, kitty, Ghostty all do the same) and eliminates the race
+        // window where a concurrent fork could inherit an un-CLOEXEC'd master.
+        //
+        // The syscall sequence below is identical to what Apple's libc forkpty()
+        // does internally (openpty → fork → login_tty → close), except we insert
+        // fcntl(FD_CLOEXEC) between openpty() and fork().
         var amaster: Int32 = -1
-        let pid: pid_t
+        var aslave: Int32 = -1
+        let openResult: Int32
         if var slaveAttributes = slaveTerminalAttributes {
-            pid = withUnsafeMutablePointer(to: &slaveAttributes) { attributesPointer in
-                forkpty(&amaster, nil, attributesPointer, &winSize)
+            openResult = withUnsafeMutablePointer(to: &slaveAttributes) { attributesPointer in
+                openpty(&amaster, &aslave, nil, attributesPointer, &winSize)
             }
         } else {
-            pid = forkpty(&amaster, nil, nil, &winSize)
+            openResult = openpty(&amaster, &aslave, nil, nil, &winSize)
+        }
+        guard openResult == 0 else {
+            throw PTYError.forkptyFailed("openpty failed: \(String(cString: strerror(errno)))")
         }
 
+        // Set close-on-exec on master BEFORE fork — the entire point of this
+        // refactor.  Future child processes will never inherit this fd.
+        _ = fcntl(amaster, F_SETFD, FD_CLOEXEC)
+
+        // ── Fork ───────────────────────────────────────────────────────────
+        // Use pterm_fork_pty (C) because Swift/Foundation marks fork() as
+        // unavailable.  The C function performs: fork → child: close(master),
+        // setsid, TIOCSCTTY, dup2(slave,0/1/2), close(slave), close fds 3..rlimit.
+        // In the parent it closes the slave fd.
+        let pid = pterm_fork_pty(amaster, aslave)
+
         if pid < 0 {
-            throw PTYError.forkptyFailed(String(cString: strerror(errno)))
+            close(amaster)
+            close(aslave)
+            throw PTYError.forkptyFailed("fork failed: \(String(cString: strerror(errno)))")
         }
 
         if pid == 0 {
-            // Child process: exec user's preferred shell or a requested program
+            // ── Child process (returned from pterm_fork_pty) ───────────────
+            // stdio is already connected to slave; all fds >= 3 are closed.
             setupChildEnvironment(shellPath: resolvedShellPath, termEnv: safeTerm, initialDirectory: initialDirectory)
             if let resolvedExecutablePath {
                 let argv = Self.makeExecArguments(
@@ -207,6 +234,9 @@ final class PTY {
                     arguments: arguments
                 )
                 execv(resolvedExecutablePath, argv)
+                for ptr in argv {
+                    if let ptr { free(ptr) }
+                }
             } else {
                 let argv: [UnsafeMutablePointer<CChar>?] = [
                     strdup(resolvedShellPath),
@@ -214,12 +244,15 @@ final class PTY {
                     nil
                 ]
                 execv(resolvedShellPath, argv)
+                for ptr in argv {
+                    if let ptr { free(ptr) }
+                }
             }
-            // If execv returns, it failed
             _exit(1)
         }
 
-        // Parent process
+        // ── Parent process ─────────────────────────────────────────────────
+        // pterm_fork_pty already closed slave in the parent.
         fdLock.lock()
         self.masterFD = amaster
         self._isRunning = true

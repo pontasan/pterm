@@ -108,7 +108,7 @@ struct TextInteractionConfiguration: Equatable {
         outputConfirmedInputAnimation: true,
         outputFrameThrottlingMode: .continuous,
         showFPSInStatusBar: false,
-        typewriterSoundEnabled: true
+        typewriterSoundEnabled: false
     )
 }
 
@@ -191,6 +191,7 @@ struct AIConfiguration: Equatable {
     let enabled: Bool
     let language: String
     let model: AIModelType
+    let dangerouslySkipPermissions: Bool
 
     /// Resolve the user's actual system language, bypassing the app bundle's
     /// localization table which can override `Locale.current` in GUI apps.
@@ -204,7 +205,8 @@ struct AIConfiguration: Equatable {
     static let `default` = AIConfiguration(
         enabled: true,
         language: defaultLanguage,
-        model: .claudeCode
+        model: .claudeCode,
+        dangerouslySkipPermissions: false
     )
 }
 
@@ -400,7 +402,8 @@ enum PtermConfigStore {
             ai: AIConfiguration(
                 enabled: boolValue(aiSection?["enabled"]) ?? defaults.ai.enabled,
                 language: stringValue(aiSection?["language"]) ?? defaults.ai.language,
-                model: stringValue(aiSection?["model"]).flatMap(AIModelType.init(configuredValue:)) ?? defaults.ai.model
+                model: stringValue(aiSection?["model"]).flatMap(AIModelType.init(configuredValue:)) ?? defaults.ai.model,
+                dangerouslySkipPermissions: boolValue(aiSection?["dangerously_skip_permissions"]) ?? defaults.ai.dangerouslySkipPermissions
             ),
             shortcuts: ShortcutParser.parseMap(shortcuts?.compactMapValues(stringValue)),
             workspaces: workspaces

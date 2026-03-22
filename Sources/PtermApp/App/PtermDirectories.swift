@@ -64,31 +64,43 @@ enum PtermDirectories {
     }
 
     /// Ensure all directories exist with correct permissions.
+    ///
+    /// After creation, each path is verified via `lstat` (not `stat`) to confirm
+    /// it is a real directory and not a symlink. This prevents a TOCTOU attack
+    /// where an attacker replaces a directory with a symlink between the existence
+    /// check and the use of the path.
     static func ensureDirectories() {
         let fm = FileManager.default
         let dirs = [base, files, sessions, sessionScrollback, audit, workspaces]
 
         for dir in dirs {
-            if !fm.fileExists(atPath: dir.path) {
-                do {
-                    try fm.createDirectory(at: dir, withIntermediateDirectories: true,
-                                          attributes: [.posixPermissions: 0o700])
-                } catch {
-                    fatalError("Failed to create directory \(dir.path): \(error)")
-                }
-            }
-        }
-
-        // Verify and enforce 0700 permissions on all directories
-        for dir in dirs {
             do {
-                let attrs = try fm.attributesOfItem(atPath: dir.path)
-                if let perms = attrs[.posixPermissions] as? Int, perms != 0o700 {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true,
+                                      attributes: [.posixPermissions: 0o700])
+            } catch {
+                fatalError("Failed to create directory \(dir.path): \(error)")
+            }
+
+            // Use lstat (not stat) to avoid following symlinks. If the path is
+            // a symlink pointing to a directory, stat would report S_IFDIR but
+            // lstat correctly reports S_IFLNK, letting us detect the attack.
+            var sb = stat()
+            guard lstat(dir.path, &sb) == 0 else {
+                fatalError("Failed to lstat directory \(dir.path): \(String(cString: strerror(errno)))")
+            }
+            guard (sb.st_mode & S_IFMT) == S_IFDIR else {
+                fatalError("Security violation: \(dir.path) is not a directory (mode=0o\(String(sb.st_mode, radix: 8))). Possible symlink attack.")
+            }
+
+            // Enforce 0700 permissions
+            let currentPerms = sb.st_mode & 0o7777
+            if currentPerms != 0o700 {
+                do {
                     try fm.setAttributes([.posixPermissions: 0o700],
                                         ofItemAtPath: dir.path)
+                } catch {
+                    fatalError("Failed to set permissions on \(dir.path): \(error)")
                 }
-            } catch {
-                // Non-fatal: permissions may already be correct
             }
         }
     }

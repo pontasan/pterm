@@ -76,7 +76,21 @@ final class ClipboardFileStore {
         guard url.deletingLastPathComponent().path == rootDirectory.path else {
             throw CocoaError(.fileNoSuchFile)
         }
-        try unlinkFile(at: url)
+        // Use fd-based unlinkat to eliminate TOCTOU window between the path
+        // validation above and the actual deletion. By opening the validated
+        // parent directory and deleting by filename component, the kernel
+        // guarantees the unlink targets the correct directory even if the
+        // filesystem changes between the check and the unlink.
+        let dirFd = open(rootDirectory.path, O_RDONLY | O_DIRECTORY)
+        guard dirFd >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { close(dirFd) }
+        let filename = url.lastPathComponent
+        let result = unlinkat(dirFd, filename, 0)
+        if result != 0 && errno != ENOENT {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 
     func deleteAllStoredFiles() throws {

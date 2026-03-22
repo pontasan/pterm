@@ -2,7 +2,6 @@ import AppKit
 import Foundation
 
 enum PtermExportImportError: Error {
-    case passwordRequired
     case invalidArchive
     case unsafeArchiveEntry(String)
     case commandFailed(String)
@@ -47,9 +46,7 @@ final class PtermExportImportManager {
         return fileManager.homeDirectoryForCurrentUser.appendingPathComponent(name)
     }
 
-    func exportArchive(to destination: URL, password: String) throws {
-        guard !password.isEmpty else { throw PtermExportImportError.passwordRequired }
-
+    func exportArchive(to destination: URL) throws {
         let staging = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: staging) }
@@ -58,7 +55,7 @@ final class PtermExportImportManager {
         try copyDirectoryIfExists(sessionsURL, to: staging.appendingPathComponent("sessions"))
         try copyDirectoryIfExists(workspacesURL, to: staging.appendingPathComponent("workspaces"))
         try copyDirectoryIfExists(auditURL, to: staging.appendingPathComponent("audit"))
-        if let note = try noteStore.exportNoteForTransfer(authorizationPassword: password) {
+        if let note = try noteStore.exportNoteForTransfer() {
             try AtomicFileWriter.write(
                 Data(note.utf8),
                 to: staging.appendingPathComponent(TransferFile.note),
@@ -72,8 +69,7 @@ final class PtermExportImportManager {
         try run("/usr/bin/ditto", ["-c", "-k", "--keepParent", staging.path, destination.path])
     }
 
-    func importArchive(from archiveURL: URL, password: String) throws {
-        guard !password.isEmpty else { throw PtermExportImportError.passwordRequired }
+    func importArchive(from archiveURL: URL) throws {
         let extractionRoot = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let backupRoot = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try fileManager.createDirectory(at: extractionRoot, withIntermediateDirectories: true)
@@ -114,7 +110,7 @@ final class PtermExportImportManager {
             }
             try normalizeImportedPermissions(for: replacements.map(\.destination))
             if let importedNote {
-                try noteStore.importTransferredNote(importedNote, authorizationPassword: password)
+                try noteStore.importTransferredNote(importedNote)
             }
         } catch {
             for created in createdDestinations.reversed() {
@@ -220,7 +216,7 @@ final class PtermExportImportManager {
 
     private func validateExtractedArchive(root: URL) throws {
         let rootPath = root.standardizedFileURL.path
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey, .linkCountKey]
         guard let enumerator = fileManager.enumerator(at: root,
                                                       includingPropertiesForKeys: Array(keys),
                                                       options: [.skipsHiddenFiles]) else {
@@ -229,10 +225,17 @@ final class PtermExportImportManager {
 
         for case let entry as URL in enumerator {
             let values = try entry.resourceValues(forKeys: keys)
+            let standardized = entry.standardizedFileURL.path
+            let relative = String(standardized.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let entryLabel = relative.isEmpty ? entry.lastPathComponent : relative
+
             if values.isSymbolicLink == true {
-                let standardized = entry.standardizedFileURL.path
-                let relative = String(standardized.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                throw PtermExportImportError.unsafeArchiveEntry(relative.isEmpty ? entry.lastPathComponent : relative)
+                throw PtermExportImportError.unsafeArchiveEntry(entryLabel)
+            }
+
+            // Reject hardlinked files (link count > 1 for non-directories)
+            if values.isDirectory != true, let linkCount = values.linkCount, linkCount > 1 {
+                throw PtermExportImportError.unsafeArchiveEntry(entryLabel)
             }
         }
     }

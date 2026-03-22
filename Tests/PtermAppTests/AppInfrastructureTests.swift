@@ -1389,10 +1389,10 @@ final class AppInfrastructureTests: XCTestCase {
         }
     }
 
-    func testPtermConfigStoreDefaultsTypewriterSoundToEnabled() {
+    func testPtermConfigStoreDefaultsTypewriterSoundToDisabled() {
         let loaded = PtermConfigStore.load(from: URL(fileURLWithPath: "/nonexistent/config.json"))
 
-        XCTAssertTrue(loaded.textInteraction.typewriterSoundEnabled)
+        XCTAssertFalse(loaded.textInteraction.typewriterSoundEnabled)
     }
 
     func testPtermConfigStoreLoadsTypewriterSoundSetting() throws {
@@ -2022,14 +2022,15 @@ final class AppInfrastructureTests: XCTestCase {
         }
     }
 
-    func testAuditKeyStoreCreatesAndReloadsStableKeyFile() throws {
-        try withTemporaryDirectory { directory in
-            let keyURL = directory.appendingPathComponent(".key")
-            let first = try AuditKeyStore.loadOrCreateKey(url: keyURL)
-            let second = try AuditKeyStore.loadOrCreateKey(url: keyURL)
-            XCTAssertEqual(first.withUnsafeBytes { Data($0) }, second.withUnsafeBytes { Data($0) })
-            XCTAssertEqual(try posixPermissions(of: keyURL) & 0o777, 0o400)
-        }
+    func testAuditKeyStoreCreatesAndReloadsStableKeyFromKeychain() throws {
+        // Clean up any previous test key
+        try? AuditKeyStore.deleteKeyFromKeychain()
+        defer { try? AuditKeyStore.deleteKeyFromKeychain() }
+
+        let first = try AuditKeyStore.loadOrCreateKey()
+        let second = try AuditKeyStore.loadOrCreateKey()
+        XCTAssertEqual(first.withUnsafeBytes { Data($0) }, second.withUnsafeBytes { Data($0) })
+        XCTAssertEqual(first.withUnsafeBytes { Data($0) }.count, 32)
     }
 
     func testAuditPathBuilderUsesProvidedTimeZone() {
@@ -2100,16 +2101,10 @@ final class AppInfrastructureTests: XCTestCase {
             )
             let archiveURL = directory.appendingPathComponent("archive.zip")
 
-            XCTAssertThrowsError(try manager.exportArchive(to: archiveURL, password: "")) { error in
-                guard case PtermExportImportError.passwordRequired = error else {
-                    return XCTFail("Expected passwordRequired, got \(error)")
-                }
-            }
-            XCTAssertThrowsError(try manager.importArchive(from: archiveURL, password: "")) { error in
-                guard case PtermExportImportError.passwordRequired = error else {
-                    return XCTFail("Expected passwordRequired, got \(error)")
-                }
-            }
+            // Password validation was removed — export/import no longer require
+            // a password.  Verify that export succeeds without a password argument.
+            try manager.exportArchive(to: archiveURL)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: archiveURL.path))
         }
     }
 
@@ -2128,7 +2123,7 @@ final class AppInfrastructureTests: XCTestCase {
             let archiveURL = directory.appendingPathComponent("archive.zip")
             let extractionRoot = directory.appendingPathComponent("extracted")
 
-            try manager.exportArchive(to: archiveURL, password: "secret")
+            try manager.exportArchive(to: archiveURL)
             try FileManager.default.createDirectory(at: extractionRoot, withIntermediateDirectories: true)
 
             let process = Process()
@@ -2174,7 +2169,7 @@ final class AppInfrastructureTests: XCTestCase {
                 auditURL: directory.appendingPathComponent("audit")
             )
 
-            try manager.importArchive(from: archiveURL, password: "destination-secret")
+            try manager.importArchive(from: archiveURL)
 
             XCTAssertEqual(try noteStore.loadNote(), "imported note")
             XCTAssertTrue(
@@ -2297,7 +2292,7 @@ final class AppInfrastructureTests: XCTestCase {
                 auditURL: directory.appendingPathComponent("audit")
             )
 
-            XCTAssertThrowsError(try manager.importArchive(from: archiveURL, password: "secret")) { error in
+            XCTAssertThrowsError(try manager.importArchive(from: archiveURL)) { error in
                 guard case let PtermExportImportError.unsafeArchiveEntry(path) = error else {
                     return XCTFail("Expected unsafeArchiveEntry, got \(error)")
                 }

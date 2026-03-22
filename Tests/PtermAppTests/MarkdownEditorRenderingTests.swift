@@ -126,6 +126,7 @@ final class MarkdownEditorRenderingTests: XCTestCase {
 
         let spy = KeyClickSpy()
         textView.inputFeedbackPlayer = spy
+        textView.typewriterSoundEnabled = true
         textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
         textView.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
         RunLoop.main.run(until: Date().addingTimeInterval(0.01))

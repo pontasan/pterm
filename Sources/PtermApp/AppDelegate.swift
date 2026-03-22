@@ -2471,16 +2471,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func exportData(_ sender: Any?) {
-        let password = promptPassword(title: "Export Password",
-                                      message: "Enter a password to unlock the encrypted note for plaintext export.")
-        guard let password else { return }
+        let confirm = NSAlert.pterm()
+        confirm.messageText = "Export Data"
+        confirm.informativeText = "Notes will be exported as plaintext so they can be imported on another Mac. Continue?"
+        confirm.addButton(withTitle: "Export")
+        confirm.addButton(withTitle: "Cancel")
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+
         let panel = NSSavePanel()
         panel.nameFieldStringValue = exportImportManager.defaultExportURL().lastPathComponent
         panel.directoryURL = exportImportManager.defaultExportURL().deletingLastPathComponent()
         panel.allowedContentTypes = [.zip]
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            try exportImportManager.exportArchive(to: url, password: password)
+            try exportImportManager.exportArchive(to: url)
             showInfoAlert(title: "Export Complete", message: url.path)
         } catch {
             NSAlert(error: error).runModal()
@@ -2492,10 +2496,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openPanel.allowedContentTypes = [.zip]
         openPanel.canChooseDirectories = false
         guard openPanel.runModal() == .OK, let url = openPanel.url else { return }
-
-        let password = promptPassword(title: "Import Password",
-                                      message: "Enter a password to re-encrypt the imported note on this Mac.")
-        guard let password else { return }
 
         let preview: PtermExportImportManager.ImportPreview
         do {
@@ -2517,7 +2517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
 
         do {
-            try exportImportManager.importArchive(from: url, password: password)
+            try exportImportManager.importArchive(from: url)
             relaunchApplication()
         } catch {
             NSAlert(error: error).runModal()
@@ -3830,6 +3830,13 @@ extension AppDelegate: MCPToolProvider {
             let title = arguments["title"] as? String
             let command = arguments["command"] as? String
             let executableArguments = arguments["arguments"] as? [String] ?? []
+
+            // Validate command path if provided: must be absolute, must exist, must be a regular executable file.
+            if let command {
+                NSLog("pterm MCP create_terminal: command provided (arguments redacted)")
+                try MCPServer.validateCommandPath(command)
+            }
+
             let terminalID = UUID()
             let isDirectLaunch = command != nil
             let workspaceName = if let command {
@@ -4027,6 +4034,15 @@ extension AppDelegate: MCPToolProvider {
                 [
                     "goal": "Move or reorganize terminals",
                     "steps": ["call move_terminal, rename_terminal, rename_workspace, or remove_workspace"]
+                ]
+            ],
+            "authentication": [
+                "description": "All tool calls require a session token. If you receive an unauthorized error, follow these steps.",
+                "steps": [
+                    "Call the auth/info method without authentication to discover the token file path.",
+                    "Read the token from the file (permissions 0600, owner-only).",
+                    "Include the token in every subsequent request as: Authorization: Bearer <token>",
+                    "The token is regenerated each time pterm starts."
                 ]
             ],
             "interaction_guidance": [

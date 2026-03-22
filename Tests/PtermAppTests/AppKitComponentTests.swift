@@ -445,7 +445,7 @@ final class AppKitComponentTests: XCTestCase {
         }
     }
 
-    func testSettingsWindowTypewriterSoundToggleDefaultsToOnAndPersists() throws {
+    func testSettingsWindowTypewriterSoundToggleDefaultsToOffAndPersists() throws {
         try withTemporaryPtermConfig { configURL in
             let controller = SettingsWindowController(configURL: configURL)
 
@@ -455,13 +455,13 @@ final class AppKitComponentTests: XCTestCase {
                     .first(where: { $0.title == "Simulate typewriter keystroke sounds" })
             )
 
-            XCTAssertEqual(checkbox.state, .on)
+            XCTAssertEqual(checkbox.state, .off)
 
-            checkbox.state = .off
+            checkbox.state = .on
             _ = checkbox.target?.perform(checkbox.action, with: checkbox)
 
             let loaded = PtermConfigStore.load(from: configURL)
-            XCTAssertFalse(loaded.textInteraction.typewriterSoundEnabled)
+            XCTAssertTrue(loaded.textInteraction.typewriterSoundEnabled)
         }
     }
 
@@ -4600,6 +4600,7 @@ final class AppKitComponentTests: XCTestCase {
         let spy = KeyClickSpy()
         view.terminalController = controller
         view.inputFeedbackPlayer = spy
+        view.typewriterSoundEnabled = true
 
         view.insertText("a", replacementRange: NSRange(location: NSNotFound, length: 0))
 
@@ -4646,6 +4647,7 @@ final class AppKitComponentTests: XCTestCase {
         let spy = KeyClickSpy()
         view.terminalController = controller
         view.inputFeedbackPlayer = spy
+        view.typewriterSoundEnabled = true
 
         view.setMarkedText("かな", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
 
@@ -4692,6 +4694,7 @@ final class AppKitComponentTests: XCTestCase {
         let spy = KeyClickSpy()
         view.terminalController = controller
         view.inputFeedbackPlayer = spy
+        view.typewriterSoundEnabled = true
 
         view.doCommand(by: #selector(NSResponder.insertTab(_:)))
 

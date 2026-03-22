@@ -50,17 +50,11 @@ final class AppNoteStore {
         try AtomicFileWriter.write(ciphertext, to: noteURL, permissions: 0o600)
     }
 
-    func exportNoteForTransfer(authorizationPassword: String) throws -> String? {
-        guard !authorizationPassword.isEmpty else {
-            throw AppNoteError.passwordRequired
-        }
-        return try loadNote()
+    func exportNoteForTransfer() throws -> String? {
+        try loadNote()
     }
 
-    func importTransferredNote(_ note: String, authorizationPassword: String) throws {
-        guard !authorizationPassword.isEmpty else {
-            throw AppNoteError.passwordRequired
-        }
+    func importTransferredNote(_ note: String) throws {
         try saveNote(note)
     }
 
@@ -215,5 +209,4 @@ enum AppNoteError: Error {
     case invalidFormat
     case invalidKeyLength
     case randomFailure
-    case passwordRequired
 }

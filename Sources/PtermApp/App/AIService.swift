@@ -84,6 +84,16 @@ enum AIService {
     }
 
     /// Resolves the full path of a CLI executable.
+    ///
+    /// Security: Only searches system-managed directories that require
+    /// administrator privileges to modify.  User-writable directories
+    /// (e.g. ~/.local/bin, ~/.npm-global/bin) are excluded to prevent
+    /// path hijack attacks where a malicious binary could steal API keys
+    /// passed via environment variables.
+    ///
+    /// After resolving a candidate path, the executable is validated via
+    /// `codesign --verify` to ensure it has not been tampered with and
+    /// carries a valid code signature.
     private static func resolveExecutable(for model: AIModelType) -> String? {
         let name: String
         switch model {
@@ -92,24 +102,25 @@ enum AIService {
         case .gemini: name = "gemini"
         }
 
-        // Search common install locations and PATH
+        // Only search directories that require root/admin to write to.
+        // User-writable paths (~/.local/bin, ~/.npm-global/bin, ~/.cargo/bin)
+        // are intentionally excluded to prevent path hijack attacks.
         let searchPaths = [
             "/usr/local/bin",
             "/opt/homebrew/bin",
-            "/usr/bin",
-            NSHomeDirectory() + "/.local/bin",
-            NSHomeDirectory() + "/.npm-global/bin",
-            NSHomeDirectory() + "/.cargo/bin"
+            "/usr/bin"
         ]
 
         for dir in searchPaths {
             let fullPath = (dir as NSString).appendingPathComponent(name)
-            if FileManager.default.isExecutableFile(atPath: fullPath) {
+            if FileManager.default.isExecutableFile(atPath: fullPath),
+               verifyCodeSignature(atPath: fullPath) {
                 return fullPath
             }
         }
 
-        // Fallback: try `which` via shell
+        // Fallback: try `which` via shell, but validate the result is in a
+        // trusted directory and has a valid code signature.
         let whichProcess = Process()
         let whichPipe = Pipe()
         whichProcess.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -123,7 +134,10 @@ enum AIService {
                 let data = whichPipe.fileHandleForReading.readDataToEndOfFile()
                 let path = (String(data: data, encoding: .utf8) ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !path.isEmpty && FileManager.default.isExecutableFile(atPath: path) {
+                if !path.isEmpty,
+                   FileManager.default.isExecutableFile(atPath: path),
+                   !isUserWritableDirectory(path),
+                   verifyCodeSignature(atPath: path) {
                     return path
                 }
             }
@@ -134,11 +148,50 @@ enum AIService {
         return nil
     }
 
+    /// Check if a file path resides under a user-writable directory.
+    ///
+    /// Rejects paths under the user's home directory to prevent path hijack
+    /// attacks where a malicious binary in ~/.local/bin etc. could steal
+    /// API keys passed via environment variables.
+    private static func isUserWritableDirectory(_ path: String) -> Bool {
+        let resolved = (path as NSString).resolvingSymlinksInPath
+        let home = NSHomeDirectory()
+        return resolved.hasPrefix(home + "/")
+    }
+
+    /// Verify that an executable at the given path has a valid code signature.
+    ///
+    /// Uses `codesign --verify` to check the signature.  Unsigned or
+    /// tampered executables are rejected to prevent supply chain attacks.
+    private static func verifyCodeSignature(atPath path: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        process.arguments = ["--verify", "--strict", path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
     /// Build the CLI arguments for a given model and prompt.
-    private static func buildArguments(for model: AIModelType, prompt: String) -> [String] {
+    private static func buildArguments(
+        for model: AIModelType,
+        prompt: String,
+        dangerouslySkipPermissions: Bool
+    ) -> [String] {
         switch model {
         case .claudeCode:
-            return ["-p", "--dangerously-skip-permissions", prompt]
+            var args = ["-p"]
+            if dangerouslySkipPermissions {
+                args.append("--dangerously-skip-permissions")
+            }
+            args.append(prompt)
+            return args
         case .codex:
             return ["exec", "--full-auto", "--skip-git-repo-check", prompt]
         case .gemini:
@@ -229,11 +282,53 @@ enum AIService {
         return parts.joined(separator: "\n\n")
     }
 
+    /// The set of environment variable keys considered safe to pass to AI subprocesses.
+    private static let safeEnvironmentKeys: Set<String> = [
+        "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE",
+        "SHELL", "USER", "LOGNAME", "TMPDIR",
+        "XDG_CONFIG_HOME", "XDG_DATA_HOME"
+    ]
+
+    /// Known environment variable prefixes used by AI providers for authentication.
+    private static let aiProviderEnvPrefixes: [AIModelType: [String]] = [
+        .claudeCode: ["ANTHROPIC_"],
+        .codex: ["OPENAI_"],
+        .gemini: ["GEMINI_", "GOOGLE_"]
+    ]
+
+    /// Build a minimal, safe environment for the AI subprocess.
+    ///
+    /// Only passes through well-known safe variables and provider-specific
+    /// API keys, preventing accidental leakage of secrets or credentials
+    /// from the parent process environment.
+    private static func buildSafeEnvironment(for model: AIModelType) -> [String: String] {
+        let fullEnv = ProcessInfo.processInfo.environment
+        var safeEnv: [String: String] = [:]
+
+        // Copy safe keys
+        for key in safeEnvironmentKeys {
+            if let value = fullEnv[key] {
+                safeEnv[key] = value
+            }
+        }
+
+        // Copy AI provider-specific keys
+        let prefixes = aiProviderEnvPrefixes[model] ?? []
+        for (key, value) in fullEnv {
+            if prefixes.contains(where: { key.hasPrefix($0) }) {
+                safeEnv[key] = value
+            }
+        }
+
+        return safeEnv
+    }
+
     /// Invoke the AI CLI asynchronously.
     ///
     /// - Parameters:
     ///   - model: The AI model to use.
     ///   - prompt: The full prompt string.
+    ///   - aiConfig: The AI configuration controlling behavior flags.
     ///   - completion: Called on the main thread with the result.
     /// - Returns: An AIProcess handle that can be used to cancel the operation.
     @discardableResult
@@ -241,6 +336,7 @@ enum AIService {
         model: AIModelType,
         prompt: String,
         workingDirectory: String? = nil,
+        aiConfig: AIConfiguration = .default,
         completion: @escaping (Result<String, AIError>) -> Void
     ) -> AIProcess? {
         guard let executablePath = resolveExecutable(for: model) else {
@@ -255,12 +351,16 @@ enum AIService {
         let stderrPipe = Pipe()
 
         process.executableURL = URL(fileURLWithPath: executablePath)
-        let args = buildArguments(for: model, prompt: prompt)
+        let args = buildArguments(
+            for: model,
+            prompt: prompt,
+            dangerouslySkipPermissions: aiConfig.dangerouslySkipPermissions
+        )
         process.arguments = args
         process.standardOutput = stdoutPipe
 
         process.standardError = stderrPipe
-        process.environment = ProcessInfo.processInfo.environment
+        process.environment = buildSafeEnvironment(for: model)
         if let dir = workingDirectory {
             let dirURL = URL(fileURLWithPath: dir)
             if FileManager.default.fileExists(atPath: dir) {

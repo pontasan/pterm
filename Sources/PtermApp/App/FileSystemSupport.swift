@@ -176,7 +176,14 @@ enum FileNameSanitizer {
             }
             return character
         }
-        let result = String(sanitized).trimmingCharacters(in: .whitespacesAndNewlines)
+        // Replace runs of 2+ consecutive dots with underscores to block ".." path traversal
+        // while preserving single dots (e.g. "file.txt" remains valid).
+        var result = String(sanitized)
+        while let range = result.range(of: "\\.\\.+", options: .regularExpression) {
+            let replacement = String(repeating: "_", count: result.distance(from: range.lowerBound, to: range.upperBound))
+            result.replaceSubrange(range, with: replacement)
+        }
+        result = result.trimmingCharacters(in: .whitespacesAndNewlines)
         return result.isEmpty ? fallback : result
     }
 }

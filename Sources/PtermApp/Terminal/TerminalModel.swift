@@ -196,7 +196,11 @@ final class TerminalModel {
     static let kittyImageEncodedPayloadDirectory: URL = {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("pterm-kitty-image-payloads", isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
         return directory
     }()
 
@@ -4296,7 +4300,10 @@ final class TerminalModel {
         var value = 0
         for byte in bytes {
             guard byte >= UInt8(ascii: "0"), byte <= UInt8(ascii: "9") else { return nil }
-            value = value * 10 + Int(byte - UInt8(ascii: "0"))
+            let (product, overflow1) = value.multipliedReportingOverflow(by: 10)
+            let (sum, overflow2) = product.addingReportingOverflow(Int(byte - UInt8(ascii: "0")))
+            if overflow1 || overflow2 { return Int.max }
+            value = sum
         }
         return value
     }
@@ -4377,12 +4384,12 @@ final class TerminalModel {
     }
 
     private static func createKittyEncodedPayloadFile(at fileURL: URL) -> Int32? {
-        let descriptor = open(fileURL.path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR)
+        let descriptor = open(fileURL.path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR)
         return descriptor >= 0 ? descriptor : nil
     }
 
     private static func openKittyEncodedPayloadFileForAppending(at fileURL: URL) -> Int32? {
-        let descriptor = open(fileURL.path, O_WRONLY | O_APPEND)
+        let descriptor = open(fileURL.path, O_WRONLY | O_APPEND | O_CLOEXEC)
         return descriptor >= 0 ? descriptor : nil
     }
 
@@ -4445,7 +4452,7 @@ final class TerminalModel {
         from sourceFileURL: URL,
         to destinationFileDescriptor: Int32
     ) -> Bool {
-        let sourceDescriptor = open(sourceFileURL.path, O_RDONLY)
+        let sourceDescriptor = open(sourceFileURL.path, O_RDONLY | O_CLOEXEC)
         guard sourceDescriptor >= 0 else { return false }
         defer { close(sourceDescriptor) }
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
@@ -4467,6 +4474,28 @@ final class TerminalModel {
         }
     }
 
+    private static let kittyGraphicsAllowedDirectories: [String] = {
+        let candidates = [
+            NSTemporaryDirectory(),
+            "/tmp",
+            "/var/tmp",
+        ]
+        return candidates.compactMap { dir in
+            try? FileManager.default.attributesOfItem(atPath: dir)
+            let resolved = (dir as NSString).resolvingSymlinksInPath
+            return resolved.hasSuffix("/") ? resolved : resolved + "/"
+        }
+    }()
+
+    private static func isPathInAllowedDirectory(_ resolvedPath: String) -> Bool {
+        for allowed in kittyGraphicsAllowedDirectories {
+            if resolvedPath.hasPrefix(allowed) {
+                return true
+            }
+        }
+        return false
+    }
+
     private static func loadKittyGraphicsFilePayload(
         atPath path: String,
         byteOffset: Int,
@@ -4475,17 +4504,28 @@ final class TerminalModel {
         let url = URL(fileURLWithPath: path)
         guard url.isFileURL else { return nil }
         let standardizedURL = url.standardizedFileURL
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: standardizedURL.path),
-              let fileType = attributes[.type] as? FileAttributeType,
-              fileType == .typeRegular else {
+
+        // Resolve symlinks to check the allowed-directory policy.
+        let resolvedPath = (standardizedURL.path as NSString).resolvingSymlinksInPath
+        guard isPathInAllowedDirectory(resolvedPath) else {
+            NSLog("[pterm] Kitty graphics: rejected file read outside allowed directories: %@", path)
             return nil
         }
 
-        let descriptor = open(standardizedURL.path, O_RDONLY)
+        // Open with O_NOFOLLOW to prevent a TOCTOU race where the file is
+        // replaced with a symlink between the path check above and the open.
+        // Then validate properties on the open fd via fstat, not the path.
+        let descriptor = open(resolvedPath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else { return nil }
         defer { close(descriptor) }
 
-        let fileLength = Int((attributes[.size] as? NSNumber)?.intValue ?? 0)
+        var st = stat()
+        guard fstat(descriptor, &st) == 0 else { return nil }
+
+        // Must be a regular file (validated on the open fd, race-free).
+        guard (st.st_mode & S_IFMT) == S_IFREG else { return nil }
+
+        let fileLength = Int(st.st_size)
         guard fileLength > 0, byteOffset >= 0, byteOffset < fileLength else {
             return nil
         }
@@ -4507,11 +4547,27 @@ final class TerminalModel {
         )
     }
 
+    private static func isValidSharedMemoryName(_ name: String) -> Bool {
+        // Must start with '/', max 255 chars, only alphanumeric/hyphen/underscore after leading '/'
+        guard name.hasPrefix("/"),
+              name.count >= 2,
+              name.count <= 255 else {
+            return false
+        }
+        let body = name.dropFirst()
+        // No additional path separators allowed; only [A-Za-z0-9_-]
+        return body.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }
+    }
+
     private static func loadKittyGraphicsSharedMemoryPayload(
         named name: String,
         byteOffset: Int,
         byteCount: Int?
     ) -> Data? {
+        guard isValidSharedMemoryName(name) else {
+            NSLog("[pterm] Kitty graphics: rejected invalid shared memory name: %@", name)
+            return nil
+        }
         let descriptor = name.withCString { posixShmOpen($0, O_RDONLY, 0) }
         guard descriptor >= 0 else { return nil }
         defer { close(descriptor) }
@@ -4539,6 +4595,16 @@ final class TerminalModel {
         )
     }
 
+    /// Maximum pixel dimension for Kitty graphics raw image formats.
+    /// Matches common GPU texture limits and prevents integer overflow
+    /// in size calculations (16384 * 16384 * 4 = 1 GB, within bounds).
+    private static let kittyGraphicsMaxPixelDimension = 16384
+
+    /// Maximum decompressed output size for Kitty graphics payloads (256 MB).
+    /// Prevents decompression bomb attacks where a small compressed payload
+    /// expands to gigabytes of memory.
+    private static let kittyGraphicsMaxDecompressedSize = 256 * 1024 * 1024
+
     private static func decompressKittyGraphicsPayload(
         _ data: Data,
         format: TerminalImagePayloadFormat?,
@@ -4548,10 +4614,17 @@ final class TerminalModel {
         let expectedSize: Int? = {
             switch format {
             case .rawRGB:
-                guard let pixelWidth, let pixelHeight else { return nil }
+                guard let pixelWidth, pixelWidth > 0, pixelWidth <= kittyGraphicsMaxPixelDimension,
+                      let pixelHeight, pixelHeight > 0, pixelHeight <= kittyGraphicsMaxPixelDimension else {
+                    return nil
+                }
+                // Overflow-safe: max is 16384 * 16384 * 3 = 805,306,368 (fits in Int)
                 return pixelWidth * pixelHeight * 3
             case .rawRGBA:
-                guard let pixelWidth, let pixelHeight else { return nil }
+                guard let pixelWidth, pixelWidth > 0, pixelWidth <= kittyGraphicsMaxPixelDimension,
+                      let pixelHeight, pixelHeight > 0, pixelHeight <= kittyGraphicsMaxPixelDimension else {
+                    return nil
+                }
                 return pixelWidth * pixelHeight * 4
             case .png, .jpeg, .gif, .webp, .none:
                 return nil
@@ -4575,7 +4648,8 @@ final class TerminalModel {
         guard status != COMPRESSION_STATUS_ERROR else { return nil }
         defer { compression_stream_destroy(&stream) }
 
-        let destinationChunkSize = max(expectedSize ?? 0, 64 * 1024)
+        let maxOutput = expectedSize ?? kittyGraphicsMaxDecompressedSize
+        let destinationChunkSize = min(max(expectedSize ?? 0, 64 * 1024), maxOutput)
         var destination = Data()
         if let expectedSize {
             destination.reserveCapacity(expectedSize)
@@ -4600,6 +4674,11 @@ final class TerminalModel {
                 }
                 if produced > 0 {
                     destination.append(contentsOf: chunk.prefix(produced))
+                }
+                // Abort if decompressed output exceeds the maximum allowed size
+                // to prevent decompression bomb attacks.
+                if destination.count > maxOutput {
+                    return nil
                 }
             } while status == COMPRESSION_STATUS_OK
 
@@ -4698,11 +4777,24 @@ final class TerminalModel {
         return true
     }
 
+    /// Characters allowed in the OSC 52 target parameter per the specification:
+    /// clipboard selections c, p, q, s, and cut buffers 0-7.
+    private static let osc52AllowedTargetCharacters = CharacterSet(charactersIn: "cpsq01234567")
+
     private func handleOSC52(_ payload: String) {
         let components = payload.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
         guard components.count == 2 else { return }
         let target = String(components[0])
         let data = String(components[1])
+
+        // Validate target to prevent response injection.  An unsanitized target
+        // echoed into the response could contain BEL (0x07) or other control
+        // characters that terminate the OSC sequence early, allowing a malicious
+        // child process to inject arbitrary escape sequences into the response stream.
+        guard !target.isEmpty,
+              target.unicodeScalars.allSatisfy({ Self.osc52AllowedTargetCharacters.contains($0) }) else {
+            return
+        }
 
         if data == "?" {
             guard let clipboardText = onClipboardRead?() else { return }
@@ -4716,6 +4808,12 @@ final class TerminalModel {
 
         guard let decoded = Data(base64Encoded: data),
               let string = decodeText?(decoded) ?? String(data: decoded, encoding: .utf8) else {
+            return
+        }
+        // Reject decoded payloads exceeding 100 KB to prevent excessive clipboard writes
+        let maxDecodedSize = 100 * 1024
+        guard decoded.count <= maxDecodedSize else {
+            NSLog("OSC 52: rejected clipboard write of %d bytes (limit: %d)", decoded.count, maxDecodedSize)
             return
         }
         onClipboardWrite?(string)

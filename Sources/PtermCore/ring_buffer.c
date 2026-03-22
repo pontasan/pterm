@@ -649,8 +649,8 @@ RingBuffer *ring_buffer_create_mmap_sized(const char *path,
     rb->max_data_capacity = max_capacity;
     rb->mmap_fd = -1;
 
-    /* O_NOFOLLOW prevents symlink attacks */
-    int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+    /* O_NOFOLLOW prevents symlink attacks; O_CLOEXEC prevents fd leak to children */
+    int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) {
         free(rb);
         return NULL;
