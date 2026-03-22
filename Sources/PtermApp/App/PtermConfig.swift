@@ -225,6 +225,7 @@ struct PtermConfig {
     let security: SecurityConfiguration
     let mcpServer: MCPServerConfiguration
     let ai: AIConfiguration
+    let ioHooks: IOHookConfiguration
     let shortcuts: ShortcutConfiguration
     let workspaces: [ConfiguredWorkspace]
 
@@ -243,6 +244,7 @@ struct PtermConfig {
         security: .default,
         mcpServer: .default,
         ai: .default,
+        ioHooks: .default,
         shortcuts: .default,
         workspaces: []
     )
@@ -405,6 +407,7 @@ enum PtermConfigStore {
                 model: stringValue(aiSection?["model"]).flatMap(AIModelType.init(configuredValue:)) ?? defaults.ai.model,
                 dangerouslySkipPermissions: boolValue(aiSection?["dangerously_skip_permissions"]) ?? defaults.ai.dangerouslySkipPermissions
             ),
+            ioHooks: IOHookConfiguration.parse(from: root),
             shortcuts: ShortcutParser.parseMap(shortcuts?.compactMapValues(stringValue)),
             workspaces: workspaces
         )

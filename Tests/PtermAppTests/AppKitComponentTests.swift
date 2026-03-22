@@ -8302,6 +8302,7 @@ final class AppKitComponentTests: XCTestCase {
             security: PtermConfig.default.security,
             mcpServer: PtermConfig.default.mcpServer,
             ai: PtermConfig.default.ai,
+            ioHooks: PtermConfig.default.ioHooks,
             shortcuts: PtermConfig.default.shortcuts,
             workspaces: PtermConfig.default.workspaces
         )
@@ -8387,6 +8388,7 @@ final class AppKitComponentTests: XCTestCase {
             security: PtermConfig.default.security,
             mcpServer: PtermConfig.default.mcpServer,
             ai: PtermConfig.default.ai,
+            ioHooks: PtermConfig.default.ioHooks,
             shortcuts: PtermConfig.default.shortcuts,
             workspaces: PtermConfig.default.workspaces
         )
