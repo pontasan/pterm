@@ -103,6 +103,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var aiLanguagePopup: NSPopUpButton?
     private var aiModelPopup: NSPopUpButton?
 
+    // I/O Hooks controls
+    private var ioHooksEnabledCheck: NSButton?
+    private var ioHooksEntries: [[String: Any]] = []
+    private var ioHooksResetButton: NSButton?
+
+    /// Called when the user clicks "Reset Hook Processes".
+    /// The AppDelegate sets this to call TerminalManager.resetAllHookProcesses().
+    var onResetHookProcesses: (() -> Void)?
+
+    /// Returns the number of active hook instances (for enabling/disabling the reset button).
+    var activeHookInstanceCount: (() -> Int)?
+
     init(configURL: URL = PtermDirectories.config) {
         self.configURL = configURL
         let contentRect = NSRect(x: 0, y: 0, width: 640, height: 480)
@@ -221,6 +233,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             "language",
             "model"
         ])
+
+        reset.removeValue(forKey: "io_hooks_enabled")
+        reset.removeValue(forKey: "io_hooks")
 
         return reset
     }
@@ -880,6 +895,200 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             ),
             28
         )
+
+        // ── I/O Hooks Section ──
+        addSpacing(24)
+        addView(makeSectionTitle("I/O Hooks"), 28)
+        addSpacing(12)
+
+        let hooksEnabled = (configData["io_hooks_enabled"] as? Bool) ?? false
+        ioHooksEntries = (configData["io_hooks"] as? [[String: Any]]) ?? []
+
+        let hooksCheck = makeCheckbox("Enable I/O Hooks", checked: hooksEnabled)
+        hooksCheck.target = self
+        hooksCheck.action = #selector(ioHooksEnabledChanged(_:))
+        ioHooksEnabledCheck = hooksCheck
+        addView(hooksCheck, 22)
+        addSpacing(2)
+        addView(
+            makeDescriptionLabel(
+                "Tap into terminal I/O streams by piping data to external processes. " +
+                "When disabled, no hook infrastructure is loaded and the PTY path is unmodified.",
+                width: width
+            ),
+            32
+        )
+        addSpacing(12)
+
+        // Per-hook entry forms
+        for (index, entry) in ioHooksEntries.enumerated() {
+            buildIOHookEntryForm(entry: entry, index: index, addView: addView,
+                                 addSpacing: addSpacing, width: width)
+        }
+
+        // Add hook button
+        let addBtn = NSButton(title: "+ Add Hook", target: self, action: #selector(ioHooksAddEntry(_:)))
+        addBtn.bezelStyle = .rounded
+        addBtn.sizeToFit()
+        addView(addBtn, 28)
+        addSpacing(12)
+
+        // Buffering mode help text
+        addView(
+            makeDescriptionLabel(
+                "Buffering modes:\n" +
+                "  immediate — Raw terminal data including escape sequences. Best for custom parsers.\n" +
+                "  line — Clean text, line by line. Best for log files. Not recommended for TUI apps.\n" +
+                "  idle — Screen content on output pause. Eliminates TUI duplicates. Recommended for AI CLI tools.",
+                width: width
+            ),
+            64
+        )
+
+        // Reset Hook Processes button
+        addSpacing(12)
+        let resetBtn = NSButton(title: "Reset Hook Processes", target: self,
+                                action: #selector(ioHooksResetClicked(_:)))
+        resetBtn.bezelStyle = .rounded
+        resetBtn.sizeToFit()
+        ioHooksResetButton = resetBtn
+        addView(resetBtn, 28)
+        addSpacing(2)
+        addView(
+            makeDescriptionLabel(
+                "Force-kill all running hook processes and respawn them. Useful during development.",
+                width: width
+            ),
+            28
+        )
+
+        updateIOHooksControlStates()
+    }
+
+    private func buildIOHookEntryForm(entry: [String: Any], index: Int,
+                                       addView: (NSView, CGFloat) -> Void,
+                                       addSpacing: (CGFloat) -> Void,
+                                       width: CGFloat) {
+        let entryEnabled = (entry["enabled"] as? Bool) ?? true
+        let name = (entry["name"] as? String) ?? ""
+        let target = (entry["target"] as? String) ?? "output"
+        let buffering = (entry["buffering"] as? String) ?? "line"
+        let command = (entry["command"] as? String) ?? ""
+        let processMatch = (entry["process_match"] as? String) ?? ""
+
+        // ── Card container ──
+        let cardHeight: CGFloat = 140
+        let card = NSView(frame: NSRect(x: 0, y: 0, width: width, height: cardHeight))
+        card.wantsLayer = true
+        card.layer?.backgroundColor = NSColor(calibratedWhite: 0.14, alpha: 1).cgColor
+        card.layer?.cornerRadius = 6
+        card.layer?.borderWidth = 1
+        card.layer?.borderColor = NSColor(calibratedWhite: 0.25, alpha: 1).cgColor
+
+        var y: CGFloat = cardHeight - 28
+        let leftMargin: CGFloat = 12
+        let labelW: CGFloat = 90
+        let controlX = leftMargin + labelW + 4
+
+        // Row 1: Enabled checkbox + Name + Remove button
+        let enabledCheck = NSButton(checkboxWithTitle: "", target: self,
+                                     action: #selector(ioHookFieldChanged(_:)))
+        enabledCheck.state = entryEnabled ? .on : .off
+        enabledCheck.frame = NSRect(x: leftMargin, y: y + 2, width: 18, height: 18)
+        enabledCheck.tag = index * 100 + 0
+        card.addSubview(enabledCheck)
+
+        let nameField = NSTextField()
+        nameField.stringValue = name
+        nameField.placeholderString = "Hook name"
+        nameField.isEditable = true
+        nameField.isBordered = true
+        nameField.backgroundColor = NSColor(calibratedWhite: 0.2, alpha: 1)
+        nameField.textColor = .white
+        nameField.font = .systemFont(ofSize: 12)
+        nameField.frame = NSRect(x: leftMargin + 22, y: y, width: 180, height: 22)
+        nameField.tag = index * 100 + 1
+        nameField.delegate = self
+        nameField.identifier = NSUserInterfaceItemIdentifier("ioHookForm_name")
+        card.addSubview(nameField)
+
+        let removeBtn = NSButton(title: "Remove", target: self,
+                                  action: #selector(ioHooksRemoveByTag(_:)))
+        removeBtn.bezelStyle = .rounded
+        removeBtn.tag = index
+        removeBtn.sizeToFit()
+        removeBtn.frame = NSRect(x: width - removeBtn.frame.width - 12, y: y,
+                                  width: removeBtn.frame.width, height: 22)
+        card.addSubview(removeBtn)
+
+        // Row 2: Target + Buffering
+        y -= 28
+        let targetLabel = makeLabel("Target:")
+        targetLabel.frame = NSRect(x: leftMargin, y: y + 2, width: labelW, height: 18)
+        card.addSubview(targetLabel)
+
+        let targetPopup = NSPopUpButton(frame: NSRect(x: controlX, y: y, width: 100, height: 22))
+        targetPopup.addItems(withTitles: ["output", "stdin"])
+        targetPopup.selectItem(withTitle: target)
+        targetPopup.tag = index * 100 + 2
+        targetPopup.target = self
+        targetPopup.action = #selector(ioHookFieldChanged(_:))
+        card.addSubview(targetPopup)
+
+        let bufLabel = makeLabel("Buffering:")
+        bufLabel.frame = NSRect(x: controlX + 110, y: y + 2, width: 70, height: 18)
+        card.addSubview(bufLabel)
+
+        let bufPopup = NSPopUpButton(frame: NSRect(x: controlX + 184, y: y, width: 110, height: 22))
+        bufPopup.addItems(withTitles: ["immediate", "line", "idle"])
+        bufPopup.selectItem(withTitle: buffering)
+        bufPopup.tag = index * 100 + 3
+        bufPopup.target = self
+        bufPopup.action = #selector(ioHookFieldChanged(_:))
+        card.addSubview(bufPopup)
+
+        // Row 3: Command
+        y -= 28
+        let cmdLabel = makeLabel("Command:")
+        cmdLabel.frame = NSRect(x: leftMargin, y: y + 2, width: labelW, height: 18)
+        card.addSubview(cmdLabel)
+
+        let cmdField = NSTextField()
+        cmdField.stringValue = command
+        cmdField.placeholderString = "/path/to/command or shell pipeline"
+        cmdField.isEditable = true
+        cmdField.isBordered = true
+        cmdField.backgroundColor = NSColor(calibratedWhite: 0.2, alpha: 1)
+        cmdField.textColor = .white
+        cmdField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        cmdField.frame = NSRect(x: controlX, y: y, width: width - controlX - 12, height: 22)
+        cmdField.tag = index * 100 + 4
+        cmdField.delegate = self
+        cmdField.identifier = NSUserInterfaceItemIdentifier("ioHookForm_command")
+        card.addSubview(cmdField)
+
+        // Row 4: Process match (optional)
+        y -= 28
+        let matchLabel = makeLabel("Process match:")
+        matchLabel.frame = NSRect(x: leftMargin, y: y + 2, width: labelW, height: 18)
+        card.addSubview(matchLabel)
+
+        let matchField = NSTextField()
+        matchField.stringValue = processMatch
+        matchField.placeholderString = "regex (empty = all processes)"
+        matchField.isEditable = true
+        matchField.isBordered = true
+        matchField.backgroundColor = NSColor(calibratedWhite: 0.2, alpha: 1)
+        matchField.textColor = .white
+        matchField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        matchField.frame = NSRect(x: controlX, y: y, width: 200, height: 22)
+        matchField.tag = index * 100 + 5
+        matchField.delegate = self
+        matchField.identifier = NSUserInterfaceItemIdentifier("ioHookForm_processMatch")
+        card.addSubview(matchField)
+
+        addView(card, cardHeight)
+        addSpacing(8)
     }
 
     // MARK: - Actions
@@ -930,8 +1139,34 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
-        guard let field = notification.object as? NSTextField,
-              field.identifier?.rawValue == "launchShellPathField" else { return }
+        guard let field = notification.object as? NSTextField else { return }
+
+        // I/O Hooks form field editing
+        if let fieldID = field.identifier?.rawValue, fieldID.hasPrefix("ioHookForm_") {
+            let index = field.tag / 100
+            guard ioHooksEntries.indices.contains(index) else { return }
+            let key = String(fieldID.dropFirst("ioHookForm_".count))
+            let value = field.stringValue.trimmingCharacters(in: .whitespaces)
+            switch key {
+            case "name":
+                ioHooksEntries[index]["name"] = value
+            case "command":
+                ioHooksEntries[index]["command"] = value
+            case "processMatch":
+                if value.isEmpty {
+                    ioHooksEntries[index].removeValue(forKey: "process_match")
+                } else {
+                    ioHooksEntries[index]["process_match"] = value
+                }
+            default:
+                break
+            }
+            saveIOHooksEntries()
+            return
+        }
+
+        // Launch shells table cell editing
+        guard field.identifier?.rawValue == "launchShellPathField" else { return }
         let row = field.tag
         guard launchShellsValues.indices.contains(row) else { return }
         let value = field.stringValue.trimmingCharacters(in: .whitespaces)
@@ -1149,6 +1384,88 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         ai["model"] = allModels[index].configuredValue
         configData["ai"] = ai
         commitConfigChange()
+    }
+
+    // MARK: - I/O Hooks Actions
+
+    @objc private func ioHooksEnabledChanged(_ sender: NSButton) {
+        let turningOff = sender.state == .off
+        configData["io_hooks_enabled"] = (sender.state == .on)
+        if turningOff {
+            onResetHookProcesses?()
+        }
+        updateIOHooksControlStates()
+        commitConfigChange()
+    }
+
+    @objc private func ioHooksAddEntry(_ sender: Any) {
+        let newEntry: [String: Any] = [
+            "enabled": true,
+            "name": "New Hook",
+            "target": "output",
+            "buffering": "line",
+            "idle_ms": IOHookEntry.defaultIdleMs,
+            "buffer_size": IOHookEntry.defaultBufferSize,
+            "command": ""
+        ]
+        ioHooksEntries.append(newEntry)
+        saveIOHooksEntries()
+        showContentForSection(.ai)
+    }
+
+    @objc private func ioHooksRemoveByTag(_ sender: NSButton) {
+        let index = sender.tag
+        guard ioHooksEntries.indices.contains(index) else { return }
+        ioHooksEntries.remove(at: index)
+        saveIOHooksEntries()
+        showContentForSection(.ai)
+    }
+
+    @objc private func ioHookFieldChanged(_ sender: Any) {
+        let tag: Int
+        if let button = sender as? NSButton { tag = button.tag }
+        else if let popup = sender as? NSPopUpButton { tag = popup.tag }
+        else { return }
+
+        let index = tag / 100
+        let field = tag % 100
+        guard ioHooksEntries.indices.contains(index) else { return }
+
+        switch field {
+        case 0:  // enabled checkbox
+            ioHooksEntries[index]["enabled"] = ((sender as? NSButton)?.state == .on)
+        case 2:  // target popup
+            ioHooksEntries[index]["target"] = (sender as? NSPopUpButton)?.titleOfSelectedItem ?? "output"
+        case 3:  // buffering popup
+            ioHooksEntries[index]["buffering"] = (sender as? NSPopUpButton)?.titleOfSelectedItem ?? "line"
+        default:
+            break
+        }
+        saveIOHooksEntries()
+    }
+
+    private func saveIOHooksEntries() {
+        configData["io_hooks"] = ioHooksEntries
+        commitConfigChange()
+    }
+
+    @objc private func ioHooksResetClicked(_ sender: NSButton) {
+        sender.isEnabled = false
+        sender.title = "Resetting…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.onResetHookProcesses?()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                sender.title = "Reset Hook Processes"
+                self.updateIOHooksControlStates()
+            }
+        }
+    }
+
+    private func updateIOHooksControlStates() {
+        let hooksEnabled = (configData["io_hooks_enabled"] as? Bool) ?? false
+        let activeCount = activeHookInstanceCount?() ?? 0
+        ioHooksResetButton?.isEnabled = hooksEnabled && activeCount > 0
     }
 
     @objc private func factoryResetClicked(_ sender: NSButton) {
@@ -1483,10 +1800,12 @@ extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
         if tableView.identifier?.rawValue == "launchShellsTable" {
             return launchShellsValues.count
         }
+        // ioHooksTable is no longer used (replaced by form-based UI).
         return Section.allCases.count
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        // ioHooksTable is no longer used (replaced by form-based UI).
         if tableView.identifier?.rawValue == "launchShellsTable" {
             let cellIdentifier = NSUserInterfaceItemIdentifier("LaunchShellCell")
             let cell: NSTableCellView
@@ -1551,6 +1870,7 @@ extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
            tableView.identifier?.rawValue == "launchShellsTable" {
             return
         }
+        // ioHooksTable is no longer used (replaced by form-based UI).
         let row = sidebarTableView.selectedRow
         guard row >= 0, let section = Section(rawValue: row) else { return }
         showContentForSection(section)

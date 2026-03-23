@@ -275,6 +275,10 @@ final class TerminalController {
     private var isShuttingDown = false
     var auditLogger: TerminalAuditLogger?
 
+    /// I/O hook manager.  Set externally when the master switch is ON.
+    /// When nil, hook-related code paths are never reached.
+    var hookManager: IOHookManager?
+
     private static let minimumCodepointBufferCapacity = 1024
     private static let maxAllTextReserveCapacity = 64 * 1024
     private static let maxSearchReserveCapacity = 4 * 1024
@@ -571,9 +575,8 @@ final class TerminalController {
     // MARK: - Start / Stop
 
     func start() throws {
-        pty.onOutputBytes = { [weak self] bytes in
-            self?.handlePTYOutput(bytes)
-        }
+        // Install initial closure (may be upgraded after hooks activate).
+        installPTYOutputClosure()
 
         pty.onExit = { [weak self] in
             self?.auditLogger?.flush()
@@ -597,9 +600,13 @@ final class TerminalController {
         ptyResizeLock.withLock {
             appliedPTYSize = (r, c)
         }
+
+        // Activate I/O hooks after the PTY is started (childPID is valid).
+        activateIOHooksIfNeeded()
     }
 
     func stop(waitForExit: Bool = false) {
+        hookManager?.deactivateTerminal(id: id)
         cancelPendingPTYResize()
         cancelPendingScrollbackCompaction()
         lock.withWriteLock {
@@ -612,6 +619,7 @@ final class TerminalController {
 
     /// Send SIGTERM and close PTY without blocking. Call awaitExit() later.
     func initiateShutdown() {
+        hookManager?.deactivateTerminal(id: id)
         lock.withWriteLock {
             isShuttingDown = true
             scrollback.flushPendingRows()
@@ -749,6 +757,7 @@ final class TerminalController {
             }
         }
         auditLogger?.recordInput(data)
+        hookManager?.dispatchRawInput(data, terminalID: id)
         pty.write(data)
     }
 
@@ -785,6 +794,167 @@ final class TerminalController {
         suppressScrollbackClear = false
         auditLogger?.recordInput(data)
         pty.writeControlCharacter(controlCharacter)
+    }
+
+    // MARK: - I/O Hook Integration
+
+    /// Install the appropriate PTY output closure based on whether hooks are
+    /// active.  When hookManager is nil (master switch OFF), this installs the
+    /// standard closure — identical to a build without hooks.
+    private func installPTYOutputClosure() {
+        if let hookManager, hookManager.needsIdleMode(for: id) {
+            // Hook-aware closure with idle mode: after processing output,
+            // mark all rows as potentially dirty.  The VT parser's batch
+            // write paths bypass handlePrint() (and thus hookTextSink),
+            // so per-character dirty tracking is incomplete.  Marking all
+            // rows dirty is safe because the grid diff filters unchanged
+            // rows via previousSnapshot comparison.  Cost: scanning ~24
+            // rows of text every 500ms — negligible.
+            let termID = id
+            pty.onOutputBytes = { [weak self] bytes in
+                guard let self else { return }
+                self.hookManager?.dispatchRawOutput(bytes, terminalID: self.id)
+                self.handlePTYOutput(bytes)
+                let rowCount = self.lock.withReadLock { self.model.rows }
+                for row in 0..<rowCount {
+                    self.hookManager?.notifyDirtyRow(row, terminalID: termID)
+                }
+            }
+        } else if hookManager != nil {
+            // Hook-aware closure without idle mode: dispatch raw bytes only.
+            pty.onOutputBytes = { [weak self] bytes in
+                guard let self else { return }
+                self.hookManager?.dispatchRawOutput(bytes, terminalID: self.id)
+                self.handlePTYOutput(bytes)
+            }
+        } else {
+            // Standard closure: zero hook overhead.
+            pty.onOutputBytes = { [weak self] bytes in
+                self?.handlePTYOutput(bytes)
+            }
+        }
+    }
+
+    /// Activate I/O hooks for this terminal after the PTY has started.
+    /// Sets up ProcessMonitor, text sink, and alternate screen callback.
+    private func activateIOHooksIfNeeded() {
+        guard let hookManager else { return }
+
+        // Activate this terminal in the hook manager (spawns matching hooks,
+        // starts kqueue process monitor if needed).
+        hookManager.activateTerminal(
+            id: id,
+            masterFD: pty.testMasterFD,
+            shellPID: pty.childPID,
+            ptyQueue: PTY.readQueue
+        )
+
+        let termID = id
+        let needsText = hookManager.needsTextCapture(for: id)
+        let needsIdle = hookManager.needsIdleMode(for: id)
+        let hasActive = hookManager.hasActiveHooks(for: id)
+        try? "activateIOHooksIfNeeded: termID=\(termID) hasActive=\(hasActive) needsText=\(needsText) needsIdle=\(needsIdle)\n".write(toFile: "/tmp/pterm_hook_debug.log", atomically: false, encoding: .utf8)
+
+        // Register grid reader for idle mode (reads row text under read lock).
+        if needsIdle {
+            let (gridRows, gridCols) = lock.withReadLock {
+                (model.rows, model.cols)
+            }
+            hookManager.registerGridReader(terminalID: termID, rows: gridRows, cols: gridCols) {
+                [weak self] row, cols in
+                guard let self else { return nil }
+                return self.lock.withReadLock {
+                    self.extractRowText(row: row, cols: cols)
+                }
+            }
+        }
+
+        // Wire up text capture for line/idle mode hooks.
+        if needsText {
+            lock.withWriteLock {
+                if needsIdle {
+                    // For idle mode: dispatch character AND track dirty rows.
+                    // This closure is called from handlePrint() which runs under
+                    // the write lock, so model.cursor.row is safe to read directly.
+                    model.hookTextSink = { [weak hookManager, weak self] codepoint in
+                        hookManager?.dispatchTextCharacter(codepoint, terminalID: termID)
+                        if let row = self?.model.cursor.row {
+                            hookManager?.notifyDirtyRow(row, terminalID: termID)
+                        }
+                    }
+                } else {
+                    // Line mode only: just dispatch characters.
+                    model.hookTextSink = { [weak hookManager] codepoint in
+                        hookManager?.dispatchTextCharacter(codepoint, terminalID: termID)
+                    }
+                }
+                model.onAlternateScreenChange = { [weak hookManager] _ in
+                    hookManager?.notifyAlternateScreenChange(terminalID: termID)
+                }
+            }
+        }
+
+        // Reinstall PTY output closure now that hooks are activated.
+        // The initial install in start() ran before activateTerminal(), so
+        // needsIdleMode was false.  Now that instances exist, the closure
+        // must be upgraded to include idle-mode dirty row tracking.
+        installPTYOutputClosure()
+    }
+
+    /// Extract text content from a single grid row (for idle mode grid diff).
+    /// Must be called under the read lock.
+    private func extractRowText(row: Int, cols: Int) -> String? {
+        guard row >= 0 && row < model.rows else { return nil }
+        var text = ""
+        for col in 0..<cols {
+            let cell = model.grid.cell(at: row, col: col)
+            if cell.isWideContinuation { continue }
+            if cell.hasInlineImage { continue }
+            text.append(cell.renderedString())
+        }
+        return text
+    }
+
+    /// Activate hooks on an already-running terminal (e.g. after Settings change).
+    /// Reinstalls the PTY output closure and activates the hook manager.
+    func reactivateIOHooks() {
+        guard hookManager != nil, pty.isRunning else { return }
+        installPTYOutputClosure()
+        activateIOHooksIfNeeded()
+    }
+
+    /// Deactivate hooks on an already-running terminal.
+    /// Reverts to the standard PTY output closure and clears text sinks.
+    func deactivateIOHooks() {
+        hookManager?.deactivateTerminal(id: id)
+        hookManager = nil
+        // Revert to standard closure.
+        pty.onOutputBytes = { [weak self] bytes in
+            self?.handlePTYOutput(bytes)
+        }
+        lock.withWriteLock {
+            model.hookTextSink = nil
+            model.onAlternateScreenChange = nil
+        }
+    }
+
+    /// Re-evaluate hook activation after a foreground process change.
+    /// Called from the hook manager's process change callback.
+    func refreshIOHookClosures() {
+        guard let hookManager else { return }
+
+        if hookManager.needsTextCapture(for: id) {
+            let termID = id
+            lock.withWriteLock {
+                model.hookTextSink = { [weak hookManager] codepoint in
+                    hookManager?.dispatchTextCharacter(codepoint, terminalID: termID)
+                }
+            }
+        } else {
+            lock.withWriteLock {
+                model.hookTextSink = nil
+            }
+        }
     }
 
     // MARK: - PTY Output Processing
@@ -1410,6 +1580,8 @@ final class TerminalController {
         }
 
         if rows != oldRows || cols != oldCols {
+            hookManager?.notifyResize(terminalID: id)
+            hookManager?.updateGridDimensions(terminalID: id, rows: rows, cols: cols)
             scheduleCoalescedPTYResize(rows: rows, cols: cols)
             scheduleMainCallbacks(needsDisplay: true, stateChange: true)
         }

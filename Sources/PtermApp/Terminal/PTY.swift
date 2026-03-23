@@ -36,7 +36,7 @@ final class PTY {
         }
     }
 
-    private static let readQueue = DispatchQueue(
+    static let readQueue = DispatchQueue(
         label: "com.pterm.pty.read",
         qos: .userInitiated
     )
@@ -48,6 +48,13 @@ final class PTY {
 
     /// File descriptor of the PTY master side
     private var masterFD: Int32 = -1
+
+    /// Read-only access to masterFD for ProcessMonitor (tcgetpgrp) and tests.
+    var testMasterFD: Int32 {
+        fdLock.lock()
+        defer { fdLock.unlock() }
+        return masterFD
+    }
 
     /// PID of the child process
     private(set) var childPID: pid_t = 0

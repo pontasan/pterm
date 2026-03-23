@@ -11,6 +11,10 @@ final class TerminalManager {
     }
     private let lifecycleQueue = DispatchQueue(label: "com.pterm.terminal-lifecycle", qos: .userInitiated)
 
+    /// I/O hook manager.  Non-nil when the master switch is ON and at least
+    /// one hook entry exists.  Shared across all terminals.
+    private(set) var hookManager: IOHookManager?
+
     /// All active terminal controllers, in display order.
     private(set) var terminals: [TerminalController] = []
 
@@ -27,10 +31,54 @@ final class TerminalManager {
         self.fullRows = rows
         self.fullCols = cols
         self.config = config
+        rebuildHookManagerIfNeeded()
     }
 
     func updateConfiguration(_ config: PtermConfig) {
+        let oldEnabled = self.config.ioHooks.enabled
         self.config = config
+        let newEnabled = config.ioHooks.enabled
+
+        if oldEnabled != newEnabled || newEnabled {
+            rebuildHookManagerIfNeeded()
+        }
+    }
+
+    private func rebuildHookManagerIfNeeded() {
+        let ioConfig = config.ioHooks
+        if ioConfig.enabled && !ioConfig.hooks.isEmpty {
+            // Shutdown old manager if config changed.
+            hookManager?.shutdown()
+            let manager = IOHookManager(config: ioConfig)
+            hookManager = manager
+            // Inject into all existing terminals and activate hooks.
+            for terminal in terminals {
+                terminal.hookManager = manager
+                terminal.reactivateIOHooks()
+            }
+        } else {
+            // Deactivate hooks on all existing terminals.
+            for terminal in terminals {
+                terminal.deactivateIOHooks()
+                terminal.hookManager = nil
+            }
+            hookManager?.shutdown()
+            hookManager = nil
+        }
+    }
+
+    /// Force-reset all hook processes (SIGKILL) and respawn matching hooks.
+    /// Returns true if there was an active hook manager to reset.
+    @discardableResult
+    func resetAllHookProcesses() -> Bool {
+        guard let hookManager else { return false }
+        hookManager.forceResetAllProcesses()
+        return true
+    }
+
+    /// Returns the number of active hook instances, or 0 if hooks are disabled.
+    var activeHookInstanceCount: Int {
+        hookManager?.activeInstanceCount ?? 0
     }
 
     /// Update the full-size dimensions and resize all terminals.
@@ -84,6 +132,9 @@ final class TerminalManager {
             id: id,
             scrollbackPersistencePath: scrollbackPath
         )
+
+        // Inject I/O hook manager if active.
+        controller.hookManager = hookManager
 
         // Auto-remove when the terminal exits
         controller.onExit = { [weak self, weak controller] in

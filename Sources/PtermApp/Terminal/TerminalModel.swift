@@ -147,6 +147,15 @@ final class TerminalModel {
     var onPendingUpdateModeChange: ((Bool) -> Void)?
     var onKittyImagePayload: ((_ index: Int, _ data: Data, _ format: TerminalImagePayloadFormat, _ pixelWidth: Int?, _ pixelHeight: Int?, _ columns: Int?, _ rows: Int?) -> Void)?
 
+    /// I/O hook text sink.  When non-nil, each printed codepoint is forwarded
+    /// to the hook manager for line/idle mode text capture.
+    /// Set by TerminalController when hooks are active; nil otherwise (zero cost).
+    var hookTextSink: ((UInt32) -> Void)?
+
+    /// Called when the terminal switches between normal and alternate screen
+    /// buffers.  The Bool is true when entering alternate screen.
+    var onAlternateScreenChange: ((Bool) -> Void)?
+
     /// OSC string accumulator
     private var oscString: String = ""
     private var oscCommandPrefix: String = ""
@@ -2444,6 +2453,13 @@ final class TerminalModel {
         }
         guard width >= 0 else { return } // Non-printable
 
+        // Forward to I/O hook text sink (line/idle mode capture).
+        // When nil (no hooks active), the compiler elides this to a single
+        // branch-not-taken.  Only printable codepoints reach here.
+        if let sink = hookTextSink {
+            sink(translatedCodepoint)
+        }
+
         if shouldAttemptAppendToPreviousGraphemeCluster(translatedCodepoint, width: width) {
             if tryAppendToPreviousGraphemeCluster(translatedCodepoint, width: width) {
                 previousPrintableEndsWithZWJ = translatedCodepoint == 0x200D
@@ -3195,6 +3211,7 @@ final class TerminalModel {
         }
 
         isAlternateScreen = alternate
+        onAlternateScreenChange?(alternate)
         if !alternate {
             mouseReporting = .none
         }

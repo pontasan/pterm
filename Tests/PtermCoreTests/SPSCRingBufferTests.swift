@@ -254,6 +254,8 @@ final class SPSCRingBufferTests: XCTestCase {
         let totalBytes = 1_000_000
         let chunkSize = 137  // intentionally not power of two
 
+        var producerFinished = false
+        let producerFinishedLock = NSLock()
         let producerDone = DispatchSemaphore(value: 0)
         let consumerDone = DispatchSemaphore(value: 0)
         var receivedBytes = Data()
@@ -272,22 +274,38 @@ final class SPSCRingBufferTests: XCTestCase {
                 spsc_ring_buffer_write(rb, chunk, len)
                 produced += len
             }
+            producerFinishedLock.lock()
+            producerFinished = true
+            producerFinishedLock.unlock()
             producerDone.signal()
         }
 
-        // Consumer
+        // Consumer — reads until the ring buffer is drained after the producer
+        // finishes.  The ring buffer is lossy, so the consumer cannot expect
+        // to receive all `totalBytes`; it must stop when the producer is done
+        // and no more data is available.
         DispatchQueue.global(qos: .userInitiated).async {
-            var consumed = 0
             var buf = [UInt8](repeating: 0, count: chunkSize * 2)
-            while consumed < totalBytes {
+            while true {
                 let read = spsc_ring_buffer_read(rb, &buf, buf.count)
                 if read > 0 {
                     receivedLock.lock()
                     receivedBytes.append(contentsOf: buf[0..<read])
                     receivedLock.unlock()
-                    consumed += read
                 } else {
-                    // Brief yield to let producer run
+                    producerFinishedLock.lock()
+                    let done = producerFinished
+                    producerFinishedLock.unlock()
+                    if done {
+                        // Drain any remaining data after producer finished.
+                        let finalRead = spsc_ring_buffer_read(rb, &buf, buf.count)
+                        if finalRead > 0 {
+                            receivedLock.lock()
+                            receivedBytes.append(contentsOf: buf[0..<finalRead])
+                            receivedLock.unlock()
+                        }
+                        break
+                    }
                     usleep(10)
                 }
             }

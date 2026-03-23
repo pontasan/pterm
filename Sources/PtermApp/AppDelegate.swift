@@ -2533,6 +2533,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onClose = { [weak self] in
             self?.settingsController = nil
         }
+        controller.onResetHookProcesses = { [weak self] in
+            self?.manager.resetAllHookProcesses()
+        }
+        controller.activeHookInstanceCount = { [weak self] in
+            self?.manager.activeHookInstanceCount ?? 0
+        }
         settingsController = controller
         controller.showWindow()
     }

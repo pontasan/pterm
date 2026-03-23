@@ -1,8 +1,13 @@
 import AppKit
+import Darwin
 
 // pterm - macOS Terminal Emulator
 //
 // Entry point. Bootstraps NSApplication with our AppDelegate.
+
+// Ignore SIGPIPE globally so that write() to a broken pipe (e.g. a crashed
+// I/O hook process) returns EPIPE instead of killing the application.
+signal(SIGPIPE, SIG_IGN)
 
 let launchOptions: LaunchOptions
 

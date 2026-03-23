@@ -551,6 +551,88 @@ final class PerformanceRegressionTests: XCTestCase {
         }
     }
 
+    /// Verify that the PTY output path with hooks master switch OFF has zero
+    /// overhead compared to the baseline.  The hookManager is nil, so the
+    /// installed closure is the standard path — no hook code executes.
+    func testPTYOutputWithHooksMasterSwitchOFF() throws {
+        let payload = makeProcessOutputData()
+        try benchmark("terminal_controller.process_pty_output_hooks_off", iterations: 10, warmupIterations: 1) {
+            let controller = self.makeBenchmarkController(rows: 24, cols: 100, scrollbackRows: 64)
+            // hookManager is nil — standard closure, zero hook overhead.
+            controller.debugProcessPTYOutputForTesting(payload)
+        }
+    }
+
+    /// Measure overhead of the hook-aware closure with an active immediate-mode
+    /// hook.  The hookManager dispatches raw bytes to an SPSC ring buffer.
+    /// Expected overhead: < 500ns per read event (memcpy to ring buffer).
+    func testPTYOutputWithHooksActiveImmediateMode() throws {
+        signal(SIGPIPE, SIG_IGN)
+
+        let hook = IOHookEntry(
+            enabled: true,
+            name: "perf-test-hook",
+            target: .output,
+            buffering: .immediate,
+            idleMs: IOHookEntry.defaultIdleMs,
+            bufferSize: IOHookEntry.defaultBufferSize,
+            command: "cat > /dev/null",
+            processMatch: nil,
+            processMatchRegex: nil,
+            includeChildren: false
+        )
+        let config = IOHookConfiguration(enabled: true, hooks: [hook])
+        let manager = IOHookManager(config: config)
+        defer { manager.shutdown() }
+
+        let payload = makeProcessOutputData()
+        try benchmark("terminal_controller.process_pty_output_hooks_immediate", iterations: 10, warmupIterations: 1) {
+            let controller = self.makeBenchmarkController(rows: 24, cols: 100, scrollbackRows: 64)
+            controller.hookManager = manager
+            // Simulate what the hook-aware closure does: dispatch + process.
+            payload.withUnsafeBytes { rawBuf in
+                guard let base = rawBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                let buf = UnsafeBufferPointer(start: base, count: rawBuf.count)
+                manager.dispatchRawOutput(buf, terminalID: controller.id)
+            }
+            controller.debugProcessPTYOutputForTesting(payload)
+        }
+    }
+
+    /// Measure overhead of the hook-aware closure with an active line-mode
+    /// hook (includes hookTextSink per-character callback).
+    func testPTYOutputWithHooksActiveLineMode() throws {
+        signal(SIGPIPE, SIG_IGN)
+
+        let hook = IOHookEntry(
+            enabled: true,
+            name: "perf-test-line-hook",
+            target: .output,
+            buffering: .line,
+            idleMs: IOHookEntry.defaultIdleMs,
+            bufferSize: IOHookEntry.defaultBufferSize,
+            command: "cat > /dev/null",
+            processMatch: nil,
+            processMatchRegex: nil,
+            includeChildren: false
+        )
+        let config = IOHookConfiguration(enabled: true, hooks: [hook])
+        let manager = IOHookManager(config: config)
+        defer { manager.shutdown() }
+
+        let payload = makeProcessOutputData()
+        try benchmark("terminal_controller.process_pty_output_hooks_line", iterations: 10, warmupIterations: 1) {
+            let controller = self.makeBenchmarkController(rows: 24, cols: 100, scrollbackRows: 64)
+            controller.hookManager = manager
+            // Install hookTextSink to simulate line-mode text capture.
+            let termID = controller.id
+            controller.model.hookTextSink = { [weak manager] codepoint in
+                manager?.dispatchTextCharacter(codepoint, terminalID: termID)
+            }
+            controller.debugProcessPTYOutputForTesting(payload)
+        }
+    }
+
     func testTerminalControllerProcessKittyBenchmarkASCIIPerformanceRegression() throws {
         let payload = makeKittyBenchmarkASCIIData()
         try benchmark("terminal_controller.process_kitty_benchmark_ascii", iterations: 8, warmupIterations: 1) {
