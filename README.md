@@ -32,6 +32,22 @@ Paste or drop an image and pterm saves it to a managed store, inserting the file
 - Responses in **40 languages** matching your macOS language
 - All processing runs through your locally installed CLI — **no data leaves your machine through pterm**
 
+### I/O Hooks — Tap Into Terminal Output
+
+Hook into terminal I/O streams and pipe data to external processes in real time. Designed for TUI-based AI tools like Claude Code — capture responses for text-to-speech, completion detection, or audit logging without interfering with the terminal.
+
+![I/O Hooks Architecture](Resources/io_hooks_architecture.png)
+
+Three buffering modes for different use cases:
+
+- **immediate** — raw PTY bytes for custom parsers and byte-level analysis
+- **line** — clean text, line by line, for log files and grep
+- **idle** — screen snapshots on output pause with **LCS-based line diff** — sends only changed lines, eliminating TUI redraw noise
+
+**Example: Read AI responses aloud.** Configure an idle-mode hook matching `claude`, connect it to a TTS engine, and pterm streams only new response content — no duplicates from screen redraws, no prompt noise. Each chunk is NUL-delimited for easy parsing in shell scripts (`read -d ''`).
+
+Zero overhead when disabled — the PTY read path is identical to a build without the hook feature.
+
 ### MCP Server
 
 Built-in [Model Context Protocol](https://modelcontextprotocol.io/) server with 20+ tools. AI agents can list, read, and control terminals programmatically — enabling fully autonomous workflows.
