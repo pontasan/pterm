@@ -317,4 +317,169 @@ final class IOHookConfigTests: XCTestCase {
         XCTAssertFalse(PtermConfig.default.ioHooks.enabled)
         XCTAssertTrue(PtermConfig.default.ioHooks.hooks.isEmpty)
     }
+
+    // MARK: - diff_only Parsing
+
+    func testDiffOnlyDefaultsToTrue() {
+        let root: [String: Any] = [
+            "io_hooks": [
+                ["name": "test", "target": "output", "command": "/bin/cat"]
+            ]
+        ]
+        let hook = IOHookConfiguration.parse(from: root).hooks[0]
+        XCTAssertTrue(hook.diffOnly, "diff_only should default to true")
+    }
+
+    func testDiffOnlyParsedAsFalse() {
+        let root: [String: Any] = [
+            "io_hooks": [
+                ["name": "test", "target": "output", "command": "/bin/cat", "diff_only": false]
+            ]
+        ]
+        let hook = IOHookConfiguration.parse(from: root).hooks[0]
+        XCTAssertFalse(hook.diffOnly, "diff_only: false should be parsed correctly")
+    }
+
+    func testDiffOnlyParsedAsTrue() {
+        let root: [String: Any] = [
+            "io_hooks": [
+                ["name": "test", "target": "output", "command": "/bin/cat", "diff_only": true]
+            ]
+        ]
+        let hook = IOHookConfiguration.parse(from: root).hooks[0]
+        XCTAssertTrue(hook.diffOnly, "explicit diff_only: true should be parsed correctly")
+    }
+
+    func testDiffOnlyDefaultMatchesStaticConstant() {
+        // Verify the static constant is true, which the parser uses as default.
+        XCTAssertTrue(IOHookEntry.defaultDiffOnly)
+    }
+
+    // MARK: - Enabled Field Parsing
+
+    func testEnabledDefaultsToTrue() {
+        let root: [String: Any] = [
+            "io_hooks": [
+                ["name": "test", "target": "output", "command": "/bin/cat"]
+            ]
+        ]
+        let hook = IOHookConfiguration.parse(from: root).hooks[0]
+        XCTAssertTrue(hook.enabled, "enabled should default to true when not specified")
+    }
+
+    func testEnabledParsedAsFalse() {
+        let root: [String: Any] = [
+            "io_hooks": [
+                ["name": "test", "target": "output", "command": "/bin/cat", "enabled": false]
+            ]
+        ]
+        let hook = IOHookConfiguration.parse(from: root).hooks[0]
+        XCTAssertFalse(hook.enabled)
+    }
+
+    // MARK: - include_children Parsing
+
+    func testIncludeChildrenDefaultsToFalse() {
+        let root: [String: Any] = [
+            "io_hooks": [
+                ["name": "test", "target": "output", "command": "/bin/cat"]
+            ]
+        ]
+        let hook = IOHookConfiguration.parse(from: root).hooks[0]
+        XCTAssertFalse(hook.includeChildren)
+    }
+
+    func testIncludeChildrenParsedAsTrue() {
+        let root: [String: Any] = [
+            "io_hooks": [
+                ["name": "test", "target": "output", "command": "/bin/cat", "include_children": true]
+            ]
+        ]
+        let hook = IOHookConfiguration.parse(from: root).hooks[0]
+        XCTAssertTrue(hook.includeChildren)
+    }
+
+    // MARK: - Empty process_match string
+
+    func testEmptyProcessMatchStringTreatedAsNil() {
+        let root: [String: Any] = [
+            "io_hooks": [
+                ["name": "test", "target": "output", "command": "/bin/cat", "process_match": ""]
+            ]
+        ]
+        let hook = IOHookConfiguration.parse(from: root).hooks[0]
+        // Empty string should result in no regex being compiled.
+        XCTAssertNil(hook.processMatchRegex,
+                     "Empty process_match should not compile a regex")
+    }
+
+    // MARK: - Buffering mode default
+
+    func testBufferingDefaultsToLine() {
+        let root: [String: Any] = [
+            "io_hooks": [
+                ["name": "test", "target": "output", "command": "/bin/cat"]
+            ]
+        ]
+        let hook = IOHookConfiguration.parse(from: root).hooks[0]
+        XCTAssertEqual(hook.buffering, .line,
+                       "Buffering should default to 'line' when not specified")
+    }
+
+    // MARK: - Negative idle_ms
+
+    func testNegativeIdleMsClampedToMin() {
+        let root: [String: Any] = [
+            "io_hooks": [
+                ["name": "test", "target": "output", "command": "/bin/cat", "idle_ms": -100]
+            ]
+        ]
+        let hook = IOHookConfiguration.parse(from: root).hooks[0]
+        XCTAssertEqual(hook.idleMs, IOHookEntry.minIdleMs,
+                       "Negative idle_ms should be clamped to minimum")
+    }
+
+    // MARK: - Equatable includes diffOnly
+
+    func testEquatableIncludesDiffOnly() {
+        let root1: [String: Any] = [
+            "io_hooks": [
+                ["name": "test", "target": "output", "command": "/bin/cat", "diff_only": true]
+            ]
+        ]
+        let root2: [String: Any] = [
+            "io_hooks": [
+                ["name": "test", "target": "output", "command": "/bin/cat", "diff_only": false]
+            ]
+        ]
+        let hook1 = IOHookConfiguration.parse(from: root1).hooks[0]
+        let hook2 = IOHookConfiguration.parse(from: root2).hooks[0]
+        XCTAssertNotEqual(hook1, hook2,
+                          "Hooks with different diffOnly should not be equal")
+    }
+
+    func testIdleModeWithDiffOnlyInFullConfig() {
+        let root: [String: Any] = [
+            "io_hooks_enabled": true,
+            "io_hooks": [
+                [
+                    "name": "idle-logger",
+                    "target": "output",
+                    "buffering": "idle",
+                    "idle_ms": 200,
+                    "diff_only": false,
+                    "buffer_size": 65536,
+                    "command": "/bin/cat",
+                    "process_match": "^claude$"
+                ]
+            ]
+        ]
+        let config = IOHookConfiguration.parse(from: root)
+        XCTAssertTrue(config.enabled)
+        XCTAssertEqual(config.hooks.count, 1)
+        let hook = config.hooks[0]
+        XCTAssertEqual(hook.buffering, .idle)
+        XCTAssertEqual(hook.idleMs, 200)
+        XCTAssertFalse(hook.diffOnly)
+    }
 }

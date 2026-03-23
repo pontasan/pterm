@@ -973,28 +973,42 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         let name = (entry["name"] as? String) ?? ""
         let target = (entry["target"] as? String) ?? "output"
         let buffering = (entry["buffering"] as? String) ?? "line"
+        let diffOnly = (entry["diff_only"] as? Bool) ?? true
+        let idleMs = (entry["idle_ms"] as? Int) ?? IOHookEntry.defaultIdleMs
         let command = (entry["command"] as? String) ?? ""
         let processMatch = (entry["process_match"] as? String) ?? ""
 
+        // ── Layout constants ──
+        let pad: CGFloat = 14
+        let rowH: CGFloat = 26
+        let rowGap: CGFloat = 6
+        let labelW: CGFloat = 100
+        let controlX = pad + labelW
+        let contentRight = width - pad
+        let fieldBg = NSColor(calibratedWhite: 0.2, alpha: 1)
+        let dimText = NSColor(calibratedWhite: 0.5, alpha: 1)
+        let closeSize: CGFloat = 20
+
+        // Calculate card height dynamically.
+        var rowCount = 4  // header, target+buffering, command, process match
+        if buffering == "idle" { rowCount += 2 }  // idle_ms row + diff_only row
+        let cardHeight = pad + CGFloat(rowCount) * rowH + CGFloat(rowCount - 1) * rowGap + pad
+
         // ── Card container ──
-        let cardHeight: CGFloat = 140
         let card = NSView(frame: NSRect(x: 0, y: 0, width: width, height: cardHeight))
         card.wantsLayer = true
-        card.layer?.backgroundColor = NSColor(calibratedWhite: 0.14, alpha: 1).cgColor
-        card.layer?.cornerRadius = 6
+        card.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1).cgColor
+        card.layer?.cornerRadius = 8
         card.layer?.borderWidth = 1
-        card.layer?.borderColor = NSColor(calibratedWhite: 0.25, alpha: 1).cgColor
+        card.layer?.borderColor = NSColor(calibratedWhite: 0.22, alpha: 1).cgColor
 
-        var y: CGFloat = cardHeight - 28
-        let leftMargin: CGFloat = 12
-        let labelW: CGFloat = 90
-        let controlX = leftMargin + labelW + 4
+        var y = cardHeight - pad - rowH
 
-        // Row 1: Enabled checkbox + Name + Remove button
+        // ── Row 1: [enabled] Name ──────────────────────── [×] ──
         let enabledCheck = NSButton(checkboxWithTitle: "", target: self,
                                      action: #selector(ioHookFieldChanged(_:)))
         enabledCheck.state = entryEnabled ? .on : .off
-        enabledCheck.frame = NSRect(x: leftMargin, y: y + 2, width: 18, height: 18)
+        enabledCheck.frame = NSRect(x: pad, y: y + 4, width: 18, height: 18)
         enabledCheck.tag = index * 100 + 0
         card.addSubview(enabledCheck)
 
@@ -1003,31 +1017,42 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         nameField.placeholderString = "Hook name"
         nameField.isEditable = true
         nameField.isBordered = true
-        nameField.backgroundColor = NSColor(calibratedWhite: 0.2, alpha: 1)
+        nameField.backgroundColor = fieldBg
         nameField.textColor = .white
-        nameField.font = .systemFont(ofSize: 12)
-        nameField.frame = NSRect(x: leftMargin + 22, y: y, width: 180, height: 22)
+        nameField.font = .systemFont(ofSize: 13, weight: .medium)
+        nameField.frame = NSRect(x: pad + 24, y: y, width: contentRight - pad - 24 - closeSize - 8, height: 22)
         nameField.tag = index * 100 + 1
         nameField.delegate = self
         nameField.identifier = NSUserInterfaceItemIdentifier("ioHookForm_name")
         card.addSubview(nameField)
 
-        let removeBtn = NSButton(title: "Remove", target: self,
-                                  action: #selector(ioHooksRemoveByTag(_:)))
-        removeBtn.bezelStyle = .rounded
-        removeBtn.tag = index
-        removeBtn.sizeToFit()
-        removeBtn.frame = NSRect(x: width - removeBtn.frame.width - 12, y: y,
-                                  width: removeBtn.frame.width, height: 22)
-        card.addSubview(removeBtn)
+        // × close button (SF Symbol)
+        let closeBtn = NSButton(frame: NSRect(x: contentRight - closeSize, y: y + 1, width: closeSize, height: closeSize))
+        closeBtn.bezelStyle = .inline
+        closeBtn.isBordered = false
+        if let img = NSImage(systemSymbolName: "xmark.circle.fill",
+                             accessibilityDescription: "Remove hook") {
+            let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+            closeBtn.image = img.withSymbolConfiguration(config)
+        } else {
+            closeBtn.title = "\u{2715}"
+        }
+        closeBtn.contentTintColor = NSColor(calibratedWhite: 0.45, alpha: 1)
+        closeBtn.target = self
+        closeBtn.action = #selector(ioHooksRemoveByTag(_:))
+        closeBtn.tag = index
+        card.addSubview(closeBtn)
 
-        // Row 2: Target + Buffering
-        y -= 28
-        let targetLabel = makeLabel("Target:")
-        targetLabel.frame = NSRect(x: leftMargin, y: y + 2, width: labelW, height: 18)
+        // ── Row 2: Target + Buffering ──
+        y -= (rowH + rowGap)
+
+        let targetLabel = makeLabel("Target")
+        targetLabel.textColor = dimText
+        targetLabel.font = .systemFont(ofSize: 11)
+        targetLabel.frame = NSRect(x: pad, y: y + 3, width: 48, height: 16)
         card.addSubview(targetLabel)
 
-        let targetPopup = NSPopUpButton(frame: NSRect(x: controlX, y: y, width: 100, height: 22))
+        let targetPopup = NSPopUpButton(frame: NSRect(x: pad + 50, y: y, width: 90, height: 22))
         targetPopup.addItems(withTitles: ["output", "stdin"])
         targetPopup.selectItem(withTitle: target)
         targetPopup.tag = index * 100 + 2
@@ -1035,11 +1060,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         targetPopup.action = #selector(ioHookFieldChanged(_:))
         card.addSubview(targetPopup)
 
-        let bufLabel = makeLabel("Buffering:")
-        bufLabel.frame = NSRect(x: controlX + 110, y: y + 2, width: 70, height: 18)
+        let bufLabel = makeLabel("Buffering")
+        bufLabel.textColor = dimText
+        bufLabel.font = .systemFont(ofSize: 11)
+        bufLabel.frame = NSRect(x: pad + 152, y: y + 3, width: 60, height: 16)
         card.addSubview(bufLabel)
 
-        let bufPopup = NSPopUpButton(frame: NSRect(x: controlX + 184, y: y, width: 110, height: 22))
+        let bufPopup = NSPopUpButton(frame: NSRect(x: pad + 214, y: y, width: 100, height: 22))
         bufPopup.addItems(withTitles: ["immediate", "line", "idle"])
         bufPopup.selectItem(withTitle: buffering)
         bufPopup.tag = index * 100 + 3
@@ -1047,10 +1074,55 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         bufPopup.action = #selector(ioHookFieldChanged(_:))
         card.addSubview(bufPopup)
 
-        // Row 3: Command
-        y -= 28
-        let cmdLabel = makeLabel("Command:")
-        cmdLabel.frame = NSRect(x: leftMargin, y: y + 2, width: labelW, height: 18)
+        // ── Idle-mode options (visible only when buffering == idle) ──
+        if buffering == "idle" {
+            // Idle timeout
+            y -= (rowH + rowGap)
+
+            let idleLabel = makeLabel("Idle timeout")
+            idleLabel.textColor = dimText
+            idleLabel.font = .systemFont(ofSize: 11)
+            idleLabel.frame = NSRect(x: pad, y: y + 3, width: labelW - 4, height: 16)
+            card.addSubview(idleLabel)
+
+            let idleMsField = NSTextField()
+            idleMsField.stringValue = "\(idleMs)"
+            idleMsField.isEditable = true
+            idleMsField.isBordered = true
+            idleMsField.backgroundColor = fieldBg
+            idleMsField.textColor = .white
+            idleMsField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+            idleMsField.alignment = .right
+            idleMsField.frame = NSRect(x: controlX, y: y, width: 60, height: 22)
+            idleMsField.tag = index * 100 + 7
+            idleMsField.delegate = self
+            idleMsField.identifier = NSUserInterfaceItemIdentifier("ioHookForm_idleMs")
+            card.addSubview(idleMsField)
+
+            let msLabel = makeLabel("ms")
+            msLabel.textColor = dimText
+            msLabel.font = .systemFont(ofSize: 11)
+            msLabel.frame = NSRect(x: controlX + 64, y: y + 3, width: 24, height: 16)
+            card.addSubview(msLabel)
+
+            // Diff only
+            y -= (rowH + rowGap)
+            let diffCheck = NSButton(checkboxWithTitle: "Diff only — send only changed lines",
+                                     target: self, action: #selector(ioHookFieldChanged(_:)))
+            diffCheck.state = diffOnly ? .on : .off
+            diffCheck.tag = index * 100 + 6
+            let diffW = min(contentRight - controlX, 300)
+            diffCheck.frame = NSRect(x: controlX, y: y + 3, width: diffW, height: 18)
+            card.addSubview(diffCheck)
+        }
+
+        // ── Row 3: Command ──
+        y -= (rowH + rowGap)
+
+        let cmdLabel = makeLabel("Command")
+        cmdLabel.textColor = dimText
+        cmdLabel.font = .systemFont(ofSize: 11)
+        cmdLabel.frame = NSRect(x: pad, y: y + 3, width: labelW - 4, height: 16)
         card.addSubview(cmdLabel)
 
         let cmdField = NSTextField()
@@ -1058,30 +1130,33 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         cmdField.placeholderString = "/path/to/command or shell pipeline"
         cmdField.isEditable = true
         cmdField.isBordered = true
-        cmdField.backgroundColor = NSColor(calibratedWhite: 0.2, alpha: 1)
+        cmdField.backgroundColor = fieldBg
         cmdField.textColor = .white
         cmdField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        cmdField.frame = NSRect(x: controlX, y: y, width: width - controlX - 12, height: 22)
+        cmdField.frame = NSRect(x: controlX, y: y, width: contentRight - controlX, height: 22)
         cmdField.tag = index * 100 + 4
         cmdField.delegate = self
         cmdField.identifier = NSUserInterfaceItemIdentifier("ioHookForm_command")
         card.addSubview(cmdField)
 
-        // Row 4: Process match (optional)
-        y -= 28
-        let matchLabel = makeLabel("Process match:")
-        matchLabel.frame = NSRect(x: leftMargin, y: y + 2, width: labelW, height: 18)
+        // ── Row 4: Process match ──
+        y -= (rowH + rowGap)
+
+        let matchLabel = makeLabel("Process match")
+        matchLabel.textColor = dimText
+        matchLabel.font = .systemFont(ofSize: 11)
+        matchLabel.frame = NSRect(x: pad, y: y + 3, width: labelW - 4, height: 16)
         card.addSubview(matchLabel)
 
         let matchField = NSTextField()
         matchField.stringValue = processMatch
-        matchField.placeholderString = "regex (empty = all processes)"
+        matchField.placeholderString = "regex (empty = all)"
         matchField.isEditable = true
         matchField.isBordered = true
-        matchField.backgroundColor = NSColor(calibratedWhite: 0.2, alpha: 1)
+        matchField.backgroundColor = fieldBg
         matchField.textColor = .white
         matchField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        matchField.frame = NSRect(x: controlX, y: y, width: 200, height: 22)
+        matchField.frame = NSRect(x: controlX, y: y, width: contentRight - controlX, height: 22)
         matchField.tag = index * 100 + 5
         matchField.delegate = self
         matchField.identifier = NSUserInterfaceItemIdentifier("ioHookForm_processMatch")
@@ -1158,6 +1233,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
                 } else {
                     ioHooksEntries[index]["process_match"] = value
                 }
+            case "idleMs":
+                let raw = Int(value) ?? IOHookEntry.defaultIdleMs
+                let clamped = max(IOHookEntry.minIdleMs, min(IOHookEntry.maxIdleMs, raw))
+                ioHooksEntries[index]["idle_ms"] = clamped
+                // Update displayed value to clamped result.
+                field.stringValue = "\(clamped)"
             default:
                 break
             }
@@ -1437,7 +1518,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         case 2:  // target popup
             ioHooksEntries[index]["target"] = (sender as? NSPopUpButton)?.titleOfSelectedItem ?? "output"
         case 3:  // buffering popup
-            ioHooksEntries[index]["buffering"] = (sender as? NSPopUpButton)?.titleOfSelectedItem ?? "line"
+            let newBuffering = (sender as? NSPopUpButton)?.titleOfSelectedItem ?? "line"
+            ioHooksEntries[index]["buffering"] = newBuffering
+            if newBuffering == "idle" {
+                if ioHooksEntries[index]["diff_only"] == nil {
+                    ioHooksEntries[index]["diff_only"] = true
+                }
+            }
+            saveIOHooksEntries()
+            showContentForSection(.ai)
+            return
+        case 6:  // diff_only checkbox (idle mode only)
+            ioHooksEntries[index]["diff_only"] = ((sender as? NSButton)?.state == .on)
         default:
             break
         }

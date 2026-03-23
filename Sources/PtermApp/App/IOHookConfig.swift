@@ -25,6 +25,7 @@ struct IOHookEntry: Equatable {
     let target: IOHookTarget
     let buffering: IOHookBufferingMode
     let idleMs: Int
+    let diffOnly: Bool
     let bufferSize: Int
     let command: String
     let processMatch: String?
@@ -37,6 +38,7 @@ struct IOHookEntry: Equatable {
         lhs.target == rhs.target &&
         lhs.buffering == rhs.buffering &&
         lhs.idleMs == rhs.idleMs &&
+        lhs.diffOnly == rhs.diffOnly &&
         lhs.bufferSize == rhs.bufferSize &&
         lhs.command == rhs.command &&
         lhs.processMatch == rhs.processMatch &&
@@ -46,6 +48,8 @@ struct IOHookEntry: Equatable {
     static let defaultIdleMs = 500
     static let minIdleMs = 1
     static let maxIdleMs = 10000
+
+    static let defaultDiffOnly = true
 
     static let defaultBufferSize = 65536
     static let minBufferSize = 1024
@@ -106,6 +110,7 @@ extension IOHookConfiguration {
             }
 
             let hookEnabled = (dict["enabled"] as? Bool) ?? true
+            let diffOnly = (dict["diff_only"] as? Bool) ?? IOHookEntry.defaultDiffOnly
             let includeChildren = (dict["include_children"] as? Bool) ?? false
 
             return IOHookEntry(
@@ -114,6 +119,7 @@ extension IOHookConfiguration {
                 target: target,
                 buffering: buffering,
                 idleMs: idleMs,
+                diffOnly: diffOnly,
                 bufferSize: bufferSize,
                 command: command,
                 processMatch: processMatchString,

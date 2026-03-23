@@ -152,6 +152,7 @@ final class IOHookManager {
         stateLock.unlock()
 
         // Force-kill every hook process immediately — no graceful shutdown.
+        // Use -pid to kill the entire process group (sh + children).
         for (_, instance) in allInstances {
             instance.active = false
             instance.idleTimer?.cancel()
@@ -161,7 +162,7 @@ final class IOHookManager {
                 instance.pipeFD = -1
             }
             if instance.hookPID > 0 {
-                kill(instance.hookPID, SIGKILL)
+                kill(-instance.hookPID, SIGKILL)
                 var status: Int32 = 0
                 waitpid(instance.hookPID, &status, 0)
             }
@@ -337,10 +338,15 @@ final class IOHookManager {
         let character = Character(scalar)
         let utf8Bytes = Array(String(character).utf8)
 
-        let isNewline = char == 0x0A || char == 0x0D
+        // Only LF (0x0A) triggers a flush.  CR (0x0D) is ignored entirely:
+        // in terminal output, `\r\n` means newline (LF will flush), and `\r`
+        // alone means carriage return (cursor to column 0, not a new line).
+        // Flushing on both CR and LF would produce spurious empty lines.
+        let isLF = char == 0x0A
+        let isCR = char == 0x0D
 
         for instance in relevant {
-            if isNewline {
+            if isLF {
                 // Flush accumulated line.
                 var payload = instance.lineBuffer
                 payload.append(0x0A)  // '\n'
@@ -355,6 +361,10 @@ final class IOHookManager {
                 instance.deliveryQueue.async { [weak self] in
                     self?.drainAndWrite(instance)
                 }
+            } else if isCR {
+                // Ignore CR — do not accumulate it into the line buffer.
+                // CR alone means "return to column 0" which doesn't produce
+                // a new line of output.
             } else {
                 instance.lineBuffer.append(contentsOf: utf8Bytes)
             }
@@ -427,17 +437,8 @@ final class IOHookManager {
             $0.hookEntry.target == .output && $0.hookEntry.buffering == .idle
         }
         let ptyQueue = ptyQueues[terminalID]
-        let instanceCount = instances.count
         stateLock.unlock()
 
-        if idleInstances.isEmpty {
-            // Debug: log once per terminal to diagnose missing notifications.
-            struct Once { static var logged = Set<UUID>() }
-            if !Once.logged.contains(terminalID) {
-                Once.logged.insert(terminalID)
-                NSLog("[pterm] notifyDirtyRow: no idle instances for terminal %@ (total instances: %d)", terminalID.uuidString, instanceCount)
-            }
-        }
         guard !idleInstances.isEmpty else { return }
 
         let now = mach_absolute_time()
@@ -517,14 +518,6 @@ final class IOHookManager {
     }
 
     private func handleIdleTimerFire(_ instance: ActiveHookInstance) {
-        do {
-            let msg = "idleTimerFire: hook=\(instance.hookEntry.name) active=\(instance.active) dirtyLines=\(instance.dirtyLines.count) pipeFD=\(instance.pipeFD)\n"
-            if let fh = FileHandle(forWritingAtPath: "/tmp/pterm_hook_debug.log") {
-                fh.seekToEndOfFile()
-                fh.write(Data(msg.utf8))
-                fh.closeFile()
-            }
-        }
         guard instance.active else { return }
 
         // Check if output is still arriving (timer may fire while new data comes).
@@ -560,7 +553,7 @@ final class IOHookManager {
 
         // Build current full-screen snapshot.
         var currentSnapshot: [Int: String] = [:]
-        var allLines: [String] = []
+        var currentLines: [String] = []
         var hasChange = false
 
         for row in 0..<dims.rows {
@@ -572,17 +565,39 @@ final class IOHookManager {
                 hasChange = true
             }
             if !trimmed.isEmpty {
-                allLines.append(trimmed)
+                currentLines.append(trimmed)
             }
+        }
+
+        guard hasChange else { return }
+
+        let outputLines: [String]
+        if instance.hookEntry.diffOnly {
+            // LCS-based diff: extract lines added or changed in current
+            // relative to previous, preserving order.
+            let previousLines: [String] = (0..<dims.rows).compactMap { row in
+                let text = instance.previousSnapshot[row] ?? ""
+                return text.isEmpty ? nil : text
+            }
+            outputLines = LineDiff.addedLines(previous: previousLines, current: currentLines)
+        } else {
+            outputLines = currentLines
         }
 
         instance.previousSnapshot = currentSnapshot
 
-        guard hasChange && !allLines.isEmpty else { return }
+        guard !outputLines.isEmpty else {
+            // Snapshot changed (e.g. lines removed) but no new content to send.
+            return
+        }
 
-        // Write full screen snapshot to ring buffer.
-        let payload = allLines.joined(separator: "\n") + "\n"
+        // Write to ring buffer.  Append NUL delimiter (\0) after the final
+        // newline so that consumers can distinguish chunk boundaries
+        // (e.g. `read -d ''` in shell scripts).
+        let payload = outputLines.joined(separator: "\n") + "\n\0"
         if let data = payload.data(using: .utf8) {
+            // data(using:) encodes the NUL as the literal byte 0x00,
+            // which is exactly what we want.
             data.withUnsafeBytes { rawBuf in
                 guard let base = rawBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
                     return
@@ -749,8 +764,8 @@ final class IOHookManager {
             if r == pid || (r == -1 && errno == ECHILD) { return }
         }
 
-        // Send SIGTERM.
-        kill(pid, SIGTERM)
+        // Send SIGTERM to the entire process group (sh + children).
+        kill(-pid, SIGTERM)
 
         // Wait up to sigkillWaitSeconds.
         for _ in 0..<(sigkillWaitSeconds * 10) {
@@ -759,8 +774,8 @@ final class IOHookManager {
             if r == pid || (r == -1 && errno == ECHILD) { return }
         }
 
-        // Force kill.
-        kill(pid, SIGKILL)
+        // Force kill the entire process group.
+        kill(-pid, SIGKILL)
         waitpid(pid, &status, 0)
     }
 
