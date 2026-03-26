@@ -595,6 +595,12 @@ final class IOHookManager {
         // newline so that consumers can distinguish chunk boundaries
         // (e.g. `read -d ''` in shell scripts).
         let payload = outputLines.joined(separator: "\n") + "\n\0"
+
+        // DEBUG: dump raw payload to file for diagnosis.
+        if let debugData = payload.data(using: .utf8) {
+            try? debugData.write(to: URL(fileURLWithPath: "/tmp/pterm_idle_payload_debug.bin"))
+        }
+
         if let data = payload.data(using: .utf8) {
             // data(using:) encodes the NUL as the literal byte 0x00,
             // which is exactly what we want.

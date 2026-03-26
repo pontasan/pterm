@@ -933,6 +933,44 @@ final class TerminalControllerTests: XCTestCase {
         }.trimmingCharacters(in: .whitespaces), "Running: Long escape codes")
     }
 
+    func testClaudeStartupAndPromptOutputDoesNotUnderlineVisibleCells() {
+        let controller = makeController(rows: 24, cols: 120)
+
+        let startupChunks: [Data] = [
+            Data("\u{1B}[?2004l\r\r\n".utf8),
+            Data("\u{1B}[?2004h\u{1B}[?1004h".utf8),
+            Data("\u{1B}[>1u\u{1B}[>4;2m\u{1B}[?25l".utf8),
+            Data("\u{1B}[>0q\u{1B}[c".utf8),
+            Data("\u{1B}[>4m\u{1B}[<u\u{1B}[?1004l\u{1B}[?2004l".utf8),
+            Data("\u{1B}[?2004h\u{1B}[?1004h\u{1B}[>1u\u{1B}[>4;2m".utf8),
+            Data("\u{1B}]0;✳ Claude Code\u{07}".utf8),
+            Data("\u{1B}[?2026h\u{1B}[38;2;215;119;87m ▐\u{1B}[48;2;0;0;0m▛███▜\u{1B}[49m▌\u{1B}[3C\u{1B}[39m\u{1B}[1mClaude\u{1B}[1CCode\u{1B}[1C\u{1B}[22m\u{1B}[38;2;153;153;153mv2.1.84\u{1B}[39m\r\r\n\u{1B}[38;2;215;119;87m▝▜\u{1B}[48;2;0;0;0m█████\u{1B}[49m▛▘\u{1B}[2C\u{1B}[38;2;153;153;153mOpus\u{1B}[1C4.6\u{1B}[1C(1M\u{1B}[1Ccontext)\u{1B}[1Cwith\u{1B}[1Cmedium\u{1B}[1Ceffort\u{1B}[1C·\u{1B}[1CClaude\u{1B}[1CMax\u{1B}[39m\r\r\n\u{1B}[2C▘▘ ▝▝\u{1B}[4C\u{1B}[38;2;153;153;153m~/wk\u{1B}[39m\r\r\n".utf8),
+            Data("────────────────────────────────────────────────────────────────────────────────────────────────────────────────\u{1B}[39m\r\r\n\u{1B}[92C\u{1B}[38;2;153;153;153m◐\u{1B}[1Cmedium\u{1B}[1C·\u{1B}[1C/effort\u{1B}[39m".utf8),
+            Data("\u{1B}[>0q\u{1B}[c".utf8),
+            Data("\u{1B}[?2026h\u{1B}[2D\u{1B}[3B\r\u{1B}[2C\u{1B}[1A\u{1B}[38;2;153;153;153mwk | claude-opus-4-6[1m] | Cost: $0.0000\u{1B}[39m\r\r\n\u{1B}[2C\u{1B}[3A\u{1B}[?2026l".utf8),
+            Data("\u{1B}[?2026h\u{1B}[25D\u{1B}[3B\r\u{1B}[4A\u{1B}[48;2;55;55;55m\u{1B}[38;2;80;80;80m❯ \u{1B}[38;2;255;255;255mhello from pterm verify\u{1B}[39m                                                                                       \r\u{1B}[1B\u{1B}[49m       \u{1B}[1C    \u{1B}[1C     \u{1B}[1C       \r\u{1B}[1B\u{1B}[38;2;215;119;87m✶\u{1B}[39m \u{1B}[38;2;215;119;87mBefuddling\u{1B}[38;2;235;159;127m…\u{1B}[38;2;215;119;87m \u{1B}[39m                                                                   ".utf8),
+            Data("────────────────────────────────────────────────────────────────────────────────────────────────────────────────".utf8),
+            Data("\u{1B}[?2026h\u{1B}[2D\u{1B}[3B\r\u{1B}[6A\u{1B}[38;2;215;119;87m✳\u{1B}[11C…\u{1B}[39m\r\r\n\r\n\r\n\r\n\r\n\r\n\u{1B}[2C\u{1B}[3A\u{1B}[?2026l".utf8),
+            Data("\u{1B}[?2026h\u{1B}[2D\u{1B}[3B\r\u{1B}[6A\u{1B}[38;2;255;255;255m⏺\u{1B}[39m こんにちは！pterm の verify についてですね。何かお手伝いできることはありますか？\r\r\n\r\n".utf8),
+            Data("────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\r\n❯ \r\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\r\nwk | claude-opus-4-6[1m] | Cost: $0.01 | Context [░░░░░░░░░░░░░░░░░░░░] 2.0%\u{1B}[?2026l".utf8)
+        ]
+
+        for chunk in startupChunks {
+            controller.debugProcessPTYOutputForTesting(chunk)
+        }
+        drainMainQueue(testCase: self)
+
+        let snapshot = controller.captureRenderSnapshot()
+        for (rowIndex, row) in snapshot.visibleRows.enumerated() {
+            for (colIndex, cell) in row.cells.enumerated() where cell.codepoint != 0 {
+                XCTAssertFalse(
+                    cell.attributes.underline,
+                    "underline unexpectedly set at row \(rowIndex) col \(colIndex) char=\(cell.renderedString())"
+                )
+            }
+        }
+    }
+
     func testIgnoredOSCPayloadFastPathStillResumesPendingUpdateMode() {
         let controller = makeController(rows: 2, cols: 40)
         controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?2026h".utf8))

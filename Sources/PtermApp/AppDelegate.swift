@@ -294,7 +294,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isIntegratedViewVisible || terminalBackgroundOpacity < 0.999
     }
 
-    init(launchOptions: LaunchOptions = LaunchOptions(profileRoot: nil, restoreSessionMode: .attempt, cliMode: false, immediateAction: nil, directLaunch: nil)) {
+    init(launchOptions: LaunchOptions = LaunchOptions(profileRoot: nil, restoreSessionMode: .attempt, unattended: false, cliMode: false, immediateAction: nil, directLaunch: nil)) {
         self.launchOptions = launchOptions
         super.init()
     }
@@ -795,7 +795,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if !isTerminating {
             let aliveCount = manager.terminals.filter { $0.isAlive }.count
-            if aliveCount > 0 {
+            if aliveCount > 0 && !launchOptions.unattended {
                 let alert = NSAlert.pterm()
                 alert.messageText = "Quit pterm?"
                 alert.informativeText = "\(aliveCount) terminal(s) are still running."
@@ -3532,7 +3532,7 @@ extension AppDelegate: NSWindowDelegate {
 
         // In integrated view, proceed with close/quit
         let aliveCount = manager.terminals.filter { $0.isAlive }.count
-        if aliveCount > 0 {
+        if aliveCount > 0 && !launchOptions.unattended {
             let alert = NSAlert.pterm()
             alert.messageText = "Quit pterm?"
             alert.informativeText = "\(aliveCount) terminal(s) are still running."

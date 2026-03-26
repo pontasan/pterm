@@ -1011,7 +1011,11 @@ final class PTYIntegrationTests: XCTestCase {
             sendChoice("2")
             try Self.waitForTerminalText(controller, toContain: "The cursor should be invisible", timeout: 10.0)
             pressReturn()
-            try Self.waitForTerminalText(controller, toContain: "The cursor should be visible again", timeout: 10.0)
+            // Disable dismissVttestPrompts here: the previous screen's
+            // "Push <RETURN>" may still be visible in the text buffer while
+            // vttest transitions to the next screen.  Auto-dismiss would
+            // send an extra Return that skips past the expected text.
+            try Self.waitForTerminalText(controller, toContain: "The cursor should be visible again", timeout: 10.0, dismissVttestPrompts: false)
             pressReturn()
             try Self.waitForTerminalText(controller, toContain: "Enter choice number (0 - 4):", timeout: 10.0)
 

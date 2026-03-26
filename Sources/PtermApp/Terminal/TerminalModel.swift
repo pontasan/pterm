@@ -195,6 +195,9 @@ final class TerminalModel {
     private(set) var pendingUpdateModeEnabled: Bool = false
     private(set) var reverseVideoEnabled = false
     private(set) var kittyKeyboardProtocolEnabled = false
+    private(set) var modifyOtherKeysMode = 0
+    private(set) var formatOtherKeysMode = 0
+    private(set) var modifyOtherKeysMask = 0
     private var insertModeEnabled = false
     private var protectedAreaModeEnabled = false
     private var nextKittyImagePlaceholderIndex = 1
@@ -1935,8 +1938,20 @@ final class TerminalModel {
                 return handleCommonPrivateMode(params: params, set: true)
             case 0x6C where privateMarker == UInt8(ascii: "?"): // DECRST
                 return handleCommonPrivateMode(params: params, set: false)
-            case 0x6D: // SGR
+            case 0x6D where privateMarker == nil: // SGR
                 handleParsedSGR(params: params, paramHasSub: paramHasSub)
+                return true
+            case 0x6D where privateMarker == UInt8(ascii: ">"): // XTMODKEYS
+                handleParsedXTMODKEYS(params: params, paramHasSub: paramHasSub)
+                return true
+            case 0x6D where privateMarker == UInt8(ascii: "?"): // XTQMODKEYS
+                handleParsedXTQMODKEYS(params: params)
+                return true
+            case 0x66 where privateMarker == UInt8(ascii: ">"): // XTFMTKEYS
+                handleParsedXTFMTKEYS(params: params)
+                return true
+            case 0x66 where privateMarker == UInt8(ascii: "?"): // XTQFMTKEYS
+                handleParsedXTQFMTKEYS(params: params)
                 return true
             case 0x75 where privateMarker == UInt8(ascii: ">"):
                 kittyKeyboardProtocolEnabled = true
@@ -2916,6 +2931,12 @@ final class TerminalModel {
             cursor.row = min(rows - 1, max(0, cursor.row + Int(n)))
             cursor.pendingWrap = false
 
+        case 0x66 where privateMarker == UInt8(ascii: ">"): // XTFMTKEYS
+            handleXTFMTKEYS(parser: parser)
+
+        case 0x66 where privateMarker == UInt8(ascii: "?"): // XTQFMTKEYS
+            handleXTQFMTKEYS(parser: parser)
+
         case 0x66: // HVP - Horizontal and Vertical Position (same as CUP)
             let row = vt_parser_param(parser, 0, 1)
             let col = vt_parser_param(parser, 1, 1)
@@ -2939,7 +2960,13 @@ final class TerminalModel {
         case 0x6C: // RM - Reset Mode
             handleSetMode(parser: parser, privateMarker: privateMarker, set: false)
 
-        case 0x6D: // SGR - Select Graphic Rendition
+        case 0x6D where privateMarker == UInt8(ascii: ">"): // XTMODKEYS
+            handleXTMODKEYS(parser: parser)
+
+        case 0x6D where privateMarker == UInt8(ascii: "?"): // XTQMODKEYS
+            handleXTQMODKEYS(parser: parser)
+
+        case 0x6D where privateMarker == 0: // SGR - Select Graphic Rendition
             handleSGR(parser: parser)
 
         case 0x6E: // DSR - Device Status Report
@@ -3389,6 +3416,105 @@ final class TerminalModel {
         default:
             break
         }
+    }
+
+    private func handleParsedXTMODKEYS(
+        params: UnsafeBufferPointer<Int32>,
+        paramHasSub: Bool
+    ) {
+        let resource = params.isEmpty ? -1 : Int(params[0])
+        let value = params.count > 1 ? Int(params[1]) : nil
+        let mask = paramHasSub && params.count > 1 ? Int(params[1]) : nil
+        applyXTMODKEYS(resource: resource, value: value, mask: mask)
+    }
+
+    private func handleParsedXTQMODKEYS(params: UnsafeBufferPointer<Int32>) {
+        let resource = params.isEmpty ? 4 : Int(params[0])
+        respondToXTQMODKEYS(resource: resource)
+    }
+
+    private func handleParsedXTFMTKEYS(params: UnsafeBufferPointer<Int32>) {
+        let resource = params.isEmpty ? -1 : Int(params[0])
+        let value = params.count > 1 ? Int(params[1]) : nil
+        applyXTFMTKEYS(resource: resource, value: value)
+    }
+
+    private func handleParsedXTQFMTKEYS(params: UnsafeBufferPointer<Int32>) {
+        let resource = params.isEmpty ? 4 : Int(params[0])
+        respondToXTQFMTKEYS(resource: resource)
+    }
+
+    private func handleXTMODKEYS(parser: UnsafePointer<VtParser>) {
+        let resource = Int(vt_parser_param(parser, 0, 0))
+        let value = parser.pointee.param_count > 1 ? Int(vt_parser_param(parser, 1, 0)) : nil
+        let mask = parser.pointee.param_has_sub && parser.pointee.param_count > 1
+            ? Int(vt_parser_param(parser, 1, 0))
+            : nil
+        applyXTMODKEYS(resource: resource, value: value, mask: mask)
+    }
+
+    private func handleXTQMODKEYS(parser: UnsafePointer<VtParser>) {
+        let resource = Int(vt_parser_param(parser, 0, 4))
+        respondToXTQMODKEYS(resource: resource)
+    }
+
+    private func handleXTFMTKEYS(parser: UnsafePointer<VtParser>) {
+        let resource = Int(vt_parser_param(parser, 0, 0))
+        let value = parser.pointee.param_count > 1 ? Int(vt_parser_param(parser, 1, 0)) : nil
+        applyXTFMTKEYS(resource: resource, value: value)
+    }
+
+    private func handleXTQFMTKEYS(parser: UnsafePointer<VtParser>) {
+        let resource = Int(vt_parser_param(parser, 0, 4))
+        respondToXTQFMTKEYS(resource: resource)
+    }
+
+    private func applyXTMODKEYS(resource: Int, value: Int?, mask: Int?) {
+        switch resource {
+        case 4:
+            modifyOtherKeysMode = normalizedModifyOtherKeysMode(value)
+            if let mask {
+                modifyOtherKeysMask = max(mask, 0)
+            } else if value == nil {
+                modifyOtherKeysMask = 0
+            }
+        case -1:
+            modifyOtherKeysMode = 0
+            modifyOtherKeysMask = 0
+        default:
+            break
+        }
+    }
+
+    private func respondToXTQMODKEYS(resource: Int) {
+        guard resource == 4 else { return }
+        sendResponse("\u{1B}[>\(resource);\(modifyOtherKeysMode)m")
+    }
+
+    private func applyXTFMTKEYS(resource: Int, value: Int?) {
+        switch resource {
+        case 4:
+            formatOtherKeysMode = normalizedFormatOtherKeysMode(value)
+        case -1:
+            formatOtherKeysMode = 0
+        default:
+            break
+        }
+    }
+
+    private func respondToXTQFMTKEYS(resource: Int) {
+        guard resource == 4 else { return }
+        sendResponse("\u{1B}[>\(resource);\(formatOtherKeysMode)f")
+    }
+
+    private func normalizedModifyOtherKeysMode(_ value: Int?) -> Int {
+        guard let value else { return 0 }
+        return min(max(value, 0), 3)
+    }
+
+    private func normalizedFormatOtherKeysMode(_ value: Int?) -> Int {
+        guard let value else { return 0 }
+        return value == 1 ? 1 : 0
     }
 
     private func sendResponse(_ response: String) {
@@ -4875,6 +5001,9 @@ final class TerminalModel {
         singleShiftInvocation = nil
         protectedAreaModeEnabled = false
         responseControlsUse8Bit = false
+        modifyOtherKeysMode = 0
+        formatOtherKeysMode = 0
+        modifyOtherKeysMask = 0
         initTabStops()
         onPendingUpdateModeChange?(false)
     }

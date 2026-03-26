@@ -4469,6 +4469,93 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(handler.debugResolvedInput(for: optionA), "\u{1B}a")
     }
 
+    func testKeyboardHandlerUsesXtermModifyOtherKeysForOptionModifiedText() throws {
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[>4;1m".utf8))
+        let handler = KeyboardHandler(controller: controller)
+        let optionA = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.option],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "a",
+            charactersIgnoringModifiers: "a",
+            isARepeat: false,
+            keyCode: 0
+        ))
+
+        XCTAssertEqual(handler.debugResolvedInput(for: optionA), "\u{1B}[27;3;97~")
+    }
+
+    func testKeyboardHandlerUsesXtermModifyOtherKeysForShiftTab() throws {
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[>4;2m".utf8))
+        let handler = KeyboardHandler(controller: controller)
+        let shiftTab = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.shift],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "\t",
+            charactersIgnoringModifiers: "\t",
+            isARepeat: false,
+            keyCode: 48
+        ))
+
+        XCTAssertEqual(handler.debugResolvedInput(for: shiftTab), "\u{1B}[27;2;9~")
+    }
+
+    func testKeyboardHandlerUsesXtermFormatOtherKeysCSIuWhenRequested() throws {
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[>4;1m\u{1B}[>4;1f".utf8))
+        let handler = KeyboardHandler(controller: controller)
+        let optionA = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.option],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "a",
+            charactersIgnoringModifiers: "a",
+            isARepeat: false,
+            keyCode: 0
+        ))
+
+        XCTAssertEqual(handler.debugResolvedInput(for: optionA), "\u{1B}[97;3u")
+    }
+
     func testKeyboardHandlerMCPKeyActionMapsEnterToTerminalNewlineInput() {
         let controller = TerminalController(
             rows: 4,

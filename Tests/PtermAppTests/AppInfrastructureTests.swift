@@ -46,6 +46,7 @@ final class AppInfrastructureTests: XCTestCase {
 
         XCTAssertEqual(options.restoreSessionMode, .attempt)
         XCTAssertNil(options.profileRoot)
+        XCTAssertFalse(options.unattended)
         XCTAssertFalse(options.cliMode)
         XCTAssertNil(options.immediateAction)
     }
@@ -65,6 +66,25 @@ final class AppInfrastructureTests: XCTestCase {
     func testLaunchOptionsRejectsInvalidRestoreSessionMode() {
         XCTAssertThrowsError(try LaunchOptions.parse(arguments: ["--restore-session=maybe"])) { error in
             XCTAssertEqual(error as? LaunchOptionsError, .invalidRestoreSessionMode("maybe"))
+        }
+    }
+
+    func testLaunchOptionsParsesUnattendedModeAndForcesRestore() throws {
+        let options = try LaunchOptions.parse(arguments: ["--unattended"])
+
+        XCTAssertTrue(options.unattended)
+        XCTAssertEqual(options.restoreSessionMode, .force)
+    }
+
+    func testLaunchOptionsRejectsDuplicateUnattendedMode() {
+        XCTAssertThrowsError(try LaunchOptions.parse(arguments: ["--unattended", "--unattended"])) { error in
+            XCTAssertEqual(error as? LaunchOptionsError, .duplicateUnattendedOption)
+        }
+    }
+
+    func testLaunchOptionsRejectsUnattendedModeCombinedWithNeverRestore() {
+        XCTAssertThrowsError(try LaunchOptions.parse(arguments: ["--unattended", "--restore-session=never"])) { error in
+            XCTAssertEqual(error as? LaunchOptionsError, .conflictingUnattendedRestoreSessionMode)
         }
     }
 
@@ -205,6 +225,7 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertTrue(help.contains("--version"))
         XCTAssertTrue(help.contains("--user-data-dir"))
         XCTAssertTrue(help.contains("--restore-session"))
+        XCTAssertTrue(help.contains("--unattended"))
         XCTAssertTrue(help.contains("--cli"))
         XCTAssertTrue(help.contains("--command"))
         XCTAssertTrue(help.contains("attempt"))

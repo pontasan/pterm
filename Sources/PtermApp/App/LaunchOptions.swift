@@ -5,6 +5,8 @@ enum LaunchOptionsError: Error, LocalizedError, Equatable {
     case duplicateProfileRootOption
     case emptyProfileRootPath
     case invalidRestoreSessionMode(String)
+    case duplicateUnattendedOption
+    case conflictingUnattendedRestoreSessionMode
     case duplicateCLIModeOption
     case duplicateCommandOption
     case emptyCommandPath
@@ -19,6 +21,10 @@ enum LaunchOptionsError: Error, LocalizedError, Equatable {
             return "Profile root path must not be empty."
         case .invalidRestoreSessionMode(let value):
             return "Invalid value for --restore-session: \(value). Expected one of: attempt, force, never."
+        case .duplicateUnattendedOption:
+            return "The --unattended option was specified more than once."
+        case .conflictingUnattendedRestoreSessionMode:
+            return "--unattended cannot be combined with --restore-session=never."
         case .duplicateCLIModeOption:
             return "CLI mode was specified more than once."
         case .duplicateCommandOption:
@@ -48,6 +54,7 @@ struct DirectLaunchOptions: Equatable {
 struct LaunchOptions: Equatable {
     let profileRoot: URL?
     let restoreSessionMode: RestoreSessionMode
+    let unattended: Bool
     let cliMode: Bool
     let immediateAction: LaunchImmediateAction?
     let directLaunch: DirectLaunchOptions?
@@ -58,6 +65,8 @@ struct LaunchOptions: Equatable {
         var index = 0
         var profileRoot: URL?
         var restoreSessionMode: RestoreSessionMode = .attempt
+        var explicitRestoreSessionMode: RestoreSessionMode?
+        var unattended = false
         var cliMode = false
         var immediateAction: LaunchImmediateAction?
         var directLaunch: DirectLaunchOptions?
@@ -86,6 +95,12 @@ struct LaunchOptions: Equatable {
                     throw LaunchOptionsError.invalidRestoreSessionMode(value)
                 }
                 restoreSessionMode = parsedMode
+                explicitRestoreSessionMode = parsedMode
+            } else if argument == "--unattended" {
+                if unattended {
+                    throw LaunchOptionsError.duplicateUnattendedOption
+                }
+                unattended = true
             } else if let value = commandValue(for: argument, nextArgument: arguments[safe: index + 1]) {
                 if directLaunch != nil {
                     throw LaunchOptionsError.duplicateCommandOption
@@ -137,9 +152,17 @@ struct LaunchOptions: Equatable {
             index += 1
         }
 
+        if unattended {
+            if explicitRestoreSessionMode == .never {
+                throw LaunchOptionsError.conflictingUnattendedRestoreSessionMode
+            }
+            restoreSessionMode = .force
+        }
+
         return LaunchOptions(
             profileRoot: profileRoot,
             restoreSessionMode: restoreSessionMode,
+            unattended: unattended,
             cliMode: cliMode,
             immediateAction: immediateAction,
             directLaunch: directLaunch
@@ -255,6 +278,11 @@ enum PtermCommandLine {
                 attempt  Try restoring. If the previous exit was unclean, ask for confirmation.
                 force    Restore without confirmation, even after an unclean exit.
                 never    Do not restore any previous session.
+
+          --unattended
+              Start in unattended verification mode.
+              This implies --restore-session=force and suppresses quit confirmation
+              dialogs when terminals are still running.
 
           --cli
               Run without opening the GUI window.

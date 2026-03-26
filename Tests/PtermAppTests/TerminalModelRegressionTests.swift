@@ -1035,6 +1035,58 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertEqual(reset.attributes.underlineColor, .default)
     }
 
+    func testTerminalModelIgnoresPrivateMarkerCSI_mSequences() {
+        let harness = TerminalModelHarness()
+
+        harness.feed("\u{1B}[>4;2mA")
+        let first = harness.model.grid.cell(at: 0, col: 0)
+        XCTAssertEqual(first.codepoint, Character("A").unicodeScalars.first?.value)
+        XCTAssertFalse(first.attributes.underline)
+        XCTAssertFalse(first.attributes.dim)
+
+        harness.feed("\u{1B}[>4mB")
+        let second = harness.model.grid.cell(at: 0, col: 1)
+        XCTAssertEqual(second.codepoint, Character("B").unicodeScalars.first?.value)
+        XCTAssertFalse(second.attributes.underline)
+        XCTAssertFalse(second.attributes.dim)
+    }
+
+    func testClaudeCapturedStartupSequenceDoesNotIntroduceUnderlineAttributes() {
+        let harness = TerminalModelHarness(rows: 24, cols: 120)
+
+        harness.feed("\u{1B}[?2004h\u{1B}[?1004h\u{1B}[>1u\u{1B}[>4;2m\u{1B}[?25l\u{1B}[>0q\u{1B}[>4m\u{1B}[<u\u{1B}[?1004l\u{1B}[?2004l\u{1B}[?2004h\u{1B}[?1004h\u{1B}[>1u\u{1B}[>4;2m\u{1B}]0;✳ Claude Code\u{07}\u{1B}[>0q\u{1B}[>1u\u{1B}[>4;2m\u{1B}]0;⠂ Claude Code\u{07}\u{1B}]0;⠂ Japanese greeting assistance\u{07}\u{1B}]0;✳ Japanese greeting assistance\u{07}")
+
+        for row in 0..<harness.model.rows {
+            for col in 0..<harness.model.cols {
+                let cell = harness.model.grid.cell(at: row, col: col)
+                XCTAssertFalse(cell.attributes.underline, "underline should remain false at row \(row) col \(col)")
+                XCTAssertFalse(cell.attributes.strikethrough, "strikethrough should remain false at row \(row) col \(col)")
+            }
+        }
+    }
+
+    func testTerminalModelTracksModifyOtherKeysAndFormatOtherKeysModes() {
+        let harness = TerminalModelHarness()
+
+        harness.feed("\u{1B}[>4;2m")
+        XCTAssertEqual(harness.model.modifyOtherKeysMode, 2)
+        XCTAssertEqual(harness.model.modifyOtherKeysMask, 0)
+
+        harness.feed("\u{1B}[>4;1f")
+        XCTAssertEqual(harness.model.formatOtherKeysMode, 1)
+
+        harness.feed("\u{1B}[>4:1m")
+        XCTAssertEqual(harness.model.modifyOtherKeysMode, 1)
+        XCTAssertEqual(harness.model.modifyOtherKeysMask, 1)
+
+        harness.feed("\u{1B}[>4m")
+        XCTAssertEqual(harness.model.modifyOtherKeysMode, 0)
+        XCTAssertEqual(harness.model.modifyOtherKeysMask, 0)
+
+        harness.feed("\u{1B}[>4f")
+        XCTAssertEqual(harness.model.formatOtherKeysMode, 0)
+    }
+
     func testTerminalModelKittyKeyboardProtocolToggleSequencesUpdateMode() {
         let harness = TerminalModelHarness()
         harness.feed("\u{1B}[>u")

@@ -32,11 +32,29 @@ final class KeyboardHandler {
         guard let controller = controller else { return false }
 
         let modifiers = event.modifierFlags
-        let kittyKeyboardProtocolEnabled = controller.withModel { $0.kittyKeyboardProtocolEnabled }
+        let keyboardModes = controller.withModel {
+            (
+                kittyKeyboardProtocolEnabled: $0.kittyKeyboardProtocolEnabled,
+                modifyOtherKeysMode: $0.modifyOtherKeysMode,
+                formatOtherKeysMode: $0.formatOtherKeysMode,
+                modifyOtherKeysMask: $0.modifyOtherKeysMask
+            )
+        }
 
-        if kittyKeyboardProtocolEnabled,
+        if keyboardModes.kittyKeyboardProtocolEnabled,
            let kittySequence = kittyKeyboardInputSequence(for: event) {
             controller.sendInput(kittySequence)
+            playInputFeedbackIfEnabled()
+            return true
+        }
+
+        if let modifyOtherKeysSequence = modifyOtherKeysInputSequence(
+            for: event,
+            mode: keyboardModes.modifyOtherKeysMode,
+            format: keyboardModes.formatOtherKeysMode,
+            factoredModifierMask: keyboardModes.modifyOtherKeysMask
+        ) {
+            controller.sendInput(modifyOtherKeysSequence)
             playInputFeedbackIfEnabled()
             return true
         }
@@ -124,11 +142,26 @@ final class KeyboardHandler {
     func debugInputSequence(for event: NSEvent) -> String? {
         guard let controller = controller else { return nil }
         let modes = controller.withModel { model in
-            (appCursor: model.applicationCursorKeys, appKeypad: model.applicationKeypadMode, kittyKeyboard: model.kittyKeyboardProtocolEnabled)
+            (
+                appCursor: model.applicationCursorKeys,
+                appKeypad: model.applicationKeypadMode,
+                kittyKeyboard: model.kittyKeyboardProtocolEnabled,
+                modifyOtherKeysMode: model.modifyOtherKeysMode,
+                formatOtherKeysMode: model.formatOtherKeysMode,
+                modifyOtherKeysMask: model.modifyOtherKeysMask
+            )
         }
         if modes.kittyKeyboard,
            let kittySequence = kittyKeyboardInputSequence(for: event) {
             return kittySequence
+        }
+        if let modifyOtherKeysSequence = modifyOtherKeysInputSequence(
+            for: event,
+            mode: modes.modifyOtherKeysMode,
+            format: modes.formatOtherKeysMode,
+            factoredModifierMask: modes.modifyOtherKeysMask
+        ) {
+            return modifyOtherKeysSequence
         }
         return translatedSpecialKeyInput(
             for: event,
@@ -465,6 +498,90 @@ final class KeyboardHandler {
         if modifiers.contains(.control) { value += 4 }
         if modifiers.contains(.command) { value += 8 }
         return value
+    }
+
+    private func modifyOtherKeysInputSequence(
+        for event: NSEvent,
+        mode: Int,
+        format: Int,
+        factoredModifierMask: Int
+    ) -> String? {
+        guard mode > 0 else { return nil }
+
+        let relevantModifiers = event.modifierFlags.intersection([.shift, .control, .option, .command])
+        let rawModifierBits = modifierBitmask(for: relevantModifiers)
+        let shouldEncode: Bool
+        switch mode {
+        case 1:
+            let nonTraditionalModifiers = rawModifierBits & ~(ModifierBit.shift.rawValue | ModifierBit.control.rawValue)
+            shouldEncode = nonTraditionalModifiers != 0
+        case 2:
+            shouldEncode = rawModifierBits != 0
+        case 3:
+            shouldEncode = true
+        default:
+            shouldEncode = false
+        }
+        guard shouldEncode else { return nil }
+
+        guard let codepoint = ordinaryKeyCodepoint(for: event, modifiers: relevantModifiers) else {
+            return nil
+        }
+
+        let encodedModifierBits = rawModifierBits & ~max(factoredModifierMask, 0)
+        let modifierParameter = encodedModifierBits + 1
+        if format == 1 {
+            return "\u{1B}[\(codepoint);\(modifierParameter)u"
+        }
+        return "\u{1B}[27;\(modifierParameter);\(codepoint)~"
+    }
+
+    private enum ModifierBit: Int {
+        case shift = 1
+        case option = 2
+        case control = 4
+        case command = 8
+    }
+
+    private func modifierBitmask(for modifiers: NSEvent.ModifierFlags) -> Int {
+        var mask = 0
+        if modifiers.contains(.shift) { mask |= ModifierBit.shift.rawValue }
+        if modifiers.contains(.option) { mask |= ModifierBit.option.rawValue }
+        if modifiers.contains(.control) { mask |= ModifierBit.control.rawValue }
+        if modifiers.contains(.command) { mask |= ModifierBit.command.rawValue }
+        return mask
+    }
+
+    private func ordinaryKeyCodepoint(
+        for event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> UInt32? {
+        switch event.keyCode {
+        case 48:
+            return 9
+        case 36, 76:
+            return 13
+        case 53:
+            return 27
+        case 51:
+            return 127
+        default:
+            break
+        }
+
+        let source: String?
+        if modifiers.contains(.control) {
+            source = event.charactersIgnoringModifiers
+        } else {
+            source = event.characters
+        }
+
+        guard let source,
+              let scalar = source.unicodeScalars.first
+        else {
+            return nil
+        }
+        return scalar.value
     }
 
     private func kittyKeyboardInputSequence(for event: NSEvent) -> String? {
