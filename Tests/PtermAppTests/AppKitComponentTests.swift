@@ -5259,6 +5259,84 @@ final class AppKitComponentTests: XCTestCase {
                        "Cursor on wide char should be 2 cells wide")
     }
 
+    func testRendererIgnoresStaleTransientCursorBehindActualCursor() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        controller.withModel { model in
+            model.cursor.row = 0
+            model.cursor.col = 3
+            model.cursor.visible = true
+            model.cursor.shape = .block
+        }
+        let snapshot = controller.captureRenderSnapshot()
+        let staleOverlay = MetalRenderer.TransientTextOverlay(
+            text: "d",
+            row: 0,
+            col: 1,
+            columnWidth: 1,
+            cursorRow: 0,
+            cursorCol: 2,
+            masksGridGlyphs: true,
+            verticalOffset: 0,
+            alpha: 1
+        )
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(
+            snapshot: snapshot,
+            transientTextOverlays: [staleOverlay]
+        )
+
+        let cursorX = try XCTUnwrap(vertexData.cursorVertices.first)
+        let scale = Float(renderer.glyphAtlas.scaleFactor)
+        let expectedX = Float(renderer.gridPadding) * scale
+            + 3 * Float(renderer.glyphAtlas.cellWidth) * scale
+        XCTAssertEqual(cursorX, expectedX, accuracy: 0.5)
+    }
+
+    func testRendererUsesTransientCursorAheadOfActualCursor() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        controller.withModel { model in
+            model.cursor.row = 0
+            model.cursor.col = 2
+            model.cursor.visible = true
+            model.cursor.shape = .block
+        }
+        let snapshot = controller.captureRenderSnapshot()
+        let predictiveOverlay = MetalRenderer.TransientTextOverlay(
+            text: "d",
+            row: 0,
+            col: 1,
+            columnWidth: 1,
+            cursorRow: 0,
+            cursorCol: 3,
+            masksGridGlyphs: true,
+            verticalOffset: 0,
+            alpha: 1
+        )
+
+        let vertexData = renderer.debugBuildVertexDataForTesting(
+            snapshot: snapshot,
+            transientTextOverlays: [predictiveOverlay]
+        )
+
+        let cursorX = try XCTUnwrap(vertexData.cursorVertices.first)
+        let scale = Float(renderer.glyphAtlas.scaleFactor)
+        let expectedX = Float(renderer.gridPadding) * scale
+            + 3 * Float(renderer.glyphAtlas.cellWidth) * scale
+        XCTAssertEqual(cursorX, expectedX, accuracy: 0.5)
+    }
+
     func testTerminalViewSetMarkedTextClearsCommittedTextPreviewAnimations() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(

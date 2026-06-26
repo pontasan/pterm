@@ -29,6 +29,21 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertEqual(AppDelegate.shellSingleQuoted("it's ok"), "'it'\\''s ok'")
     }
 
+    func testAIRoomMCPProtocolDescriptionEmphasizesMCPDeliveryRequirement() {
+        let critical = AppDelegate.aiRoomMCPResponseDeliveryCriticalDescription()
+
+        XCTAssertEqual(
+            critical["summary"],
+            "Cross-terminal AI replies are delivered only through this pterm AI Room MCP protocol."
+        )
+        XCTAssertTrue(critical["requesting_ai_must"]?.contains("call send_room_message") == true)
+        XCTAssertTrue(critical["requesting_ai_must"]?.contains("ordinary chat text") == true)
+        XCTAssertTrue(critical["target_ai_must"]?.contains("exact begin/end markers") == true)
+        XCTAssertTrue(critical["target_ai_must"]?.contains("normal unmarked answer") == true)
+        XCTAssertTrue(critical["mcp_result_is_not_the_answer"]?.contains("acknowledgement") == true)
+        XCTAssertTrue(critical["failure_mode"]?.contains("will not receive the response") == true)
+    }
+
     func testAIRoomTargetPromptAddsStrictMarkerFormatWithoutConfiguredMarkerExamples() {
         let prompt = AppDelegate.aiRoomTargetPrompt(
             protocolConfiguration: AIRoomMCPProtocolConfiguration(
@@ -41,10 +56,17 @@ final class AppInfrastructureTests: XCTestCase {
         )
 
         XCTAssertFalse(prompt.contains("Reply with markers."))
-        XCTAssertTrue(prompt.contains("pterm reads the marker lines automatically"))
-        XCTAssertTrue(prompt.contains("CRITICAL: Your entire answer must use exactly this format:"))
-        XCTAssertTrue(prompt.contains("BEGIN\n<your response text>\nEND"))
-        XCTAssertTrue(prompt.contains("If either exact marker is missing, pterm cannot detect or deliver your answer."))
+        XCTAssertTrue(prompt.contains("pterm machine-reads the marker lines"))
+        XCTAssertTrue(prompt.contains("CRITICAL: Missing or changing either exact marker makes delivery fail."))
+        XCTAssertTrue(prompt.contains("Build the first-line marker by concatenating these fields in order"))
+        XCTAssertTrue(prompt.contains("Build the final-line marker by concatenating these fields in order"))
+        XCTAssertTrue(prompt.contains("first field: BE"))
+        XCTAssertTrue(prompt.contains("second field: GIN"))
+        XCTAssertTrue(prompt.contains("first field: E"))
+        XCTAssertTrue(prompt.contains("second field: ND"))
+        XCTAssertTrue(prompt.contains("- First line: the first-line marker built from the fields above."))
+        XCTAssertTrue(prompt.contains("- Then: your response text only."))
+        XCTAssertTrue(prompt.contains("- Final line: the final-line marker built from the fields above."))
         XCTAssertTrue(prompt.contains("Do not wrap the markers in quotes or a code block."))
         XCTAssertTrue(prompt.hasSuffix("Message:\nreview this"))
     }
@@ -62,10 +84,54 @@ final class AppInfrastructureTests: XCTestCase {
             message: "review this"
         )
 
-        XCTAssertTrue(prompt.contains("BEGIN__ABC123__\n<your response text>\nEND__ABC123__"))
-        XCTAssertTrue(prompt.contains("The first line must be exactly:\nBEGIN__ABC123__"))
-        XCTAssertTrue(prompt.contains("The final line must be exactly:\nEND__ABC123__"))
+        XCTAssertFalse(prompt.contains("BEGIN__ABC123__"))
+        XCTAssertFalse(prompt.contains("END__ABC123__"))
+        XCTAssertTrue(prompt.contains("Build the first-line marker by concatenating these fields in order"))
+        XCTAssertTrue(prompt.contains("Build the final-line marker by concatenating these fields in order"))
+        XCTAssertTrue(prompt.contains("prefix field: BEGIN__"))
+        XCTAssertTrue(prompt.contains("prefix field: END__"))
+        XCTAssertTrue(prompt.contains("token field: ABC123"))
+        XCTAssertTrue(prompt.contains("suffix field: __"))
         XCTAssertTrue(prompt.contains("Do not omit the final line."))
+    }
+
+    func testAIRoomTargetPromptDoesNotContainCompleteMarkerPairBeforeMessage() {
+        let begin = "BEGIN__ABC123__"
+        let end = "END__ABC123__"
+        let prompt = AppDelegate.aiRoomTargetPrompt(
+            protocolConfiguration: AIRoomMCPProtocolConfiguration(
+                responseInstructionPrompt: "Use markers.",
+                beginMarker: "BEGIN",
+                endMarker: "END",
+                returnPrefixPrompt: "Returned"
+            ),
+            beginMarker: begin,
+            endMarker: end,
+            message: "review this"
+        )
+
+        let instructionText = prompt.components(separatedBy: "\nMessage:\n").first ?? prompt
+        XCTAssertNil(
+            AIRoomMCPResponseCoordinator.firstCompleteMarkerBody(
+                in: instructionText,
+                beginMarker: begin,
+                endMarker: end
+            )
+        )
+        XCTAssertEqual(
+            AIRoomMCPResponseCoordinator.completeMarkerBodies(
+                in: instructionText,
+                beginMarker: begin,
+                endMarker: end
+            ),
+            []
+        )
+        let normalizedInstruction = instructionText.unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) || $0 == "_" }
+            .map(String.init)
+            .joined()
+        XCTAssertFalse(normalizedInstruction.contains(begin), normalizedInstruction)
+        XCTAssertFalse(normalizedInstruction.contains(end), normalizedInstruction)
     }
 
     func testAIRoomViewportPollingUsesOnlyTextAddedAfterBaseline() {
@@ -81,6 +147,26 @@ final class AppInfrastructureTests: XCTestCase {
             AppDelegate.textAddedAfterViewportBaseline(baseline, currentText: current),
             "\nnew prompt\nAI_RESPONSE_BEGIN\nsecond answer\nAI_RESPONSE_END"
         )
+    }
+
+    func testAIRoomSemanticDeltaReportsContinuousOverlap() {
+        let delta = AppDelegate.textDeltaAfterBaseline(
+            "old line\nAI_RESPONSE_BEGIN",
+            currentText: "AI_RESPONSE_BEGIN\nbody"
+        )
+
+        XCTAssertTrue(delta.isContinuousWithBaseline)
+        XCTAssertEqual(delta.text, "\nbody")
+    }
+
+    func testAIRoomSemanticDeltaReportsDiscontinuousSnapshotWhenOverlapIsLost() {
+        let delta = AppDelegate.textDeltaAfterBaseline(
+            "AI_RESPONSE_BEGIN__REQ__\nold body prefix",
+            currentText: "later body only\nAI_RESPONSE_END__REQ__"
+        )
+
+        XCTAssertFalse(delta.isContinuousWithBaseline)
+        XCTAssertEqual(delta.text, "later body only\nAI_RESPONSE_END__REQ__")
     }
 
     func testAIRoomViewportPollingHandlesScrolledOverlap() {

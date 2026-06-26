@@ -337,6 +337,90 @@ final class AIRoomMCPResponseCoordinatorTests: XCTestCase {
         }
     }
 
+    func testPromptEchoAndCodexFooterDoNotCompleteBeforeActualMarkedResponse() throws {
+        let coordinator = AIRoomMCPResponseCoordinator()
+        let begin = "AI_RESPONSE_BEGIN__1C7CF41263B04E05AB05C2A94EE9BE55__"
+        let end = "AI_RESPONSE_END__1C7CF41263B04E05AB05C2A94EE9BE55__"
+        let request = try coordinator.beginRequest(
+            callerTerminalID: UUID(),
+            targetTerminalID: UUID(),
+            beginMarker: begin,
+            endMarker: end
+        )
+        let outbound = AppDelegate.aiRoomTargetPrompt(
+            protocolConfiguration: AIRoomMCPProtocolConfiguration(
+                responseInstructionPrompt: "Use markers.",
+                beginMarker: "AI_RESPONSE_BEGIN",
+                endMarker: "AI_RESPONSE_END",
+                returnPrefixPrompt: "The following response was received."
+            ),
+            beginMarker: begin,
+            endMarker: end,
+            message: "軽く雑談しませんか"
+        )
+        let echoedPromptAndFooter = outbound + "\n›Explain this codebasegpt-5.5 high fast · ~/Developments/workspace/collabo"
+
+        switch coordinator.completeIfResponsePresent(in: echoedPromptAndFooter, for: request) {
+        case .waiting:
+            break
+        case .completed(let response):
+            XCTFail("prompt echo and Codex footer should not complete request: \(response)")
+        case .failed(let error):
+            XCTFail("request failed unexpectedly: \(error)")
+        }
+
+        let actualResponse = echoedPromptAndFooter + """
+
+        • \(begin)
+          いいですよ。今日はどんな感じですか？
+          \(end)
+        """
+        switch coordinator.completeIfResponsePresent(in: actualResponse, for: request) {
+        case .completed(let response):
+            XCTAssertEqual(response, "いいですよ。今日はどんな感じですか？")
+        case .waiting:
+            XCTFail("actual marked response should complete request")
+        case .failed(let error):
+            XCTFail("request failed unexpectedly: \(error)")
+        }
+    }
+
+    func testSnapshotResponseFailsWhenUnmarkedTextExceedsBufferLimit() throws {
+        let coordinator = AIRoomMCPResponseCoordinator()
+        let request = try coordinator.beginRequest(
+            callerTerminalID: UUID(),
+            targetTerminalID: UUID(),
+            beginMarker: "BEGIN",
+            endMarker: "END",
+            maxBufferCharacterCount: 8
+        )
+
+        switch coordinator.completeIfResponsePresent(in: "123456789", for: request) {
+        case .failed(.responseBufferExceeded):
+            break
+        case let other:
+            XCTFail("expected responseBufferExceeded, got \(other)")
+        }
+    }
+
+    func testSnapshotResponseFailsWhenMarkedBodyExceedsBufferLimit() throws {
+        let coordinator = AIRoomMCPResponseCoordinator()
+        let request = try coordinator.beginRequest(
+            callerTerminalID: UUID(),
+            targetTerminalID: UUID(),
+            beginMarker: "BEGIN",
+            endMarker: "END",
+            maxBufferCharacterCount: 4
+        )
+
+        switch coordinator.completeIfResponsePresent(in: "BEGIN 12345 END", for: request) {
+        case .failed(.responseBufferExceeded):
+            break
+        case let other:
+            XCTFail("expected responseBufferExceeded, got \(other)")
+        }
+    }
+
     func testRejectsConcurrentRequestToSameTargetFromDifferentCaller() throws {
         let coordinator = AIRoomMCPResponseCoordinator()
         let targetID = UUID()

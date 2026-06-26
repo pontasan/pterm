@@ -902,6 +902,20 @@ final class MetalRenderer {
         var underline: Bool = false
     }
 
+    private func effectiveCursorOverlay(
+        in overlays: [TransientTextOverlay],
+        actualRow: Int,
+        actualCol: Int
+    ) -> TransientTextOverlay? {
+        overlays.last { overlay in
+            guard let row = overlay.cursorRow,
+                  let col = overlay.cursorCol else {
+                return false
+            }
+            return row > actualRow || (row == actualRow && col >= actualCol)
+        }
+    }
+
     func render(model: TerminalModel, scrollback: ScrollbackBuffer,
                 scrollOffset: Int, selection: TerminalSelection?,
                 searchHighlight: SearchHighlight? = nil,
@@ -1681,7 +1695,11 @@ final class MetalRenderer {
 
         // Cursor (only visible when not scrolled back)
         if scrollOffset == 0 && model.cursor.visible {
-            let cursorOverlay = transientTextOverlays.last { $0.cursorRow != nil && $0.cursorCol != nil }
+            let cursorOverlay = effectiveCursorOverlay(
+                in: transientTextOverlays,
+                actualRow: model.cursor.row,
+                actualCol: model.cursor.col
+            )
             let cursorCol = cursorOverlay?.cursorCol.map { min(max($0, 0), max(viewCols - 1, 0)) } ?? model.cursor.col
             let cursorRow = cursorOverlay?.cursorRow.map { min(max($0, 0), max(viewRows - 1, 0)) } ?? model.cursor.row
             let cursorCellWidth: Float = {
@@ -2239,7 +2257,11 @@ final class MetalRenderer {
         }
 
         if snapshot.scrollOffset == 0 && snapshot.cursor.visible && viewRows > 0 {
-            let cursorOverlay = transientTextOverlays.last { $0.cursorRow != nil && $0.cursorCol != nil }
+            let cursorOverlay = effectiveCursorOverlay(
+                in: transientTextOverlays,
+                actualRow: snapshot.cursor.row,
+                actualCol: snapshot.cursor.col
+            )
             let cursorCol = min(
                 max(cursorOverlay?.cursorCol ?? snapshot.cursor.col, 0),
                 max(viewCols - 1, 0)

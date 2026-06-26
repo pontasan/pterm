@@ -219,6 +219,13 @@ final class TerminalController {
     var onWorkspaceNameChange: ((String) -> Void)?
     var onStateChange: (() -> Void)?
     var onInlineImageReachabilityChange: ((UUID, Set<Int>) -> Void)?
+    private var semanticContentSink: ((String) -> Void)?
+    private var semanticScrolledTextSink: ((String) -> Void)?
+    private struct PendingSemanticScrolledRow {
+        let text: String
+    }
+    private var pendingSemanticScrolledRow: PendingSemanticScrolledRow?
+    private var pendingSemanticScrolledTextChunks: [String] = []
 
     /// Coalesces bursty PTY-driven callbacks onto a single main-queue hop.
     private let callbackLock = NSLock()
@@ -319,6 +326,22 @@ final class TerminalController {
     var currentRenderContentVersion: UInt64 {
         callbackLock.withLock {
             renderContentVersion
+        }
+    }
+
+    func setSemanticContentSink(_ sink: ((String) -> Void)?) {
+        callbackLock.withLock {
+            semanticContentSink = sink
+        }
+    }
+
+    func setSemanticScrolledTextSink(_ sink: ((String) -> Void)?) {
+        callbackLock.withLock {
+            semanticScrolledTextSink = sink
+            if sink == nil {
+                pendingSemanticScrolledRow = nil
+                pendingSemanticScrolledTextChunks.removeAll(keepingCapacity: false)
+            }
         }
     }
 
@@ -513,6 +536,7 @@ final class TerminalController {
             if self.model.isAlternateScreen {
                 return
             }
+            self.recordSemanticScrolledRow(row)
             if self.isBatchingParserScrollOut {
                 self.pendingParserScrollOutRows.append(row)
                 if self.scrollOffset > 0 {
@@ -621,12 +645,6 @@ final class TerminalController {
             releaseScratchStorageNow()
         }
         pty.stop(waitForExit: waitForExit)
-    }
-
-    func setMCPTextSink(_ sink: ((UInt32) -> Void)?) {
-        lock.withWriteLock {
-            model.mcpTextSink = sink
-        }
     }
 
     /// Send SIGTERM and close PTY without blocking. Call awaitExit() later.
@@ -1155,6 +1173,7 @@ final class TerminalController {
             }
 
             flushPendingParserScrollOutBatch()
+            flushPendingSemanticScrolledRowAgainstCurrentGridLocked()
             renderingSuppressed = terminalRenderingSuppressed
             renderingSuppressedChanges = pendingRenderingSuppressedChanges
             pendingRenderingSuppressedChanges.removeAll(keepingCapacity: true)
@@ -1188,6 +1207,8 @@ final class TerminalController {
                     stateChange: clearedScrollback,
                     endingSuppressed: true
                 )
+                emitSemanticScrolledTextIfNeeded()
+                emitSemanticContentIfNeeded()
                 if shouldScheduleScrollbackCompaction {
                     scheduleScrollbackCompaction()
                 }
@@ -1203,6 +1224,8 @@ final class TerminalController {
                     stateChange: clearedScrollback
                 )
                 dispatchRenderingSuppressionChanges(renderingSuppressedChanges)
+                emitSemanticScrolledTextIfNeeded()
+                emitSemanticContentIfNeeded()
                 if shouldScheduleScrollbackCompaction {
                     scheduleScrollbackCompaction()
                 }
@@ -1235,6 +1258,8 @@ final class TerminalController {
             outputActivity: shouldReportOutputActivityNow,
             stateChange: clearedScrollback
         )
+        emitSemanticScrolledTextIfNeeded()
+        emitSemanticContentIfNeeded()
         if shouldScheduleScrollbackCompaction {
             scheduleScrollbackCompaction()
         }
@@ -1574,6 +1599,35 @@ final class TerminalController {
         }
         pendingParserScrollOutRows.removeAll(keepingCapacity: true)
         pendingParserScrollOffsetDelta = 0
+    }
+
+    private func recordSemanticScrolledRow(_ row: ScrollbackBuffer.BufferedRow) {
+        let rowText = Self.semanticText(forScrolledRow: row)
+        callbackLock.withLock {
+            guard semanticScrolledTextSink != nil else { return }
+            if let pending = pendingSemanticScrolledRow {
+                var completed = pending.text
+                if !row.isWrapped {
+                    completed.append("\n")
+                }
+                pendingSemanticScrolledTextChunks.append(completed)
+            }
+            pendingSemanticScrolledRow = PendingSemanticScrolledRow(text: rowText)
+        }
+    }
+
+    private func flushPendingSemanticScrolledRowAgainstCurrentGridLocked() {
+        let nextIsWrapped = model.rows > 0 && model.grid.isWrapped(0)
+        callbackLock.withLock {
+            guard semanticScrolledTextSink != nil,
+                  let pending = pendingSemanticScrolledRow else { return }
+            var completed = pending.text
+            if !nextIsWrapped {
+                completed.append("\n")
+            }
+            pendingSemanticScrolledTextChunks.append(completed)
+            pendingSemanticScrolledRow = nil
+        }
     }
 
     // MARK: - Resize
@@ -2048,12 +2102,13 @@ final class TerminalController {
             return extractionScratchLock.withLock {
                 textExtractionGridRowBuffer.reserveCapacity(dimensions.cols)
                 textExtractionScrollbackRowBuffer.reserveCapacity(dimensions.cols)
-                let lastRowText = textForAbsoluteRowLocked(
+                var lastRowText = textForAbsoluteRowLocked(
                     totalRows - 1,
                     totalRows: totalRows,
                     cols: dimensions.cols,
                     includeLineEnding: false
                 )
+                Self.trimTrailingSpaces(from: &lastRowText)
                 return TextBaseline(absoluteLastRow: absoluteLastRow, lastRowCharacterCount: lastRowText.count)
             }
         }
@@ -2544,6 +2599,25 @@ final class TerminalController {
         }
     }
 
+    private func emitSemanticContentIfNeeded() {
+        guard let sink = callbackLock.withLock({ semanticContentSink }) else { return }
+        sink(allText())
+    }
+
+    private func emitSemanticScrolledTextIfNeeded() {
+        let emission = callbackLock.withLock { () -> (sink: ((String) -> Void)?, text: String?) in
+            guard let sink = semanticScrolledTextSink,
+                  !pendingSemanticScrolledTextChunks.isEmpty else {
+                return (nil, nil)
+            }
+            let text = pendingSemanticScrolledTextChunks.joined()
+            pendingSemanticScrolledTextChunks.removeAll(keepingCapacity: true)
+            return (sink, text)
+        }
+        guard let sink = emission.sink, let text = emission.text, !text.isEmpty else { return }
+        sink(text)
+    }
+
     private func scheduleInterruptDrainCompletion() {
         let workItem = DispatchWorkItem { [weak self] in
             self?.completeInterruptDrainIfNeeded()
@@ -2940,6 +3014,19 @@ final class TerminalController {
             if cell.isWideContinuation || cell.hasInlineImage { continue }
             output.append(cell.renderedString())
         }
+    }
+
+    private static func semanticText(forScrolledRow row: ScrollbackBuffer.BufferedRow) -> String {
+        let cells = row.cells
+        guard !cells.isEmpty else { return "" }
+        let maxColumn = max(min(row.cellCount, cells.count) - 1, 0)
+        guard let textEndColumn = lastNonSpaceColumn(in: cells, through: maxColumn) else {
+            return ""
+        }
+        var result = ""
+        result.reserveCapacity(textEndColumn + 1)
+        appendCells(in: cells, from: 0, through: textEndColumn, to: &result)
+        return result
     }
 
     private static func trimTrailingSpaces(from string: inout String) {

@@ -186,10 +186,18 @@ final class AIRoomMCPResponseCoordinator {
             endMarker: request.endMarker,
             ignoredMarkerBodyFingerprints: request.ignoredMarkerBodyFingerprints
         ) else {
+            if text.count > request.maxBufferCharacterCount {
+                failLocked(request, error: .responseBufferExceeded)
+                return .failed(.responseBufferExceeded)
+            }
             return .waiting
         }
 
         let trimmed = responseBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count > request.maxBufferCharacterCount {
+            failLocked(request, error: .responseBufferExceeded)
+            return .failed(.responseBufferExceeded)
+        }
         request.completedResponse = trimmed
         removeLocked(request)
         return .completed(trimmed)

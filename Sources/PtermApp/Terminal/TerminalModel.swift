@@ -151,7 +151,6 @@ final class TerminalModel {
     /// to the hook manager for line/idle mode text capture.
     /// Set by TerminalController when hooks are active; nil otherwise (zero cost).
     var hookTextSink: ((UInt32) -> Void)?
-    var mcpTextSink: ((UInt32) -> Void)?
 
     /// Called when the terminal switches between normal and alternate screen
     /// buffers.  The Bool is true when entering alternate screen.
@@ -481,11 +480,13 @@ final class TerminalModel {
         g2Charset == .ascii &&
         g3Charset == .ascii &&
         singleShiftInvocation == nil &&
-        cursor.autoWrapMode
+        cursor.autoWrapMode &&
+        hookTextSink == nil
     }
 
     var canUseKnownWideUTF8GroundFastPath: Bool {
-        !insertModeEnabled
+        !insertModeEnabled &&
+        hookTextSink == nil
     }
 
     /// Fast path for the common "ground-state text stream" case.
@@ -857,7 +858,8 @@ final class TerminalModel {
         grid.hasOnlySingleWidthLines &&
         !insertModeEnabled &&
         !protectedAreaModeEnabled &&
-        cursor.attributes == .default
+        cursor.attributes == .default &&
+        hookTextSink == nil
     }
 
     @inline(__always)
@@ -2458,29 +2460,37 @@ final class TerminalModel {
         if let sink = hookTextSink {
             sink(codepoint)
         }
-        if let sink = mcpTextSink {
-            sink(codepoint)
-        }
     }
 
     private func dispatchPrintedCodepoints(_ codepoints: UnsafePointer<UInt32>, count: Int) {
-        guard count > 0, hookTextSink != nil || mcpTextSink != nil else { return }
+        guard count > 0, hookTextSink != nil else { return }
         for index in 0..<count {
             dispatchPrintedCodepoint(codepoints[index])
         }
     }
 
     private func dispatchPrintedASCIIBytes(_ bytes: UnsafePointer<UInt8>, count: Int) {
-        guard count > 0, hookTextSink != nil || mcpTextSink != nil else { return }
+        guard count > 0, hookTextSink != nil else { return }
         for index in 0..<count {
             dispatchPrintedCodepoint(UInt32(bytes[index]))
         }
     }
 
     private func dispatchRepeatedPrintedCodepoint(_ codepoint: UInt32, count: Int) {
-        guard count > 0, hookTextSink != nil || mcpTextSink != nil else { return }
+        guard count > 0, hookTextSink != nil else { return }
         for _ in 0..<count {
             dispatchPrintedCodepoint(codepoint)
+        }
+    }
+
+    private func dispatchTextControlCodepoint(_ codepoint: UInt32) {
+        switch codepoint {
+        case 0x09:
+            dispatchPrintedCodepoint(0x09)
+        case 0x0A, 0x0B, 0x0C:
+            dispatchPrintedCodepoint(0x0A)
+        default:
+            break
         }
     }
 
@@ -2599,6 +2609,8 @@ final class TerminalModel {
     // MARK: - C0 Controls
 
     private func handleExecute(_ cp: UInt32) {
+        dispatchTextControlCodepoint(cp)
+
         switch cp {
         case 0x07: // BEL
             onBell?()
@@ -2609,6 +2621,10 @@ final class TerminalModel {
         case 0x08: // BS (Backspace)
             if cursor.col > 0 {
                 cursor.col -= 1
+                cursor.pendingWrap = false
+            } else if cursor.row > 0, grid.isWrapped(cursor.row) {
+                cursor.row -= 1
+                cursor.col = max(0, visibleColumnCount(for: cursor.row) - 1)
                 cursor.pendingWrap = false
             }
 

@@ -224,6 +224,35 @@ final class TerminalModelRegressionTests: XCTestCase {
         XCTAssertTrue(harness.model.cursor.pendingWrap)
     }
 
+    func testBackspaceAtWrappedContinuationStartReturnsToPreviousLineEnd() {
+        let harness = TerminalModelHarness(rows: 3, cols: 10)
+
+        harness.feed("abcdefghijk")
+        XCTAssertTrue(harness.model.grid.isWrapped(1))
+        XCTAssertEqual(harness.model.cursor.row, 1)
+        XCTAssertEqual(harness.model.cursor.col, 1)
+
+        harness.feed(codepoints: [0x08, 0x08])
+
+        XCTAssertEqual(harness.model.cursor.row, 0)
+        XCTAssertEqual(harness.model.cursor.col, 9)
+        XCTAssertFalse(harness.model.cursor.pendingWrap)
+    }
+
+    func testBackspaceAtUnwrappedLineStartDoesNotMoveToPreviousLine() {
+        let harness = TerminalModelHarness(rows: 3, cols: 10)
+
+        harness.feed("abc\r\n")
+        XCTAssertFalse(harness.model.grid.isWrapped(1))
+        XCTAssertEqual(harness.model.cursor.row, 1)
+        XCTAssertEqual(harness.model.cursor.col, 0)
+
+        harness.feed(codepoints: [0x08])
+
+        XCTAssertEqual(harness.model.cursor.row, 1)
+        XCTAssertEqual(harness.model.cursor.col, 0)
+    }
+
     func testDisplayLocalInterruptPromptBoundaryMovesToNextLineWhenCurrentLineHasContent() {
         let harness = TerminalModelHarness(rows: 3, cols: 8)
         harness.feed("abc")

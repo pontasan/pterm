@@ -1479,6 +1479,232 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertTrue(controller.viewportText().contains(markerText))
     }
 
+    func testSemanticMarkedResponseExtractionExcludesTUIFooterRepaintedAfterEndMarker() {
+        let controller = makeController(rows: 10, cols: 120)
+        let begin = "AI_RESPONSE_BEGIN__REQ__"
+        let end = "AI_RESPONSE_END__REQ__"
+        let footer = "› Use /skills to list available skills"
+        let status = "gpt-5.5 high fast · ~/Developments/workspace/collabo"
+        let body = "AIは、かなり強力な「考える道具」だと思います。"
+        let rawPTYOrder = """
+        \(begin)
+        \(footer)
+        \(status)
+        \u{1B}[2A\r\u{1B}[2K\(body)
+        \r\u{1B}[2K\(end)
+        \(footer)
+        \(status)
+        """
+
+        XCTAssertTrue(
+            AIRoomMCPResponseCoordinator.firstCompleteMarkerBody(
+                in: rawPTYOrder,
+                beginMarker: begin,
+                endMarker: end
+            )?.contains(footer) == true
+        )
+
+        controller.debugProcessPTYOutputForTesting(Data(rawPTYOrder.utf8))
+
+        let semanticBody = AIRoomMCPResponseCoordinator.firstCompleteMarkerBody(
+            in: controller.allText(),
+            beginMarker: begin,
+            endMarker: end
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(semanticBody, body)
+        XCTAssertFalse(semanticBody?.contains(footer) == true)
+        let renderedText = controller.allText()
+        guard let endRange = renderedText.range(of: end),
+              let footerRange = renderedText.range(of: footer) else {
+            return XCTFail(renderedText)
+        }
+        XCTAssertLessThan(endRange.upperBound, footerRange.lowerBound, renderedText)
+    }
+
+    func testSemanticTextDiffResponseExtractionExcludesTUIFooterRepaintedAfterEndMarker() {
+        let controller = makeController(rows: 10, cols: 120)
+        let begin = "AI_RESPONSE_BEGIN__REQ__"
+        let end = "AI_RESPONSE_END__REQ__"
+        let footer = "› Use /skills to list available skills"
+        let status = "gpt-5.5 high fast · ~/Developments/workspace/collabo"
+        let body = "AIは、かなり強力な「考える道具」だと思います。"
+        controller.debugProcessPTYOutputForTesting(Data("old history that must not be scanned\r\n".utf8))
+        let baselineText = controller.allText()
+
+        let rawPTYOrder = """
+        \(begin)
+        \(footer)
+        \(status)
+        \u{1B}[2A\r\u{1B}[2K\(body)
+        \r\u{1B}[2K\(end)
+        \(footer)
+        \(status)
+        """
+        controller.debugProcessPTYOutputForTesting(Data(rawPTYOrder.utf8))
+
+        let semanticDelta = AppDelegate.textAddedAfterViewportBaseline(
+            baselineText,
+            currentText: controller.allText()
+        )
+        let semanticBody = AIRoomMCPResponseCoordinator.firstCompleteMarkerBody(
+            in: semanticDelta,
+            beginMarker: begin,
+            endMarker: end
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        XCTAssertEqual(semanticBody, body, semanticDelta)
+        XCTAssertFalse(semanticBody?.contains(footer) == true)
+    }
+
+    func testSemanticMarkedResponseExtractionSurvivesScrollback() {
+        let controller = makeController(rows: 5, cols: 120)
+        let begin = "AI_RESPONSE_BEGIN__SCROLL__"
+        let end = "AI_RESPONSE_END__SCROLL__"
+        let bodyLines = (0..<40).map { "line-\($0): AI response body" }
+        let output = ([begin] + bodyLines + [end]).joined(separator: "\r\n") + "\r\n"
+
+        controller.debugProcessPTYOutputForTesting(Data(output.utf8))
+
+        let renderedText = controller.allText()
+        let body = AIRoomMCPResponseCoordinator.firstCompleteMarkerBody(
+            in: renderedText,
+            beginMarker: begin,
+            endMarker: end
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        XCTAssertEqual(body, bodyLines.joined(separator: "\n"), renderedText)
+    }
+
+    func testSemanticTextDiffResponseExtractionSurvivesScrollbackAndIgnoresPriorHistory() {
+        let controller = makeController(rows: 5, cols: 120)
+        let begin = "AI_RESPONSE_BEGIN__SCROLL__"
+        let end = "AI_RESPONSE_END__SCROLL__"
+        controller.debugProcessPTYOutputForTesting(
+            Data("AI_RESPONSE_BEGIN__OLD__\r\nold body\r\nAI_RESPONSE_END__OLD__\r\n".utf8)
+        )
+        let baselineText = controller.allText()
+        let bodyLines = (0..<40).map { "line-\($0): AI response body" }
+        let output = ([begin] + bodyLines + [end]).joined(separator: "\r\n") + "\r\n"
+
+        controller.debugProcessPTYOutputForTesting(Data(output.utf8))
+
+        let semanticDelta = AppDelegate.textAddedAfterViewportBaseline(
+            baselineText,
+            currentText: controller.allText()
+        )
+        let body = AIRoomMCPResponseCoordinator.firstCompleteMarkerBody(
+            in: semanticDelta,
+            beginMarker: begin,
+            endMarker: end
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        XCTAssertEqual(body, bodyLines.joined(separator: "\n"), semanticDelta)
+    }
+
+    func testSemanticContentSinkEmitsVTAppliedTextAfterDisplayMutation() {
+        let controller = makeController(rows: 5, cols: 80)
+        var snapshots: [String] = []
+        controller.setSemanticContentSink { text in
+            snapshots.append(text)
+        }
+
+        controller.debugProcessPTYOutputForTesting(Data("AI_RESPONSE_BEGIN__REQ__\r\nbody".utf8))
+        controller.debugProcessPTYOutputForTesting(Data("\r\nAI_RESPONSE_END__REQ__\r\n".utf8))
+
+        XCTAssertTrue(snapshots.count >= 2)
+        XCTAssertTrue(snapshots.last?.contains("AI_RESPONSE_BEGIN__REQ__\nbody\nAI_RESPONSE_END__REQ__") == true)
+    }
+
+    func testSemanticScrolledTextSinkPreservesResponseEvictedWithinSingleOutputBatch() {
+        let controller = makeController(
+            rows: 3,
+            cols: 80,
+            scrollbackInitialCapacity: 256,
+            scrollbackMaxCapacity: 256
+        )
+        let begin = "AI_RESPONSE_BEGIN__EVICT__"
+        let end = "AI_RESPONSE_END__EVICT__"
+        var streamed = ""
+        controller.setSemanticScrolledTextSink { text in
+            streamed.append(text)
+        }
+
+        let bodyLines = (0..<80).map { "line-\($0)" }
+        let output = ([begin] + bodyLines + [end]).joined(separator: "\r\n") + "\r\n"
+        controller.debugProcessPTYOutputForTesting(Data(output.utf8))
+
+        let combinedSemanticText = streamed + AppDelegate.textAddedAfterViewportBaseline(
+            streamed,
+            currentText: controller.allText()
+        )
+        let streamedBody = AIRoomMCPResponseCoordinator.firstCompleteMarkerBody(
+            in: combinedSemanticText,
+            beginMarker: begin,
+            endMarker: end
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        XCTAssertEqual(streamedBody, bodyLines.joined(separator: "\n"), combinedSemanticText)
+    }
+
+    func testSemanticScrolledTextSinkPreservesWrappedMarkersAcrossEviction() {
+        let controller = makeController(
+            rows: 3,
+            cols: 10,
+            scrollbackInitialCapacity: 256,
+            scrollbackMaxCapacity: 256
+        )
+        let begin = "AI_RESPONSE_BEGIN__WRAPPED__"
+        let end = "AI_RESPONSE_END__WRAPPED__"
+        var streamed = ""
+        controller.setSemanticScrolledTextSink { text in
+            streamed.append(text)
+        }
+
+        let bodyLines = (0..<20).map { "body-\($0)" }
+        let output = ([begin] + bodyLines + [end]).joined(separator: "\r\n") + "\r\n"
+        controller.debugProcessPTYOutputForTesting(Data(output.utf8))
+
+        let combinedSemanticText = streamed + AppDelegate.textAddedAfterViewportBaseline(
+            streamed,
+            currentText: controller.allText()
+        )
+        let streamedBody = AIRoomMCPResponseCoordinator.firstCompleteMarkerBody(
+            in: combinedSemanticText,
+            beginMarker: begin,
+            endMarker: end
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        XCTAssertEqual(streamedBody, bodyLines.joined(separator: "\n"), combinedSemanticText)
+    }
+
+    func testASCIIFastPathBackspaceTraversesSoftWrappedContinuation() {
+        let controller = makeController(rows: 3, cols: 10)
+
+        controller.debugProcessPTYOutputForTesting(Data("abcdefghijk".utf8))
+        controller.debugProcessPTYOutputForTesting(Data([0x08, 0x08]))
+
+        let cursor = controller.withModel { model in
+            (row: model.cursor.row, col: model.cursor.col, pendingWrap: model.cursor.pendingWrap)
+        }
+        XCTAssertEqual(cursor.row, 0)
+        XCTAssertEqual(cursor.col, 9)
+        XCTAssertFalse(cursor.pendingWrap)
+    }
+
+    func testZshStyleCompletionRedrawBackspacesAcrossWrappedLine() {
+        let controller = makeController(rows: 3, cols: 10)
+        let payload = "abcdefghi\r1234567890ABCDE     " + String(repeating: "\u{08}", count: 10)
+
+        controller.debugProcessPTYOutputForTesting(Data(payload.utf8))
+
+        let cursor = controller.withModel { model in
+            (row: model.cursor.row, col: model.cursor.col, pendingWrap: model.cursor.pendingWrap)
+        }
+        XCTAssertEqual(cursor.row, 0)
+        XCTAssertEqual(cursor.col, 9)
+        XCTAssertFalse(cursor.pendingWrap)
+    }
+
     func testFindMatchesLargeScrollbackThresholdGuard() {
         let controller = makeController(
             rows: 4,

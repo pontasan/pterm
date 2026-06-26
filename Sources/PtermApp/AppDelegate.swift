@@ -210,8 +210,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let callerTerminalID: UUID
         let targetTerminalID: UUID
         let protocolConfiguration: AIRoomMCPProtocolConfiguration
-        let targetTextBaseline: TerminalController.TextBaseline
-        let targetViewportBaseline: String
+        let targetSemanticBaselineText: String
+        var targetLatestSemanticText: String
+        var targetAccumulatedSemanticText: String
+        var targetLastSemanticContentVersion: UInt64
     }
     private var aiRoomWaitingByCallerTerminalID: [UUID: AIRoomWaitingPresentation] = [:]
     private var aiRoomActiveRequestByRequestID: [UUID: AIRoomSendRequestContext] = [:]
@@ -617,28 +619,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) -> String {
         let requestBeginMarker = beginMarker ?? protocolConfiguration.beginMarker
         let requestEndMarker = endMarker ?? protocolConfiguration.endMarker
+        let beginRecipe = markerPromptRecipe(
+            marker: requestBeginMarker,
+            configuredMarker: protocolConfiguration.beginMarker
+        )
+        let endRecipe = markerPromptRecipe(
+            marker: requestEndMarker,
+            configuredMarker: protocolConfiguration.endMarker
+        )
         return """
         Reply to the message below.
 
-        pterm reads the marker lines automatically to extract your response and deliver it back to the requesting terminal.
-        CRITICAL: Your entire answer must use exactly this format:
-        \(requestBeginMarker)
-        <your response text>
-        \(requestEndMarker)
+        pterm machine-reads the marker lines to extract your response and deliver it back to the requesting terminal.
+        CRITICAL: Missing or changing either exact marker makes delivery fail.
 
-        The first line must be exactly:
-        \(requestBeginMarker)
+        Build the first-line marker by concatenating these fields in order:
+        \(beginRecipe)
 
-        The final line must be exactly:
-        \(requestEndMarker)
+        Build the final-line marker by concatenating these fields in order:
+        \(endRecipe)
 
+        Output rules:
+        - First line: the first-line marker built from the fields above.
+        - Then: your response text only.
+        - Final line: the final-line marker built from the fields above.
+        - Do not print any text before the first-line marker or after the final-line marker.
         Do not omit the final line.
-        If either exact marker is missing, pterm cannot detect or deliver your answer.
         Do not use any other marker.
         Do not wrap the markers in quotes or a code block.
 
         Message:
         \(message)
+        """
+    }
+
+    private static func markerPromptRecipe(marker: String, configuredMarker: String) -> String {
+        let markerPrefix = configuredMarker + "__"
+        if marker.hasPrefix(markerPrefix), marker.hasSuffix("__"), marker.count > markerPrefix.count + 2 {
+            let tokenStart = marker.index(marker.startIndex, offsetBy: markerPrefix.count)
+            let tokenEnd = marker.index(marker.endIndex, offsetBy: -2)
+            let token = String(marker[tokenStart..<tokenEnd])
+            return """
+            prefix field: \(markerPrefix)
+            token field: \(token)
+            suffix field: __
+            """
+        }
+
+        let splitIndex = marker.index(marker.startIndex, offsetBy: marker.count / 2)
+        return """
+        first field: \(String(marker[..<splitIndex]))
+        second field: \(String(marker[splitIndex...]))
         """
     }
 
@@ -2906,25 +2937,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func handleAIRoomTargetOutput(
-        _ codepoint: UInt32,
-        terminalID: UUID,
-        request: AIRoomMCPResponseCoordinator.PendingRequest
-    ) {
-        switch aiRoomResponseCoordinator.appendOutputCodepoint(codepoint, terminalID: terminalID) {
-        case .completed(let responseBody):
-            DispatchQueue.main.async { [weak self] in
-                self?.finishAIRoomRequest(requestID: request.id, responseBody: responseBody)
-            }
-        case .failed:
-            DispatchQueue.main.async { [weak self] in
-                self?.finishAIRoomRequest(requestID: request.id, responseBody: nil)
-            }
-        case .waiting:
-            break
-        }
-    }
-
     private func startAIRoomResponsePolling(requestID: UUID) {
         aiRoomPollingTimerByRequestID[requestID]?.invalidate()
         let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -2935,48 +2947,112 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func pollAIRoomResponse(requestID: UUID) {
-        guard let context = aiRoomActiveRequestByRequestID[requestID] else {
+        guard var context = aiRoomActiveRequestByRequestID[requestID] else {
             aiRoomPollingTimerByRequestID.removeValue(forKey: requestID)?.invalidate()
             return
         }
-        let deltaText = context.target.textSinceBaseline(
-            context.targetTextBaseline,
-            maxCharacters: context.request.maxBufferCharacterCount
-        )
-        switch completeAIRoomRequestIfResponsePresent(deltaText, requestID: requestID, context: context) {
-        case true:
+        let contentVersion = context.target.currentRenderContentVersion
+        guard contentVersion != context.targetLastSemanticContentVersion else {
             return
-        case false:
-            break
+        }
+        context.targetLastSemanticContentVersion = contentVersion
+        aiRoomActiveRequestByRequestID[requestID] = context
+        _ = processAIRoomSemanticText(context.target.allText(), requestID: requestID)
+    }
+
+    private func handleAIRoomTargetSemanticText(_ currentText: String, requestID: UUID) {
+        _ = processAIRoomSemanticText(currentText, requestID: requestID)
+    }
+
+    private func handleAIRoomTargetSemanticScrolledText(_ text: String, requestID: UUID) {
+        guard var context = aiRoomActiveRequestByRequestID[requestID] else { return }
+        context.targetAccumulatedSemanticText.append(text)
+        aiRoomActiveRequestByRequestID[requestID] = context
+        _ = completeAIRoomRequestIfResponsePresent(
+            context.targetAccumulatedSemanticText,
+            requestID: requestID,
+            context: context
+        )
+    }
+
+    @discardableResult
+    private func processAIRoomSemanticText(_ currentText: String, requestID: UUID) -> Bool {
+        guard var context = aiRoomActiveRequestByRequestID[requestID] else { return false }
+
+        let incrementalDelta = Self.textDeltaAfterBaseline(
+            context.targetLatestSemanticText,
+            currentText: currentText
+        )
+        if incrementalDelta.isContinuousWithBaseline, !incrementalDelta.text.isEmpty {
+            context.targetAccumulatedSemanticText.append(incrementalDelta.text)
+        } else if !incrementalDelta.isContinuousWithBaseline,
+                  !context.targetAccumulatedSemanticText.isEmpty {
+            let accumulatedDelta = Self.textDeltaAfterBaseline(
+                context.targetAccumulatedSemanticText,
+                currentText: currentText
+            )
+            context.targetAccumulatedSemanticText.append(
+                accumulatedDelta.isContinuousWithBaseline ? accumulatedDelta.text : currentText
+            )
+        }
+        context.targetLatestSemanticText = currentText
+        aiRoomActiveRequestByRequestID[requestID] = context
+
+        if completeAIRoomRequestIfResponsePresent(
+            context.targetAccumulatedSemanticText,
+            requestID: requestID,
+            context: context
+        ) {
+            return true
         }
 
-        let viewportText = Self.textAddedAfterViewportBaseline(
-            context.targetViewportBaseline,
-            currentText: context.target.viewportText(maxLines: 200)
+        let semanticText = Self.textAddedAfterViewportBaseline(
+            context.targetSemanticBaselineText,
+            currentText: currentText
         )
-        guard viewportText != deltaText else { return }
-        _ = completeAIRoomRequestIfResponsePresent(viewportText, requestID: requestID, context: context)
+        return completeAIRoomRequestIfResponsePresent(semanticText, requestID: requestID, context: context)
     }
 
     static func textAddedAfterViewportBaseline(_ baselineText: String, currentText: String) -> String {
-        guard !baselineText.isEmpty else { return currentText }
-        guard baselineText != currentText else { return "" }
+        textDeltaAfterBaseline(baselineText, currentText: currentText).text
+    }
+
+    struct TextDeltaAfterBaseline {
+        let text: String
+        let isContinuousWithBaseline: Bool
+    }
+
+    static func textDeltaAfterBaseline(_ baselineText: String, currentText: String) -> TextDeltaAfterBaseline {
+        guard !baselineText.isEmpty else {
+            return TextDeltaAfterBaseline(text: currentText, isContinuousWithBaseline: true)
+        }
+        guard baselineText != currentText else {
+            return TextDeltaAfterBaseline(text: "", isContinuousWithBaseline: true)
+        }
         if currentText.hasPrefix(baselineText) {
-            return String(currentText.dropFirst(baselineText.count))
+            return TextDeltaAfterBaseline(
+                text: String(currentText.dropFirst(baselineText.count)),
+                isContinuousWithBaseline: true
+            )
         }
 
         let maxOverlap = min(baselineText.count, currentText.count)
-        guard maxOverlap > 0 else { return currentText }
+        guard maxOverlap > 0 else {
+            return TextDeltaAfterBaseline(text: currentText, isContinuousWithBaseline: false)
+        }
         var overlapLength = maxOverlap
         while overlapLength > 0 {
             let baselineSuffixStart = baselineText.index(baselineText.endIndex, offsetBy: -overlapLength)
             let currentPrefixEnd = currentText.index(currentText.startIndex, offsetBy: overlapLength)
             if baselineText[baselineSuffixStart...] == currentText[..<currentPrefixEnd] {
-                return String(currentText[currentPrefixEnd...])
+                return TextDeltaAfterBaseline(
+                    text: String(currentText[currentPrefixEnd...]),
+                    isContinuousWithBaseline: true
+                )
             }
             overlapLength -= 1
         }
-        return currentText
+        return TextDeltaAfterBaseline(text: currentText, isContinuousWithBaseline: false)
     }
 
     @discardableResult
@@ -3006,7 +3082,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         aiRoomPollingTimerByRequestID.removeValue(forKey: requestID)?.invalidate()
 
         if aiRoomActiveRequestIDByTargetTerminalID[context.targetTerminalID] == requestID {
-            context.target.setMCPTextSink(nil)
+            context.target.setSemanticContentSink(nil)
+            context.target.setSemanticScrolledTextSink(nil)
             aiRoomActiveRequestIDByTargetTerminalID.removeValue(forKey: context.targetTerminalID)
         }
         clearAIRoomWaiting(callerTerminalID: context.callerTerminalID)
@@ -4166,6 +4243,18 @@ private final class AIRoomMCPToolProvider: MCPToolProvider {
     }
 }
 
+extension AppDelegate {
+    static func aiRoomMCPResponseDeliveryCriticalDescription() -> [String: String] {
+        [
+            "summary": "Cross-terminal AI replies are delivered only through this pterm AI Room MCP protocol.",
+            "requesting_ai_must": "To ask another terminal's AI for a response, call send_room_message over this MCP endpoint. Writing ordinary chat text such as 'please ask terminal B' in your own conversation does not deliver anything to terminal B.",
+            "target_ai_must": "If you are the target AI that received a pterm-routed request, your answer must be printed in your terminal between the exact begin/end markers shown in the prompt. A normal unmarked answer stays in your terminal and pterm cannot route it back to the requester.",
+            "mcp_result_is_not_the_answer": "send_room_message returns only an acknowledgement. The real answer is injected later into the caller terminal after pterm detects the target AI's exact markers.",
+            "failure_mode": "If the request is not sent with send_room_message, or if the target response omits the exact markers, the originating AI will not receive the response."
+        ]
+    }
+}
+
 private extension AppDelegate {
     static func generateAIRoomMCPPassword() -> String {
         var bytes = [UInt8](repeating: 0, count: 32)
@@ -4195,7 +4284,7 @@ private extension AppDelegate {
             ),
             MCPToolDefinition(
                 name: "send_room_message",
-                description: "Send a message to a room-visible target terminal and return immediately. pterm keeps watching the target terminal; when the target prints the configured begin/end markers, pterm pastes the extracted response back into the caller terminal and presses Return. Do not wait for the AI answer in this MCP result.",
+                description: "Send a message to a room-visible target terminal and return immediately. This MCP tool is required for cross-terminal delivery; ordinary chat text is not routed to another terminal. pterm keeps watching the target terminal; when the target prints the configured begin/end markers, pterm pastes the extracted response back into the caller terminal and presses Return. Do not wait for the AI answer in this MCP result.",
                 inputSchema: [
                     "type": "object",
                     "properties": [
@@ -4238,6 +4327,7 @@ private extension AppDelegate {
     func aiRoomMCPProtocolDescriptionPayload() -> [String: Any] {
         let protocolConfig = config.aiRoomMCPServer.protocolConfiguration
         return [
+            "00_critical_response_delivery": Self.aiRoomMCPResponseDeliveryCriticalDescription(),
             "server": [
                 "name": "pterm-ai-room-mcp",
                 "default_port": AIRoomMCPServerConfiguration.defaultPort,
@@ -4280,7 +4370,7 @@ private extension AppDelegate {
             "tools": [
                 "identify_self": "Authenticate and include X-Pterm-Terminal-Id to confirm which pterm terminal you are.",
                 "list_visible_terminals": "Authenticate and include X-Pterm-Terminal-Id to list target terminals visible to you.",
-                "send_room_message": "Authenticate, include X-Pterm-Terminal-Id, target_terminal_id, and message. pterm sends the configured marker instruction plus your message to the target terminal and returns an acknowledgement immediately. Do not wait for the AI answer in the MCP result. pterm continues watching the target terminal; after it detects the first complete marker pair, it trims the body, pastes the configured return prefix plus that body into your caller terminal, and presses Return."
+                "send_room_message": "Authenticate, include X-Pterm-Terminal-Id, target_terminal_id, and message. This is the required delivery mechanism for asking another terminal's AI; ordinary chat text is not cross-terminal transport. pterm sends the configured marker instruction plus your message to the target terminal and returns an acknowledgement immediately. Do not wait for the AI answer in the MCP result. pterm continues watching the target terminal; after it detects the first complete marker pair, it trims the body, pastes the configured return prefix plus that body into your caller terminal, and presses Return."
             ],
             "response_markers": [
                 "instruction_prompt": protocolConfig.responseInstructionPrompt,
@@ -4291,6 +4381,8 @@ private extension AppDelegate {
             ],
             "notes": [
                 "Do not use the admin MCP tools for AI-room communication.",
+                "For cross-terminal requests, always use send_room_message. Without this MCP call, pterm has no request to route and no caller terminal to return the response to.",
+                "If you are responding as the target AI, do not provide only an ordinary unmarked reply. pterm can return your answer to the requester only when it sees the exact begin/end markers.",
                 "If target_terminal_id is already waiting for another response, send_room_message returns target_busy.",
                 "After send_room_message returns success, continue normally. The target AI response will arrive later as terminal input injected by pterm, not as the MCP call result."
             ]
@@ -4317,7 +4409,7 @@ private extension AppDelegate {
             cancelAIRoomActiveRequestForCallerTerminalID(caller.id)
 
             let protocolConfig = config.aiRoomMCPServer.protocolConfiguration
-            let markerToken = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            let markerToken = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16))
             let requestBeginMarker = "\(protocolConfig.beginMarker)__\(markerToken)__"
             let requestEndMarker = "\(protocolConfig.endMarker)__\(markerToken)__"
             let outbound = Self.aiRoomTargetPrompt(
@@ -4337,11 +4429,7 @@ private extension AppDelegate {
                     endMarker: requestEndMarker
                 )
             )
-            target.setMCPTextSink { [weak self] codepoint in
-                self?.handleAIRoomTargetOutput(codepoint, terminalID: targetID, request: request)
-            }
-            let targetTextBaseline = target.textBaseline()
-            let targetViewportBaseline = target.viewportText(maxLines: 200)
+            let targetSemanticBaselineText = target.allText()
             aiRoomActiveRequestByRequestID[request.id] = AIRoomSendRequestContext(
                 request: request,
                 caller: caller,
@@ -4349,10 +4437,22 @@ private extension AppDelegate {
                 callerTerminalID: caller.id,
                 targetTerminalID: targetID,
                 protocolConfiguration: protocolConfig,
-                targetTextBaseline: targetTextBaseline,
-                targetViewportBaseline: targetViewportBaseline
+                targetSemanticBaselineText: targetSemanticBaselineText,
+                targetLatestSemanticText: targetSemanticBaselineText,
+                targetAccumulatedSemanticText: "",
+                targetLastSemanticContentVersion: target.currentRenderContentVersion
             )
             aiRoomActiveRequestIDByTargetTerminalID[targetID] = request.id
+            target.setSemanticContentSink { [weak self] currentText in
+                DispatchQueue.main.async {
+                    self?.handleAIRoomTargetSemanticText(currentText, requestID: request.id)
+                }
+            }
+            target.setSemanticScrolledTextSink { [weak self] text in
+                DispatchQueue.main.async {
+                    self?.handleAIRoomTargetSemanticScrolledText(text, requestID: request.id)
+                }
+            }
             setAIRoomWaiting(callerTerminalID: caller.id, target: target)
             startAIRoomResponsePolling(requestID: request.id)
 
