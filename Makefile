@@ -68,14 +68,15 @@ bundle:
 		-o $(BUILD_DIR)/shaders/terminal.air; \
 	$(METAL_TOOLCHAIN) xcrun -sdk macosx metallib $(BUILD_DIR)/shaders/terminal.air \
 		-o $(APP_BUNDLE)/Contents/Resources/default.metallib; \
+	codesign --force --deep --sign - $(APP_BUNDLE); \
 	echo "Bundle created at $(APP_BUNDLE)"
 
 # Create distributable archives from the bundled app (use 'make build' first)
 package:
 	@rm -f $(DIST_ARCHIVE)
 	@rm -f $(DIST_ZIP)
-	tar czf $(DIST_ARCHIVE) -C $(BUILD_DIR) pterm.app
-	ditto -c -k --sequesterRsrc --keepParent $(APP_BUNDLE) $(DIST_ZIP)
+	COPYFILE_DISABLE=1 tar czf $(DIST_ARCHIVE) -C $(BUILD_DIR) pterm.app
+	cd $(BUILD_DIR) && /usr/bin/zip -qry -X pterm-darwin-arm64.zip pterm.app
 	@echo "Packages created at $(DIST_ARCHIVE) and $(DIST_ZIP)"
 
 # Verify bundle structure and embedded resources
@@ -139,4 +140,5 @@ notarize: build sign package
 	fi
 	xcrun stapler staple $(APP_BUNDLE)
 	@$(MAKE) verify-signature
-	@echo "Notarized and stapled."
+	@$(MAKE) package
+	@echo "Notarized, stapled, and packaged."
