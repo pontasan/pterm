@@ -167,6 +167,90 @@ struct MCPServerConfiguration: Equatable {
     }
 }
 
+struct AIRoomMCPProtocolConfiguration: Equatable {
+    static let defaultResponseInstructionPrompt = "Please respond to the following AI answer. You must prefix your response with AI_RESPONSE_BEGIN and suffix your response with AI_RESPONSE_END. This is used to automatically determine whether the text is an AI answer."
+    static let defaultBeginMarker = "AI_RESPONSE_BEGIN"
+    static let defaultEndMarker = "AI_RESPONSE_END"
+    static let defaultReturnPrefixPrompt = "The following response was received."
+
+    let responseInstructionPrompt: String
+    let beginMarker: String
+    let endMarker: String
+    let returnPrefixPrompt: String
+
+    static let `default` = AIRoomMCPProtocolConfiguration(
+        responseInstructionPrompt: defaultResponseInstructionPrompt,
+        beginMarker: defaultBeginMarker,
+        endMarker: defaultEndMarker,
+        returnPrefixPrompt: defaultReturnPrefixPrompt
+    )
+
+    init(
+        responseInstructionPrompt: String,
+        beginMarker: String,
+        endMarker: String,
+        returnPrefixPrompt: String
+    ) {
+        self.responseInstructionPrompt = Self.normalizedNonEmpty(
+            responseInstructionPrompt,
+            fallback: Self.defaultResponseInstructionPrompt
+        )
+        self.beginMarker = Self.normalizedNonEmpty(beginMarker, fallback: Self.defaultBeginMarker)
+        self.endMarker = Self.normalizedNonEmpty(endMarker, fallback: Self.defaultEndMarker)
+        self.returnPrefixPrompt = Self.normalizedNonEmpty(
+            returnPrefixPrompt,
+            fallback: Self.defaultReturnPrefixPrompt
+        )
+    }
+
+    private static func normalizedNonEmpty(_ value: String, fallback: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+}
+
+struct AIRoomConfiguration: Equatable {
+    let id: String
+    let name: String
+    let terminalIDs: Set<UUID>
+
+    init(id: String, name: String, terminalIDs: Set<UUID>) {
+        let normalizedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.id = normalizedID.isEmpty ? UUID().uuidString : normalizedID
+        self.name = normalizedName.isEmpty ? "Room" : normalizedName
+        self.terminalIDs = terminalIDs
+    }
+}
+
+struct AIRoomMCPServerConfiguration: Equatable {
+    static let defaultPort = 46258
+
+    let enabled: Bool
+    let port: Int
+    let protocolConfiguration: AIRoomMCPProtocolConfiguration
+    let rooms: [AIRoomConfiguration]
+
+    static let `default` = AIRoomMCPServerConfiguration(
+        enabled: true,
+        port: defaultPort,
+        protocolConfiguration: .default,
+        rooms: []
+    )
+
+    init(
+        enabled: Bool,
+        port: Int,
+        protocolConfiguration: AIRoomMCPProtocolConfiguration,
+        rooms: [AIRoomConfiguration]
+    ) {
+        self.enabled = enabled
+        self.port = MCPServerConfiguration.normalizedPort(port)
+        self.protocolConfiguration = protocolConfiguration
+        self.rooms = rooms
+    }
+}
+
 enum AIModelType: String, Equatable, CaseIterable {
     case claudeCode = "claude_code"
     case codex = "codex"
@@ -224,6 +308,7 @@ struct PtermConfig {
     let audit: AuditConfiguration
     let security: SecurityConfiguration
     let mcpServer: MCPServerConfiguration
+    let aiRoomMCPServer: AIRoomMCPServerConfiguration
     let ai: AIConfiguration
     let ioHooks: IOHookConfiguration
     let shortcuts: ShortcutConfiguration
@@ -243,6 +328,7 @@ struct PtermConfig {
         audit: .disabled,
         security: .default,
         mcpServer: .default,
+        aiRoomMCPServer: .default,
         ai: .default,
         ioHooks: .default,
         shortcuts: .default,
@@ -349,6 +435,7 @@ enum PtermConfigStore {
         let audit = dictionaryValue(root["audit"])
         let security = dictionaryValue(root["security"])
         let mcpServer = dictionaryValue(root["mcp_server"])
+        let aiRoomMCPServer = dictionaryValue(root["ai_room_mcp_server"])
         let aiSection = dictionaryValue(root["ai"])
         let shortcuts = dictionaryValue(root["shortcuts"])
         let shells = dictionaryValue(root["shells"])
@@ -401,6 +488,23 @@ enum PtermConfigStore {
                 enabled: boolValue(mcpServer?["enabled"]) ?? defaults.mcpServer.enabled,
                 port: MCPServerConfiguration.normalizedPort(intValue(mcpServer?["port"]) ?? defaults.mcpServer.port)
             ),
+            aiRoomMCPServer: AIRoomMCPServerConfiguration(
+                enabled: boolValue(aiRoomMCPServer?["enabled"]) ?? defaults.aiRoomMCPServer.enabled,
+                port: MCPServerConfiguration.normalizedPort(
+                    intValue(aiRoomMCPServer?["port"]) ?? defaults.aiRoomMCPServer.port
+                ),
+                protocolConfiguration: AIRoomMCPProtocolConfiguration(
+                    responseInstructionPrompt: stringValue(aiRoomMCPServer?["response_instruction_prompt"])
+                        ?? defaults.aiRoomMCPServer.protocolConfiguration.responseInstructionPrompt,
+                    beginMarker: stringValue(aiRoomMCPServer?["begin_marker"])
+                        ?? defaults.aiRoomMCPServer.protocolConfiguration.beginMarker,
+                    endMarker: stringValue(aiRoomMCPServer?["end_marker"])
+                        ?? defaults.aiRoomMCPServer.protocolConfiguration.endMarker,
+                    returnPrefixPrompt: stringValue(aiRoomMCPServer?["return_prefix_prompt"])
+                        ?? defaults.aiRoomMCPServer.protocolConfiguration.returnPrefixPrompt
+                ),
+                rooms: roomList(aiRoomMCPServer?["rooms"])
+            ),
             ai: AIConfiguration(
                 enabled: boolValue(aiSection?["enabled"]) ?? defaults.ai.enabled,
                 language: stringValue(aiSection?["language"]) ?? defaults.ai.language,
@@ -423,6 +527,19 @@ enum PtermConfigStore {
 
     private static func stringArrayValue(_ value: Any?) -> [String]? {
         value as? [String]
+    }
+
+    private static func roomList(_ value: Any?) -> [AIRoomConfiguration] {
+        guard let roomObjects = value as? [[String: Any]] else { return [] }
+        return roomObjects.compactMap { roomObject in
+            let terminalIDs = stringArrayValue(roomObject["terminal_ids"]) ?? []
+            let parsedTerminalIDs = Set(terminalIDs.compactMap(UUID.init(uuidString:)))
+            return AIRoomConfiguration(
+                id: stringValue(roomObject["id"]) ?? UUID().uuidString,
+                name: stringValue(roomObject["name"]) ?? "Room",
+                terminalIDs: parsedTerminalIDs
+            )
+        }
     }
 
     private static func intValue(_ value: Any?) -> Int? {

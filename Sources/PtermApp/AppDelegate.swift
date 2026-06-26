@@ -1,6 +1,7 @@
 import AppKit
 import MetalKit
 import QuartzCore
+import Security
 
 private extension String {
     func appendLine(to url: URL) throws {
@@ -171,6 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var commandIdentityShortcutGlobalMonitor: Any?
     private var commandIdentityHeaderSuppressedUntilCommandRelease = false
     private var titlebarBackButton: NSButton?
+    private var titlebarAIRoomChatButton: NSButton?
 
     private var metricsMonitor: ProcessMetricsMonitor?
     private var fpsRefreshTimer: Timer?
@@ -192,6 +194,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var perControllerPastedImages: [UUID: [URL]] = [:]
     private var clipboardCleanupService: ClipboardCleanupService?
     private var mcpServer: MCPServer?
+    private var aiRoomMCPServer: MCPServer?
+    private lazy var aiRoomMCPToolProvider = AIRoomMCPToolProvider(appDelegate: self)
+    private let aiRoomResponseCoordinator = AIRoomMCPResponseCoordinator()
+    private var aiRoomMCPPassword = AppDelegate.generateAIRoomMCPPassword()
+    private struct AIRoomWaitingPresentation {
+        let targetTerminalID: UUID
+        let targetTitle: String
+        let startedAt: Date
+    }
+    private struct AIRoomSendRequestContext {
+        let request: AIRoomMCPResponseCoordinator.PendingRequest
+        let caller: TerminalController
+        let target: TerminalController
+        let callerTerminalID: UUID
+        let targetTerminalID: UUID
+        let protocolConfiguration: AIRoomMCPProtocolConfiguration
+        let targetTextBaseline: TerminalController.TextBaseline
+        let targetViewportBaseline: String
+    }
+    private var aiRoomWaitingByCallerTerminalID: [UUID: AIRoomWaitingPresentation] = [:]
+    private var aiRoomActiveRequestByRequestID: [UUID: AIRoomSendRequestContext] = [:]
+    private var aiRoomActiveRequestIDByTargetTerminalID: [UUID: UUID] = [:]
+    private var aiRoomPollingTimerByRequestID: [UUID: Timer] = [:]
+    private let aiRoomSubmitAfterPasteDelay: TimeInterval = 0.18
     private let sessionStore = SessionStore()
     private let singleInstanceLock = SingleInstanceLock()
     private let appNoteStore = AppNoteStore()
@@ -233,6 +259,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var splitContainerView: SplitTerminalContainerView?
     private var appNoteEditor: MarkdownEditorWindowController?
     private var settingsController: SettingsWindowController?
+    private var aiRoomManagerController: AIRoomManagerWindowController?
+    private var aiRoomChatPromptController: AIRoomChatPromptWindowController?
     private var aboutController: AboutWindowController?
 
     /// Currently focused terminal controller (nil = integrated view mode)
@@ -525,6 +553,95 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return FileNameSanitizer.sanitize("\(baseName) \(suffix)", fallback: WorkspaceNaming.transientBaseName)
     }
 
+    static func aiRoomChatInstructionPrompt(
+        port: Int,
+        password: String,
+        targetTerminalID: UUID,
+        text: String
+    ) -> String {
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": "send-room-message",
+            "method": "tools/call",
+            "params": [
+                "name": "send_room_message",
+                "arguments": [
+                    "target_terminal_id": targetTerminalID.uuidString,
+                    "message": text
+                ]
+            ]
+        ]
+        let payloadJSON = jsonObjectString(payload)
+        let command = """
+        /usr/bin/curl -sS -X POST \(shellSingleQuoted("http://127.0.0.1:\(port)/")) \\
+          -H \(shellSingleQuoted("Content-Type: application/json")) \\
+          -H \(shellSingleQuoted("Authorization: Bearer \(password)")) \\
+          -H "X-Pterm-Terminal-Id: ${PTERM_TERMINAL_ID:?PTERM_TERMINAL_ID is not set}" \\
+          --data-binary \(shellSingleQuoted(payloadJSON))
+        """
+        return """
+        Do not configure an MCP client. Use curl directly.
+
+        MCP HTTP endpoint URL:
+        http://127.0.0.1:\(port)/
+
+        Run this exact command to ask pterm to send the message to terminal id=\(targetTerminalID.uuidString):
+
+        ```sh
+        \(command)
+        ```
+
+        The curl result is only an acknowledgement. Do not wait for the target AI answer in the curl response. pterm will watch the target terminal, extract the marker-delimited answer, paste it back into this terminal, and press Return.
+        """
+    }
+
+    static func shellSingleQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func jsonObjectString(_ object: [String: Any]) -> String {
+        let data: Data
+        do {
+            data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        } catch {
+            preconditionFailure("Failed to serialize AI room MCP curl payload: \(error)")
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    static func aiRoomTargetPrompt(
+        protocolConfiguration: AIRoomMCPProtocolConfiguration,
+        beginMarker: String? = nil,
+        endMarker: String? = nil,
+        message: String
+    ) -> String {
+        let requestBeginMarker = beginMarker ?? protocolConfiguration.beginMarker
+        let requestEndMarker = endMarker ?? protocolConfiguration.endMarker
+        return """
+        Reply to the message below.
+
+        pterm reads the marker lines automatically to extract your response and deliver it back to the requesting terminal.
+        CRITICAL: Your entire answer must use exactly this format:
+        \(requestBeginMarker)
+        <your response text>
+        \(requestEndMarker)
+
+        The first line must be exactly:
+        \(requestBeginMarker)
+
+        The final line must be exactly:
+        \(requestEndMarker)
+
+        Do not omit the final line.
+        If either exact marker is missing, pterm cannot detect or deliver your answer.
+        Do not use any other marker.
+        Do not wrap the markers in quotes or a code block.
+
+        Message:
+        \(message)
+        """
+    }
+
     static func persistedPresentationPlan(
         currentPresentation: TerminalListPresentation,
         persistedTerminalIDs: Set<UUID>
@@ -666,6 +783,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.isRestorable = false // Disable macOS state restoration
         setupWindowContentHierarchy()
         installTitlebarBackButton()
+        installTitlebarAIRoomChatButton()
 
         configureWindowAppearance()
 
@@ -886,6 +1004,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let remainingTerminalIDs = Set(manager.terminals.map(\.id))
         let removedTerminalIDs = knownTerminalIDs.subtracting(remainingTerminalIDs)
         for removedID in removedTerminalIDs {
+            cancelAIRoomActiveRequestsInvolving(terminalID: removedID)
             purgeInlineImageResources(ownerID: removedID, retaining: [], removingOwner: true)
         }
         knownTerminalIDs = remainingTerminalIDs
@@ -1018,6 +1137,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return false }
             return self.handleTerminalFileDrop(controller: controller, urls: urls)
         }
+        sv.terminalView.onCancelAIRoomWait = { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            self.cancelAIRoomWait(forCallerTerminalID: controller.id)
+        }
         sv.terminalView.onBackToIntegrated = { [weak self] in
             self?.switchToIntegrated()
         }
@@ -1068,6 +1191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setCommandIdentityHeadersVisible(currentCommandModifierHeld())
         window.makeFirstResponder(sv.terminalView)
         sv.terminalView.syncScaleFactorIfNeeded()
+        syncAIRoomWaitingIndicators()
 
         updateWindowTitle()
         requestSessionPersist()
@@ -1113,6 +1237,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         splitView.onFileDropURLs = { [weak self] controller, urls in
             guard let self else { return false }
             return self.handleTerminalFileDrop(controller: controller, urls: urls)
+        }
+        splitView.onCancelAIRoomWait = { [weak self] terminalID in
+            self?.cancelAIRoomWait(forCallerTerminalID: terminalID)
         }
         splitView.onActiveControllerChange = { [weak self] controller in
             self?.applyRendererSettings(for: controller)
@@ -1195,6 +1322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let first = splitView.subviews.first as? TerminalScrollView {
             window.makeFirstResponder(first.terminalView)
         }
+        syncAIRoomWaitingIndicators()
         updateWindowTitle()
         requestSessionPersist()
     }
@@ -1246,6 +1374,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshStatusBarCommandHints()
         setCommandIdentityHeadersVisible(false)
         window.makeFirstResponder(iv)
+        syncAIRoomWaitingIndicators()
 
         updateWindowTitle()
         requestSessionPersist()
@@ -1279,6 +1408,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         iv.onRenameTerminalTitle = { [weak self] controller, title in
             self?.renameTerminalTitle(controller, title: title)
+        }
+        iv.onCancelAIRoomWait = { [weak self] controller in
+            self?.cancelAIRoomWait(forCallerTerminalID: controller.id)
         }
         iv.onMultiSelect = { [weak self] controllers in
             self?.switchToSplit(controllers)
@@ -1462,6 +1594,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                        action: #selector(showAboutPanel),
                        keyEquivalent: "")
         appMenu.addItem(makeMenuItem(title: "Settings\u{2026}", shortcut: .openSettings))
+        appMenu.addItem(withTitle: "AI Room Manager\u{2026}", action: #selector(openAIRoomManager(_:)), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Export", action: #selector(exportData(_:)),
                         keyEquivalent: "")
@@ -1632,12 +1765,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         layoutTitlebarBackButton()
     }
 
+    private func installTitlebarAIRoomChatButton() {
+        guard let titlebarView = window.standardWindowButton(.closeButton)?.superview else { return }
+        let button = NSButton(title: "", target: self, action: #selector(openAIRoomChatPrompt(_:)))
+        if let image = NSImage(systemSymbolName: "message", accessibilityDescription: "AI Room Chat") {
+            button.image = image
+            button.imagePosition = .imageOnly
+        } else {
+            button.title = "Chat"
+            button.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        }
+        button.bezelStyle = .texturedRounded
+        button.isBordered = true
+        button.contentTintColor = .white
+        button.toolTip = "Open AI Room Chat"
+        button.isHidden = true
+        button.autoresizingMask = [.minXMargin, .minYMargin]
+        titlebarView.addSubview(button)
+        titlebarAIRoomChatButton = button
+        layoutTitlebarAIRoomChatButton()
+    }
+
     private func layoutTitlebarBackButton() {
         guard let titlebarBackButton,
               let zoomButton = window.standardWindowButton(.zoomButton),
               let titlebarView = zoomButton.superview else { return }
         let zoomFrame = titlebarView.convert(zoomButton.frame, to: nil)
         titlebarBackButton.frame = NSRect(x: zoomFrame.maxX + 12, y: zoomFrame.minY - 1, width: 30, height: 24)
+    }
+
+    private func layoutTitlebarAIRoomChatButton() {
+        guard let titlebarAIRoomChatButton,
+              let titlebarView = titlebarAIRoomChatButton.superview else { return }
+        let width: CGFloat = 32
+        let height: CGFloat = 24
+        titlebarAIRoomChatButton.frame = NSRect(
+            x: max(8, titlebarView.bounds.width - width - 12),
+            y: max(0, titlebarView.bounds.midY - height / 2),
+            width: width,
+            height: height
+        )
     }
 
     private func updateTitlebarBackButtonVisibility() {
@@ -1655,6 +1822,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusBarView?.setBackButtonVisible(shouldShow)
         statusBarView?.setOverviewSelectAllHintVisible(shouldShowOverviewSelectAllHint)
         layoutTitlebarBackButton()
+        updateTitlebarAIRoomChatButtonVisibility()
+    }
+
+    private func updateTitlebarAIRoomChatButtonVisibility(identityHeadersVisible: Bool? = nil) {
+        let visibleMode: Bool
+        switch viewMode {
+        case .focused, .split:
+            visibleMode = true
+        case .integrated:
+            visibleMode = false
+        }
+        let headersVisible = identityHeadersVisible ?? currentCommandIdentityHeadersVisible()
+        titlebarAIRoomChatButton?.isHidden = !(visibleMode && headersVisible)
+        layoutTitlebarAIRoomChatButton()
     }
 
     private func stopConfigWatcher() {
@@ -2019,14 +2200,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let text = pasteboard.string(forType: .string) {
             guard shouldPasteText(text) else { return }
 
-            if controller.model.bracketedPasteMode {
-                let sanitized = text.replacingOccurrences(of: "\u{1B}[201~", with: "")
-                controller.sendInput("\u{1B}[200~")
-                controller.sendInput(sanitized)
-                controller.sendInput("\u{1B}[201~")
-            } else {
-                controller.sendInput(text)
-            }
+            controller.sendPastedText(text)
             return
         }
 
@@ -2543,6 +2717,382 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.showWindow()
     }
 
+    @objc func openAIRoomManager(_ sender: Any?) {
+        if let existing = aiRoomManagerController {
+            existing.showWindow(sender)
+            return
+        }
+        let controller = makeAIRoomManagerController()
+        aiRoomManagerController = controller
+        controller.showWindow(sender)
+    }
+
+    @objc private func openAIRoomChatPrompt(_ sender: Any?) {
+        guard let source = activeAIRoomChatSourceTerminal() else { return }
+        if let existing = aiRoomChatPromptController {
+            existing.close()
+        }
+
+        let controller = AIRoomChatPromptWindowController(
+            password: aiRoomMCPPassword,
+            port: config.aiRoomMCPServer.port,
+            sourceTerminalID: source.id,
+            terminals: aiRoomChatTerminalInfos(),
+            rooms: aiRoomChatRoomInfos()
+        )
+        controller.onSend = { [weak self, weak source] targetTerminalID, text in
+            guard let self, let source else { return }
+            let prompt = Self.aiRoomChatInstructionPrompt(
+                port: self.config.aiRoomMCPServer.port,
+                password: self.aiRoomMCPPassword,
+                targetTerminalID: targetTerminalID,
+                text: text
+            )
+            self.sendPastedTextAndSubmit(prompt, to: source)
+        }
+        controller.onClose = { [weak self] in
+            self?.aiRoomChatPromptController = nil
+        }
+        aiRoomChatPromptController = controller
+        controller.showWindow(sender)
+    }
+
+    private func activeAIRoomChatSourceTerminal() -> TerminalController? {
+        switch viewMode {
+        case .focused(let controller):
+            return controller
+        case .split:
+            return splitContainerView?.activeController
+        case .integrated:
+            return nil
+        }
+    }
+
+    private func makeAIRoomManagerController() -> AIRoomManagerWindowController {
+        let controller = AIRoomManagerWindowController(
+            password: aiRoomMCPPassword,
+            port: config.aiRoomMCPServer.port,
+            terminals: aiRoomManagerTerminalInfos(),
+            rooms: aiRoomManagerRoomInfos()
+        )
+        controller.onSaveRooms = { [weak self] rooms in
+            self?.saveAIRoomConfigurations(rooms.map {
+                AIRoomConfiguration(id: $0.id, name: $0.name, terminalIDs: $0.terminalIDs)
+            })
+            self?.refreshAIRoomManagerWindow()
+        }
+        controller.onRegeneratePassword = { [weak self] in
+            self?.regenerateAIRoomMCPPassword()
+        }
+        controller.onRefresh = { [weak self] in
+            self?.refreshAIRoomManagerWindow()
+        }
+        controller.onClose = { [weak self] in
+            self?.aiRoomManagerController = nil
+        }
+        return controller
+    }
+
+    private func refreshAIRoomManagerWindow() {
+        if let controller = aiRoomManagerController {
+            controller.refresh(
+                password: aiRoomMCPPassword,
+                port: config.aiRoomMCPServer.port,
+                terminals: aiRoomManagerTerminalInfos(),
+                rooms: aiRoomManagerRoomInfos()
+            )
+        } else {
+            openAIRoomManager(nil)
+        }
+    }
+
+    private func aiRoomChatTerminalInfos() -> [AIRoomChatPromptWindowController.TerminalInfo] {
+        manager.terminals.map {
+            AIRoomChatPromptWindowController.TerminalInfo(
+                id: $0.id,
+                title: $0.title,
+                foregroundProcessName: $0.foregroundProcessName
+            )
+        }
+    }
+
+    private func aiRoomChatRoomInfos() -> [AIRoomChatPromptWindowController.RoomInfo] {
+        config.aiRoomMCPServer.rooms.map {
+            AIRoomChatPromptWindowController.RoomInfo(
+                id: $0.id,
+                name: $0.name,
+                terminalIDs: $0.terminalIDs
+            )
+        }
+    }
+
+    private func aiRoomManagerTerminalInfos() -> [AIRoomManagerWindowController.TerminalInfo] {
+        manager.terminals.map {
+            AIRoomManagerWindowController.TerminalInfo(
+                id: $0.id,
+                title: $0.title,
+                foregroundProcessName: $0.foregroundProcessName
+            )
+        }
+    }
+
+    private func aiRoomManagerRoomInfos() -> [AIRoomManagerWindowController.RoomInfo] {
+        config.aiRoomMCPServer.rooms.map {
+            AIRoomManagerWindowController.RoomInfo(
+                id: $0.id,
+                name: $0.name,
+                terminalIDs: $0.terminalIDs
+            )
+        }
+    }
+
+    private func regenerateAIRoomMCPPassword() {
+        aiRoomMCPPassword = Self.generateAIRoomMCPPassword()
+        configureMCPServer()
+        refreshAIRoomManagerWindow()
+    }
+
+    private func cancelAIRoomRequestsInvalidatedByRoomChange(from oldRooms: [AIRoomConfiguration], to newRooms: [AIRoomConfiguration]) {
+        let oldByID = Dictionary(uniqueKeysWithValues: oldRooms.map { ($0.id, $0) })
+        let newByID = Dictionary(uniqueKeysWithValues: newRooms.map { ($0.id, $0) })
+
+        var affectedTerminalIDs = Set<UUID>()
+        for oldRoom in oldRooms where newByID[oldRoom.id] == nil {
+            affectedTerminalIDs.formUnion(oldRoom.terminalIDs)
+        }
+        for newRoom in newRooms {
+            guard let oldRoom = oldByID[newRoom.id] else { continue }
+            affectedTerminalIDs.formUnion(oldRoom.terminalIDs.subtracting(newRoom.terminalIDs))
+        }
+
+        for terminalID in affectedTerminalIDs {
+            cancelAIRoomActiveRequestsInvolving(terminalID: terminalID)
+        }
+    }
+
+    private func setAIRoomWaiting(callerTerminalID: UUID, target: TerminalController) {
+        aiRoomWaitingByCallerTerminalID[callerTerminalID] = AIRoomWaitingPresentation(
+            targetTerminalID: target.id,
+            targetTitle: target.title,
+            startedAt: Date()
+        )
+        syncAIRoomWaitingIndicators()
+    }
+
+    private func clearAIRoomWaiting(callerTerminalID: UUID) {
+        guard aiRoomWaitingByCallerTerminalID.removeValue(forKey: callerTerminalID) != nil else { return }
+        syncAIRoomWaitingIndicators()
+    }
+
+    private func cancelAIRoomWait(forCallerTerminalID callerTerminalID: UUID) {
+        cancelAIRoomActiveRequestForCallerTerminalID(callerTerminalID)
+    }
+
+    private func cancelAIRoomActiveRequestForCallerTerminalID(_ callerTerminalID: UUID) {
+        guard let context = aiRoomActiveRequestByRequestID.values.first(where: { $0.callerTerminalID == callerTerminalID }) else {
+            return
+        }
+        aiRoomResponseCoordinator.cancelRequestForCallerTerminalID(callerTerminalID)
+        finishAIRoomRequest(requestID: context.request.id, responseBody: nil)
+    }
+
+    private func cancelAIRoomActiveRequestsInvolving(terminalID: UUID) {
+        let requestIDs = aiRoomActiveRequestByRequestID.values
+            .filter { $0.callerTerminalID == terminalID || $0.targetTerminalID == terminalID }
+            .map { $0.request.id }
+        aiRoomResponseCoordinator.cancelRequestsInvolving(terminalID: terminalID)
+        for requestID in requestIDs {
+            finishAIRoomRequest(requestID: requestID, responseBody: nil)
+        }
+    }
+
+    private func handleAIRoomTargetOutput(
+        _ codepoint: UInt32,
+        terminalID: UUID,
+        request: AIRoomMCPResponseCoordinator.PendingRequest
+    ) {
+        switch aiRoomResponseCoordinator.appendOutputCodepoint(codepoint, terminalID: terminalID) {
+        case .completed(let responseBody):
+            DispatchQueue.main.async { [weak self] in
+                self?.finishAIRoomRequest(requestID: request.id, responseBody: responseBody)
+            }
+        case .failed:
+            DispatchQueue.main.async { [weak self] in
+                self?.finishAIRoomRequest(requestID: request.id, responseBody: nil)
+            }
+        case .waiting:
+            break
+        }
+    }
+
+    private func startAIRoomResponsePolling(requestID: UUID) {
+        aiRoomPollingTimerByRequestID[requestID]?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.pollAIRoomResponse(requestID: requestID)
+        }
+        aiRoomPollingTimerByRequestID[requestID] = timer
+        pollAIRoomResponse(requestID: requestID)
+    }
+
+    private func pollAIRoomResponse(requestID: UUID) {
+        guard let context = aiRoomActiveRequestByRequestID[requestID] else {
+            aiRoomPollingTimerByRequestID.removeValue(forKey: requestID)?.invalidate()
+            return
+        }
+        let deltaText = context.target.textSinceBaseline(
+            context.targetTextBaseline,
+            maxCharacters: context.request.maxBufferCharacterCount
+        )
+        switch completeAIRoomRequestIfResponsePresent(deltaText, requestID: requestID, context: context) {
+        case true:
+            return
+        case false:
+            break
+        }
+
+        let viewportText = Self.textAddedAfterViewportBaseline(
+            context.targetViewportBaseline,
+            currentText: context.target.viewportText(maxLines: 200)
+        )
+        guard viewportText != deltaText else { return }
+        _ = completeAIRoomRequestIfResponsePresent(viewportText, requestID: requestID, context: context)
+    }
+
+    static func textAddedAfterViewportBaseline(_ baselineText: String, currentText: String) -> String {
+        guard !baselineText.isEmpty else { return currentText }
+        guard baselineText != currentText else { return "" }
+        if currentText.hasPrefix(baselineText) {
+            return String(currentText.dropFirst(baselineText.count))
+        }
+
+        let maxOverlap = min(baselineText.count, currentText.count)
+        guard maxOverlap > 0 else { return currentText }
+        var overlapLength = maxOverlap
+        while overlapLength > 0 {
+            let baselineSuffixStart = baselineText.index(baselineText.endIndex, offsetBy: -overlapLength)
+            let currentPrefixEnd = currentText.index(currentText.startIndex, offsetBy: overlapLength)
+            if baselineText[baselineSuffixStart...] == currentText[..<currentPrefixEnd] {
+                return String(currentText[currentPrefixEnd...])
+            }
+            overlapLength -= 1
+        }
+        return currentText
+    }
+
+    @discardableResult
+    private func completeAIRoomRequestIfResponsePresent(
+        _ text: String,
+        requestID: UUID,
+        context: AIRoomSendRequestContext
+    ) -> Bool {
+        guard !text.isEmpty else { return false }
+        switch aiRoomResponseCoordinator.completeIfResponsePresent(in: text, for: context.request) {
+        case .completed(let responseBody):
+            finishAIRoomRequest(requestID: requestID, responseBody: responseBody)
+            return true
+        case .failed:
+            finishAIRoomRequest(requestID: requestID, responseBody: nil)
+            return true
+        case .waiting:
+            return false
+        }
+    }
+
+    private func finishAIRoomRequest(requestID: UUID, responseBody: String?) {
+        guard let context = aiRoomActiveRequestByRequestID.removeValue(forKey: requestID) else {
+            return
+        }
+
+        aiRoomPollingTimerByRequestID.removeValue(forKey: requestID)?.invalidate()
+
+        if aiRoomActiveRequestIDByTargetTerminalID[context.targetTerminalID] == requestID {
+            context.target.setMCPTextSink(nil)
+            aiRoomActiveRequestIDByTargetTerminalID.removeValue(forKey: context.targetTerminalID)
+        }
+        clearAIRoomWaiting(callerTerminalID: context.callerTerminalID)
+        aiRoomResponseCoordinator.clearFinishedRequest(context.request)
+
+        guard let responseBody else { return }
+        guard manager.terminals.contains(where: { $0.id == context.callerTerminalID }),
+              manager.terminals.contains(where: { $0.id == context.targetTerminalID }) else {
+            return
+        }
+
+        let returnedText = context.protocolConfiguration.returnPrefixPrompt + "\n\n" + responseBody
+        sendPastedTextAndSubmit(returnedText, to: context.caller)
+    }
+
+    private func sendPastedTextAndSubmit(_ text: String, to controller: TerminalController) {
+        let terminalID = controller.id
+        controller.sendPastedText(text)
+        DispatchQueue.main.asyncAfter(deadline: .now() + aiRoomSubmitAfterPasteDelay) { [weak self, weak controller] in
+            guard let self,
+                  let controller,
+                  controller.isAlive,
+                  self.manager.terminals.contains(where: { $0.id == terminalID }) else {
+                return
+            }
+            controller.sendInput(controller.newlineKeyInput())
+        }
+    }
+
+    private func aiRoomWaitingMessagesByTerminalID() -> [UUID: String] {
+        aiRoomWaitingByCallerTerminalID.mapValues { presentation in
+            "MCP waiting: \(presentation.targetTitle) - click to cancel"
+        }
+    }
+
+    private func syncAIRoomWaitingIndicators() {
+        let messages = aiRoomWaitingMessagesByTerminalID()
+        if let terminalView,
+           let terminalID = terminalView.terminalController?.id,
+           let message = messages[terminalID] {
+            terminalView.setAIRoomWaitingMessage(message)
+        } else {
+            terminalView?.setAIRoomWaitingMessage(nil)
+        }
+        splitContainerView?.setAIRoomWaitingMessages(messages)
+        integratedView?.setAIRoomWaitingTerminalIDs(Set(messages.keys))
+    }
+
+    private func saveAIRoomConfigurations(_ rooms: [AIRoomConfiguration]) {
+        cancelAIRoomRequestsInvalidatedByRoomChange(
+            from: config.aiRoomMCPServer.rooms,
+            to: rooms
+        )
+        var root: [String: Any] = {
+            guard let data = try? Data(contentsOf: PtermDirectories.config),
+                  let object = try? JSONSerialization.jsonObject(with: data),
+                  let dictionary = object as? [String: Any] else {
+                return [:]
+            }
+            return dictionary
+        }()
+        var section = (root["ai_room_mcp_server"] as? [String: Any]) ?? [:]
+        section["enabled"] = config.aiRoomMCPServer.enabled
+        section["port"] = config.aiRoomMCPServer.port
+        let protocolConfig = config.aiRoomMCPServer.protocolConfiguration
+        section["response_instruction_prompt"] = protocolConfig.responseInstructionPrompt
+        section["begin_marker"] = protocolConfig.beginMarker
+        section["end_marker"] = protocolConfig.endMarker
+        section["return_prefix_prompt"] = protocolConfig.returnPrefixPrompt
+        section["rooms"] = rooms.map { room in
+            [
+                "id": room.id,
+                "name": room.name,
+                "terminal_ids": Array(room.terminalIDs).map(\.uuidString).sorted()
+            ] as [String: Any]
+        }
+        root["ai_room_mcp_server"] = section
+        do {
+            let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+            try AtomicFileWriter.write(data, to: PtermDirectories.config, permissions: 0o600)
+            reloadConfigurationFromDisk(force: true)
+        } catch {
+            NSAlert(error: error).runModal()
+        }
+    }
+
     @objc func cut(_ sender: Any?) {
         let activeTerminalInputView: TerminalView? = {
             switch viewMode {
@@ -2874,6 +3424,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminalView?.setCommandIdentityHeaderVisible(visible)
         splitContainerView?.setCommandModifierActive(commandHeld)
         splitContainerView?.setIdentityHeaderVisible(visible)
+        updateTitlebarAIRoomChatButtonVisibility(identityHeadersVisible: visible)
     }
 
     private func refreshStatusBarCommandHints() {
@@ -3149,15 +3700,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func configureMCPServer() {
         stopMCPServer()
-        guard config.mcpServer.enabled else { return }
+        stopAIRoomMCPServer()
 
-        do {
-            let server = MCPServer(configuration: config.mcpServer, toolProvider: self)
-            try server.start()
-            mcpServer = server
-        } catch {
-            mcpServer = nil
-            presentMCPServerError(error)
+        if config.mcpServer.enabled {
+            do {
+                let server = MCPServer(configuration: config.mcpServer, toolProvider: self)
+                try server.start()
+                mcpServer = server
+            } catch {
+                mcpServer = nil
+                presentMCPServerError(error, serverName: "MCP server")
+            }
+        }
+
+        if config.aiRoomMCPServer.enabled {
+            do {
+                let server = MCPServer(
+                    port: config.aiRoomMCPServer.port,
+                    serverName: "pterm-ai-room-mcp",
+                    authToken: aiRoomMCPPassword,
+                    tokenFileURL: nil,
+                    authInstructions: "Ask the human user to read the current AI Room MCP password from pterm's room management UI. "
+                        + "Then include it in every authenticated request as: Authorization: Bearer <password>. "
+                        + "Also include X-Pterm-Terminal-Id with your own PTERM_TERMINAL_ID value so pterm can apply room visibility.",
+                    unauthenticatedToolNames: ["describe_ai_terminal_protocol"],
+                    toolProvider: aiRoomMCPToolProvider
+                )
+                try server.start()
+                aiRoomMCPServer = server
+            } catch {
+                aiRoomMCPServer = nil
+                presentMCPServerError(error, serverName: "AI Room MCP server")
+            }
         }
     }
 
@@ -3166,9 +3740,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mcpServer = nil
     }
 
-    private func presentMCPServerError(_ error: Error) {
+    private func stopAIRoomMCPServer() {
+        aiRoomMCPServer?.stop()
+        aiRoomMCPServer = nil
+    }
+
+    private func presentMCPServerError(_ error: Error, serverName: String) {
         let alert = NSAlert.pterm()
-        alert.messageText = "Failed to start MCP server"
+        alert.messageText = "Failed to start \(serverName)"
         alert.informativeText = "\(error.localizedDescription)\n\nChange the port in Settings > General and try again."
         alert.alertStyle = .critical
         alert.runModal()
@@ -3330,6 +3909,7 @@ extension AppDelegate: NSWindowDelegate {
         // Update full-size grid dimensions for all terminals
         let pad = renderer.gridPadding * 2
         layoutTitlebarBackButton()
+        layoutTitlebarAIRoomChatButton()
         statusBarView.frame = statusBarFrame()
         searchBarView?.frame = searchBarFrame()
         windowPresentationHostView?.frame = availableContentFrame()
@@ -3408,6 +3988,7 @@ extension AppDelegate: NSWindowDelegate {
 
     private func syncVisibleRenderScaleFactors() {
         layoutTitlebarBackButton()
+        layoutTitlebarAIRoomChatButton()
         integratedView?.syncScaleFactorIfNeeded()
         terminalView?.syncScaleFactorIfNeeded()
         splitContainerView?.syncScaleFactorIfNeeded()
@@ -3553,11 +4134,308 @@ extension AppDelegate: NSWindowDelegate {
         removeBackShortcutMonitor()
         stopConfigWatcher()
         stopMCPServer()
+        stopAIRoomMCPServer()
         metricsMonitor?.stop()
         clipboardCleanupService?.stop()
         manager?.stopAll(preserveScrollback: config.sessionScrollBufferPersistence)
         try? sessionStore.markCleanShutdown()
         singleInstanceLock.release()
+    }
+}
+
+private final class AIRoomMCPToolProvider: MCPToolProvider {
+    private weak var appDelegate: AppDelegate?
+
+    init(appDelegate: AppDelegate) {
+        self.appDelegate = appDelegate
+    }
+
+    func toolDefinitions() -> [MCPToolDefinition] {
+        appDelegate?.aiRoomMCPToolDefinitions() ?? []
+    }
+
+    func callTool(named name: String, arguments: [String: Any]) throws -> String {
+        guard let appDelegate else {
+            throw MCPServerError.toolNotFound(name)
+        }
+        return try appDelegate.callAIRoomMCPTool(named: name, arguments: arguments)
+    }
+
+    func shouldCallToolOnMainThread(named name: String) -> Bool {
+        name != "send_room_message"
+    }
+}
+
+private extension AppDelegate {
+    static func generateAIRoomMCPPassword() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard status == errSecSuccess else {
+            fatalError("Failed to generate cryptographically random AI Room MCP password (SecRandomCopyBytes status: \(status))")
+        }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    func aiRoomMCPToolDefinitions() -> [MCPToolDefinition] {
+        [
+            MCPToolDefinition(
+                name: "describe_ai_terminal_protocol",
+                description: "Explain how an AI running inside pterm authenticates, identifies its terminal, lists room-visible terminals, and asks another room-visible AI terminal for a marker-delimited response.",
+                inputSchema: ["type": "object", "properties": [:]]
+            ),
+            MCPToolDefinition(
+                name: "identify_self",
+                description: "Return the pterm terminal associated with the X-Pterm-Terminal-Id request header.",
+                inputSchema: ["type": "object", "properties": [:]]
+            ),
+            MCPToolDefinition(
+                name: "list_visible_terminals",
+                description: "List only terminals that share at least one AI room with the caller terminal.",
+                inputSchema: ["type": "object", "properties": [:]]
+            ),
+            MCPToolDefinition(
+                name: "send_room_message",
+                description: "Send a message to a room-visible target terminal and return immediately. pterm keeps watching the target terminal; when the target prints the configured begin/end markers, pterm pastes the extracted response back into the caller terminal and presses Return. Do not wait for the AI answer in this MCP result.",
+                inputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "target_terminal_id": ["type": "string"],
+                        "message": ["type": "string"]
+                    ],
+                    "required": ["target_terminal_id", "message"]
+                ]
+            )
+        ]
+    }
+
+    func callAIRoomMCPTool(named name: String, arguments: [String: Any]) throws -> String {
+        let payload: Any
+        switch name {
+        case "describe_ai_terminal_protocol":
+            payload = aiRoomMCPProtocolDescriptionPayload()
+        case "identify_self":
+            let caller = try aiRoomCallerTerminal(from: arguments)
+            payload = [
+                "terminal": aiRoomTerminalPayload(for: caller),
+                "joined_rooms": aiRoomNames(for: caller.id)
+            ]
+        case "list_visible_terminals":
+            let caller = try aiRoomCallerTerminal(from: arguments)
+            payload = [
+                "caller_terminal_id": caller.id.uuidString,
+                "visible_terminals": aiRoomVisibleTerminals(forCallerID: caller.id).map(aiRoomTerminalPayload(for:))
+            ]
+        case "send_room_message":
+            payload = try aiRoomSendRoomMessage(arguments: arguments)
+        default:
+            throw MCPServerError.toolNotFound(name)
+        }
+
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    func aiRoomMCPProtocolDescriptionPayload() -> [String: Any] {
+        let protocolConfig = config.aiRoomMCPServer.protocolConfiguration
+        return [
+            "server": [
+                "name": "pterm-ai-room-mcp",
+                "default_port": AIRoomMCPServerConfiguration.defaultPort,
+                "configured_port": config.aiRoomMCPServer.port
+            ],
+            "direct_http_quickstart": [
+                "preferred_access": "Use curl directly instead of spending time configuring an MCP client.",
+                "url": "http://127.0.0.1:\(config.aiRoomMCPServer.port)/",
+                "method": "POST",
+                "content_type": "application/json",
+                "jsonrpc_method": "tools/call",
+                "tool_name": "send_room_message",
+                "required_headers": [
+                    "Authorization: Bearer <pterm-ai-room-mcp-password>",
+                    "X-Pterm-Terminal-Id: <PTERM_TERMINAL_ID>"
+                ],
+                "curl_template": """
+                /usr/bin/curl -sS -X POST 'http://127.0.0.1:\(config.aiRoomMCPServer.port)/' \\
+                  -H 'Content-Type: application/json' \\
+                  -H 'Authorization: Bearer <pterm-ai-room-mcp-password>' \\
+                  -H "X-Pterm-Terminal-Id: ${PTERM_TERMINAL_ID:?PTERM_TERMINAL_ID is not set}" \\
+                  --data-binary '{"jsonrpc":"2.0","id":"send-room-message","method":"tools/call","params":{"name":"send_room_message","arguments":{"target_terminal_id":"<target-terminal-id>","message":"<message>"}}}'
+                """
+            ],
+            "authentication": [
+                "required_except_tools": ["describe_ai_terminal_protocol"],
+                "scheme": "Bearer",
+                "header": "Authorization: Bearer <pterm-ai-room-mcp-password>",
+                "password_source": "Ask the human user to read the current AI Room MCP password from pterm's room management UI. The password is regenerated every time pterm starts and is not persisted."
+            ],
+            "caller_identity": [
+                "header": "X-Pterm-Terminal-Id: <PTERM_TERMINAL_ID>",
+                "source": "Read PTERM_TERMINAL_ID from your terminal process environment. pterm injects it when the terminal session starts. It identifies the caller terminal only; it is not an authentication secret."
+            ],
+            "room_model": [
+                "meaning": "A room is a visibility boundary, not conversation context.",
+                "visibility": "A caller can see the union of terminals in every room that includes the caller terminal.",
+                "room_selection": "The AI client does not specify a room when sending; pterm applies room visibility from membership."
+            ],
+            "tools": [
+                "identify_self": "Authenticate and include X-Pterm-Terminal-Id to confirm which pterm terminal you are.",
+                "list_visible_terminals": "Authenticate and include X-Pterm-Terminal-Id to list target terminals visible to you.",
+                "send_room_message": "Authenticate, include X-Pterm-Terminal-Id, target_terminal_id, and message. pterm sends the configured marker instruction plus your message to the target terminal and returns an acknowledgement immediately. Do not wait for the AI answer in the MCP result. pterm continues watching the target terminal; after it detects the first complete marker pair, it trims the body, pastes the configured return prefix plus that body into your caller terminal, and presses Return."
+            ],
+            "response_markers": [
+                "instruction_prompt": protocolConfig.responseInstructionPrompt,
+                "configured_begin_marker_prefix": protocolConfig.beginMarker,
+                "configured_end_marker_prefix": protocolConfig.endMarker,
+                "per_request_markers": "send_room_message generates unique begin/end markers for each request by appending a request token to the configured marker prefixes. Use the exact markers printed in the terminal prompt for that request.",
+                "return_prefix_prompt": protocolConfig.returnPrefixPrompt
+            ],
+            "notes": [
+                "Do not use the admin MCP tools for AI-room communication.",
+                "If target_terminal_id is already waiting for another response, send_room_message returns target_busy.",
+                "After send_room_message returns success, continue normally. The target AI response will arrive later as terminal input injected by pterm, not as the MCP call result."
+            ]
+        ]
+    }
+
+    func aiRoomSendRoomMessage(arguments: [String: Any]) throws -> [String: Any] {
+        try performAIRoomMainSync {
+            let caller = try aiRoomCallerTerminal(from: arguments)
+            guard let rawTargetID = arguments["target_terminal_id"] as? String,
+                  let targetID = UUID(uuidString: rawTargetID) else {
+                throw MCPServerError.invalidRequest
+            }
+            guard let target = manager.terminals.first(where: { $0.id == targetID }) else {
+                throw AIRoomMCPError.targetTerminalNotFound(targetID)
+            }
+            guard let message = arguments["message"] as? String else {
+                throw MCPServerError.invalidRequest
+            }
+            guard aiRoomVisibleTerminalIDs(forCallerID: caller.id).contains(targetID) else {
+                throw AIRoomMCPError.notInRoom
+            }
+
+            cancelAIRoomActiveRequestForCallerTerminalID(caller.id)
+
+            let protocolConfig = config.aiRoomMCPServer.protocolConfiguration
+            let markerToken = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            let requestBeginMarker = "\(protocolConfig.beginMarker)__\(markerToken)__"
+            let requestEndMarker = "\(protocolConfig.endMarker)__\(markerToken)__"
+            let outbound = Self.aiRoomTargetPrompt(
+                protocolConfiguration: protocolConfig,
+                beginMarker: requestBeginMarker,
+                endMarker: requestEndMarker,
+                message: message
+            )
+            let request = try aiRoomResponseCoordinator.beginRequest(
+                callerTerminalID: caller.id,
+                targetTerminalID: targetID,
+                beginMarker: requestBeginMarker,
+                endMarker: requestEndMarker,
+                ignoredMarkerBodies: AIRoomMCPResponseCoordinator.completeMarkerBodies(
+                    in: outbound,
+                    beginMarker: requestBeginMarker,
+                    endMarker: requestEndMarker
+                )
+            )
+            target.setMCPTextSink { [weak self] codepoint in
+                self?.handleAIRoomTargetOutput(codepoint, terminalID: targetID, request: request)
+            }
+            let targetTextBaseline = target.textBaseline()
+            let targetViewportBaseline = target.viewportText(maxLines: 200)
+            aiRoomActiveRequestByRequestID[request.id] = AIRoomSendRequestContext(
+                request: request,
+                caller: caller,
+                target: target,
+                callerTerminalID: caller.id,
+                targetTerminalID: targetID,
+                protocolConfiguration: protocolConfig,
+                targetTextBaseline: targetTextBaseline,
+                targetViewportBaseline: targetViewportBaseline
+            )
+            aiRoomActiveRequestIDByTargetTerminalID[targetID] = request.id
+            setAIRoomWaiting(callerTerminalID: caller.id, target: target)
+            startAIRoomResponsePolling(requestID: request.id)
+
+            sendPastedTextAndSubmit(outbound, to: target)
+        }
+
+        return [
+            "status": "sent",
+            "delivery": "asynchronous_terminal_injection",
+            "caller_terminal_id": try aiRoomHeaderTerminalID(from: arguments).uuidString,
+            "target_terminal_id": arguments["target_terminal_id"] as? String ?? "",
+            "mcp_result_contains_ai_response": false,
+            "instruction": "Do not wait for the target AI response in this MCP result. pterm is now watching the target terminal. When pterm detects the configured begin/end markers, it will paste the extracted response into the caller terminal and press Return."
+        ]
+    }
+
+    func aiRoomHeaderTerminalID(from arguments: [String: Any]) throws -> UUID {
+        guard let headers = arguments["__request_headers"] as? [String: String],
+              let rawID = headers["x-pterm-terminal-id"],
+              let id = UUID(uuidString: rawID) else {
+            throw AIRoomMCPError.missingCallerTerminalID
+        }
+        return id
+    }
+
+    func performAIRoomMainSync<T>(_ body: () throws -> T) throws -> T {
+        if Thread.isMainThread {
+            return try body()
+        }
+
+        var result: Result<T, Error>!
+        DispatchQueue.main.sync {
+            result = Result { try body() }
+        }
+        return try result.get()
+    }
+
+    func aiRoomCallerTerminal(from arguments: [String: Any]) throws -> TerminalController {
+        guard let headers = arguments["__request_headers"] as? [String: String],
+              let rawID = headers["x-pterm-terminal-id"] else {
+            throw AIRoomMCPError.missingCallerTerminalID
+        }
+        guard let id = UUID(uuidString: rawID) else {
+            throw AIRoomMCPError.invalidCallerTerminalID(rawID)
+        }
+        guard let controller = manager.terminals.first(where: { $0.id == id }) else {
+            throw AIRoomMCPError.callerTerminalNotFound(id)
+        }
+        return controller
+    }
+
+    func aiRoomVisibleTerminals(forCallerID callerID: UUID) -> [TerminalController] {
+        let visibleIDs = aiRoomVisibleTerminalIDs(forCallerID: callerID)
+        return manager.terminals.filter { visibleIDs.contains($0.id) }
+    }
+
+    func aiRoomVisibleTerminalIDs(forCallerID callerID: UUID) -> Set<UUID> {
+        var visibleIDs = Set<UUID>()
+        for room in config.aiRoomMCPServer.rooms where room.terminalIDs.contains(callerID) {
+            visibleIDs.formUnion(room.terminalIDs)
+        }
+        return visibleIDs
+    }
+
+    func aiRoomNames(for terminalID: UUID) -> [String] {
+        config.aiRoomMCPServer.rooms
+            .filter { $0.terminalIDs.contains(terminalID) }
+            .map(\.name)
+    }
+
+    func aiRoomTerminalPayload(for controller: TerminalController) -> [String: Any] {
+        let snapshot = controller.sessionSnapshot
+        return [
+            "pterm_terminal_id": controller.id.uuidString,
+            "title": controller.title,
+            "custom_title": controller.customTitle ?? NSNull(),
+            "workspace_name": snapshot.workspaceName,
+            "current_directory": snapshot.currentDirectory,
+            "foreground_process_id": controller.foregroundProcessID.map { Int($0) } ?? NSNull(),
+            "foreground_process_name": controller.foregroundProcessName ?? NSNull(),
+            "is_alive": controller.isAlive,
+            "joined_rooms": aiRoomNames(for: controller.id)
+        ]
     }
 }
 

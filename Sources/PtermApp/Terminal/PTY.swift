@@ -152,7 +152,8 @@ final class PTY {
                shellLaunchOrder: [String] = ShellLaunchConfiguration.default.launchOrder,
                slaveTerminalAttributes: termios? = nil,
                executablePath: String? = nil,
-               arguments: [String] = []) throws {
+               arguments: [String] = [],
+               ptermTerminalID: String? = nil) throws {
         // Validate TERM value: only allow alphanumeric and hyphens
         let validTerm = termEnv.allSatisfy {
             $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_")
@@ -234,7 +235,12 @@ final class PTY {
         if pid == 0 {
             // ── Child process (returned from pterm_fork_pty) ───────────────
             // stdio is already connected to slave; all fds >= 3 are closed.
-            setupChildEnvironment(shellPath: resolvedShellPath, termEnv: safeTerm, initialDirectory: initialDirectory)
+            setupChildEnvironment(
+                shellPath: resolvedShellPath,
+                termEnv: safeTerm,
+                initialDirectory: initialDirectory,
+                ptermTerminalID: ptermTerminalID
+            )
             if let resolvedExecutablePath {
                 let argv = Self.makeExecArguments(
                     executablePath: resolvedExecutablePath,
@@ -484,7 +490,12 @@ final class PTY {
         return argv
     }
 
-    private func setupChildEnvironment(shellPath: String, termEnv: String, initialDirectory: String?) {
+    private func setupChildEnvironment(
+        shellPath: String,
+        termEnv: String,
+        initialDirectory: String?,
+        ptermTerminalID: String?
+    ) {
         let userInfo = getpwuid(getuid())
         let fallbackHome = FileManager.default.homeDirectoryForCurrentUser.path
         let homeDirectory = userInfo.flatMap { String(validatingUTF8: $0.pointee.pw_dir) }
@@ -505,6 +516,9 @@ final class PTY {
         // Terminal identification
         setenv("TERM", termEnv, 1)
         setenv("COLORTERM", "truecolor", 1)
+        if let ptermTerminalID, UUID(uuidString: ptermTerminalID) != nil {
+            setenv("PTERM_TERMINAL_ID", ptermTerminalID, 1)
+        }
 
         // Locale
         setenv("LANG", "en_US.UTF-8", 1)

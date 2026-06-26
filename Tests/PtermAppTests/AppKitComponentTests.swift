@@ -3567,9 +3567,11 @@ final class AppKitComponentTests: XCTestCase {
 
         view.hasActiveOutput = true
         XCTAssertTrue(view.debugHasOutputPulseTimer)
+        XCTAssertGreaterThanOrEqual(view.debugOutputPulseInterval ?? 0, 0.25)
 
         view.hasActiveOutput = false
         XCTAssertFalse(view.debugHasOutputPulseTimer)
+        XCTAssertNil(view.debugOutputPulseInterval)
     }
 
     func testSearchBarViewUpdatesCountAndInvokesCallbacks() {
@@ -8388,6 +8390,7 @@ final class AppKitComponentTests: XCTestCase {
             audit: PtermConfig.default.audit,
             security: PtermConfig.default.security,
             mcpServer: PtermConfig.default.mcpServer,
+            aiRoomMCPServer: PtermConfig.default.aiRoomMCPServer,
             ai: PtermConfig.default.ai,
             ioHooks: PtermConfig.default.ioHooks,
             shortcuts: PtermConfig.default.shortcuts,
@@ -8474,6 +8477,7 @@ final class AppKitComponentTests: XCTestCase {
             audit: PtermConfig.default.audit,
             security: PtermConfig.default.security,
             mcpServer: PtermConfig.default.mcpServer,
+            aiRoomMCPServer: PtermConfig.default.aiRoomMCPServer,
             ai: PtermConfig.default.ai,
             ioHooks: PtermConfig.default.ioHooks,
             shortcuts: PtermConfig.default.shortcuts,

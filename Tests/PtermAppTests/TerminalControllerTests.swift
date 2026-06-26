@@ -153,6 +153,20 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertFalse(TerminalController.shouldSuppressOutputActivity(forInput: Data("echo test\r".utf8)))
     }
 
+    func testPastedTextInputSequenceUsesBracketedPasteWhenEnabled() {
+        let controller = makeController()
+        let text = "line1\nline2\u{1B}[201~tail"
+
+        XCTAssertEqual(controller.inputSequenceForPastedText(text), text)
+
+        controller.withModel { $0.bracketedPasteMode = true }
+
+        XCTAssertEqual(
+            controller.inputSequenceForPastedText(text),
+            "\u{1B}[200~line1\nline2tail\u{1B}[201~"
+        )
+    }
+
     func testTerminalControllerDecodeBufferGrowsOnlyWhenNeeded() {
         let controller = makeController()
 
@@ -1405,6 +1419,64 @@ final class TerminalControllerTests: XCTestCase {
         measure {
             _ = controller.allText()
         }
+    }
+
+    func testTextSinceBaselineSurvivesScrollbackEviction() {
+        let controller = makeController(
+            rows: 2,
+            cols: 48,
+            scrollbackInitialCapacity: 1024,
+            scrollbackMaxCapacity: 1024
+        )
+        for index in 0..<20 {
+            let text = String(format: "before%02d payload", index)
+            controller.scrollback.appendRow(ArraySlice(text.unicodeScalars.map {
+                Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+            }), isWrapped: false)
+        }
+
+        let baseline = controller.textBaseline()
+        for index in 0..<24 {
+            let text = String(format: "after%02d payload", index)
+            controller.scrollback.appendRow(ArraySlice(text.unicodeScalars.map {
+                Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+            }), isWrapped: false)
+        }
+        let markerText = "AI_RESPONSE_BEGIN body AI_RESPONSE_END"
+        controller.scrollback.appendRow(ArraySlice(markerText.unicodeScalars.map {
+            Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+        }), isWrapped: false)
+        for index in 0..<2 {
+            let text = String(format: "tail%02d payload", index)
+            controller.scrollback.appendRow(ArraySlice(text.unicodeScalars.map {
+                Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+            }), isWrapped: false)
+        }
+
+        let delta = controller.textSinceBaseline(baseline, maxCharacters: 4096)
+        XCTAssertTrue(delta.contains(markerText), delta)
+    }
+
+    func testViewportTextCanRecoverVisibleMarkerWhenBaselineDeltaMissesRewrittenRows() {
+        let controller = makeController(rows: 3, cols: 48)
+        controller.scrollback.appendRow(ArraySlice("history".unicodeScalars.map {
+            Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+        }), isWrapped: false)
+
+        let baseline = controller.textBaseline()
+        let markerText = "AI_RESPONSE_BEGIN visible body AI_RESPONSE_END"
+        let markerCodepoints = markerText.unicodeScalars.map(\.value)
+        controller.withModel { model in
+            model.grid.writeSingleWidthDefaultCells(
+                markerCodepoints,
+                count: markerCodepoints.count,
+                atRow: 0,
+                startCol: 0
+            )
+        }
+
+        XCTAssertFalse(controller.textSinceBaseline(baseline, maxCharacters: 4096).contains(markerText))
+        XCTAssertTrue(controller.viewportText().contains(markerText))
     }
 
     func testFindMatchesLargeScrollbackThresholdGuard() {

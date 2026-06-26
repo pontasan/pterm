@@ -78,6 +78,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var scrollPersistenceCheck: NSButton?
     private var mcpServerEnabledCheck: NSButton?
     private var mcpServerPortField: NSTextField?
+    private var aiRoomMCPServerEnabledCheck: NSButton?
+    private var aiRoomMCPServerPortField: NSTextField?
+    private var aiRoomMCPResponseInstructionField: NSTextField?
+    private var aiRoomMCPBeginMarkerField: NSTextField?
+    private var aiRoomMCPEndMarkerField: NSTextField?
+    private var aiRoomMCPReturnPrefixField: NSTextField?
     private var fontNameLabel: NSTextField?
     private var fontSizeStepper: NSStepper?
     private var fontSizeField: NSTextField?
@@ -507,6 +513,90 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             ),
             28
         )
+        addSpacing(20)
+
+        let aiRoomMCPSection = (configData["ai_room_mcp_server"] as? [String: Any]) ?? [:]
+        let aiRoomMCPEnabled = (aiRoomMCPSection["enabled"] as? Bool)
+            ?? AIRoomMCPServerConfiguration.default.enabled
+        let aiRoomMCPEnabledCheck = makeCheckbox("Enable AI Room MCP server", checked: aiRoomMCPEnabled)
+        aiRoomMCPEnabledCheck.target = self
+        aiRoomMCPEnabledCheck.action = #selector(aiRoomMCPServerEnabledChanged(_:))
+        aiRoomMCPServerEnabledCheck = aiRoomMCPEnabledCheck
+        addView(aiRoomMCPEnabledCheck, 22)
+        addSpacing(12)
+
+        let aiRoomMCPPort = MCPServerConfiguration.normalizedPort(
+            intVal(aiRoomMCPSection["port"]) ?? AIRoomMCPServerConfiguration.default.port
+        )
+        let (aiRoomMCPPortRow, aiRoomMCPPortField) = makeTextFieldRow(
+            label: "AI Room MCP Port:",
+            value: "\(aiRoomMCPPort)",
+            width: width
+        )
+        aiRoomMCPPortField.target = self
+        aiRoomMCPPortField.action = #selector(aiRoomMCPServerPortChanged(_:))
+        aiRoomMCPPortField.isEnabled = aiRoomMCPEnabled
+        aiRoomMCPServerPortField = aiRoomMCPPortField
+        addView(aiRoomMCPPortRow, 28)
+        addSpacing(4)
+        addView(
+            makeDescriptionLabel(
+                "Room-scoped MCP endpoint for AI-to-AI terminal requests. Default: \(AIRoomMCPServerConfiguration.defaultPort).",
+                width: width
+            ),
+            28
+        )
+        addSpacing(8)
+
+        let defaults = AIRoomMCPProtocolConfiguration.default
+        let (instructionRow, instructionField) = makeTextFieldRow(
+            label: "AI Response Instruction:",
+            value: (aiRoomMCPSection["response_instruction_prompt"] as? String)
+                ?? defaults.responseInstructionPrompt,
+            width: width
+        )
+        instructionField.target = self
+        instructionField.action = #selector(aiRoomMCPProtocolFieldChanged(_:))
+        instructionField.isEnabled = aiRoomMCPEnabled
+        aiRoomMCPResponseInstructionField = instructionField
+        addView(instructionRow, 28)
+        addSpacing(8)
+
+        let (beginMarkerRow, beginMarkerField) = makeTextFieldRow(
+            label: "Begin Marker:",
+            value: (aiRoomMCPSection["begin_marker"] as? String) ?? defaults.beginMarker,
+            width: width
+        )
+        beginMarkerField.target = self
+        beginMarkerField.action = #selector(aiRoomMCPProtocolFieldChanged(_:))
+        beginMarkerField.isEnabled = aiRoomMCPEnabled
+        aiRoomMCPBeginMarkerField = beginMarkerField
+        addView(beginMarkerRow, 28)
+        addSpacing(8)
+
+        let (endMarkerRow, endMarkerField) = makeTextFieldRow(
+            label: "End Marker:",
+            value: (aiRoomMCPSection["end_marker"] as? String) ?? defaults.endMarker,
+            width: width
+        )
+        endMarkerField.target = self
+        endMarkerField.action = #selector(aiRoomMCPProtocolFieldChanged(_:))
+        endMarkerField.isEnabled = aiRoomMCPEnabled
+        aiRoomMCPEndMarkerField = endMarkerField
+        addView(endMarkerRow, 28)
+        addSpacing(8)
+
+        let (returnPrefixRow, returnPrefixField) = makeTextFieldRow(
+            label: "Return Prefix:",
+            value: (aiRoomMCPSection["return_prefix_prompt"] as? String)
+                ?? defaults.returnPrefixPrompt,
+            width: width
+        )
+        returnPrefixField.target = self
+        returnPrefixField.action = #selector(aiRoomMCPProtocolFieldChanged(_:))
+        returnPrefixField.isEnabled = aiRoomMCPEnabled
+        aiRoomMCPReturnPrefixField = returnPrefixField
+        addView(returnPrefixRow, 28)
         addSpacing(20)
 
         let resetButton = NSButton(title: "Restore Defaults…", target: self, action: #selector(factoryResetClicked(_:)))
@@ -1289,6 +1379,66 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         mcpServer["port"] = normalizedPort
         configData["mcp_server"] = mcpServer
         commitConfigChange()
+    }
+
+    @objc private func aiRoomMCPServerEnabledChanged(_ sender: NSButton) {
+        var section = (configData["ai_room_mcp_server"] as? [String: Any]) ?? [:]
+        let enabled = (sender.state == .on)
+        section["enabled"] = enabled
+        section["port"] = MCPServerConfiguration.normalizedPort(
+            Int(aiRoomMCPServerPortField?.stringValue ?? "")
+                ?? intVal(section["port"])
+                ?? AIRoomMCPServerConfiguration.default.port
+        )
+        applyAIRoomMCPProtocolFields(to: &section)
+        configData["ai_room_mcp_server"] = section
+        aiRoomMCPServerPortField?.isEnabled = enabled
+        aiRoomMCPResponseInstructionField?.isEnabled = enabled
+        aiRoomMCPBeginMarkerField?.isEnabled = enabled
+        aiRoomMCPEndMarkerField?.isEnabled = enabled
+        aiRoomMCPReturnPrefixField?.isEnabled = enabled
+        commitConfigChange()
+    }
+
+    @objc private func aiRoomMCPServerPortChanged(_ sender: NSTextField) {
+        let normalizedPort = MCPServerConfiguration.normalizedPort(Int(sender.stringValue))
+        sender.stringValue = "\(normalizedPort)"
+        var section = (configData["ai_room_mcp_server"] as? [String: Any]) ?? [:]
+        section["enabled"] = (aiRoomMCPServerEnabledCheck?.state == .on)
+        section["port"] = normalizedPort
+        applyAIRoomMCPProtocolFields(to: &section)
+        configData["ai_room_mcp_server"] = section
+        commitConfigChange()
+    }
+
+    @objc private func aiRoomMCPProtocolFieldChanged(_ sender: NSTextField) {
+        var section = (configData["ai_room_mcp_server"] as? [String: Any]) ?? [:]
+        section["enabled"] = (aiRoomMCPServerEnabledCheck?.state == .on)
+        section["port"] = MCPServerConfiguration.normalizedPort(
+            Int(aiRoomMCPServerPortField?.stringValue ?? "")
+                ?? intVal(section["port"])
+                ?? AIRoomMCPServerConfiguration.default.port
+        )
+        applyAIRoomMCPProtocolFields(to: &section)
+        configData["ai_room_mcp_server"] = section
+        commitConfigChange()
+    }
+
+    private func applyAIRoomMCPProtocolFields(to section: inout [String: Any]) {
+        let protocolConfig = AIRoomMCPProtocolConfiguration(
+            responseInstructionPrompt: aiRoomMCPResponseInstructionField?.stringValue
+                ?? AIRoomMCPProtocolConfiguration.default.responseInstructionPrompt,
+            beginMarker: aiRoomMCPBeginMarkerField?.stringValue
+                ?? AIRoomMCPProtocolConfiguration.default.beginMarker,
+            endMarker: aiRoomMCPEndMarkerField?.stringValue
+                ?? AIRoomMCPProtocolConfiguration.default.endMarker,
+            returnPrefixPrompt: aiRoomMCPReturnPrefixField?.stringValue
+                ?? AIRoomMCPProtocolConfiguration.default.returnPrefixPrompt
+        )
+        section["response_instruction_prompt"] = protocolConfig.responseInstructionPrompt
+        section["begin_marker"] = protocolConfig.beginMarker
+        section["end_marker"] = protocolConfig.endMarker
+        section["return_prefix_prompt"] = protocolConfig.returnPrefixPrompt
     }
 
     @objc private func chooseFontClicked(_ sender: NSButton) {

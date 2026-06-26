@@ -5,6 +5,189 @@ import XCTest
 @testable import PtermApp
 
 final class AppInfrastructureTests: XCTestCase {
+    func testAIRoomChatInstructionPromptUsesDirectCurlCommand() {
+        let targetID = UUID(uuidString: "69AFE3AA-1499-477E-8603-0C932857A2E2")!
+        let prompt = AppDelegate.aiRoomChatInstructionPrompt(
+            port: 46258,
+            password: "secret-pass",
+            targetTerminalID: targetID,
+            text: "review this\nand reply"
+        )
+
+        XCTAssertTrue(prompt.contains("Do not configure an MCP client. Use curl directly."))
+        XCTAssertTrue(prompt.contains("MCP HTTP endpoint URL:\nhttp://127.0.0.1:46258/"))
+        XCTAssertTrue(prompt.contains("/usr/bin/curl -sS -X POST 'http://127.0.0.1:46258/'"))
+        XCTAssertTrue(prompt.contains("-H 'Authorization: Bearer secret-pass'"))
+        XCTAssertTrue(prompt.contains("-H \"X-Pterm-Terminal-Id: ${PTERM_TERMINAL_ID:?PTERM_TERMINAL_ID is not set}\""))
+        XCTAssertTrue(prompt.contains("\"name\":\"send_room_message\""))
+        XCTAssertTrue(prompt.contains("\"target_terminal_id\":\"69AFE3AA-1499-477E-8603-0C932857A2E2\""))
+        XCTAssertTrue(prompt.contains("\"message\":\"review this\\nand reply\""))
+        XCTAssertTrue(prompt.contains("The curl result is only an acknowledgement."))
+    }
+
+    func testShellSingleQuotedEscapesApostrophesForCurlPayload() {
+        XCTAssertEqual(AppDelegate.shellSingleQuoted("it's ok"), "'it'\\''s ok'")
+    }
+
+    func testAIRoomTargetPromptAddsStrictMarkerFormatWithoutConfiguredMarkerExamples() {
+        let prompt = AppDelegate.aiRoomTargetPrompt(
+            protocolConfiguration: AIRoomMCPProtocolConfiguration(
+                responseInstructionPrompt: "Reply with markers.",
+                beginMarker: "BEGIN",
+                endMarker: "END",
+                returnPrefixPrompt: "Returned"
+            ),
+            message: "review this"
+        )
+
+        XCTAssertFalse(prompt.contains("Reply with markers."))
+        XCTAssertTrue(prompt.contains("pterm reads the marker lines automatically"))
+        XCTAssertTrue(prompt.contains("CRITICAL: Your entire answer must use exactly this format:"))
+        XCTAssertTrue(prompt.contains("BEGIN\n<your response text>\nEND"))
+        XCTAssertTrue(prompt.contains("If either exact marker is missing, pterm cannot detect or deliver your answer."))
+        XCTAssertTrue(prompt.contains("Do not wrap the markers in quotes or a code block."))
+        XCTAssertTrue(prompt.hasSuffix("Message:\nreview this"))
+    }
+
+    func testAIRoomTargetPromptUsesRequestSpecificMarkers() {
+        let prompt = AppDelegate.aiRoomTargetPrompt(
+            protocolConfiguration: AIRoomMCPProtocolConfiguration(
+                responseInstructionPrompt: "Use BEGIN and END.",
+                beginMarker: "BEGIN",
+                endMarker: "END",
+                returnPrefixPrompt: "Returned"
+            ),
+            beginMarker: "BEGIN__ABC123__",
+            endMarker: "END__ABC123__",
+            message: "review this"
+        )
+
+        XCTAssertTrue(prompt.contains("BEGIN__ABC123__\n<your response text>\nEND__ABC123__"))
+        XCTAssertTrue(prompt.contains("The first line must be exactly:\nBEGIN__ABC123__"))
+        XCTAssertTrue(prompt.contains("The final line must be exactly:\nEND__ABC123__"))
+        XCTAssertTrue(prompt.contains("Do not omit the final line."))
+    }
+
+    func testAIRoomViewportPollingUsesOnlyTextAddedAfterBaseline() {
+        let baseline = """
+        old prompt
+        AI_RESPONSE_BEGIN
+        first answer
+        AI_RESPONSE_END
+        """
+        let current = baseline + "\nnew prompt\nAI_RESPONSE_BEGIN\nsecond answer\nAI_RESPONSE_END"
+
+        XCTAssertEqual(
+            AppDelegate.textAddedAfterViewportBaseline(baseline, currentText: current),
+            "\nnew prompt\nAI_RESPONSE_BEGIN\nsecond answer\nAI_RESPONSE_END"
+        )
+    }
+
+    func testAIRoomViewportPollingHandlesScrolledOverlap() {
+        let baseline = """
+        line 1
+        line 2
+        AI_RESPONSE_BEGIN
+        first answer
+        AI_RESPONSE_END
+        """
+        let current = """
+        AI_RESPONSE_BEGIN
+        first answer
+        AI_RESPONSE_END
+        AI_RESPONSE_BEGIN
+        second answer
+        AI_RESPONSE_END
+        """
+
+        XCTAssertEqual(
+            AppDelegate.textAddedAfterViewportBaseline(baseline, currentText: current),
+            "\nAI_RESPONSE_BEGIN\nsecond answer\nAI_RESPONSE_END"
+        )
+    }
+
+    func testAIRoomMCPConfigurationDefaults() {
+        let config = PtermConfigStore.load(from: URL(fileURLWithPath: "/tmp/pterm-missing-config-\(UUID().uuidString).json"))
+
+        XCTAssertTrue(config.aiRoomMCPServer.enabled)
+        XCTAssertEqual(config.aiRoomMCPServer.port, 46258)
+        XCTAssertEqual(config.aiRoomMCPServer.protocolConfiguration.beginMarker, "AI_RESPONSE_BEGIN")
+        XCTAssertEqual(config.aiRoomMCPServer.protocolConfiguration.endMarker, "AI_RESPONSE_END")
+        XCTAssertTrue(config.aiRoomMCPServer.rooms.isEmpty)
+    }
+
+    func testAIRoomMCPConfigurationParsesRoomsAndProtocolSettings() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pterm-config-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let configURL = directory.appendingPathComponent("config.json")
+        let firstID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+        let secondID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+        let json = """
+        {
+          "ai_room_mcp_server": {
+            "enabled": true,
+            "port": 46259,
+            "response_instruction_prompt": "Prompt",
+            "begin_marker": "BEGIN",
+            "end_marker": "END",
+            "return_prefix_prompt": "Returned",
+            "rooms": [
+              {
+                "id": "room-1",
+                "name": "Review",
+                "terminal_ids": [
+                  "\(firstID.uuidString)",
+                  "\(secondID.uuidString)"
+                ]
+              }
+            ]
+          }
+        }
+        """
+        try Data(json.utf8).write(to: configURL)
+
+        let config = PtermConfigStore.load(from: configURL)
+
+        XCTAssertEqual(config.aiRoomMCPServer.port, 46259)
+        XCTAssertEqual(config.aiRoomMCPServer.protocolConfiguration.responseInstructionPrompt, "Prompt")
+        XCTAssertEqual(config.aiRoomMCPServer.protocolConfiguration.beginMarker, "BEGIN")
+        XCTAssertEqual(config.aiRoomMCPServer.protocolConfiguration.endMarker, "END")
+        XCTAssertEqual(config.aiRoomMCPServer.protocolConfiguration.returnPrefixPrompt, "Returned")
+        XCTAssertEqual(config.aiRoomMCPServer.rooms.count, 1)
+        XCTAssertEqual(config.aiRoomMCPServer.rooms[0].id, "room-1")
+        XCTAssertEqual(config.aiRoomMCPServer.rooms[0].name, "Review")
+        XCTAssertEqual(config.aiRoomMCPServer.rooms[0].terminalIDs, Set([firstID, secondID]))
+    }
+
+    func testAIRoomMCPConfigurationPreservesEmptyRooms() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pterm-config-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let configURL = directory.appendingPathComponent("config.json")
+        let json = """
+        {
+          "ai_room_mcp_server": {
+            "rooms": [
+              {
+                "id": "empty-room",
+                "name": "Empty Review Room",
+                "terminal_ids": []
+              }
+            ]
+          }
+        }
+        """
+        try Data(json.utf8).write(to: configURL)
+
+        let config = PtermConfigStore.load(from: configURL)
+
+        XCTAssertEqual(config.aiRoomMCPServer.rooms.count, 1)
+        XCTAssertEqual(config.aiRoomMCPServer.rooms[0].id, "empty-room")
+        XCTAssertEqual(config.aiRoomMCPServer.rooms[0].name, "Empty Review Room")
+        XCTAssertTrue(config.aiRoomMCPServer.rooms[0].terminalIDs.isEmpty)
+    }
+
     func testLaunchOptionsParseChromeStyleProfileDirectoryEqualsForm() throws {
         let cwd = URL(fileURLWithPath: "/tmp/current", isDirectory: true)
         let options = try LaunchOptions.parse(

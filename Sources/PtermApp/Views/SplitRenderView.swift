@@ -45,10 +45,12 @@ final class SplitRenderView: MTKView {
     private var viewIsOpaque = false
     private var idleBufferReleaseTimer: Timer?
     private var outputPulseTimer: Timer?
+    private var outputPulseInterval: TimeInterval?
     private var inlineImageLayers: [String: CALayer] = [:]
     private var inlineImageLayerIDs: [String: InlineImageLayerID] = [:]
 
     var debugHasOutputPulseTimer: Bool { outputPulseTimer != nil }
+    var debugOutputPulseInterval: TimeInterval? { outputPulseInterval }
     var debugInlineImageLayerCount: Int { inlineImageLayers.count }
     func debugInlineImageLayerFrames() -> [CGRect] {
         inlineImageLayers.values.map(\.frame).sorted { lhs, rhs in
@@ -82,6 +84,7 @@ final class SplitRenderView: MTKView {
     deinit {
         idleBufferReleaseTimer?.invalidate()
         outputPulseTimer?.invalidate()
+        outputPulseInterval = nil
         clearInlineImageLayers()
         renderer.removeBuffers(for: self)
     }
@@ -125,17 +128,26 @@ final class SplitRenderView: MTKView {
     private func updateOutputPulseTimer() {
         outputPulseTimer?.invalidate()
         outputPulseTimer = nil
+        outputPulseInterval = nil
         guard hasActiveOutput else { return }
         let configuredCap = max(outputFrameThrottlingMode.preferredOutputFPSCap, 1)
         let screenCap = window?.screen?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? 0
         let effectiveCap = screenCap > 0 ? min(configuredCap, screenCap) : configuredCap
         let floorInterval = 1.0 / Double(max(effectiveCap, 1))
-        let interval = max(floorInterval, 0.25 / outputFrameThrottlingMode.redrawCadenceCoefficient)
+        // Split rendering redraws every pane in one pass, so continuous-mode pulse
+        // rates that are acceptable for a single focused terminal are too expensive here.
+        let splitRenderFloorInterval: TimeInterval = 0.25
+        let interval = max(
+            splitRenderFloorInterval,
+            floorInterval,
+            0.25 / outputFrameThrottlingMode.redrawCadenceCoefficient
+        )
         let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.requestRender()
         }
         RunLoop.main.add(timer, forMode: .common)
         outputPulseTimer = timer
+        outputPulseInterval = interval
     }
 
     private func scheduleIdleBufferRelease() {
@@ -311,6 +323,7 @@ final class SplitRenderView: MTKView {
         idleBufferReleaseTimer = nil
         outputPulseTimer?.invalidate()
         outputPulseTimer = nil
+        outputPulseInterval = nil
         renderer.releaseSplitBuffers(for: self)
         _ = renderer.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
         drawableSize = .zero
@@ -321,6 +334,7 @@ final class SplitRenderView: MTKView {
         idleBufferReleaseTimer = nil
         outputPulseTimer?.invalidate()
         outputPulseTimer = nil
+        outputPulseInterval = nil
         renderer.releaseSplitBuffers(for: self)
         _ = renderer.compactIdleGlyphAtlas(maximumInactiveGenerations: 0)
     }

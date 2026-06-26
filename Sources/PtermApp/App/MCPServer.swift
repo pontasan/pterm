@@ -19,6 +19,13 @@ struct MCPToolDefinition {
 protocol MCPToolProvider: AnyObject {
     func toolDefinitions() -> [MCPToolDefinition]
     func callTool(named name: String, arguments: [String: Any]) throws -> String
+    func shouldCallToolOnMainThread(named name: String) -> Bool
+}
+
+extension MCPToolProvider {
+    func shouldCallToolOnMainThread(named name: String) -> Bool {
+        true
+    }
 }
 
 enum MCPServerError: LocalizedError {
@@ -48,24 +55,50 @@ enum MCPServerError: LocalizedError {
 }
 
 final class MCPServer {
-    private let configuration: MCPServerConfiguration
+    private let portValue: Int
+    private let serverName: String
     private weak var toolProvider: MCPToolProvider?
     private let queue = DispatchQueue(label: "com.pterm.mcp-server", qos: .userInitiated)
     private var listener: NWListener?
     private let authToken: String
-    private let tokenFileURL: URL
+    private let tokenFileURL: URL?
+    private let authInstructions: String
+    private let unauthenticatedToolNames: Set<String>
 
     /// Maximum request buffer size: 1 MB. Requests exceeding this are rejected with 413.
     static let maximumRequestBufferSize = 1_048_576
 
     init(configuration: MCPServerConfiguration, toolProvider: MCPToolProvider) {
-        self.configuration = configuration
+        self.portValue = configuration.port
+        self.serverName = "pterm-mcp"
         self.toolProvider = toolProvider
         self.authToken = Self.generateToken()
         self.tokenFileURL = PtermDirectories.base.appendingPathComponent("mcp-token")
+        self.authInstructions = "Read the session token from the file at token_file (permissions 0600, owner-only). "
+            + "Include it in every subsequent request as an HTTP header: Authorization: Bearer <token>. "
+            + "The token is regenerated each time pterm starts."
+        self.unauthenticatedToolNames = []
     }
 
-    var port: Int { configuration.port }
+    init(
+        port: Int,
+        serverName: String,
+        authToken: String,
+        tokenFileURL: URL?,
+        authInstructions: String,
+        unauthenticatedToolNames: Set<String> = [],
+        toolProvider: MCPToolProvider
+    ) {
+        self.portValue = MCPServerConfiguration.normalizedPort(port)
+        self.serverName = serverName
+        self.toolProvider = toolProvider
+        self.authToken = authToken
+        self.tokenFileURL = tokenFileURL
+        self.authInstructions = authInstructions
+        self.unauthenticatedToolNames = unauthenticatedToolNames
+    }
+
+    var port: Int { portValue }
 
     func start() throws {
         // Write auth token to file with 0600 permissions before accepting connections.
@@ -75,7 +108,7 @@ final class MCPServer {
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
             host: .ipv4(.loopback),
-            port: NWEndpoint.Port(rawValue: UInt16(configuration.port))!
+            port: NWEndpoint.Port(rawValue: UInt16(portValue))!
         )
 
         let listener = try NWListener(using: parameters)
@@ -109,6 +142,7 @@ final class MCPServer {
     }
 
     private func writeTokenFile() throws {
+        guard let tokenFileURL else { return }
         let fm = FileManager.default
         let dir = tokenFileURL.deletingLastPathComponent()
         if !fm.fileExists(atPath: dir.path) {
@@ -140,6 +174,7 @@ final class MCPServer {
     }
 
     private func removeTokenFile() {
+        guard let tokenFileURL else { return }
         try? FileManager.default.removeItem(at: tokenFileURL)
     }
 
@@ -179,7 +214,7 @@ final class MCPServer {
                 if !parsed.authorized {
                     // Allow unauthenticated access to auth/info so clients can
                     // discover how to obtain a session token.
-                    if let unauthResponse = self.handleUnauthenticatedRequest(parsed.body) {
+                    if let unauthResponse = self.handleUnauthenticatedRequest(parsed.body, headers: parsed.headers) {
                         response = unauthResponse
                     } else {
                         response = self.httpResponse(
@@ -192,7 +227,7 @@ final class MCPServer {
                         )
                     }
                 } else {
-                    response = self.handleRequest(parsed.body)
+                    response = self.handleRequest(parsed.body, headers: parsed.headers)
                 }
                 self.send(response: response, on: connection)
                 return
@@ -210,6 +245,7 @@ final class MCPServer {
     private struct ParsedHTTPRequest {
         let body: Data
         let authorized: Bool
+        let headers: [String: String]
     }
 
     /// Parse HTTP request, extracting the body and checking the Authorization header.
@@ -221,26 +257,28 @@ final class MCPServer {
         }
         let headerData = data[..<headerRange.lowerBound]
         guard let headerString = String(data: headerData, encoding: .utf8) else {
-            return ParsedHTTPRequest(body: Data(), authorized: false)
+            return ParsedHTTPRequest(body: Data(), authorized: false, headers: [:])
         }
         let lines = headerString.components(separatedBy: "\r\n")
         guard let requestLine = lines.first, requestLine.hasPrefix("POST ") else {
-            return ParsedHTTPRequest(body: Data(), authorized: false)
+            return ParsedHTTPRequest(body: Data(), authorized: false, headers: [:])
         }
 
         // Extract headers
         var contentLength = 0
         var bearerToken: String?
+        var headers: [String: String] = [:]
         for line in lines.dropFirst() {
             let parts = line.split(separator: ":", maxSplits: 1).map(String.init)
             guard parts.count == 2 else { continue }
             let headerName = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
             let headerValue = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            headers[headerName.lowercased()] = headerValue
 
             if headerName.caseInsensitiveCompare("Content-Length") == .orderedSame {
                 let parsed = Int(headerValue) ?? 0
                 guard parsed >= 0, parsed <= Self.maximumRequestBufferSize else {
-                    return ParsedHTTPRequest(body: Data(), authorized: false)
+                    return ParsedHTTPRequest(body: Data(), authorized: false, headers: headers)
                 }
                 contentLength = parsed
             } else if headerName.caseInsensitiveCompare("Authorization") == .orderedSame {
@@ -271,31 +309,55 @@ final class MCPServer {
             authorized = false
         }
 
-        return ParsedHTTPRequest(body: body, authorized: authorized)
+        return ParsedHTTPRequest(body: body, authorized: authorized, headers: headers)
     }
 
     // MARK: - Unauthenticated Endpoint
 
     /// Handle a limited set of methods that do not require authentication.
     /// Returns a response if the method is allowed unauthenticated, nil otherwise.
-    private func handleUnauthenticatedRequest(_ body: Data) -> Data? {
+    private func handleUnauthenticatedRequest(_ body: Data, headers: [String: String]) -> Data? {
         guard !body.isEmpty,
               let jsonObject = try? JSONSerialization.jsonObject(with: body),
               let request = jsonObject as? [String: Any],
-              let method = request["method"] as? String,
-              method == "auth/info" else {
+              let method = request["method"] as? String else {
             return nil
         }
         let id = request["id"]
-        let result: [String: Any] = [
-            "token_file": tokenFileURL.path,
-            "auth_scheme": "Bearer",
-            "header_format": "Authorization: Bearer <token>",
-            "instructions": "Read the session token from the file at token_file (permissions 0600, owner-only). "
-                + "Include it in every subsequent request as an HTTP header: Authorization: Bearer <token>. "
-                + "The token is regenerated each time pterm starts."
-        ]
-        return httpResponse(status: 200, body: responseBody(id: id, result: result))
+        if method == "auth/info" {
+            return httpResponse(status: 200, body: responseBody(id: id, result: authInfoPayload()))
+        }
+        if method == "tools/list", !unauthenticatedToolNames.isEmpty {
+            do {
+                let tools = try performOnMain {
+                    self.toolProvider?.toolDefinitions()
+                        .filter { self.unauthenticatedToolNames.contains($0.name) }
+                        .map(\.jsonObject) ?? []
+                }
+                return httpResponse(status: 200, body: responseBody(id: id, result: ["tools": tools]))
+            } catch {
+                return httpResponse(
+                    status: 200,
+                    body: errorBody(code: -32000, message: error.localizedDescription, id: id)
+                )
+            }
+        }
+        guard method == "tools/call",
+              let params = request["params"] as? [String: Any],
+              let name = params["name"] as? String,
+              unauthenticatedToolNames.contains(name) else {
+            return nil
+        }
+        do {
+            let arguments = params["arguments"] as? [String: Any] ?? [:]
+            let result = try dispatchToolCall(name: name, arguments: arguments, headers: headers)
+            return httpResponse(status: 200, body: responseBody(id: id, result: result))
+        } catch {
+            return httpResponse(
+                status: 200,
+                body: errorBody(code: -32000, message: error.localizedDescription, id: id)
+            )
+        }
     }
 
     /// Extract the JSON-RPC "id" field from raw body data, returning nil on failure.
@@ -308,7 +370,7 @@ final class MCPServer {
         return request["id"]
     }
 
-    private func handleRequest(_ body: Data) -> Data {
+    private func handleRequest(_ body: Data, headers: [String: String]) -> Data {
         guard !body.isEmpty else {
             return httpResponse(status: 400, body: errorBody(code: -32600, message: "Empty request body", id: nil))
         }
@@ -323,7 +385,11 @@ final class MCPServer {
         }
 
         do {
-            let result = try dispatch(method: method, params: request["params"] as? [String: Any] ?? [:])
+            let result = try dispatch(
+                method: method,
+                params: request["params"] as? [String: Any] ?? [:],
+                headers: headers
+            )
             return httpResponse(status: 200, body: responseBody(id: id, result: result))
         } catch {
             return httpResponse(
@@ -333,7 +399,7 @@ final class MCPServer {
         }
     }
 
-    private func dispatch(method: String, params: [String: Any]) throws -> [String: Any] {
+    private func dispatch(method: String, params: [String: Any], headers: [String: String]) throws -> [String: Any] {
         switch method {
         case "initialize":
             return [
@@ -342,7 +408,7 @@ final class MCPServer {
                     "tools": [:]
                 ],
                 "serverInfo": [
-                    "name": "pterm-mcp",
+                    "name": serverName,
                     "version": "1.0"
                 ]
             ]
@@ -351,14 +417,7 @@ final class MCPServer {
         case "ping":
             return [:]
         case "auth/info":
-            return [
-                "token_file": tokenFileURL.path,
-                "auth_scheme": "Bearer",
-                "header_format": "Authorization: Bearer <token>",
-                "instructions": "Read the session token from the file at token_file (permissions 0600, owner-only). "
-                    + "Include it in every subsequent request as an HTTP header: Authorization: Bearer <token>. "
-                    + "The token is regenerated each time pterm starts."
-            ]
+            return authInfoPayload()
         case "tools/list":
             let tools = try performOnMain {
                 self.toolProvider?.toolDefinitions().map(\.jsonObject) ?? []
@@ -369,24 +428,48 @@ final class MCPServer {
                 throw MCPServerError.invalidRequest
             }
             let arguments = params["arguments"] as? [String: Any] ?? [:]
-            let text = try performOnMain {
-                guard let toolProvider = self.toolProvider else {
-                    throw MCPServerError.toolNotFound(name)
-                }
-                return try toolProvider.callTool(named: name, arguments: arguments)
-            }
-            return [
-                "content": [
-                    [
-                        "type": "text",
-                        "text": text
-                    ]
-                ],
-                "isError": false
-            ]
+            return try dispatchToolCall(name: name, arguments: arguments, headers: headers)
         default:
             throw MCPServerError.unsupportedMethod(method)
         }
+    }
+
+    private func authInfoPayload() -> [String: Any] {
+        [
+            "token_file": tokenFileURL?.path ?? NSNull(),
+            "auth_scheme": "Bearer",
+            "header_format": "Authorization: Bearer <token>",
+            "instructions": authInstructions
+        ]
+    }
+
+    private func dispatchToolCall(
+        name: String,
+        arguments: [String: Any],
+        headers: [String: String]
+    ) throws -> [String: Any] {
+        var argumentsWithRequestContext = arguments
+        argumentsWithRequestContext["__request_headers"] = headers
+        guard let toolProvider = self.toolProvider else {
+            throw MCPServerError.toolNotFound(name)
+        }
+        let text: String
+        if toolProvider.shouldCallToolOnMainThread(named: name) {
+            text = try performOnMain {
+                try toolProvider.callTool(named: name, arguments: argumentsWithRequestContext)
+            }
+        } else {
+            text = try toolProvider.callTool(named: name, arguments: argumentsWithRequestContext)
+        }
+        return [
+            "content": [
+                [
+                    "type": "text",
+                    "text": text
+                ]
+            ],
+            "isError": false
+        ]
     }
 
     private func performOnMain<T>(_ body: () throws -> T) throws -> T {

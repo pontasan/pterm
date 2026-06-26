@@ -286,6 +286,7 @@ final class IntegratedView: MTKView, NSDraggingSource {
     var onRenameWorkspace: ((String, String) -> Void)?
     var onMoveTerminalToWorkspace: ((TerminalController, String) -> Void)?
     var onRenameTerminalTitle: ((TerminalController, String?) -> Void)?
+    var onCancelAIRoomWait: ((TerminalController) -> Void)?
 
     /// Set of currently selected terminals (for multi-select with Shift)
     private(set) var selectedTerminals: Set<UUID> = []
@@ -329,6 +330,13 @@ final class IntegratedView: MTKView, NSDraggingSource {
             updateRenderLoopState()
             setNeedsDisplay(bounds)
         }
+    }
+    private var aiRoomWaitingTerminalIDs: Set<UUID> = []
+
+    func setAIRoomWaitingTerminalIDs(_ terminalIDs: Set<UUID>) {
+        guard aiRoomWaitingTerminalIDs != terminalIDs else { return }
+        aiRoomWaitingTerminalIDs = terminalIDs
+        setNeedsDisplay(bounds)
     }
 
     @discardableResult
@@ -1827,6 +1835,17 @@ final class IntegratedView: MTKView, NSDraggingSource {
         return nil
     }
 
+    private func aiRoomWaitingTitleTarget(at point: NSPoint) -> TerminalController? {
+        guard !aiRoomWaitingTerminalIDs.isEmpty else { return nil }
+        for layout in cachedFlattenedThumbnails
+            where aiRoomWaitingTerminalIDs.contains(layout.controller.id)
+                && layout.title.contains(point)
+                && !layout.close.insetBy(dx: -4, dy: -4).contains(point) {
+            return layout.controller
+        }
+        return nil
+    }
+
     /// Returns true when the point is inside a workspace frame but not over
     /// any interactive element (thumbnail, button, header, title).
     private func isOverWorkspaceBackground(at point: NSPoint) -> Bool {
@@ -1880,6 +1899,11 @@ final class IntegratedView: MTKView, NSDraggingSource {
            workspaceAddTarget(at: point) == nil,
            workspaceRemoveTarget(at: point) == nil {
             promptRenameWorkspace(workspace)
+            return
+        }
+
+        if let controller = aiRoomWaitingTitleTarget(at: point) {
+            onCancelAIRoomWait?(controller)
             return
         }
 
@@ -3185,12 +3209,15 @@ extension IntegratedView: MTKViewDelegate {
         glyphVertices: inout [Float]
     ) {
         let maxChars = Int(frame.width / renderer.glyphAtlas.cellWidth) - 2 // Leave room for close button
-        let displayTitle = String(title.prefix(max(0, maxChars)))
+        let rawTitle = aiRoomWaitingTerminalIDs.contains(controllerID) ? "[MCP] \(title)" : title
+        let displayTitle = String(rawTitle.prefix(max(0, maxChars)))
         let titleVertices = textVertices(
             for: displayTitle,
             scaleFactor: scaleFactor,
             glyphScale: 0.85,
-            color: Self.uiTitleTextColor(alpha: 1.0),
+            color: aiRoomWaitingTerminalIDs.contains(controllerID)
+                ? (0.65, 0.82, 1.0, 1.0)
+                : Self.uiTitleTextColor(alpha: 1.0),
             useCache: true
         )
         appendTranslatedVertices(

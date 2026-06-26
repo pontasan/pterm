@@ -17,6 +17,7 @@ final class TerminalManagerIntegrationTests: XCTestCase {
             audit: .disabled,
             security: .default,
             mcpServer: .default,
+            aiRoomMCPServer: .default,
             ai: .default,
             ioHooks: .default,
             shortcuts: .default,

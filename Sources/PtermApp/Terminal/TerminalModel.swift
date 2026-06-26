@@ -151,6 +151,7 @@ final class TerminalModel {
     /// to the hook manager for line/idle mode text capture.
     /// Set by TerminalController when hooks are active; nil otherwise (zero cost).
     var hookTextSink: ((UInt32) -> Void)?
+    var mcpTextSink: ((UInt32) -> Void)?
 
     /// Called when the terminal switches between normal and alternate screen
     /// buffers.  The Bool is true when entering alternate screen.
@@ -1044,6 +1045,7 @@ final class TerminalModel {
     }
 
     private func handleASCIIRun(_ codepoints: UnsafePointer<UInt32>, count: Int) {
+        dispatchPrintedCodepoints(codepoints, count: count)
         previousPrintableEndsWithZWJ = false
         handleSingleWidthCodepointRun(codepoints, count: count)
     }
@@ -2164,6 +2166,7 @@ final class TerminalModel {
 
     private func handleASCIIByteRun(_ bytes: UnsafePointer<UInt8>, count: Int, containsSpace: Bool) {
         guard count > 0 else { return }
+        dispatchPrintedASCIIBytes(bytes, count: count)
         previousPrintableEndsWithZWJ = false
 
         let attributes = currentPrintAttributes()
@@ -2357,6 +2360,7 @@ final class TerminalModel {
 
     private func handleRepeatedASCIIByte(_ byte: UInt8, count: Int) {
         guard count > 0 else { return }
+        dispatchRepeatedPrintedCodepoint(UInt32(byte), count: count)
         previousPrintableEndsWithZWJ = false
 
         var remainingCount = count
@@ -2450,6 +2454,36 @@ final class TerminalModel {
         }
     }
 
+    private func dispatchPrintedCodepoint(_ codepoint: UInt32) {
+        if let sink = hookTextSink {
+            sink(codepoint)
+        }
+        if let sink = mcpTextSink {
+            sink(codepoint)
+        }
+    }
+
+    private func dispatchPrintedCodepoints(_ codepoints: UnsafePointer<UInt32>, count: Int) {
+        guard count > 0, hookTextSink != nil || mcpTextSink != nil else { return }
+        for index in 0..<count {
+            dispatchPrintedCodepoint(codepoints[index])
+        }
+    }
+
+    private func dispatchPrintedASCIIBytes(_ bytes: UnsafePointer<UInt8>, count: Int) {
+        guard count > 0, hookTextSink != nil || mcpTextSink != nil else { return }
+        for index in 0..<count {
+            dispatchPrintedCodepoint(UInt32(bytes[index]))
+        }
+    }
+
+    private func dispatchRepeatedPrintedCodepoint(_ codepoint: UInt32, count: Int) {
+        guard count > 0, hookTextSink != nil || mcpTextSink != nil else { return }
+        for _ in 0..<count {
+            dispatchPrintedCodepoint(codepoint)
+        }
+    }
+
     private func handlePrint(_ codepoint: UInt32) {
         let translatedCodepoint: UInt32
         let width: Int
@@ -2468,12 +2502,7 @@ final class TerminalModel {
         }
         guard width >= 0 else { return } // Non-printable
 
-        // Forward to I/O hook text sink (line/idle mode capture).
-        // When nil (no hooks active), the compiler elides this to a single
-        // branch-not-taken.  Only printable codepoints reach here.
-        if let sink = hookTextSink {
-            sink(translatedCodepoint)
-        }
+        dispatchPrintedCodepoint(translatedCodepoint)
 
         if shouldAttemptAppendToPreviousGraphemeCluster(translatedCodepoint, width: width) {
             if tryAppendToPreviousGraphemeCluster(translatedCodepoint, width: width) {

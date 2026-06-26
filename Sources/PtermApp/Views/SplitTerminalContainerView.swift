@@ -19,6 +19,8 @@ final class SplitTerminalContainerView: NSView {
     private var identityHeaderVisible = false
     private var stagedSelectionModeActive = false
     private var scrollViews: [TerminalScrollView] = []
+    private var aiRoomWaitingMessagesByTerminalID: [UUID: String] = [:]
+    private var aiRoomWaitingButtonsByTerminalID: [UUID: NSButton] = [:]
     /// Single MTKView overlay that renders all terminal cells.
     /// Avoids macOS CAMetalLayer compositing issues with multiple Metal layers.
     private var splitRenderView: SplitRenderView?
@@ -56,6 +58,7 @@ final class SplitTerminalContainerView: NSView {
     var onMaximizeTerminal: ((TerminalController) -> Void)?
     var onCommandClickTerminal: ((TerminalController) -> Void)?
     var onCommitSelectedControllers: (([TerminalController]) -> Void)?
+    var onCancelAIRoomWait: ((UUID) -> Void)?
     var imagePreviewURLProvider: ((UUID, Int) -> URL?)? {
         didSet {
             scrollViews.forEach { $0.terminalView.imagePreviewURLProvider = imagePreviewURLProvider }
@@ -239,6 +242,10 @@ final class SplitTerminalContainerView: NSView {
                 guard let self, let controller else { return }
                 self.toggleSplitSelection(for: controller)
             }
+            scrollView.terminalView.onCancelAIRoomWait = { [weak self, weak controller] in
+                guard let self, let controller else { return }
+                self.onCancelAIRoomWait?(controller.id)
+            }
             scrollView.toolTip = commandClickTooltip
             scrollView.terminalView.cmdClickMenuLabel = cmdClickMenuLabel
         }
@@ -258,6 +265,7 @@ final class SplitTerminalContainerView: NSView {
         splitRenderView?.outputFrameThrottlingMode = outputFrameThrottlingMode
         splitRenderView?.hasActiveOutput = !activeOutputTerminalIDs.isEmpty
         syncRenderCells()
+        syncAIRoomWaitingButtons()
         applyAppearanceSettings()
     }
 
@@ -303,6 +311,68 @@ final class SplitTerminalContainerView: NSView {
 
         splitRenderView?.frame = bounds
         syncRenderCells()
+        layoutAIRoomWaitingButtons()
+    }
+
+    func setAIRoomWaitingMessages(_ messagesByTerminalID: [UUID: String]) {
+        let relevantIDs = Set(controllers.map(\.id))
+        aiRoomWaitingMessagesByTerminalID = messagesByTerminalID.filter { relevantIDs.contains($0.key) }
+        syncAIRoomWaitingButtons()
+    }
+
+    private func syncAIRoomWaitingButtons() {
+        let desiredIDs = Set(aiRoomWaitingMessagesByTerminalID.keys)
+        let obsoleteIDs = aiRoomWaitingButtonsByTerminalID.keys.filter { !desiredIDs.contains($0) }
+        for terminalID in obsoleteIDs {
+            aiRoomWaitingButtonsByTerminalID.removeValue(forKey: terminalID)?.removeFromSuperview()
+        }
+        for terminalID in desiredIDs {
+            let button = aiRoomWaitingButtonsByTerminalID[terminalID] ?? {
+                let button = NSButton(title: "", target: self, action: #selector(cancelAIRoomWaitClicked(_:)))
+                button.bezelStyle = .regularSquare
+                button.isBordered = false
+                button.font = .systemFont(ofSize: 12, weight: .semibold)
+                button.contentTintColor = .white
+                button.wantsLayer = true
+                button.layer?.cornerRadius = 6
+                button.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.58).cgColor
+                button.identifier = NSUserInterfaceItemIdentifier(terminalID.uuidString)
+                addSubview(button)
+                aiRoomWaitingButtonsByTerminalID[terminalID] = button
+                return button
+            }()
+            button.title = aiRoomWaitingMessagesByTerminalID[terminalID] ?? ""
+            button.toolTip = "Click to cancel AI Room MCP wait"
+        }
+        layoutAIRoomWaitingButtons()
+    }
+
+    private func layoutAIRoomWaitingButtons() {
+        for (terminalID, button) in aiRoomWaitingButtonsByTerminalID {
+            guard let scrollView = scrollViews.first(where: { $0.terminalView.terminalController?.id == terminalID }) else {
+                button.isHidden = true
+                continue
+            }
+            button.isHidden = false
+            let cell = scrollView.frame
+            let fittingSize = button.fittingSize
+            let width = min(max(fittingSize.width + 28, 200), max(cell.width - 24, 140))
+            let height: CGFloat = 28
+            button.frame = NSRect(
+                x: cell.midX - width / 2,
+                y: cell.maxY - height - 8,
+                width: width,
+                height: height
+            )
+        }
+    }
+
+    @objc private func cancelAIRoomWaitClicked(_ sender: NSButton) {
+        guard let rawID = sender.identifier?.rawValue,
+              let terminalID = UUID(uuidString: rawID) else {
+            return
+        }
+        onCancelAIRoomWait?(terminalID)
     }
 
     func fontSizeDidChange() {

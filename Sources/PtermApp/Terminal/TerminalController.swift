@@ -14,6 +14,11 @@ import Dispatch
 /// lock for the entire decode+parse operation, while rendering and search
 /// paths take shared read locks.
 final class TerminalController {
+    struct TextBaseline {
+        let absoluteLastRow: Int?
+        let lastRowCharacterCount: Int
+    }
+
     private static let kittyImageProcessingConcurrency = min(
         max(ProcessInfo.processInfo.activeProcessorCount / 2, 2),
         8
@@ -595,7 +600,8 @@ final class TerminalController {
             initialDirectory: initialDirectory,
             shellLaunchOrder: shellLaunchOrder,
             executablePath: executablePath,
-            arguments: executableArguments
+            arguments: executableArguments,
+            ptermTerminalID: id.uuidString
         )
         ptyResizeLock.withLock {
             appliedPTYSize = (r, c)
@@ -615,6 +621,12 @@ final class TerminalController {
             releaseScratchStorageNow()
         }
         pty.stop(waitForExit: waitForExit)
+    }
+
+    func setMCPTextSink(_ sink: ((UInt32) -> Void)?) {
+        lock.withWriteLock {
+            model.mcpTextSink = sink
+        }
     }
 
     /// Send SIGTERM and close PTY without blocking. Call awaitExit() later.
@@ -765,6 +777,18 @@ final class TerminalController {
     func sendInput(_ string: String) {
         guard let data = textEncoding.encode(string) else { return }
         sendInput(data)
+    }
+
+    func inputSequenceForPastedText(_ text: String) -> String {
+        guard withModel({ $0.bracketedPasteMode }) else {
+            return text
+        }
+        let sanitized = text.replacingOccurrences(of: "\u{1B}[201~", with: "")
+        return "\u{1B}[200~" + sanitized + "\u{1B}[201~"
+    }
+
+    func sendPastedText(_ text: String) {
+        sendInput(inputSequenceForPastedText(text))
     }
 
     /// Sequence emitted for an Enter/Return keypress, honoring ANSI newline mode.
@@ -2010,6 +2034,125 @@ final class TerminalController {
                 return result
             }
         }
+    }
+
+    func textBaseline() -> TextBaseline {
+        lock.withReadLock {
+            let dimensions = visibleGridDimensionsLocked()
+            let totalRows = scrollback.rowCount + dimensions.rows
+            guard totalRows > 0 else {
+                return TextBaseline(absoluteLastRow: nil, lastRowCharacterCount: 0)
+            }
+            let absoluteLastRow = scrollback.totalEvictedRows + totalRows - 1
+
+            return extractionScratchLock.withLock {
+                textExtractionGridRowBuffer.reserveCapacity(dimensions.cols)
+                textExtractionScrollbackRowBuffer.reserveCapacity(dimensions.cols)
+                let lastRowText = textForAbsoluteRowLocked(
+                    totalRows - 1,
+                    totalRows: totalRows,
+                    cols: dimensions.cols,
+                    includeLineEnding: false
+                )
+                return TextBaseline(absoluteLastRow: absoluteLastRow, lastRowCharacterCount: lastRowText.count)
+            }
+        }
+    }
+
+    func textSinceBaseline(_ baseline: TextBaseline, maxCharacters: Int) -> String {
+        guard maxCharacters > 0 else { return "" }
+        return lock.withReadLock {
+            let dimensions = visibleGridDimensionsLocked()
+            let totalRows = scrollback.rowCount + dimensions.rows
+            guard totalRows > 0 else { return "" }
+
+            return extractionScratchLock.withLock {
+                var result = ""
+                result.reserveCapacity(min(maxCharacters, max(dimensions.cols, 1) * min(totalRows, 128)))
+                textExtractionGridRowBuffer.reserveCapacity(dimensions.cols)
+                textExtractionScrollbackRowBuffer.reserveCapacity(dimensions.cols)
+
+                let currentFirstAbsoluteRow = scrollback.totalEvictedRows
+                let firstRow = {
+                    guard let baselineAbsoluteLastRow = baseline.absoluteLastRow else {
+                        return 0
+                    }
+                    return min(max(baselineAbsoluteLastRow - currentFirstAbsoluteRow, 0), totalRows - 1)
+                }()
+                for absoluteRow in firstRow..<totalRows {
+                    var rowText = textForAbsoluteRowLocked(
+                        absoluteRow,
+                        totalRows: totalRows,
+                        cols: dimensions.cols,
+                        includeLineEnding: absoluteRow < totalRows - 1
+                    )
+                    if absoluteRow == firstRow,
+                       let baselineAbsoluteLastRow = baseline.absoluteLastRow,
+                       baselineAbsoluteLastRow >= currentFirstAbsoluteRow,
+                       baseline.lastRowCharacterCount > 0,
+                       baseline.lastRowCharacterCount < rowText.count {
+                        let start = rowText.index(rowText.startIndex, offsetBy: baseline.lastRowCharacterCount)
+                        rowText = String(rowText[start...])
+                    } else if absoluteRow == firstRow,
+                              let baselineAbsoluteLastRow = baseline.absoluteLastRow,
+                              baselineAbsoluteLastRow >= currentFirstAbsoluteRow,
+                              baseline.lastRowCharacterCount >= rowText.count {
+                        rowText = ""
+                    }
+
+                    guard !rowText.isEmpty else { continue }
+                    result.append(rowText)
+                    if result.count > maxCharacters {
+                        let start = result.index(result.endIndex, offsetBy: -maxCharacters)
+                        result = String(result[start...])
+                    }
+                }
+
+                return result
+            }
+        }
+    }
+
+    private func textForAbsoluteRowLocked(
+        _ absoluteRow: Int,
+        totalRows: Int,
+        cols: Int,
+        includeLineEnding: Bool
+    ) -> String {
+        let cells: [Cell]
+        if absoluteRow < scrollback.rowCount {
+            _ = scrollback.getRow(at: absoluteRow, into: &textExtractionScrollbackRowBuffer)
+            cells = textExtractionScrollbackRowBuffer
+        } else {
+            let gridRow = absoluteRow - scrollback.rowCount
+            textExtractionGridRowBuffer.removeAll(keepingCapacity: true)
+            textExtractionGridRowBuffer.append(contentsOf: model.grid.rowCells(gridRow))
+            cells = textExtractionGridRowBuffer
+        }
+
+        let maxColumn = max(cols - 1, 0)
+        var result = ""
+        result.reserveCapacity(cols + 1)
+        if includeLineEnding {
+            if let textEndColumn = Self.lastNonSpaceColumn(in: cells, through: maxColumn) {
+                Self.appendCells(in: cells, from: 0, through: textEndColumn, to: &result)
+            }
+            let nextIsWrapped: Bool
+            if absoluteRow + 1 < scrollback.rowCount {
+                nextIsWrapped = scrollback.isRowWrapped(at: absoluteRow + 1)
+            } else if absoluteRow + 1 < totalRows {
+                let nextGridRow = absoluteRow + 1 - scrollback.rowCount
+                nextIsWrapped = model.grid.isWrapped(nextGridRow)
+            } else {
+                nextIsWrapped = false
+            }
+            if !nextIsWrapped {
+                result.append("\n")
+            }
+        } else {
+            Self.appendCells(in: cells, from: 0, through: maxColumn, to: &result)
+        }
+        return result
     }
 
     /// Extract visible viewport text, limited to the specified maximum number of lines.

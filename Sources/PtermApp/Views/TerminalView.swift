@@ -126,6 +126,8 @@ final class TerminalView: MTKView, NSTextInputClient {
     var textImagePlaceholderURLProvider: ((UUID, Int) -> URL?)?
     /// Routes dropped files through the same managed-file pipeline as paste.
     var onFileDropURLs: ((TerminalController, [URL]) -> Bool)?
+    /// Cancels an active AI Room MCP response wait for this terminal.
+    var onCancelAIRoomWait: (() -> Void)?
 
     /// When true, rendering is demand-driven (only on model changes) instead of 60fps continuous.
     /// Used in split view to avoid overwhelming GPU with many independent display links.
@@ -232,6 +234,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     private var committedTextPreviews: [CommittedTextPreview] = []
     private var recentCommittedInsertions: [RecentCommittedInsertion] = []
     private var pendingCommittedTextIntents: [CommittedTextAnimationIntent] = []
+    private var aiRoomWaitingButton: NSButton?
     private var pendingTextInputHandled = false
     private var viewIsOpaque = false
     private var debugSuppressInterpretKeyEvents = false
@@ -297,6 +300,35 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     func setTerminalRenderingSuppressed(_ suppressed: Bool) {
         terminalRenderingSuppressed = suppressed
+    }
+
+    func setAIRoomWaitingMessage(_ message: String?) {
+        guard let message, !message.isEmpty else {
+            aiRoomWaitingButton?.removeFromSuperview()
+            aiRoomWaitingButton = nil
+            return
+        }
+
+        let button = aiRoomWaitingButton ?? {
+            let button = NSButton(title: "", target: self, action: #selector(cancelAIRoomWaitClicked(_:)))
+            button.bezelStyle = .regularSquare
+            button.isBordered = false
+            button.font = .systemFont(ofSize: 12, weight: .semibold)
+            button.contentTintColor = .white
+            button.wantsLayer = true
+            button.layer?.cornerRadius = 6
+            button.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.58).cgColor
+            addSubview(button)
+            aiRoomWaitingButton = button
+            return button
+        }()
+        button.title = message
+        button.toolTip = "Click to cancel AI Room MCP wait"
+        layoutAIRoomWaitingButton()
+    }
+
+    @objc private func cancelAIRoomWaitClicked(_ sender: Any?) {
+        onCancelAIRoomWait?()
     }
 
     private func refreshEffectiveRenderingSuppression() {
@@ -527,6 +559,24 @@ final class TerminalView: MTKView, NSTextInputClient {
         super.viewDidMoveToWindow()
         syncScaleFactor()
         updateWindowObservers()
+    }
+
+    override func layout() {
+        super.layout()
+        layoutAIRoomWaitingButton()
+    }
+
+    private func layoutAIRoomWaitingButton() {
+        guard let button = aiRoomWaitingButton else { return }
+        let fittingSize = button.fittingSize
+        let width = min(max(fittingSize.width + 28, 220), max(bounds.width - 32, 160))
+        let height: CGFloat = 30
+        button.frame = NSRect(
+            x: bounds.midX - width / 2,
+            y: bounds.height - height - 12,
+            width: width,
+            height: height
+        )
     }
 
     /// Public entry point for NSWindowDelegate to trigger scale sync.
