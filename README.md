@@ -8,6 +8,21 @@ Analyze logs, get instant explanations, ask questions — all without leaving th
 
 ## AI Integration
 
+### AI-to-AI Terminal Conversations
+
+Let AI agents running in different terminals talk to each other. pterm can route a prompt from one terminal to another through its MCP server, wait for the target AI's marked response, and send the extracted answer back to the originating terminal automatically.
+
+This makes multi-agent workflows practical: ask Claude Code to review Codex's plan, have Codex request implementation feedback from another session, or coordinate specialized agents without manually copying prompts between terminals.
+
+Use it to make coding agents check each other's work:
+
+- Ask **Claude Code** to review a **Codex** implementation plan before changes are made
+- Send a completed **Codex** patch to **Claude Code** for risk review and missing-test checks
+- Have one agent focused on implementation while another agent reviews architecture, security, or release readiness
+- Keep long-running specialist agents in separate terminals and request their input without breaking your current flow
+
+![AI-to-AI terminal conversation](Resources/pterm8.gif)
+
 ### Summarize Anything
 
 Select any output — error logs, stack traces, command results — and let AI break it down instantly. Right-click, summarize, done.
@@ -51,6 +66,8 @@ Zero overhead when disabled — the PTY read path is identical to a build withou
 ### MCP Server
 
 Built-in [Model Context Protocol](https://modelcontextprotocol.io/) server with 20+ tools. AI agents can list, read, and control terminals programmatically — enabling fully autonomous workflows.
+
+pterm also includes an AI-terminal protocol for room-scoped terminal conversations, so agents can safely discover how to authenticate, select visible peer terminals, send a request, and receive the marked response back through pterm.
 
 ## One Window, Every Session
 
