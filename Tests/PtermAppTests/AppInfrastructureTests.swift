@@ -159,6 +159,27 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertEqual(delta.text, "\nbody")
     }
 
+    func testAIRoomSemanticDeltaReportsContinuousFullCurrentTextOverlap() {
+        let delta = AppDelegate.textDeltaAfterBaseline(
+            "old line\nAI_RESPONSE_BEGIN\nbody",
+            currentText: "AI_RESPONSE_BEGIN\nbody"
+        )
+
+        XCTAssertTrue(delta.isContinuousWithBaseline)
+        XCTAssertEqual(delta.text, "")
+    }
+
+    func testAIRoomSemanticDeltaHandlesLargeRepeatedTextWithoutQuadraticScan() {
+        let repeatedPrefix = String(repeating: "a", count: 20_000)
+        let delta = AppDelegate.textDeltaAfterBaseline(
+            repeatedPrefix + "b",
+            currentText: repeatedPrefix + "c"
+        )
+
+        XCTAssertFalse(delta.isContinuousWithBaseline)
+        XCTAssertEqual(delta.text, repeatedPrefix + "c")
+    }
+
     func testAIRoomSemanticDeltaReportsDiscontinuousSnapshotWhenOverlapIsLost() {
         let delta = AppDelegate.textDeltaAfterBaseline(
             "AI_RESPONSE_BEGIN__REQ__\nold body prefix",

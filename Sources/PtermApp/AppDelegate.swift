@@ -3036,23 +3036,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
 
-        let maxOverlap = min(baselineText.count, currentText.count)
-        guard maxOverlap > 0 else {
+        let overlapLength = longestPrefixOfCurrentTextMatchingBaselineSuffix(
+            baselineText: baselineText,
+            currentText: currentText
+        )
+        guard overlapLength > 0 else {
             return TextDeltaAfterBaseline(text: currentText, isContinuousWithBaseline: false)
         }
-        var overlapLength = maxOverlap
-        while overlapLength > 0 {
-            let baselineSuffixStart = baselineText.index(baselineText.endIndex, offsetBy: -overlapLength)
-            let currentPrefixEnd = currentText.index(currentText.startIndex, offsetBy: overlapLength)
-            if baselineText[baselineSuffixStart...] == currentText[..<currentPrefixEnd] {
-                return TextDeltaAfterBaseline(
-                    text: String(currentText[currentPrefixEnd...]),
-                    isContinuousWithBaseline: true
-                )
+        let currentPrefixEnd = currentText.index(currentText.startIndex, offsetBy: overlapLength)
+        return TextDeltaAfterBaseline(
+            text: String(currentText[currentPrefixEnd...]),
+            isContinuousWithBaseline: true
+        )
+    }
+
+    private static func longestPrefixOfCurrentTextMatchingBaselineSuffix(
+        baselineText: String,
+        currentText: String
+    ) -> Int {
+        let pattern = Array(currentText)
+        guard !pattern.isEmpty else { return 0 }
+
+        var failure = Array(repeating: 0, count: pattern.count)
+        if pattern.count > 1 {
+            var prefixLength = 0
+            for index in 1..<pattern.count {
+                while prefixLength > 0, pattern[index] != pattern[prefixLength] {
+                    prefixLength = failure[prefixLength - 1]
+                }
+                if pattern[index] == pattern[prefixLength] {
+                    prefixLength += 1
+                    failure[index] = prefixLength
+                }
             }
-            overlapLength -= 1
         }
-        return TextDeltaAfterBaseline(text: currentText, isContinuousWithBaseline: false)
+
+        var overlapLength = 0
+        for character in baselineText {
+            while overlapLength == pattern.count ||
+                    (overlapLength > 0 && character != pattern[overlapLength]) {
+                overlapLength = failure[overlapLength - 1]
+            }
+            if character == pattern[overlapLength] {
+                overlapLength += 1
+            }
+        }
+        return overlapLength
     }
 
     @discardableResult
