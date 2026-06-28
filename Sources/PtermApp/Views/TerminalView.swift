@@ -208,6 +208,9 @@ final class TerminalView: MTKView, NSTextInputClient {
     /// Accumulated scroll delta for smooth (trackpad) scrolling.
     /// We accumulate fractional lines until a full line is reached.
     private var scrollAccumulator: CGFloat = 0
+    private var mouseReportDirectScrollAccumulator: CGFloat = 0
+    private var mouseReportMomentumScrollAccumulator: CGFloat = 0
+    private var mouseReportDirectScrollGestureActive = false
     private var searchMatches: [TerminalController.SearchMatch] = []
     private var currentSearchIndex: Int?
     private var selectionBeforeSearch: TerminalSelection?
@@ -1866,12 +1869,91 @@ final class TerminalView: MTKView, NSTextInputClient {
                                              protocolMode: state.protocolMode))
             return true
         case .scroll:
-            guard event.scrollingDeltaY != 0 else { return false }
+            if event.hasPreciseScrollingDeltas {
+                guard let renderer else { return true }
+                let cellH = renderer.glyphAtlas.cellHeight
+                guard cellH > 0 else { return true }
+
+                if !event.momentumPhase.isEmpty {
+                    if event.momentumPhase.contains(.began) {
+                        mouseReportMomentumScrollAccumulator = 0
+                    }
+                    if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled) {
+                        mouseReportMomentumScrollAccumulator = 0
+                    }
+                    if mouseReportDirectScrollGestureActive {
+                        return true
+                    }
+                    guard event.scrollingDeltaY != 0 else { return true }
+                    let result = Self.accumulatedMouseWheelSteps(
+                        delta: event.scrollingDeltaY,
+                        cellHeight: cellH,
+                        accumulator: mouseReportMomentumScrollAccumulator
+                    )
+                    mouseReportMomentumScrollAccumulator = result.accumulator
+                    guard result.lines != 0 else { return true }
+                    let button = result.lines > 0 ? 64 : 65
+                    for _ in 0..<abs(result.lines) {
+                        controller.sendInput(encodeMouse(button: button, position: position, phase: .scroll,
+                                                         protocolMode: state.protocolMode))
+                    }
+                    return true
+                }
+
+                if event.phase.contains(.began) {
+                    mouseReportDirectScrollAccumulator = 0
+                    mouseReportMomentumScrollAccumulator = 0
+                    mouseReportDirectScrollGestureActive = true
+                }
+                if event.phase.contains(.ended) || event.phase.contains(.cancelled) {
+                    mouseReportDirectScrollAccumulator = 0
+                    mouseReportDirectScrollGestureActive = false
+                }
+                guard event.scrollingDeltaY != 0 else { return true }
+
+                let result = Self.accumulatedMouseWheelSteps(
+                    delta: event.scrollingDeltaY,
+                    cellHeight: cellH,
+                    accumulator: mouseReportDirectScrollAccumulator
+                )
+                mouseReportDirectScrollAccumulator = result.accumulator
+                guard result.lines != 0 else { return true }
+
+                let button = result.lines > 0 ? 64 : 65
+                for _ in 0..<abs(result.lines) {
+                    controller.sendInput(encodeMouse(button: button, position: position, phase: .scroll,
+                                                     protocolMode: state.protocolMode))
+                }
+                return true
+            }
+
+            mouseReportDirectScrollAccumulator = 0
+            mouseReportMomentumScrollAccumulator = 0
+            mouseReportDirectScrollGestureActive = false
+            guard event.scrollingDeltaY != 0 else { return true }
             let button = event.scrollingDeltaY > 0 ? 64 : 65
             controller.sendInput(encodeMouse(button: button, position: position, phase: .scroll,
                                              protocolMode: state.protocolMode))
             return true
         }
+    }
+
+    private static func accumulatedMouseWheelSteps(
+        delta: CGFloat,
+        cellHeight: CGFloat,
+        accumulator: CGFloat
+    ) -> (accumulator: CGFloat, lines: Int) {
+        var nextAccumulator = accumulator
+        if nextAccumulator != 0, (nextAccumulator > 0) != (delta > 0) {
+            nextAccumulator = 0
+        }
+        nextAccumulator += delta
+        let lines = Int(nextAccumulator / cellHeight)
+        if lines == 0 {
+            return (nextAccumulator, 0)
+        }
+        nextAccumulator -= CGFloat(lines) * cellHeight
+        return (nextAccumulator, lines)
     }
 
     private func clampedGridPosition(from event: NSEvent) -> GridPosition? {

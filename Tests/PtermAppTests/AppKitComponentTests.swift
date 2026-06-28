@@ -10519,6 +10519,181 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(spy.didInvokeClearScreen)
     }
 
+    func testTerminalViewPreciseWheelMouseReportingAccumulatesSubCellDeltas() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let scrollView = TerminalScrollView(frame: NSRect(x: 0, y: 0, width: 320, height: 180), renderer: renderer)
+        scrollView.terminalView.terminalController = controller
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?1002h\u{1B}[?1006h".utf8))
+
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(scrollView)
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(scrollView.terminalView)
+
+        try withTemporaryDirectory { directory in
+            controller.auditLogger = TerminalAuditLogger(
+                rootDirectory: directory,
+                sessionID: UUID(uuidString: "00000000-0000-0000-0000-0000000000B1")!,
+                timeZoneIdentifier: "Asia/Tokyo",
+                termEnv: "xterm-256color",
+                workspaceNameProvider: { "Main" },
+                terminalNameProvider: { "claude" },
+                sizeProvider: { (12, 4) },
+                nowProvider: { Date(timeIntervalSince1970: 1_700_000_000) }
+            )
+            defer {
+                controller.auditLogger?.close()
+                controller.auditLogger = nil
+            }
+
+            let point = NSPoint(x: scrollView.bounds.midX, y: scrollView.bounds.midY)
+            let smallScroll = try XCTUnwrap(makeScrollWheelEvent(deltaY: 1, point: point, in: scrollView, window: window, precise: true))
+            scrollView.terminalView.scrollWheel(with: smallScroll)
+            controller.auditLogger?.flush()
+
+            XCTAssertFalse(try optionalCastContents(in: directory)?.contains("[<64;") ?? false)
+
+            let cellHeight = renderer.glyphAtlas.cellHeight
+            let remainingDelta = max(1, Int(ceil(cellHeight)) - 1)
+            let completingScroll = try XCTUnwrap(makeScrollWheelEvent(deltaY: Int32(remainingDelta), point: point, in: scrollView, window: window, precise: true))
+            scrollView.terminalView.scrollWheel(with: completingScroll)
+            controller.auditLogger?.flush()
+
+            XCTAssertEqual(try castContents(in: directory).components(separatedBy: "[<64;").count - 1, 1)
+        }
+    }
+
+    func testTerminalViewPreciseWheelMouseReportingDoesNotLetOldDirectionRemainderBlockReverseScroll() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let scrollView = TerminalScrollView(frame: NSRect(x: 0, y: 0, width: 320, height: 180), renderer: renderer)
+        scrollView.terminalView.terminalController = controller
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?1002h\u{1B}[?1006h".utf8))
+
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(scrollView)
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(scrollView.terminalView)
+
+        try withTemporaryDirectory { directory in
+            controller.auditLogger = TerminalAuditLogger(
+                rootDirectory: directory,
+                sessionID: UUID(uuidString: "00000000-0000-0000-0000-0000000000B2")!,
+                timeZoneIdentifier: "Asia/Tokyo",
+                termEnv: "xterm-256color",
+                workspaceNameProvider: { "Main" },
+                terminalNameProvider: { "claude" },
+                sizeProvider: { (12, 4) },
+                nowProvider: { Date(timeIntervalSince1970: 1_700_000_000) }
+            )
+            defer {
+                controller.auditLogger?.close()
+                controller.auditLogger = nil
+            }
+
+            let point = NSPoint(x: scrollView.bounds.midX, y: scrollView.bounds.midY)
+            let cellHeight = renderer.glyphAtlas.cellHeight
+            let remainderDelta = max(1, Int32(floor(cellHeight / 2)))
+            let positiveRemainder = try XCTUnwrap(makeScrollWheelEvent(deltaY: remainderDelta, point: point, in: scrollView, window: window, precise: true))
+            scrollView.terminalView.scrollWheel(with: positiveRemainder)
+            controller.auditLogger?.flush()
+            XCTAssertFalse(try optionalCastContents(in: directory)?.contains("[<64;") ?? false)
+            XCTAssertFalse(try optionalCastContents(in: directory)?.contains("[<65;") ?? false)
+
+            let reverseFullCell = try XCTUnwrap(makeScrollWheelEvent(deltaY: -Int32(ceil(cellHeight)), point: point, in: scrollView, window: window, precise: true))
+            scrollView.terminalView.scrollWheel(with: reverseFullCell)
+            controller.auditLogger?.flush()
+
+            let contents = try castContents(in: directory)
+            XCTAssertEqual(contents.components(separatedBy: "[<64;").count - 1, 0)
+            XCTAssertEqual(contents.components(separatedBy: "[<65;").count - 1, 1)
+        }
+    }
+
+    func testTerminalViewPreciseWheelMouseReportingSuppressesMomentumOnlyWhileDirectGestureIsActive() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4,
+            cols: 12,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13
+        )
+        let scrollView = TerminalScrollView(frame: NSRect(x: 0, y: 0, width: 320, height: 180), renderer: renderer)
+        scrollView.terminalView.terminalController = controller
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?1002h\u{1B}[?1006h".utf8))
+
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220),
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(scrollView)
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(scrollView.terminalView)
+
+        try withTemporaryDirectory { directory in
+            controller.auditLogger = TerminalAuditLogger(
+                rootDirectory: directory,
+                sessionID: UUID(uuidString: "00000000-0000-0000-0000-0000000000B3")!,
+                timeZoneIdentifier: "Asia/Tokyo",
+                termEnv: "xterm-256color",
+                workspaceNameProvider: { "Main" },
+                terminalNameProvider: { "claude" },
+                sizeProvider: { (12, 4) },
+                nowProvider: { Date(timeIntervalSince1970: 1_700_000_000) }
+            )
+            defer {
+                controller.auditLogger?.close()
+                controller.auditLogger = nil
+            }
+
+            let point = NSPoint(x: scrollView.bounds.midX, y: scrollView.bounds.midY)
+            let cellDelta = Int32(ceil(renderer.glyphAtlas.cellHeight))
+            let directUp = try XCTUnwrap(makeScrollWheelEvent(deltaY: cellDelta, point: point, in: scrollView, window: window, precise: true, phase: .began))
+            scrollView.terminalView.scrollWheel(with: directUp)
+            let momentumUp = try XCTUnwrap(makeScrollWheelEvent(deltaY: cellDelta, point: point, in: scrollView, window: window, precise: true, momentumPhase: .changed))
+            scrollView.terminalView.scrollWheel(with: momentumUp)
+            let directDown = try XCTUnwrap(makeScrollWheelEvent(deltaY: -cellDelta, point: point, in: scrollView, window: window, precise: true, phase: .changed))
+            scrollView.terminalView.scrollWheel(with: directDown)
+            controller.auditLogger?.flush()
+
+            let contents = try castContents(in: directory)
+            XCTAssertEqual(contents.components(separatedBy: "[<64;").count - 1, 1)
+            XCTAssertEqual(contents.components(separatedBy: "[<65;").count - 1, 1)
+        }
+    }
+
     func testWindowInterruptShortcutBypassesTerminalKeyHandlingPath() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(
@@ -11683,6 +11858,68 @@ final class AppKitComponentTests: XCTestCase {
             clickCount: 1,
             pressure: 1
         )
+    }
+
+    private func makeScrollWheelEvent(
+        deltaY: Int32,
+        point: NSPoint,
+        in view: NSView,
+        window: NSWindow,
+        precise: Bool,
+        phase: NSEvent.Phase = [],
+        momentumPhase: NSEvent.Phase = []
+    ) -> NSEvent? {
+        let unit: CGScrollEventUnit = precise ? .pixel : .line
+        guard let event = CGEvent(
+            scrollWheelEvent2Source: nil,
+            units: unit,
+            wheelCount: 1,
+            wheel1: deltaY,
+            wheel2: 0,
+            wheel3: 0
+        ) else {
+            return nil
+        }
+        event.location = window.convertPoint(toScreen: view.convert(point, to: nil))
+        if !phase.isEmpty {
+            event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Self.cgScrollPhaseValue(for: phase))
+        }
+        if !momentumPhase.isEmpty {
+            event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Self.cgMomentumPhaseValue(for: momentumPhase))
+        }
+        return NSEvent(cgEvent: event)
+    }
+
+    private static func cgScrollPhaseValue(for phase: NSEvent.Phase) -> Int64 {
+        if phase.contains(.began) { return 1 }
+        if phase.contains(.changed) { return 2 }
+        if phase.contains(.ended) { return 4 }
+        if phase.contains(.cancelled) { return 8 }
+        return 0
+    }
+
+    private static func cgMomentumPhaseValue(for phase: NSEvent.Phase) -> Int64 {
+        if phase.contains(.began) { return 1 }
+        if phase.contains(.changed) { return 2 }
+        if phase.contains(.ended) { return 3 }
+        if phase.contains(.cancelled) { return 4 }
+        return 0
+    }
+
+    private func castContents(in directory: URL) throws -> String {
+        let path = try XCTUnwrap(
+            FileManager.default.subpathsOfDirectory(atPath: directory.path)
+                .first(where: { $0.hasSuffix(".cast") })
+        )
+        return try String(contentsOf: directory.appendingPathComponent(path))
+    }
+
+    private func optionalCastContents(in directory: URL) throws -> String? {
+        guard let path = try FileManager.default.subpathsOfDirectory(atPath: directory.path)
+            .first(where: { $0.hasSuffix(".cast") }) else {
+            return nil
+        }
+        return try String(contentsOf: directory.appendingPathComponent(path))
     }
 
     private func makeFlagsEvent(window: NSWindow, modifiers: NSEvent.ModifierFlags) -> NSEvent? {
