@@ -192,7 +192,25 @@ final class SplitTerminalContainerView: NSView {
         selectedTerminalIDs.removeAll()
         stagedSelectionModeActive = false
 
-        // Phase 1: Create scroll views WITHOUT assigning controllers.
+        // Phase 1: Create the single-MTKView split renderer behind the scroll views.
+        //
+        // Split rendering must stay in one Metal view, but native AppKit scrollers
+        // belong to each TerminalScrollView. Keeping the renderer behind the
+        // transparent scroll views lets the per-pane overlay scrollers stay visible
+        // and keeps wheel/trackpad events on the native NSScrollView path.
+        let overlay = SplitRenderView(frame: bounds, renderer: renderer)
+        overlay.autoresizingMask = [.width, .height]
+        overlay.delegate = overlay
+        overlay.borderConfigProvider = { [weak self] tv in
+            self?.borderConfig(for: tv)
+        }
+        overlay.headerOverlayConfigProvider = { [weak self] controller in
+            self?.headerOverlayConfig(for: controller)
+        }
+        addSubview(overlay)
+        splitRenderView = overlay
+
+        // Phase 2: Create scroll views WITHOUT assigning controllers.
         // This avoids premature terminal resizes with incorrect (full-window) bounds.
         for _ in controllers {
             let scrollView = TerminalScrollView(frame: bounds, renderer: renderer)
@@ -201,10 +219,10 @@ final class SplitTerminalContainerView: NSView {
             scrollViews.append(scrollView)
         }
 
-        // Phase 2: Set correct cell-sized frames before controllers are assigned.
+        // Phase 3: Set correct cell-sized frames before controllers are assigned.
         layoutGrid()
 
-        // Phase 3: Assign controllers now that frames are correct.
+        // Phase 4: Assign controllers now that frames are correct.
         for (index, controller) in controllers.enumerated() {
             let scrollView = scrollViews[index]
             scrollView.terminalView.shortcutConfiguration = shortcutConfiguration
@@ -250,18 +268,6 @@ final class SplitTerminalContainerView: NSView {
             scrollView.terminalView.cmdClickMenuLabel = cmdClickMenuLabel
         }
 
-        // Phase 4: Create single-MTKView overlay on top of all scroll views.
-        let overlay = SplitRenderView(frame: bounds, renderer: renderer)
-        overlay.autoresizingMask = [.width, .height]
-        overlay.delegate = overlay
-        overlay.borderConfigProvider = { [weak self] tv in
-            self?.borderConfig(for: tv)
-        }
-        overlay.headerOverlayConfigProvider = { [weak self] controller in
-            self?.headerOverlayConfig(for: controller)
-        }
-        addSubview(overlay)
-        splitRenderView = overlay
         splitRenderView?.outputFrameThrottlingMode = outputFrameThrottlingMode
         splitRenderView?.hasActiveOutput = !activeOutputTerminalIDs.isEmpty
         syncRenderCells()

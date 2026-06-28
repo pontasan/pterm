@@ -643,6 +643,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         - First line: the first-line marker built from the fields above.
         - Then: your response text only.
         - Final line: the final-line marker built from the fields above.
+        - Before sending, verify that your response text is enclosed by those two marker lines.
         - Do not print any text before the first-line marker or after the final-line marker.
         Do not omit the final line.
         Do not use any other marker.
@@ -1350,7 +1351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let activeController = splitView.activeController {
             applyRendererSettings(for: activeController)
         }
-        if let first = splitView.subviews.first as? TerminalScrollView {
+        if let first = splitView.subviews.compactMap({ $0 as? TerminalScrollView }).first {
             window.makeFirstResponder(first.terminalView)
         }
         syncAIRoomWaitingIndicators()

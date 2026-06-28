@@ -6228,6 +6228,40 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertTrue(scrollViews.allSatisfy { $0.terminalView.drawableSize == .zero })
     }
 
+    func testSplitTerminalContainerKeepsNativeScrollViewsAboveRenderSurface() throws {
+        let renderer = try makeRendererOrSkip()
+        let controllers = (0..<2).map { index in
+            TerminalController(
+                rows: 4,
+                cols: 12,
+                termEnv: "xterm-256color",
+                textEncoding: .utf8,
+                scrollbackInitialCapacity: 4096,
+                scrollbackMaxCapacity: 4096,
+                fontName: "Menlo",
+                fontSize: 13,
+                initialDirectory: "/tmp/split-scroll-\(index)"
+            )
+        }
+        let view = SplitTerminalContainerView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 240),
+            renderer: renderer,
+            controllers: controllers
+        )
+
+        view.layoutSubtreeIfNeeded()
+
+        let directSubviews = view.subviews
+        let renderIndex = try XCTUnwrap(directSubviews.firstIndex { $0 is SplitRenderView })
+        let scrollIndices = directSubviews.indices.filter { directSubviews[$0] is TerminalScrollView }
+
+        XCTAssertEqual(scrollIndices.count, 2)
+        XCTAssertTrue(
+            scrollIndices.allSatisfy { $0 > renderIndex },
+            "TerminalScrollView instances must stay above SplitRenderView so per-pane native scrollers are visible and receive native scroll handling"
+        )
+    }
+
     func testSplitTerminalContainerRequestRenderSyncsNativeScrollerToControllerOffset() throws {
         let renderer = try makeRendererOrSkip()
         let controller = TerminalController(

@@ -67,6 +67,7 @@ final class AppInfrastructureTests: XCTestCase {
         XCTAssertTrue(prompt.contains("- First line: the first-line marker built from the fields above."))
         XCTAssertTrue(prompt.contains("- Then: your response text only."))
         XCTAssertTrue(prompt.contains("- Final line: the final-line marker built from the fields above."))
+        XCTAssertTrue(prompt.contains("- Before sending, verify that your response text is enclosed by those two marker lines."))
         XCTAssertTrue(prompt.contains("Do not wrap the markers in quotes or a code block."))
         XCTAssertTrue(prompt.hasSuffix("Message:\nreview this"))
     }
