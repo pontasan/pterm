@@ -198,6 +198,10 @@ final class TerminalView: MTKView, NSTextInputClient {
             requestDisplayUpdate()
         }
     }
+    private struct ShiftClickSelectionAnchor {
+        var position: GridPosition
+    }
+    private var pendingShiftClickSelectionAnchor: ShiftClickSelectionAnchor?
 
     /// Click count tracker for double/triple click detection
     private var clickCount: Int = 0
@@ -347,6 +351,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     func debugSetSelectionForTesting(_ sel: TerminalSelection?) {
+        pendingShiftClickSelectionAnchor = nil
         selection = sel
     }
 
@@ -1284,6 +1289,7 @@ final class TerminalView: MTKView, NSTextInputClient {
             suppressCommandIdentityHeaderUntilCommandRelease = false
         }
         commandModifierActive = commandHeld
+        updateActiveSelectionMode(for: event.modifierFlags)
         // Split container identity header visibility is managed exclusively
         // by AppDelegate via AppWindow.sendEvent → onCommandModifierChange.
         // Do NOT set it here — commandIdentityHeaderVisible is not updated
@@ -1515,11 +1521,31 @@ final class TerminalView: MTKView, NSTextInputClient {
 
         window?.makeFirstResponder(self)
 
-        if sendMouseEventIfNeeded(event, phase: .down, buttonOverride: 0) {
+        guard let pos = gridPosition(from: event) else { return }
+
+        guard let controller = terminalController else { return }
+        let globalRow = controller.viewportRowToGlobalRow(pos.row)
+        let globalPos = GridPosition(row: globalRow, col: pos.col)
+
+        if event.modifierFlags.contains(.shift),
+           var sel = selectionForShiftClickExtension() {
+            sel.active = globalPos
+            sel.mode = selectionMode(for: event)
+            sel.isDragging = false
+            if sel.isEmpty {
+                pendingShiftClickSelectionAnchor = ShiftClickSelectionAnchor(position: sel.anchor)
+                selection = nil
+            } else {
+                pendingShiftClickSelectionAnchor = nil
+                selection = sel
+            }
             return
         }
 
-        guard let pos = gridPosition(from: event) else { return }
+        if sendMouseEventIfNeeded(event, phase: .down, buttonOverride: 0) {
+            pendingShiftClickSelectionAnchor = ShiftClickSelectionAnchor(position: globalPos)
+            return
+        }
 
         let now = event.timestamp
 
@@ -1536,8 +1562,8 @@ final class TerminalView: MTKView, NSTextInputClient {
 
         if clickCount == 2 {
             // Double-click: word selection
-            guard let controller = terminalController else { return }
             if let sel = controller.wordSelectionAtViewportPosition(pos) {
+                pendingShiftClickSelectionAnchor = nil
                 selection = sel
             }
             return
@@ -1545,30 +1571,44 @@ final class TerminalView: MTKView, NSTextInputClient {
 
         if clickCount >= 3 {
             // Triple-click: line selection
-            guard let controller = terminalController else { return }
-            let globalRow = controller.viewportRowToGlobalRow(pos.row)
             controller.withModel { model in
+                pendingShiftClickSelectionAnchor = nil
                 selection = TerminalSelection.lineSelection(row: globalRow, cols: model.cols)
             }
             clickCount = 3 // cap
             return
         }
 
-        // Single click
-        guard let controller = terminalController else { return }
-        let globalRow = controller.viewportRowToGlobalRow(pos.row)
-        let globalPos = GridPosition(row: globalRow, col: pos.col)
-        if event.modifierFlags.contains(.shift), var sel = selection {
-            // Shift+click: extend selection
-            sel.active = globalPos
-            selection = sel
-        } else {
-            // Start new selection
-            let mode: SelectionMode = event.modifierFlags.contains(.option) ? .rectangular : .normal
-            var newSelection = TerminalSelection(anchor: globalPos, active: globalPos, mode: mode)
-            newSelection.isDragging = true
-            selection = newSelection
+        // Start new selection
+        var newSelection = TerminalSelection(anchor: globalPos, active: globalPos, mode: selectionMode(for: event))
+        newSelection.isDragging = true
+        pendingShiftClickSelectionAnchor = nil
+        selection = newSelection
+    }
+
+    private func selectionMode(for event: NSEvent) -> SelectionMode {
+        selectionMode(for: event.modifierFlags)
+    }
+
+    private func selectionMode(for modifiers: NSEvent.ModifierFlags) -> SelectionMode {
+        modifiers.contains(.option) ? .rectangular : .normal
+    }
+
+    private func updateActiveSelectionMode(for modifiers: NSEvent.ModifierFlags) {
+        guard var sel = selection, sel.isDragging else { return }
+        let mode = selectionMode(for: modifiers)
+        guard sel.mode != mode else { return }
+        sel.mode = mode
+        selection = sel
+    }
+
+    private func selectionForShiftClickExtension() -> TerminalSelection? {
+        if var sel = selection {
+            sel.isDragging = false
+            return sel
         }
+        guard let anchor = pendingShiftClickSelectionAnchor else { return nil }
+        return TerminalSelection(anchor: anchor.position, active: anchor.position, mode: .normal)
     }
 
     private func handleDetectedLinkClick(_ event: NSEvent) -> Bool {
@@ -1697,17 +1737,21 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if var sel = selection, sel.isDragging,
+           let controller = terminalController {
+            autoScrollSelectionIfNeeded(for: event)
+            guard let pos = clampedGridPosition(from: event) else { return }
+
+            let globalRow = controller.viewportRowToGlobalRow(pos.row)
+            sel.active = GridPosition(row: globalRow, col: pos.col)
+            sel.mode = selectionMode(for: event)
+            selection = sel
+            return
+        }
+
         if sendMouseEventIfNeeded(event, phase: .dragged) {
             return
         }
-        guard var sel = selection, sel.isDragging,
-              let controller = terminalController else { return }
-        autoScrollSelectionIfNeeded(for: event)
-        guard let pos = clampedGridPosition(from: event) else { return }
-
-        let globalRow = controller.viewportRowToGlobalRow(pos.row)
-        sel.active = GridPosition(row: globalRow, col: pos.col)
-        selection = sel
     }
 
     override func rightMouseDragged(with event: NSEvent) {
@@ -1745,25 +1789,30 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     override func mouseUp(with event: NSEvent) {
         defer { pressedMouseButton = nil }
-        if sendMouseEventIfNeeded(event, phase: .up) {
+        if var sel = selection {
+            if sel.isDragging {
+                if let pos = gridPosition(from: event),
+                   let controller = terminalController {
+                    let globalRow = controller.viewportRowToGlobalRow(pos.row)
+                    sel.active = GridPosition(row: globalRow, col: pos.col)
+                }
+                sel.mode = selectionMode(for: event)
+                sel.isDragging = false
+
+                // If the selection is empty (click without drag), clear it
+                if sel.isEmpty {
+                    pendingShiftClickSelectionAnchor = ShiftClickSelectionAnchor(position: sel.anchor)
+                    selection = nil
+                } else {
+                    pendingShiftClickSelectionAnchor = nil
+                    selection = sel
+                }
+            }
             return
         }
-        guard var sel = selection else { return }
 
-        if sel.isDragging {
-            if let pos = gridPosition(from: event),
-               let controller = terminalController {
-                let globalRow = controller.viewportRowToGlobalRow(pos.row)
-                sel.active = GridPosition(row: globalRow, col: pos.col)
-            }
-            sel.isDragging = false
-
-            // If the selection is empty (click without drag), clear it
-            if sel.isEmpty {
-                selection = nil
-            } else {
-                selection = sel
-            }
+        if sendMouseEventIfNeeded(event, phase: .up) {
+            return
         }
     }
 
@@ -2026,6 +2075,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     /// Clear the current selection.
     func clearSelection() {
         selectAllActive = false
+        pendingShiftClickSelectionAnchor = nil
         selection = nil
     }
 

@@ -5168,6 +5168,277 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertFalse(view.selection!.isEmpty)
     }
 
+    func testTerminalViewShiftClickExtendsPendingSelectionAnchorAfterScroll() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        controller.model.mouseReporting = .normal
+        for rowIndex in 0..<12 {
+            let row = ArraySlice("ROW\(rowIndex)".unicodeScalars.map {
+                Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+            })
+            controller.scrollback.appendRow(row, isWrapped: false)
+        }
+
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        func point(row: Int, col: Int) -> NSPoint {
+            NSPoint(
+                x: renderer.gridPadding + CGFloat(col) * renderer.glyphAtlas.cellWidth + renderer.glyphAtlas.cellWidth * 0.5,
+                y: view.bounds.height - renderer.gridPadding - CGFloat(row) * renderer.glyphAtlas.cellHeight - renderer.glyphAtlas.cellHeight * 0.5
+            )
+        }
+
+        let anchorViewportRow = 1
+        let anchorCol = 2
+        let expectedAnchor = GridPosition(
+            row: controller.viewportRowToGlobalRow(anchorViewportRow),
+            col: anchorCol
+        )
+        let anchorPoint = point(row: anchorViewportRow, col: anchorCol)
+        view.mouseDown(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: anchorPoint, in: view, window: window)))
+        view.mouseUp(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseUp, point: anchorPoint, in: view, window: window)))
+
+        XCTAssertNil(view.debugGetSelectionForTesting(), "A plain click should not leave a visible empty selection.")
+
+        controller.setScrollOffset(6)
+        let activeViewportRow = 2
+        let activeCol = 7
+        let expectedActive = GridPosition(
+            row: controller.viewportRowToGlobalRow(activeViewportRow),
+            col: activeCol
+        )
+        let activePoint = point(row: activeViewportRow, col: activeCol)
+        view.mouseDown(with: try XCTUnwrap(makeMouseEvent(
+            type: .leftMouseDown,
+            point: activePoint,
+            in: view,
+            window: window,
+            modifiers: [.shift]
+        )))
+        view.mouseUp(with: try XCTUnwrap(makeMouseEvent(
+            type: .leftMouseUp,
+            point: activePoint,
+            in: view,
+            window: window,
+            modifiers: [.shift]
+        )))
+
+        let selection = try XCTUnwrap(view.debugGetSelectionForTesting())
+        XCTAssertEqual(selection.anchor, expectedAnchor)
+        XCTAssertEqual(selection.active, expectedActive)
+        if case .normal = selection.mode {
+        } else {
+            XCTFail("Shift+click must extend the pending anchor as a normal selection.")
+        }
+        XCTAssertFalse(selection.isEmpty)
+    }
+
+    func testTerminalViewShiftOptionClickExtendsPendingSelectionAnchorAsRectangularAfterScroll() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        controller.model.mouseReporting = .normal
+        for rowIndex in 0..<12 {
+            let row = ArraySlice("ROW\(rowIndex)".unicodeScalars.map {
+                Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+            })
+            controller.scrollback.appendRow(row, isWrapped: false)
+        }
+
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        func point(row: Int, col: Int) -> NSPoint {
+            NSPoint(
+                x: renderer.gridPadding + CGFloat(col) * renderer.glyphAtlas.cellWidth + renderer.glyphAtlas.cellWidth * 0.5,
+                y: view.bounds.height - renderer.gridPadding - CGFloat(row) * renderer.glyphAtlas.cellHeight - renderer.glyphAtlas.cellHeight * 0.5
+            )
+        }
+
+        let anchorViewportRow = 1
+        let anchorCol = 2
+        let expectedAnchor = GridPosition(
+            row: controller.viewportRowToGlobalRow(anchorViewportRow),
+            col: anchorCol
+        )
+        let anchorPoint = point(row: anchorViewportRow, col: anchorCol)
+        view.mouseDown(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: anchorPoint, in: view, window: window)))
+        view.mouseUp(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseUp, point: anchorPoint, in: view, window: window)))
+
+        XCTAssertNil(view.debugGetSelectionForTesting(), "An anchor click should not leave a visible empty selection.")
+
+        controller.setScrollOffset(6)
+        let activeViewportRow = 2
+        let activeCol = 7
+        let expectedActive = GridPosition(
+            row: controller.viewportRowToGlobalRow(activeViewportRow),
+            col: activeCol
+        )
+        let activePoint = point(row: activeViewportRow, col: activeCol)
+        view.mouseDown(with: try XCTUnwrap(makeMouseEvent(
+            type: .leftMouseDown,
+            point: activePoint,
+            in: view,
+            window: window,
+            modifiers: [.shift, .option]
+        )))
+        view.mouseUp(with: try XCTUnwrap(makeMouseEvent(
+            type: .leftMouseUp,
+            point: activePoint,
+            in: view,
+            window: window,
+            modifiers: [.shift, .option]
+        )))
+
+        let selection = try XCTUnwrap(view.debugGetSelectionForTesting())
+        XCTAssertEqual(selection.anchor, expectedAnchor)
+        XCTAssertEqual(selection.active, expectedActive)
+        if case .rectangular = selection.mode {
+        } else {
+            XCTFail("Shift+Option+click must create a rectangular selection from the pending anchor.")
+        }
+        XCTAssertFalse(selection.isEmpty)
+    }
+
+    func testTerminalViewOptionDuringDragSwitchesActiveSelectionToRectangular() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        func point(row: Int, col: Int) -> NSPoint {
+            NSPoint(
+                x: renderer.gridPadding + CGFloat(col) * renderer.glyphAtlas.cellWidth + renderer.glyphAtlas.cellWidth * 0.5,
+                y: view.bounds.height - renderer.gridPadding - CGFloat(row) * renderer.glyphAtlas.cellHeight - renderer.glyphAtlas.cellHeight * 0.5
+            )
+        }
+
+        let anchorPoint = point(row: 0, col: 1)
+        let interimPoint = point(row: 1, col: 4)
+        let activePoint = point(row: 2, col: 8)
+        view.mouseDown(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: anchorPoint, in: view, window: window)))
+        view.mouseDragged(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDragged, point: interimPoint, in: view, window: window)))
+        view.flagsChanged(with: try XCTUnwrap(makeFlagsEvent(window: window, modifiers: [.option])))
+
+        let activeSelection = try XCTUnwrap(view.debugGetSelectionForTesting())
+        if case .rectangular = activeSelection.mode {
+        } else {
+            XCTFail("Pressing Option during an active drag must switch the selection to rectangular mode immediately.")
+        }
+
+        view.mouseDragged(with: try XCTUnwrap(makeMouseEvent(
+            type: .leftMouseDragged,
+            point: activePoint,
+            in: view,
+            window: window,
+            modifiers: [.option]
+        )))
+        view.mouseUp(with: try XCTUnwrap(makeMouseEvent(
+            type: .leftMouseUp,
+            point: activePoint,
+            in: view,
+            window: window,
+            modifiers: [.option]
+        )))
+
+        let selection = try XCTUnwrap(view.debugGetSelectionForTesting())
+        if case .rectangular = selection.mode {
+        } else {
+            XCTFail("Holding Option during an active drag must switch the selection to rectangular mode.")
+        }
+        XCTAssertEqual(selection.anchor, GridPosition(row: 0, col: 1))
+        XCTAssertEqual(selection.active, GridPosition(row: 2, col: 8))
+    }
+
+    func testTerminalViewReleasingOptionDuringDragSwitchesActiveSelectionBackToNormal() throws {
+        let renderer = try makeRendererOrSkip()
+        let controller = TerminalController(
+            rows: 4, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
+            fontName: "Menlo", fontSize: 13
+        )
+        controller.model.mouseReporting = .buttonEvent
+
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+
+        func point(row: Int, col: Int) -> NSPoint {
+            NSPoint(
+                x: renderer.gridPadding + CGFloat(col) * renderer.glyphAtlas.cellWidth + renderer.glyphAtlas.cellWidth * 0.5,
+                y: view.bounds.height - renderer.gridPadding - CGFloat(row) * renderer.glyphAtlas.cellHeight - renderer.glyphAtlas.cellHeight * 0.5
+            )
+        }
+
+        let anchorPoint = point(row: 0, col: 1)
+        let interimPoint = point(row: 1, col: 4)
+        let activePoint = point(row: 2, col: 8)
+        view.mouseDown(with: try XCTUnwrap(makeMouseEvent(
+            type: .leftMouseDown,
+            point: anchorPoint,
+            in: view,
+            window: window,
+            modifiers: [.option]
+        )))
+        view.mouseDragged(with: try XCTUnwrap(makeMouseEvent(
+            type: .leftMouseDragged,
+            point: interimPoint,
+            in: view,
+            window: window,
+            modifiers: [.option]
+        )))
+        view.flagsChanged(with: try XCTUnwrap(makeFlagsEvent(window: window, modifiers: [])))
+
+        let activeSelection = try XCTUnwrap(view.debugGetSelectionForTesting())
+        if case .normal = activeSelection.mode {
+        } else {
+            XCTFail("Releasing Option during an active drag must switch the selection back to normal mode immediately.")
+        }
+
+        view.mouseDragged(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDragged, point: activePoint, in: view, window: window)))
+        view.mouseUp(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseUp, point: activePoint, in: view, window: window)))
+
+        let selection = try XCTUnwrap(view.debugGetSelectionForTesting())
+        if case .normal = selection.mode {
+        } else {
+            XCTFail("Releasing Option during an active drag must switch the selection back to normal mode.")
+        }
+        XCTAssertEqual(selection.anchor, GridPosition(row: 0, col: 1))
+        XCTAssertEqual(selection.active, GridPosition(row: 2, col: 8))
+    }
+
     // MARK: - Selection background translucency
 
     func testSelectionBackgroundAlphaIsTranslucent() throws {

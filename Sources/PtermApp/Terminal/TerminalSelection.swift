@@ -7,7 +7,7 @@ struct GridPosition: Equatable {
 }
 
 /// Selection mode: normal (line-continuous) or rectangular (column).
-enum SelectionMode {
+enum SelectionMode: Equatable {
     case normal
     case rectangular
 }
