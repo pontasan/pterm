@@ -4443,6 +4443,60 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(handler.debugInputSequence(for: altUpArrow), "\u{1B}[1;3A")
     }
 
+    /// Shift+navigation keys must reach the foreground program as xterm
+    /// modified sequences in every keyboard mode, so editors that implement
+    /// shift-selection (e.g. TUI input fields) can see them. `ESC[>5u` is the
+    /// kitty flag set Claude Code pushes at startup.
+    func testKeyboardHandlerEncodesShiftNavigationKeysInEveryKeyboardMode() throws {
+        let keys: [(keyCode: UInt16, functionKey: Int, final: String)] = [
+            (123, NSLeftArrowFunctionKey, "D"),
+            (124, NSRightArrowFunctionKey, "C"),
+            (126, NSUpArrowFunctionKey, "A"),
+            (125, NSDownArrowFunctionKey, "B"),
+            (115, NSHomeFunctionKey, "H"),
+            (119, NSEndFunctionKey, "F"),
+        ]
+        let modes: [(name: String, setup: String)] = [
+            ("normal", ""),
+            ("application cursor keys", "\u{1B}[?1h"),
+            ("kitty keyboard flags 5", "\u{1B}[>5u"),
+        ]
+        for mode in modes {
+            let controller = TerminalController(
+                rows: 4,
+                cols: 12,
+                termEnv: "xterm-256color",
+                textEncoding: .utf8,
+                scrollbackInitialCapacity: 4096,
+                scrollbackMaxCapacity: 4096,
+                fontName: "Menlo",
+                fontSize: 13
+            )
+            controller.debugProcessPTYOutputForTesting(Data(mode.setup.utf8))
+            let handler = KeyboardHandler(controller: controller)
+            for key in keys {
+                for (flags, parameter) in [(NSEvent.ModifierFlags.shift, 2), ([.shift, .option], 4)] {
+                    let characters = String(UnicodeScalar(key.functionKey)!)
+                    let event = try XCTUnwrap(NSEvent.keyEvent(
+                        with: .keyDown,
+                        location: .zero,
+                        modifierFlags: flags,
+                        timestamp: 0,
+                        windowNumber: 0,
+                        context: nil,
+                        characters: characters,
+                        charactersIgnoringModifiers: characters,
+                        isARepeat: false,
+                        keyCode: key.keyCode
+                    ))
+                    XCTAssertEqual(handler.debugInputSequence(for: event),
+                                   "\u{1B}[1;\(parameter)\(key.final)",
+                                   "mode=\(mode.name) keyCode=\(key.keyCode) modifier=\(parameter)")
+                }
+            }
+        }
+    }
+
     func testKeyboardHandlerPrefixesOptionModifiedTextWithEscape() throws {
         let controller = TerminalController(
             rows: 4,

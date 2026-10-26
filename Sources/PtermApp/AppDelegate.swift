@@ -2168,15 +2168,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             controller = nil
             sourceView = nil
         }
-        guard let controller, let sourceView else { return }
+        guard controller != nil, let sourceView else { return }
 
         if let text = sourceView.selectedText() {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.setString(text, forType: .string)
         } else {
-            // No selection: send SIGINT (Ctrl+C)
-            controller.performInterrupt()
+            // No selection: behave exactly like the Ctrl+C key, including the
+            // kitty keyboard protocol encoding when the program enabled it.
+            sourceView.handlePriorityInterruptShortcut()
         }
     }
 

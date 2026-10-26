@@ -99,17 +99,19 @@ final class ScrollbackBuffer {
     private let recentRowsByteBudget: Int
     private var recentRows: [BufferedRow] = []
     private var recentSerializedBytesUsed = 0
+    /// Recent rows discarded by `clear()` before reaching the ring buffer.
+    private var clearedRecentRowCount = 0
 
     /// Number of rows currently stored
     var rowCount: Int {
         archivedRowCount + recentRows.count
     }
 
-    /// Cumulative number of rows evicted since creation (monotonically increasing).
+    /// Cumulative number of rows evicted or cleared since creation (monotonically increasing).
     /// Used to create stable global absolute row addresses that survive buffer eviction.
     var totalEvictedRows: Int {
         guard let rb = ringBuffer else { return 0 }
-        return Int(ring_buffer_evicted_rows(rb))
+        return Int(ring_buffer_evicted_rows(rb)) + clearedRecentRowCount
     }
 
     /// Total allocated capacity in bytes
@@ -606,6 +608,7 @@ final class ScrollbackBuffer {
     func clear() {
         guard let rb = ringBuffer else { return }
         ring_buffer_clear(rb)
+        clearedRecentRowCount += recentRows.count
         recentRows.removeAll(keepingCapacity: true)
         recentSerializedBytesUsed = 0
         releaseSerializationBuffer()

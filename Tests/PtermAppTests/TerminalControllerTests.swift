@@ -1303,6 +1303,49 @@ final class TerminalControllerTests: XCTestCase {
         XCTAssertEqual(controller.selectedText(for: selection), "")
     }
 
+    /// Regression (STEP2 of the clipboard selection task): while a program keeps
+    /// streaming output, a selection made in scrollback must keep pointing at the
+    /// same text. Global rows are `evicted + absoluteRow`; the evicted count used
+    /// to reset to 0 whenever the ring buffer repacked (row index growth, shrink
+    /// after eviction), so the selection silently jumped to other rows.
+    func testScrollbackSelectionKeepsSelectedTextWhileOutputStreamsThroughEvictingBuffer() {
+        let controller = makeController(rows: 4, cols: 24,
+                                        scrollbackInitialCapacity: 4096,
+                                        scrollbackMaxCapacity: 16 * 1024)
+        var lineNumber = 0
+        func emitLongRows(_ count: Int) {
+            var output = ""
+            for _ in 0..<count {
+                output += String(format: "ROW%05d-", lineNumber) + String(repeating: "x", count: 14) + "\r\n"
+                lineNumber += 1
+            }
+            controller.debugProcessPTYOutputForTesting(Data(output.utf8))
+        }
+
+        // Fill the scrollback with long rows until it is evicting at max capacity.
+        emitLongRows(2_000)
+        XCTAssertGreaterThan(controller.scrollback.totalEvictedRows, 0, "fixture must already be evicting")
+
+        // Select the most recent scrollback row.
+        controller.setScrollOffset(1)
+        let globalRow = controller.viewportRowToGlobalRow(0)
+        let selection = TerminalSelection(anchor: .init(row: globalRow, col: 0),
+                                          active: .init(row: globalRow, col: 23),
+                                          mode: .normal)
+        let selectedText = controller.selectedText(for: selection)
+        XCTAssertTrue(selectedText.hasPrefix("ROW01996-"), "unexpected fixture row: \(selectedText)")
+
+        // An AI CLI then streams many blank / short rows. Each evicted long row
+        // frees room for several short rows, so the live row count grows and the
+        // ring buffer regrows its row index while it keeps evicting.
+        for chunk in 0..<400 {
+            controller.debugProcessPTYOutputForTesting(Data((chunk % 3 == 0 ? "ok\r\n" : "\r\n").utf8))
+            let current = controller.selectedText(for: selection)
+            XCTAssertEqual(current, selectedText, "Selection drifted after streaming \(chunk + 1) more rows")
+            if current != selectedText { return }
+        }
+    }
+
     func testSelectedTextRectangularSelectionIncludesVisibleScrollbackRows() {
         let controller = makeController(rows: 2, cols: 4)
         controller.scrollback.appendRow(ArraySlice([

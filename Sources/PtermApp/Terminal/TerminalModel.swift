@@ -3223,8 +3223,10 @@ final class TerminalModel {
                     cursor.visible = set
                 case 47, 1047: // Alternate Screen Buffer
                     switchScreen(alternate: set)
-                case 1000: // X10 mouse reporting
+                case 9: // X10 mouse reporting (button press only)
                     setMouseReporting(set ? .x10 : .none)
+                case 1000: // VT200 normal tracking (press and release)
+                    setMouseReporting(set ? .normal : .none)
                 case 1002: // Button event mouse reporting
                     setMouseReporting(set ? .buttonEvent : .none)
                 case 1003: // Any event mouse reporting

@@ -50,6 +50,7 @@ typedef struct {
     uint32_t      row_count;     /* Current number of valid rows */
     uint64_t      row_head;      /* Index of oldest row (uint64 to prevent overflow) */
     uint64_t      row_tail;      /* Index of next row to write */
+    uint64_t      evicted_rows;  /* Cumulative rows dropped (evicted or cleared); never reset by repacking */
 
     size_t        bytes_used;    /* Total bytes currently in use */
     uint32_t      flags;         /* RING_FLAG_MMAP etc. */

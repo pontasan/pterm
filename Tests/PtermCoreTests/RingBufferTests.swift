@@ -720,4 +720,54 @@ final class RingBufferTests: XCTestCase {
         XCTAssertEqual(ring_buffer_append_row(rb, nil, 0, false), -1)
         XCTAssertEqual(ring_buffer_row_count(rb), 0)
     }
+
+    /// Global row addresses used by selection, search and MCP text capture are
+    /// `evicted + rowIndex`. They are only stable if the evicted count is a true
+    /// cumulative counter. It used to be `row_head`, which every heap repack
+    /// (row index growth, data growth, shrink after eviction, compaction)
+    /// reset to 0, shifting every global row while output was streaming.
+    func testEvictedRowCountIsCumulativeAcrossGrowthShrinkAndCompaction() {
+        let rb = ring_buffer_create_sized(64, 512)
+        XCTAssertNotNil(rb)
+        defer { ring_buffer_destroy(rb) }
+
+        var state: UInt64 = 0x9E37_79B9_7F4A_7C15
+        func nextLength() -> Int {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            let roll = Int(state >> 33) % 100
+            if roll < 70 { return 1 + roll % 4 }       // blank-ish / short rows
+            if roll < 95 { return 8 + roll % 24 }      // regular rows
+            return 200 + roll                          // long rows forcing bulk eviction
+        }
+
+        var appended: UInt64 = 0
+        var previousEvicted: UInt64 = 0
+        let payload = [UInt8](repeating: 0x41, count: 512)
+        for step in 0..<5_000 {
+            let length = nextLength()
+            payload.withUnsafeBufferPointer { pointer in
+                XCTAssertGreaterThanOrEqual(
+                    ring_buffer_append_row(rb, pointer.baseAddress, UInt32(length), false), 0)
+            }
+            appended += 1
+            if step % 97 == 0 {
+                _ = ring_buffer_compact(rb)
+            }
+
+            let evicted = ring_buffer_evicted_rows(rb)
+            let liveRows = UInt64(ring_buffer_row_count(rb))
+            XCTAssertGreaterThanOrEqual(evicted, previousEvicted, "evicted count went backwards at step \(step)")
+            XCTAssertEqual(evicted + liveRows, appended,
+                           "evicted + live rows must equal appended rows at step \(step)")
+            guard evicted >= previousEvicted, evicted + liveRows == appended else { return }
+            previousEvicted = evicted
+        }
+        XCTAssertGreaterThan(previousEvicted, 0, "fixture must exercise eviction")
+
+        let liveRows = UInt64(ring_buffer_row_count(rb))
+        ring_buffer_clear(rb)
+        XCTAssertEqual(ring_buffer_row_count(rb), 0)
+        XCTAssertEqual(ring_buffer_evicted_rows(rb), previousEvicted + liveRows,
+                       "clearing discards live rows, so they count as evicted")
+    }
 }

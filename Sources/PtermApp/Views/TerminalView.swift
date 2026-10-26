@@ -1897,25 +1897,25 @@ final class TerminalView: MTKView, NSTextInputClient {
         case .down:
             pressedMouseButton = buttonOverride ?? mouseButtonCode(for: event)
             guard let button = pressedMouseButton else { return false }
-            controller.sendInput(encodeMouse(button: button, position: position, phase: .down,
-                                             protocolMode: state.protocolMode))
+            sendMouseReport(button: button, position: position, phase: .press,
+                            protocolMode: state.protocolMode, to: controller)
             return true
         case .up:
             guard state.mode != .x10 else { return true }
-            controller.sendInput(encodeMouse(button: pressedMouseButton ?? mouseButtonCode(for: event) ?? 0,
-                                             position: position, phase: .up,
-                                             protocolMode: state.protocolMode))
+            sendMouseReport(button: pressedMouseButton ?? mouseButtonCode(for: event) ?? 0,
+                            position: position, phase: .release,
+                            protocolMode: state.protocolMode, to: controller)
             return true
         case .dragged:
             guard state.mode == .buttonEvent || state.mode == .anyEvent,
                   let button = pressedMouseButton ?? mouseButtonCode(for: event) else { return false }
-            controller.sendInput(encodeMouse(button: button, position: position, phase: .dragged,
-                                             protocolMode: state.protocolMode))
+            sendMouseReport(button: button, position: position, phase: .drag,
+                            protocolMode: state.protocolMode, to: controller)
             return true
         case .moved:
             guard state.mode == .anyEvent else { return false }
-            controller.sendInput(encodeMouse(button: pressedMouseButton ?? 0, position: position, phase: .moved,
-                                             protocolMode: state.protocolMode))
+            sendMouseReport(button: MouseReportEncoder.noButton, position: position, phase: .motion,
+                            protocolMode: state.protocolMode, to: controller)
             return true
         case .scroll:
             if event.hasPreciseScrollingDeltas {
@@ -1943,8 +1943,8 @@ final class TerminalView: MTKView, NSTextInputClient {
                     guard result.lines != 0 else { return true }
                     let button = result.lines > 0 ? 64 : 65
                     for _ in 0..<abs(result.lines) {
-                        controller.sendInput(encodeMouse(button: button, position: position, phase: .scroll,
-                                                         protocolMode: state.protocolMode))
+                        sendMouseReport(button: button, position: position, phase: .wheel,
+                            protocolMode: state.protocolMode, to: controller)
                     }
                     return true
                 }
@@ -1970,8 +1970,8 @@ final class TerminalView: MTKView, NSTextInputClient {
 
                 let button = result.lines > 0 ? 64 : 65
                 for _ in 0..<abs(result.lines) {
-                    controller.sendInput(encodeMouse(button: button, position: position, phase: .scroll,
-                                                     protocolMode: state.protocolMode))
+                    sendMouseReport(button: button, position: position, phase: .wheel,
+                            protocolMode: state.protocolMode, to: controller)
                 }
                 return true
             }
@@ -1981,8 +1981,8 @@ final class TerminalView: MTKView, NSTextInputClient {
             mouseReportDirectScrollGestureActive = false
             guard event.scrollingDeltaY != 0 else { return true }
             let button = event.scrollingDeltaY > 0 ? 64 : 65
-            controller.sendInput(encodeMouse(button: button, position: position, phase: .scroll,
-                                             protocolMode: state.protocolMode))
+            sendMouseReport(button: button, position: position, phase: .wheel,
+                            protocolMode: state.protocolMode, to: controller)
             return true
         }
     }
@@ -2028,46 +2028,17 @@ final class TerminalView: MTKView, NSTextInputClient {
         }
     }
 
-    private func encodeMouse(button: Int,
-                             position: GridPosition,
-                             phase: MousePhase,
-                             protocolMode: TerminalModel.MouseProtocol) -> String {
-        let col = position.col + 1
-        let row = position.row + 1
-        let baseCode: Int
-        switch phase {
-        case .up:
-            baseCode = 3
-        case .dragged, .moved:
-            baseCode = button | 32
-        case .down, .scroll:
-            baseCode = button
-        }
-
-        switch protocolMode {
-        case .sgr:
-            let suffix = phase == .up ? "m" : "M"
-            return "\u{1B}[<\(baseCode);\(col);\(row)\(suffix)"
-        case .utf8:
-            let bytes: [UInt8] = [
-                0x1B, 0x5B, 0x4D,
-                UInt8(min(255, 32 + baseCode))
-            ] + utf8MouseCoordinateBytes(33 + col) + utf8MouseCoordinateBytes(33 + row)
-            return String(decoding: bytes, as: UTF8.self)
-        case .x10:
-            let bytes: [UInt8] = [
-                0x1B, 0x5B, 0x4D,
-                UInt8(min(255, 32 + baseCode)),
-                UInt8(min(255, 33 + col)),
-                UInt8(min(255, 33 + row))
-            ]
-            return String(decoding: bytes, as: UTF8.self)
-        }
-    }
-
-    private func utf8MouseCoordinateBytes(_ value: Int) -> [UInt8] {
-        let clamped = max(0, min(value, 0x10FFFF))
-        return Array(String(UnicodeScalar(clamped)!).utf8)
+    private func sendMouseReport(button: Int,
+                                 position: GridPosition,
+                                 phase: MouseReportEncoder.Phase,
+                                 protocolMode: TerminalModel.MouseProtocol,
+                                 to controller: TerminalController) {
+        guard let report = MouseReportEncoder.encode(button: button,
+                                                     column: position.col,
+                                                     row: position.row,
+                                                     phase: phase,
+                                                     protocolMode: protocolMode) else { return }
+        controller.sendInput(report)
     }
 
     // MARK: - Selection API

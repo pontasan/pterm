@@ -811,6 +811,7 @@ static bool ring_buffer_evict(RingBuffer *rb, size_t needed) {
         rb->rows[head_idx].length = 0;
         rb->row_head++;
         rb->row_count--;
+        rb->evicted_rows++;
         evicted = true;
     }
     return evicted;
@@ -883,6 +884,7 @@ static bool ring_buffer_append_row_internal(RingBuffer *rb,
         rb->bytes_used -= rb->rows[head_idx].length;
         rb->row_head++;
         rb->row_count--;
+        rb->evicted_rows++;
         did_evict = true;
     }
 
@@ -994,7 +996,7 @@ uint32_t ring_buffer_row_count(const RingBuffer *rb) {
 }
 
 uint64_t ring_buffer_evicted_rows(const RingBuffer *rb) {
-    return rb ? rb->row_head : 0;
+    return rb ? rb->evicted_rows : 0;
 }
 
 uint32_t ring_buffer_row_index_capacity(const RingBuffer *rb) {
@@ -1068,6 +1070,7 @@ void ring_buffer_clear(RingBuffer *rb) {
     if (rb->data) {
         ring_buffer_zero_memory(rb->data, rb->data_capacity);
     }
+    rb->evicted_rows += rb->row_count;
     rb->write_offset = 0;
     rb->row_count = 0;
     rb->row_head = 0;

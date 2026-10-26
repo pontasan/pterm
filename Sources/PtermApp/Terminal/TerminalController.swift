@@ -231,7 +231,6 @@ final class TerminalController {
     private let callbackLock = NSLock()
     private let renderSnapshotCacheLock = NSLock()
     private let extractionScratchLock = NSLock()
-    private let interruptDrainLock = NSLock()
     private var mainCallbacksScheduled = false
     private var pendingNeedsDisplay = false
     private var pendingOutputActivity = false
@@ -240,8 +239,6 @@ final class TerminalController {
     private var lastKnownInlineImageReachabilityWasNonEmpty = false
     private var terminalRenderingSuppressed = false
     private var pendingRenderingSuppressedChanges: [Bool] = []
-    private var interruptDiscardingOutput = false
-    private var pendingInterruptDrainCompletion: DispatchWorkItem?
     private var renderContentVersion: UInt64 = 0
     private var cachedRenderSnapshot: RenderSnapshot?
     private var cachedRenderSnapshotVersion: UInt64 = 0
@@ -295,7 +292,6 @@ final class TerminalController {
     private static let maxAllTextReserveCapacity = 64 * 1024
     private static let maxSearchReserveCapacity = 4 * 1024
     private static let inputEchoSuppressionInterval: TimeInterval = 0.35
-    private static let interruptDrainQuietPeriod: TimeInterval = 0.10
     private static let ptyResizeCoalescingDelay: TimeInterval = 0.05
     private static let scrollbackCompactionDelay: TimeInterval = 1.0
     private static let scrollbackCompactionQueue = DispatchQueue(
@@ -822,12 +818,15 @@ final class TerminalController {
         performInterrupt(controlCharacter: 0x03)
     }
 
+    /// PTY output produced after the interrupt is never discarded: it carries
+    /// the foreground program's terminal-state restoration (alternate screen
+    /// exit, mouse tracking reset, etc.), and dropping it would desynchronize
+    /// the emulator from the program. Flushing stale output on SIGINT is the
+    /// kernel line discipline's job (ISIG without NOFLSH), not the emulator's.
     func performInterrupt(controlCharacter: UInt8) {
         callbackLock.withLock {
-            interruptDiscardingOutput = true
             outputActivitySuppressedUntilUptime = 0
         }
-        scheduleInterruptDrainCompletion()
         sendControlCharacter(controlCharacter)
     }
 
@@ -1015,14 +1014,6 @@ final class TerminalController {
     }
 
     private func handlePTYOutput(_ data: UnsafeBufferPointer<UInt8>) {
-        let shouldDiscardInterruptOutput = callbackLock.withLock {
-            interruptDiscardingOutput
-        }
-        if shouldDiscardInterruptOutput {
-            scheduleInterruptDrainCompletion()
-            return
-        }
-
         processPTYOutput(data, recordAudit: true)
     }
 
@@ -2616,33 +2607,6 @@ final class TerminalController {
         }
         guard let sink = emission.sink, let text = emission.text, !text.isEmpty else { return }
         sink(text)
-    }
-
-    private func scheduleInterruptDrainCompletion() {
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.completeInterruptDrainIfNeeded()
-        }
-
-        interruptDrainLock.withLock {
-            pendingInterruptDrainCompletion?.cancel()
-            pendingInterruptDrainCompletion = workItem
-        }
-
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + Self.interruptDrainQuietPeriod,
-            execute: workItem
-        )
-    }
-
-    private func completeInterruptDrainIfNeeded() {
-        interruptDrainLock.withLock {
-            pendingInterruptDrainCompletion = nil
-        }
-
-        callbackLock.withLock {
-            guard interruptDiscardingOutput else { return }
-            interruptDiscardingOutput = false
-        }
     }
 
     static func shouldSuppressOutputActivity(forInput data: Data) -> Bool {

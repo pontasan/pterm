@@ -178,6 +178,73 @@ final class PTYIntegrationTests: XCTestCase {
         XCTAssertTrue(collectedOutput.contains(directory.path))
     }
 
+    /// Regression: a full-screen TUI (e.g. Claude Code) that exits on Ctrl+C
+    /// emits its terminal-state restoration right after the interrupt. The
+    /// emulator used to discard all PTY output for a quiet period after an
+    /// interrupt, which dropped `?1049l` / `?1003l` / `?1006l`; the shell then
+    /// stayed on the alternate screen with any-event mouse tracking enabled and
+    /// every mouse movement was typed into zsh as `32;12;5M...`.
+    @MainActor
+    func testTerminalControllerRealPTYKeepsTerminalStateRestorationEmittedRightAfterInterrupt() throws {
+        let script = """
+        stty raw -echo
+        printf '\\033[?1049h\\033[?1003h\\033[?1006hTUI_READY__'
+        dd bs=1 count=1 >/dev/null 2>&1
+        printf '\\033[?1006l\\033[?1003l\\033[?1049lRESTORED__'
+        """
+        let controller = TerminalController(
+            rows: 6,
+            cols: 40,
+            termEnv: "xterm-256color",
+            textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096,
+            scrollbackMaxCapacity: 4096,
+            fontName: "Menlo",
+            fontSize: 13,
+            executablePath: "/bin/sh",
+            executableArguments: ["-c", script]
+        )
+        defer { controller.stop(waitForExit: true) }
+
+        let exitExpectation = expectation(description: "tui-exit-after-interrupt")
+        var exited = false
+        controller.onExit = {
+            guard !exited else { return }
+            exited = true
+            exitExpectation.fulfill()
+        }
+
+        try controller.start()
+
+        func waitUntil(_ description: String, timeout: TimeInterval = 5.0, _ condition: () -> Bool) {
+            let deadline = Date().addingTimeInterval(timeout)
+            while !condition() {
+                guard Date() < deadline else {
+                    return XCTFail("Timed out waiting for \(description)")
+                }
+                RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+            }
+        }
+
+        waitUntil("TUI to enter alternate screen with mouse tracking") {
+            controller.withModel {
+                $0.isAlternateScreen && $0.mouseReporting == .anyEvent && $0.mouseProtocol == .sgr
+            } && controller.allText().contains("TUI_READY__")
+        }
+
+        controller.performInterrupt()
+
+        wait(for: [exitExpectation], timeout: 8.0)
+        waitUntil("restoration output to be processed") {
+            controller.allText().contains("RESTORED__")
+        }
+
+        let state = controller.withModel { ($0.isAlternateScreen, $0.mouseReporting, $0.mouseProtocol) }
+        XCTAssertFalse(state.0, "Alternate screen exit emitted after Ctrl+C must be applied")
+        XCTAssertEqual(state.1, .none, "Mouse tracking reset emitted after Ctrl+C must be applied")
+        XCTAssertEqual(state.2, .x10, "SGR mouse protocol reset emitted after Ctrl+C must be applied")
+    }
+
     @MainActor
     func testTerminalControllerRealPTYCoalescesDisplayNotificationsAcrossManyOutputLines() throws {
         let controller = TerminalController(

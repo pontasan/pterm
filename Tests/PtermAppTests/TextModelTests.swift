@@ -874,6 +874,25 @@ final class TextModelTests: XCTestCase {
         XCTAssertEqual(selection.extractText(from: grid), "")
     }
 
+    func testScrollbackBufferClearCountsRecentAndArchivedRowsAsEvicted() {
+        // A large budget keeps freshly appended rows in the Swift-side recent
+        // queue; flushing moves some of them into the C ring buffer first.
+        let buffer = ScrollbackBuffer(initialCapacity: 64 * 1024, maxCapacity: 1024 * 1024)
+        let row = ArraySlice("row".unicodeScalars.map {
+            Cell(codepoint: $0.value, attributes: .default, width: 1, isWideContinuation: false)
+        })
+        for _ in 0..<5 { buffer.appendRow(row, isWrapped: false) }
+        buffer.flushPendingRows()
+        for _ in 0..<3 { buffer.appendRow(row, isWrapped: false) }
+        XCTAssertEqual(buffer.totalEvictedRows + buffer.rowCount, 8)
+
+        buffer.clear()
+
+        XCTAssertEqual(buffer.rowCount, 0)
+        XCTAssertEqual(buffer.totalEvictedRows, 8,
+                       "clear must keep `evicted + rowCount` stable so live grid rows keep their global address")
+    }
+
     func testScrollbackBufferRoundTripsCellsAndWrapFlags() throws {
         let buffer = ScrollbackBuffer(initialCapacity: 1024, maxCapacity: 1024)
         let cell = Cell(codepoint: 0x3042, attributes: .init(foreground: .rgb(1, 2, 3), background: .indexed(4), bold: true, italic: false, underline: true, strikethrough: false, inverse: false, hidden: false, dim: true, blink: false), width: 2, isWideContinuation: false)
