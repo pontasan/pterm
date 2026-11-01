@@ -202,8 +202,6 @@ static RingBuffer *ring_buffer_alloc_struct(size_t capacity,
     rb->mapping_base = NULL;
     rb->mapping_length = 0;
     rb->mmap_header = NULL;
-    rb->copy_buf = NULL;
-    rb->copy_buf_cap = 0;
 
     return rb;
 }
@@ -296,13 +294,6 @@ static bool ring_buffer_prepare_append_batch(RingBuffer *rb,
     return true;
 }
 
-static void ring_buffer_release_copy_buf(RingBuffer *rb) {
-    if (!rb) return;
-    free(rb->copy_buf);
-    rb->copy_buf = NULL;
-    rb->copy_buf_cap = 0;
-}
-
 static bool ring_buffer_repack_into(const RingBuffer *rb,
                                     uint8_t *destination_data,
                                     size_t destination_capacity,
@@ -389,7 +380,6 @@ static bool ring_buffer_resize_heap(RingBuffer *rb,
     rb->row_count = row_count;
     rb->row_head = 0;
     rb->row_tail = row_count;
-    ring_buffer_release_copy_buf(rb);
     return true;
 }
 
@@ -504,7 +494,6 @@ static bool ring_buffer_resize_mmap(RingBuffer *rb,
     rb->row_head = 0;
     rb->row_tail = row_count;
     ring_buffer_sync_header(rb);
-    ring_buffer_release_copy_buf(rb);
 
     free(packed_data);
     free(packed_rows);
@@ -772,7 +761,6 @@ static void ring_buffer_free_internal(RingBuffer *rb) {
     }
 
     free(rb->mmap_path);
-    ring_buffer_release_copy_buf(rb);
     if (!(rb->flags & RING_FLAG_MMAP)) {
         free(rb->rows);
     }
@@ -952,8 +940,9 @@ int64_t ring_buffer_append_rows(RingBuffer *rb,
     return (int64_t)(rb->row_tail - 1);
 }
 
-bool ring_buffer_get_row(RingBuffer *rb, uint32_t row_index,
-                         const uint8_t **out_data, uint32_t *out_length,
+bool ring_buffer_get_row(const RingBuffer *rb, uint32_t row_index,
+                         const uint8_t **out_first, uint32_t *out_first_length,
+                         const uint8_t **out_second, uint32_t *out_second_length,
                          bool *out_continuation) {
     if (!rb || row_index >= rb->row_count) return false;
 
@@ -961,31 +950,18 @@ bool ring_buffer_get_row(RingBuffer *rb, uint32_t row_index,
     const RingRowEntry *entry = &rb->rows[actual_idx];
 
     if (entry->length == 0) return false;
+    if (entry->offset >= rb->data_capacity || entry->length > rb->data_capacity) return false;
 
-    /* Check for wrap-around read */
     size_t end = (size_t)entry->offset + (size_t)entry->length;
-    if (end <= rb->data_capacity) {
-        /* Contiguous read */
-        if (out_data) *out_data = rb->data + entry->offset;
-    } else {
-        /* Data wraps around the buffer boundary.
-         * Copy both segments into a contiguous temporary buffer. */
-        size_t first = rb->data_capacity - entry->offset;
-        size_t second = (size_t)entry->length - first;
+    uint32_t first_length = end <= rb->data_capacity
+        ? entry->length
+        : (uint32_t)(rb->data_capacity - entry->offset);
+    uint32_t second_length = entry->length - first_length;
 
-        if ((size_t)entry->length > rb->copy_buf_cap) {
-            uint8_t *new_buf = realloc(rb->copy_buf, (size_t)entry->length);
-            if (!new_buf) return false;
-            rb->copy_buf = new_buf;
-            rb->copy_buf_cap = (size_t)entry->length;
-        }
-
-        memcpy(rb->copy_buf, rb->data + entry->offset, first);
-        memcpy(rb->copy_buf + first, rb->data, second);
-        if (out_data) *out_data = rb->copy_buf;
-    }
-
-    if (out_length) *out_length = entry->length;
+    if (out_first) *out_first = rb->data + entry->offset;
+    if (out_first_length) *out_first_length = first_length;
+    if (out_second) *out_second = second_length > 0 ? rb->data : NULL;
+    if (out_second_length) *out_second_length = second_length;
     if (out_continuation) *out_continuation = (entry->flags & 1) != 0;
 
     return true;
@@ -1058,7 +1034,6 @@ bool ring_buffer_compact(RingBuffer *rb) {
     ring_buffer_maybe_shrink(rb);
     ring_buffer_maybe_shrink_rows(rb);
     ring_buffer_sync_header(rb);
-    ring_buffer_release_copy_buf(rb);
 
     return rb->data_capacity != original_data_capacity ||
            rb->row_capacity != original_row_capacity;
@@ -1096,6 +1071,5 @@ void ring_buffer_clear(RingBuffer *rb) {
         free(rb->rows);
         rb->rows = NULL;
     }
-    ring_buffer_release_copy_buf(rb);
     ring_buffer_sync_header(rb);
 }

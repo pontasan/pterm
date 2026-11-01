@@ -16,6 +16,23 @@ final class RingBufferTests: XCTestCase {
         rb.pointee.rows[0].reserved = (0, 0, 0)
     }
 
+    /// Reads a row and joins its two segments, as `ScrollbackBuffer.getRow` does.
+    private func readRow(_ rb: UnsafeMutablePointer<RingBuffer>?, _ index: UInt32) -> (bytes: [UInt8], continuation: Bool)? {
+        var first: UnsafePointer<UInt8>?
+        var firstLength: UInt32 = 0
+        var second: UnsafePointer<UInt8>?
+        var secondLength: UInt32 = 0
+        var continuation = false
+        guard ring_buffer_get_row(rb, index, &first, &firstLength, &second, &secondLength, &continuation) else {
+            return nil
+        }
+        var bytes = Array(UnsafeBufferPointer(start: first, count: Int(firstLength)))
+        if secondLength > 0 {
+            bytes += Array(UnsafeBufferPointer(start: second, count: Int(secondLength)))
+        }
+        return (bytes, continuation)
+    }
+
     private func overwriteBufferWithWrappedSingleRow(_ rb: UnsafeMutablePointer<RingBuffer>,
                                                      bytes: [UInt8],
                                                      offset: UInt32) {
@@ -58,18 +75,13 @@ final class RingBufferTests: XCTestCase {
 
         XCTAssertEqual(ring_buffer_row_count(rb), 2)
 
-        var dataPtr: UnsafePointer<UInt8>?
-        var length: UInt32 = 0
-        var continuation = false
-        XCTAssertTrue(ring_buffer_get_row(rb, 0, &dataPtr, &length, &continuation))
-        XCTAssertEqual(length, 3)
-        XCTAssertFalse(continuation)
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: dataPtr, count: Int(length))), row1)
+        let first = readRow(rb, 0)
+        XCTAssertEqual(first?.bytes, row1)
+        XCTAssertEqual(first?.continuation, false)
 
-        XCTAssertTrue(ring_buffer_get_row(rb, 1, &dataPtr, &length, &continuation))
-        XCTAssertEqual(length, 2)
-        XCTAssertTrue(continuation)
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: dataPtr, count: Int(length))), row2)
+        let second = readRow(rb, 1)
+        XCTAssertEqual(second?.bytes, row2)
+        XCTAssertEqual(second?.continuation, true)
     }
 
     func testBufferEvictsOldestRowsWhenCapacityExceeded() {
@@ -86,12 +98,8 @@ final class RingBufferTests: XCTestCase {
 
         XCTAssertEqual(ring_buffer_row_count(rb), 2)
 
-        var dataPtr: UnsafePointer<UInt8>?
-        var length: UInt32 = 0
-        XCTAssertTrue(ring_buffer_get_row(rb, 0, &dataPtr, &length, nil))
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: dataPtr, count: Int(length))), [2, 2, 2, 2])
-        XCTAssertTrue(ring_buffer_get_row(rb, 1, &dataPtr, &length, nil))
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: dataPtr, count: Int(length))), [3, 3, 3, 3])
+        XCTAssertEqual(readRow(rb, 0)?.bytes, [2, 2, 2, 2])
+        XCTAssertEqual(readRow(rb, 1)?.bytes, [3, 3, 3, 3])
     }
 
     func testClearRemovesAllRowsAndBytes() {
@@ -222,12 +230,8 @@ final class RingBufferTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(result, 0)
         XCTAssertEqual(ring_buffer_row_count(rb), 2)
 
-        var dataPtr: UnsafePointer<UInt8>?
-        var length: UInt32 = 0
-        XCTAssertTrue(ring_buffer_get_row(rb, 0, &dataPtr, &length, nil))
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: dataPtr, count: Int(length))), [2, 2, 2, 2])
-        XCTAssertTrue(ring_buffer_get_row(rb, 1, &dataPtr, &length, nil))
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: dataPtr, count: Int(length))), [3, 3, 3, 3])
+        XCTAssertEqual(readRow(rb, 0)?.bytes, [2, 2, 2, 2])
+        XCTAssertEqual(readRow(rb, 1)?.bytes, [3, 3, 3, 3])
     }
 
     func testInitialRowIndexCapacityStartsAtSoftLimitInsteadOfScalingWithInitialBytes() {
@@ -345,7 +349,7 @@ final class RingBufferTests: XCTestCase {
         XCTAssertEqual(ring_buffer_bytes_used(rb), 0)
     }
 
-    func testClearReleasesWrappedReadScratchBuffer() {
+    func testWrappedRowReadReturnsBothSegmentsWithoutMutatingBuffer() {
         let rb = ring_buffer_create_sized(8, 8)
         XCTAssertNotNil(rb)
         defer { ring_buffer_destroy(rb) }
@@ -357,17 +361,23 @@ final class RingBufferTests: XCTestCase {
 
         overwriteBufferWithWrappedSingleRow(rb!, bytes: [9, 8, 7, 6], offset: 6)
 
-        var dataPtr: UnsafePointer<UInt8>?
-        var length: UInt32 = 0
-        XCTAssertTrue(ring_buffer_get_row(rb, 0, &dataPtr, &length, nil))
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: dataPtr, count: Int(length))), [9, 8, 7, 6])
-        XCTAssertNotNil(rb?.pointee.copy_buf)
-        XCTAssertEqual(rb?.pointee.copy_buf_cap, 4)
-
-        ring_buffer_clear(rb)
-
-        XCTAssertNil(rb?.pointee.copy_buf)
-        XCTAssertEqual(rb?.pointee.copy_buf_cap, 0)
+        func snapshot() -> Data {
+            Data(bytes: UnsafeRawPointer(rb!), count: MemoryLayout<RingBuffer>.size)
+                + Data(bytes: rb!.pointee.data, count: Int(rb!.pointee.data_capacity))
+        }
+        let before = snapshot()
+        var first: UnsafePointer<UInt8>?
+        var firstLength: UInt32 = 0
+        var second: UnsafePointer<UInt8>?
+        var secondLength: UInt32 = 0
+        XCTAssertTrue(ring_buffer_get_row(rb, 0, &first, &firstLength, &second, &secondLength, nil))
+        XCTAssertEqual(firstLength, 2)
+        XCTAssertEqual(secondLength, 2)
+        XCTAssertEqual(first, UnsafePointer(rb!.pointee.data + 6))
+        XCTAssertEqual(second, UnsafePointer(rb!.pointee.data))
+        XCTAssertEqual(readRow(rb, 0)?.bytes, [9, 8, 7, 6])
+        XCTAssertEqual(snapshot(), before,
+                       "reads must not mutate the ring buffer: concurrent readers share it")
     }
 
     func testClearShrinksHeapRowIndexBackToInitialCapacity() {
@@ -477,14 +487,10 @@ final class RingBufferTests: XCTestCase {
         XCTAssertEqual(ring_buffer_row_count(rb), 1)
         XCTAssertEqual(ring_buffer_bytes_used(rb), 1)
 
-        var dataPtr: UnsafePointer<UInt8>?
-        var length: UInt32 = 0
-        XCTAssertTrue(ring_buffer_get_row(rb, 0, &dataPtr, &length, nil))
-        XCTAssertEqual(length, 1)
-        XCTAssertEqual(dataPtr?[0], 42)
+        XCTAssertEqual(readRow(rb, 0)?.bytes, [42])
     }
 
-    func testCompactReleasesWrappedReadScratchBufferAfterRepack() {
+    func testCompactUnwrapsWrappedRowIntoOneSegment() {
         let rb = ring_buffer_create_sized(8, 64)
         XCTAssertNotNil(rb)
         defer { ring_buffer_destroy(rb) }
@@ -497,18 +503,14 @@ final class RingBufferTests: XCTestCase {
 
         overwriteBufferWithWrappedSingleRow(rb!, bytes: [4, 3, 2, 1], offset: 62)
 
-        var dataPtr: UnsafePointer<UInt8>?
-        var length: UInt32 = 0
-        XCTAssertTrue(ring_buffer_get_row(rb, 0, &dataPtr, &length, nil))
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: dataPtr, count: Int(length))), [4, 3, 2, 1])
-        XCTAssertNotNil(rb?.pointee.copy_buf)
+        XCTAssertEqual(readRow(rb, 0)?.bytes, [4, 3, 2, 1])
 
         XCTAssertTrue(ring_buffer_compact(rb))
-        XCTAssertNil(rb?.pointee.copy_buf)
-        XCTAssertEqual(rb?.pointee.copy_buf_cap, 0)
 
-        XCTAssertTrue(ring_buffer_get_row(rb, 0, &dataPtr, &length, nil))
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: dataPtr, count: Int(length))), [4, 3, 2, 1])
+        var secondLength: UInt32 = 99
+        XCTAssertTrue(ring_buffer_get_row(rb, 0, nil, nil, nil, &secondLength, nil))
+        XCTAssertEqual(secondLength, 0, "a repacked row is contiguous")
+        XCTAssertEqual(readRow(rb, 0)?.bytes, [4, 3, 2, 1])
     }
 
     func testCompactShrinksUnderutilizedMmapBufferAndRowsWhilePreservingRows() throws {
@@ -537,11 +539,7 @@ final class RingBufferTests: XCTestCase {
         XCTAssertEqual(ring_buffer_row_index_capacity(rb), initialRowCapacity)
         XCTAssertEqual(ring_buffer_row_count(rb), 1)
 
-        var dataPtr: UnsafePointer<UInt8>?
-        var length: UInt32 = 0
-        XCTAssertTrue(ring_buffer_get_row(rb, 0, &dataPtr, &length, nil))
-        XCTAssertEqual(length, 1)
-        XCTAssertEqual(dataPtr?[0], 99)
+        XCTAssertEqual(readRow(rb, 0)?.bytes, [99])
     }
 
     func testMmapBackedBufferPersistsRowsAcrossReopen() throws {
@@ -566,12 +564,9 @@ final class RingBufferTests: XCTestCase {
         XCTAssertNotNil(reopened)
         defer { ring_buffer_destroy(reopened) }
 
-        var dataPtr: UnsafePointer<UInt8>?
-        var length: UInt32 = 0
-        var continuation = false
-        XCTAssertTrue(ring_buffer_get_row(reopened, 0, &dataPtr, &length, &continuation))
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: dataPtr, count: Int(length))), [9, 8, 7])
-        XCTAssertTrue(continuation)
+        let row = readRow(reopened, 0)
+        XCTAssertEqual(row?.bytes, [9, 8, 7])
+        XCTAssertEqual(row?.continuation, true)
     }
 
     func testDestroyAndUnlinkRemovesMmapBackingFile() throws {
@@ -707,9 +702,7 @@ final class RingBufferTests: XCTestCase {
         XCTAssertNotNil(rb)
         defer { ring_buffer_destroy(rb) }
 
-        var dataPtr: UnsafePointer<UInt8>?
-        var length: UInt32 = 0
-        XCTAssertFalse(ring_buffer_get_row(rb, 0, &dataPtr, &length, nil))
+        XCTAssertNil(readRow(rb, 0))
     }
 
     func testAppendZeroLengthRowIsRejected() {

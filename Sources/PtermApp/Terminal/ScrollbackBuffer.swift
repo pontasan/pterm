@@ -417,26 +417,44 @@ final class ScrollbackBuffer {
             return false
         }
 
-        var dataPtr: UnsafePointer<UInt8>?
-        var length: UInt32 = 0
-        var continuation: Bool = false
+        var firstPtr: UnsafePointer<UInt8>?
+        var firstLength: UInt32 = 0
+        var secondPtr: UnsafePointer<UInt8>?
+        var secondLength: UInt32 = 0
 
-        guard ring_buffer_get_row(rb, UInt32(rowIndex), &dataPtr, &length, &continuation) else {
+        guard ring_buffer_get_row(rb, UInt32(rowIndex), &firstPtr, &firstLength,
+                                  &secondPtr, &secondLength, nil),
+              let firstPtr, firstLength > 0 else {
             destination.removeAll(keepingCapacity: true)
             return false
         }
 
-        guard let ptr = dataPtr, length > 0 else {
-            destination.removeAll(keepingCapacity: true)
-            return false
+        guard secondLength > 0, let secondPtr else {
+            Self.decodeArchivedRow(from: firstPtr, length: Int(firstLength), into: &destination)
+            return true
         }
 
+        // The row wraps around the ring's end. Join the two segments in
+        // call-local storage: the ring itself is shared by concurrent readers.
+        let length = Int(firstLength) + Int(secondLength)
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: length) { joined in
+            let base = joined.baseAddress!
+            base.initialize(from: firstPtr, count: Int(firstLength))
+            (base + Int(firstLength)).initialize(from: secondPtr, count: Int(secondLength))
+            Self.decodeArchivedRow(from: UnsafePointer(base), length: length, into: &destination)
+        }
+        return true
+    }
+
+    private static func decodeArchivedRow(from ptr: UnsafePointer<UInt8>,
+                                          length: Int,
+                                          into destination: inout [Cell]) {
         let cellCount: Int
         destination.removeAll(keepingCapacity: true)
-        if Self.isCompactDefaultRowFormat(length: Int(length), firstByte: ptr[0]) {
+        if Self.isCompactDefaultRowFormat(length: length, firstByte: ptr[0]) {
             let trimmed = ptr[0] == RowFormat.compactDefaultTrimmed
             let headerBytes = trimmed ? Self.compactTrimmedRowHeaderBytes : Self.compactRowHeaderBytes
-            let serializedCount = (Int(length) - headerBytes) / MemoryLayout<UInt32>.size
+            let serializedCount = (length - headerBytes) / MemoryLayout<UInt32>.size
             cellCount = trimmed ? Int(Self.deserializeUInt16(from: ptr + 1)) : serializedCount
             destination.reserveCapacity(cellCount)
             var offset = headerBytes
@@ -447,7 +465,7 @@ final class ScrollbackBuffer {
             if trimmed && cellCount > serializedCount {
                 destination.append(contentsOf: repeatElement(Cell.empty, count: cellCount - serializedCount))
             }
-        } else if Self.isCompactUniformAttributesRowFormat(length: Int(length), firstByte: ptr[0]) {
+        } else if Self.isCompactUniformAttributesRowFormat(length: length, firstByte: ptr[0]) {
             let trimmed = ptr[0] == RowFormat.compactUniformAttributesTrimmed
             let sharedAttributes = Self.deserializeAttributes(
                 foregroundPtr: ptr + 1,
@@ -457,7 +475,7 @@ final class ScrollbackBuffer {
                 underlineColorPtr: ptr + 11
             )
             let headerBytes = trimmed ? Self.uniformAttributesTrimmedHeaderBytes : Self.uniformAttributesHeaderBytes
-            let serializedCount = (Int(length) - headerBytes) / Self.uniformAttributesBytesPerCell
+            let serializedCount = (length - headerBytes) / Self.uniformAttributesBytesPerCell
             cellCount = trimmed ? Int(Self.deserializeUInt16(from: ptr + 15)) : serializedCount
             destination.reserveCapacity(cellCount)
             var offset = headerBytes
@@ -476,14 +494,13 @@ final class ScrollbackBuffer {
                 destination.append(contentsOf: repeatElement(blank, count: cellCount - serializedCount))
             }
         } else {
-            cellCount = Int(length) / Self.bytesPerCell
+            cellCount = length / Self.bytesPerCell
             destination.reserveCapacity(cellCount)
             for i in 0..<cellCount {
                 destination.append(Self.deserializeCell(from: ptr + i * Self.bytesPerCell))
             }
         }
 
-        return true
     }
 
     /// Check if a row is a soft-wrapped continuation.
@@ -497,7 +514,7 @@ final class ScrollbackBuffer {
 
         guard let rb = ringBuffer else { return false }
         var continuation: Bool = false
-        guard ring_buffer_get_row(rb, UInt32(rowIndex), nil, nil, &continuation) else {
+        guard ring_buffer_get_row(rb, UInt32(rowIndex), nil, nil, nil, nil, &continuation) else {
             return false
         }
         return continuation
@@ -958,9 +975,9 @@ final class ScrollbackBuffer {
                 : compactTrimmedRowHeaderBytes
             return headerBytes + (serializedCount * MemoryLayout<UInt32>.size)
         case .compactUniformAttributes(_, let serializedCount):
-            let headerBytes = serializedCount == cellCount
-                ? uniformAttributesHeaderBytes
-                : uniformAttributesTrimmedHeaderBytes
+            let headerBytes = usesTrimmedUniformHeader(serializedCount: serializedCount, cellCount: cellCount)
+                ? uniformAttributesTrimmedHeaderBytes
+                : uniformAttributesHeaderBytes
             return headerBytes + (serializedCount * uniformAttributesBytesPerCell)
         case .full:
             return cellCount * bytesPerCell
@@ -1011,7 +1028,7 @@ final class ScrollbackBuffer {
                 offset += MemoryLayout<UInt32>.size
             }
         case .compactUniformAttributes(let sharedAttributes, let serializedCount):
-            let trimmed = serializedCount != cellCount
+            let trimmed = usesTrimmedUniformHeader(serializedCount: serializedCount, cellCount: cellCount)
             buf[0] = trimmed ? RowFormat.compactUniformAttributesTrimmed : RowFormat.compactUniformAttributes
             serializeColor(sharedAttributes.foreground, to: buf + 1)
             serializeColor(sharedAttributes.background, to: buf + 5)
@@ -1037,6 +1054,18 @@ final class ScrollbackBuffer {
         }
     }
 
+    /// Full rows carry no format tag: their first byte is the first cell's
+    /// codepoint. They are told apart from compact rows by length alone, so no
+    /// compact row may ever be a multiple of `bytesPerCell` long. Compact
+    /// default rows are always odd-length. Trimmed uniform rows are
+    /// `17 + 5n`, never a multiple of 5. Untrimmed uniform rows (`15 + 5n`)
+    /// collide when `n % 12 == 9`, so those rows use the trimmed header,
+    /// which records the cell count explicitly and decodes identically.
+    private static func usesTrimmedUniformHeader(serializedCount: Int, cellCount: Int) -> Bool {
+        serializedCount != cellCount
+            || (uniformAttributesHeaderBytes + serializedCount * uniformAttributesBytesPerCell) % bytesPerCell == 0
+    }
+
     private static func isCompactDefaultRowFormat(length: Int, firstByte: UInt8) -> Bool {
         guard length > compactRowHeaderBytes,
               length % bytesPerCell != 0,
@@ -1051,6 +1080,7 @@ final class ScrollbackBuffer {
 
     private static func isCompactUniformAttributesRowFormat(length: Int, firstByte: UInt8) -> Bool {
         guard length > uniformAttributesHeaderBytes,
+              length % bytesPerCell != 0,
               firstByte == RowFormat.compactUniformAttributes ||
                 firstByte == RowFormat.compactUniformAttributesTrimmed else {
             return false
@@ -1081,7 +1111,9 @@ final class ScrollbackBuffer {
         cell.graphemeTail6 == other.graphemeTail6
     }
 
-    private static func isCompactDefaultCell(_ cell: Cell) -> Bool {
+    /// Whether `cell` survives the compact-default row format, which stores
+    /// only the codepoint. Grid row-encoding hints must use this same rule.
+    static func isCompactDefaultCell(_ cell: Cell) -> Bool {
         !cell.hasInlineImage &&
         !cell.hasGraphemeTail &&
         cell.attributes == .default &&

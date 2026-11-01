@@ -163,6 +163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowRootContentView: NSView!
     private var windowHostedContentView: NSView!
     private var windowPresentationHostView: NSView!
+    private var contentLayoutRectObservation: NSKeyValueObservation?
     private var configWatchSource: DispatchSourceFileSystemObject?
     private var pendingConfigReload: DispatchWorkItem?
     private var lastLoadedConfigSignature = ConfigFileSignature.capture(at: PtermDirectories.config)
@@ -784,7 +785,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Create window
         let appWindow = PtermWindow(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: WindowChrome.requiredStyleMask.union([.closable, .miniaturizable, .resizable]),
             backing: .buffered,
             defer: false
         )
@@ -1992,15 +1993,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let contentWidth = pad + CGFloat(cols) * renderer.glyphAtlas.cellWidth
         let contentHeight = pad + CGFloat(rows) * renderer.glyphAtlas.cellHeight
             + Layout.statusBarHeight + searchInset
-        let contentRect = NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight)
-        var newFrame = window.frameRect(forContentRect: contentRect)
+        setWindowFrameKeepingTopLeft(hostedContentSize: NSSize(width: contentWidth, height: contentHeight))
+    }
 
-        // Preserve the top-left corner position (macOS coordinates: origin is
-        // bottom-left, so we fix maxY and adjust origin.y).
+    /// Resizes the window so that the area below the titlebar (hosted content)
+    /// becomes `hostedContentSize`, keeping the window's top-left corner fixed.
+    private func setWindowFrameKeepingTopLeft(hostedContentSize: NSSize) {
+        let frameSize = WindowChrome.windowFrameSize(forHostedContentSize: hostedContentSize, of: window)
+        // macOS coordinates are bottom-left based: fix maxY and adjust origin.y.
         let oldFrame = window.frame
-        newFrame.origin.x = oldFrame.origin.x
-        newFrame.origin.y = oldFrame.maxY - newFrame.height
-
+        let newFrame = NSRect(x: oldFrame.minX,
+                              y: oldFrame.maxY - frameSize.height,
+                              width: frameSize.width,
+                              height: frameSize.height)
         window.setFrame(newFrame, display: true, animate: false)
     }
 
@@ -3516,6 +3521,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowRootContentView = rootView
         windowHostedContentView = hostedContentView
         windowPresentationHostView = presentationHostView
+        WindowChrome.configureTitlebar(of: window)
+        normalizeHostedContentFrame()
+
+        // The titlebar height is not constant (e.g. it collapses in full
+        // screen), so hosted content follows contentLayoutRect explicitly.
+        contentLayoutRectObservation = window.observe(\.contentLayoutRect, options: [.new]) { [weak self] _, _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.normalizeHostedContentFrame()
+                self.synchronizeWindowLayout(shouldPersistSession: false)
+            }
+        }
     }
 
     private func currentCommandModifierHeld() -> Bool {
@@ -3575,6 +3592,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Builds the production window content hierarchy and chrome on `window`
+    /// (only visible via @testable import).
+    func installWindowShellForTesting(window: NSWindow) {
+        self.window = window
+        setupWindowContentHierarchy()
+        configureWindowAppearance()
+    }
+
+    func debugWindowShellViewsForTesting() -> (root: NSView, hosted: NSView, glass: NSView?) {
+        (windowRootContentView, windowHostedContentView, windowBackgroundGlassView)
+    }
+
     func debugStatusBarCommandClickHintForTesting() -> String? {
         statusBarView.subviews
             .compactMap { $0 as? NSTextField }
@@ -3620,7 +3649,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func normalizeHostedContentFrame() {
         guard let rootView = windowRootContentView else { return }
-        windowHostedContentView.frame = rootView.bounds
+        windowHostedContentView.frame = WindowChrome.hostedContentFrame(in: rootView, of: window)
         windowHostedContentView.autoresizingMask = [.width, .height]
         windowPresentationHostView?.frame = availableContentFrame()
         windowPresentationHostView?.autoresizingMask = [.width, .height]
@@ -3986,20 +4015,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let contentWidth = pad + CGFloat(cols) * renderer.glyphAtlas.cellWidth
         let contentHeight = pad + CGFloat(rows) * renderer.glyphAtlas.cellHeight
             + Layout.statusBarHeight + searchInset
-        let contentRect = NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight)
-        let frameRect = window.frameRect(forContentRect: contentRect)
-        window.setFrame(frameRect, display: true, animate: false)
+        setWindowFrameKeepingTopLeft(hostedContentSize: NSSize(width: contentWidth, height: contentHeight))
     }
 
     private func resizeWindowToPixelContent(width: Int, height: Int) {
         guard width > 0, height > 0 else { return }
         let searchInset = searchBarView == nil ? 0 : Layout.searchBarHeight
-        let contentRect = NSRect(x: 0,
-                                 y: 0,
-                                 width: CGFloat(width),
-                                 height: CGFloat(height) + Layout.statusBarHeight + searchInset)
-        let frameRect = window.frameRect(forContentRect: contentRect)
-        window.setFrame(frameRect, display: true, animate: false)
+        setWindowFrameKeepingTopLeft(hostedContentSize: NSSize(width: CGFloat(width),
+                                                               height: CGFloat(height) + Layout.statusBarHeight + searchInset))
     }
 }
 
@@ -4143,7 +4166,7 @@ extension AppDelegate: NSWindowDelegate {
 
     private func configureWindowAppearance() {
         window.appearance = NSAppearance(named: .darkAqua)
-        window.titlebarAppearsTransparent = false
+        WindowChrome.configureTitlebar(of: window)
         let rootView = windowRootContentView ?? window.contentView
         let hostedContentView = contentHostView()
         rootView?.wantsLayer = true

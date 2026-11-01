@@ -59,10 +59,6 @@ typedef struct {
     void         *mapping_base;  /* Base address of mmap region */
     size_t        mapping_length;/* Total length of mmap region */
     void         *mmap_header;   /* Internal header pointer for mmap mode */
-
-    /* Temporary buffer for wrap-around reads */
-    uint8_t      *copy_buf;
-    size_t        copy_buf_cap;
 } RingBuffer;
 
 /*
@@ -123,17 +119,21 @@ int64_t ring_buffer_append_rows(RingBuffer *rb,
 /*
  * Read row data by logical index (0 = oldest visible row).
  * row_index: 0-based index from oldest to newest.
- * out_data: pointer set to the row data (valid until next write or get_row call).
- * out_length: set to the row byte length.
+ * out_first / out_first_length: the row bytes up to the end of the data
+ *   buffer (the whole row unless it wraps around the buffer boundary).
+ * out_second / out_second_length: the remaining bytes from the start of the
+ *   data buffer; length 0 (and pointer NULL) when the row is contiguous.
  * out_continuation: set to the continuation flag.
+ * Any out pointer may be NULL. Pointers stay valid until the next write.
  *
- * For rows that wrap around the buffer boundary, data is copied to an
- * internal temporary buffer to guarantee contiguous access.
+ * Never mutates the buffer, so concurrent readers holding the external read
+ * lock are safe. Callers join the two segments themselves when needed.
  *
  * Returns true if the row exists, false if out of range.
  */
-bool ring_buffer_get_row(RingBuffer *rb, uint32_t row_index,
-                         const uint8_t **out_data, uint32_t *out_length,
+bool ring_buffer_get_row(const RingBuffer *rb, uint32_t row_index,
+                         const uint8_t **out_first, uint32_t *out_first_length,
+                         const uint8_t **out_second, uint32_t *out_second_length,
                          bool *out_continuation);
 
 /* Get the number of rows currently stored. */

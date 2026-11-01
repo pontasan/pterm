@@ -298,7 +298,7 @@ final class TerminalControllerTests: XCTestCase {
                 col: 0
             )
             model.grid.debugCorruptReadableStateForTesting(
-                physicalSparseCompactDefaultPrefixCounts: [0, 0],
+                physicalSparsePrefixCounts: [0, 0],
                 rowEncodingHintStatesCount: 2
             )
         }
@@ -1343,6 +1343,104 @@ final class TerminalControllerTests: XCTestCase {
             let current = controller.selectedText(for: selection)
             XCTAssertEqual(current, selectedText, "Selection drifted after streaming \(chunk + 1) more rows")
             if current != selectedText { return }
+        }
+    }
+
+    /// Copying wide (CJK) text that has scrolled into scrollback must return the
+    /// same text that was printed: no U+0000 cells, widths and continuation
+    /// cells intact, for every grid write path that produces wide cells.
+    func testWideTextScrolledIntoScrollbackCopiesWithoutNulCharacters() {
+        let lines = [
+            "あいう",          // wide cells on a blank row
+            "あab",            // wide prefix extended by ASCII
+            "あ----",          // wide prefix extended by a run of one ASCII byte
+            "abあい",          // ASCII prefix extended by wide cells
+            "日本語",          // wide-only run
+            "あいうえ",        // full row of wide cells (cols == 8)
+            "cafe\u{0301}!",  // grapheme tail on a single-width cell
+        ]
+        let controller = makeController(rows: 3, cols: 8,
+                                        scrollbackInitialCapacity: 64 * 1024,
+                                        scrollbackMaxCapacity: 64 * 1024)
+        var output = ""
+        for line in lines { output += line + "\r\n" }
+        output += String(repeating: "\r\n", count: 4)
+        controller.debugProcessPTYOutputForTesting(Data(output.utf8))
+
+        let scrollback = controller.scrollback
+        for (index, line) in lines.enumerated() {
+            let cells = scrollback.getRow(at: index) ?? []
+            XCTAssertFalse(cells.contains { $0.codepoint == 0 && !$0.isWideContinuation },
+                           "row \(index) (\(line)) has non-continuation U+0000 cells")
+            let wideCount = cells.filter { $0.width == 2 }.count
+            let continuationCount = cells.filter(\.isWideContinuation).count
+            XCTAssertEqual(wideCount, line.unicodeScalars.filter { CharacterWidth.width(of: $0.value) == 2 }.count,
+                           "row \(index) (\(line))")
+            XCTAssertEqual(continuationCount, wideCount, "row \(index) (\(line))")
+
+            let globalRow = scrollback.totalEvictedRows + index
+            let displayWidth = line.unicodeScalars.reduce(0) { $0 + max(CharacterWidth.width(of: $1.value), 0) }
+            let selection = TerminalSelection(anchor: .init(row: globalRow, col: 0),
+                                              active: .init(row: globalRow, col: displayWidth - 1),
+                                              mode: .normal)
+            XCTAssertEqual(Array(controller.selectedText(for: selection).unicodeScalars), Array(line.unicodeScalars),
+                           "row \(index)")
+        }
+        XCTAssertFalse(controller.allText().unicodeScalars.contains { $0.value == 0 })
+    }
+
+    /// Seeded stress over TUI-style output (CJK, emoji, combining marks, SGR,
+    /// cursor motion, erase/insert/delete, REP, scroll regions, alternate
+    /// screen, resizes). No grid write path may leave a non-continuation
+    /// U+0000 cell in scrollback, and copied text must never contain U+0000.
+    func testRandomizedTUIOutputNeverLeavesNulCellsInScrollbackOrCopiedText() {
+        struct SplitMix64: RandomNumberGenerator {
+            var state: UInt64
+            mutating func next() -> UInt64 {
+                state &+= 0x9E37_79B9_7F4A_7C15
+                var z = state
+                z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+                z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+                return z ^ (z >> 31)
+            }
+        }
+        let tokens: [String] = [
+            "a", "hello ", "あ", "日本語", "─", "│", "👍", "👍🏽", "e\u{0301}", "\u{FE0F}", "☺\u{FE0F}",
+            "\r\n", "\n", "\r", "\t", "\u{1B}[K", "\u{1B}[1K", "\u{1B}[2K", "\u{1B}[J", "\u{1B}[2J",
+            "\u{1B}[H", "\u{1B}[3;5H", "\u{1B}[10G", "\u{1B}[2C", "\u{1B}[3D", "\u{1B}[A", "\u{1B}[B",
+            "\u{1B}[31m", "\u{1B}[0m", "\u{1B}[1;38;2;10;20;30m", "\u{1B}[7m", "\u{1B}[3@", "\u{1B}[2P",
+            "\u{1B}[4X", "\u{1B}[2L", "\u{1B}[1M", "\u{1B}[5b", "\u{1B}[2S", "\u{1B}[1T", "\u{1B}[2;5r",
+            "\u{1B}[r", "\u{1B}7", "\u{1B}8", "\u{1B}D", "\u{1B}M", "\u{1B}E", "\u{1B}[4h", "\u{1B}[4l",
+            "\u{1B}[?7l", "\u{1B}[?7h", "\u{1B}[?2026h", "\u{1B}[?2026l", "\u{1B}[?1049h", "\u{1B}[?1049l",
+            "\u{1B}[3J", String(repeating: "x", count: 30), String(repeating: "あ", count: 12),
+            "\u{0}", "\u{7F}", "\u{1B}(0q\u{1B}(B",
+        ]
+        var rng = SplitMix64(state: 0x5054_4552_4D00_0001)
+        for iteration in 0..<300 {
+            let cols = [7, 8, 13, 40, 80].randomElement(using: &rng)!
+            let controller = makeController(rows: 5, cols: cols,
+                                            scrollbackInitialCapacity: 4096,
+                                            scrollbackMaxCapacity: 32 * 1024)
+            for step in 0..<400 {
+                let token = tokens.randomElement(using: &rng)!
+                controller.debugProcessPTYOutputForTesting(Data(token.utf8))
+                if step % 97 == 96 {
+                    controller.resize(rows: Int.random(in: 3...7, using: &rng),
+                                      cols: [6, 9, 20, 81].randomElement(using: &rng)!)
+                }
+            }
+            controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?1049l\u{1B}[0m".utf8))
+
+            let scrollback = controller.scrollback
+            for row in 0..<scrollback.rowCount {
+                let cells = scrollback.getRow(at: row) ?? []
+                guard !cells.contains(where: { $0.codepoint == 0 && !$0.isWideContinuation }) else {
+                    return XCTFail("iteration \(iteration): scrollback row \(row) has a U+0000 cell")
+                }
+            }
+            guard !controller.allText().unicodeScalars.contains(where: { $0.value == 0 }) else {
+                return XCTFail("iteration \(iteration): copied text contains U+0000")
+            }
         }
     }
 

@@ -256,6 +256,150 @@ final class AppKitComponentTests: XCTestCase {
         }
     }
 
+    // MARK: - Window chrome (titlebar backdrop owned by pterm)
+
+    private func makeChromeTestWindow(size: NSSize = NSSize(width: 800, height: 600)) -> NSWindow {
+        let window = NSWindow(
+            contentRect: NSRect(origin: NSPoint(x: 100, y: 100), size: size),
+            styleMask: WindowChrome.requiredStyleMask.union([.closable, .miniaturizable, .resizable]),
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        return window
+    }
+
+    /// Asserts that `backdrop` covers the whole window, titlebar strip included,
+    /// and that `hosted` occupies exactly the area below the titlebar.
+    private func assertBackdropCoversTitlebar(window: NSWindow,
+                                              backdrop: NSView,
+                                              hosted: NSView,
+                                              file: StaticString = #filePath,
+                                              line: UInt = #line) {
+        let windowBounds = NSRect(origin: .zero, size: window.frame.size)
+        let contentLayoutRect = WindowChrome.resolvedContentLayoutRect(of: window)
+        let backdropInWindow = backdrop.convert(backdrop.bounds, to: nil)
+        let hostedInWindow = hosted.convert(hosted.bounds, to: nil)
+        let titlebarHeight = WindowChrome.titlebarHeight(windowFrameSize: window.frame.size,
+                                                         contentLayoutRect: contentLayoutRect)
+
+        XCTAssertGreaterThan(titlebarHeight, 0, "titlebar must take vertical space", file: file, line: line)
+        XCTAssertEqual(backdropInWindow, windowBounds, "backdrop must extend under the titlebar", file: file, line: line)
+        XCTAssertEqual(hostedInWindow, contentLayoutRect, "hosted content must stay below the titlebar", file: file, line: line)
+        XCTAssertEqual(hostedInWindow.maxY + titlebarHeight, windowBounds.maxY, accuracy: 0.001, file: file, line: line)
+        XCTAssertTrue(window.titlebarAppearsTransparent, "system titlebar material must not cover the backdrop", file: file, line: line)
+        XCTAssertTrue(window.styleMask.contains(.fullSizeContentView), file: file, line: line)
+    }
+
+    func testWindowChromeFrameSizeAddsTitlebarChromeToHostedContent() {
+        let size = WindowChrome.windowFrameSize(
+            forHostedContentSize: NSSize(width: 640, height: 400),
+            windowFrameSize: NSSize(width: 800, height: 628),
+            contentLayoutRect: NSRect(x: 0, y: 0, width: 800, height: 600)
+        )
+        XCTAssertEqual(size, NSSize(width: 640, height: 428))
+        XCTAssertEqual(
+            WindowChrome.titlebarHeight(windowFrameSize: NSSize(width: 800, height: 628),
+                                        contentLayoutRect: NSRect(x: 0, y: 0, width: 800, height: 600)),
+            28
+        )
+    }
+
+    func testWindowChromeFrameSizeHandlesCollapsedTitlebar() {
+        // Full screen collapses the titlebar: contentLayoutRect equals the frame.
+        let size = WindowChrome.windowFrameSize(
+            forHostedContentSize: NSSize(width: 1000, height: 700),
+            windowFrameSize: NSSize(width: 1440, height: 900),
+            contentLayoutRect: NSRect(x: 0, y: 0, width: 1440, height: 900)
+        )
+        XCTAssertEqual(size, NSSize(width: 1000, height: 700))
+    }
+
+    func testWindowChromeFrameSizeRoundTripsOnRealWindow() {
+        let window = makeChromeTestWindow()
+        WindowChrome.configureTitlebar(of: window)
+        for hosted in [NSSize(width: 640, height: 400), NSSize(width: 1234, height: 777)] {
+            let frameSize = WindowChrome.windowFrameSize(forHostedContentSize: hosted, of: window)
+            window.setFrame(NSRect(origin: window.frame.origin, size: frameSize), display: false)
+            XCTAssertEqual(WindowChrome.resolvedContentLayoutRect(of: window).size, hosted)
+        }
+    }
+
+    /// Regression: inserting NSGlassEffectView makes AppKit report a transient
+    /// contentLayoutRect (origin.y == -frame.height) via KVO. Hosted content
+    /// must still end up below the titlebar, inside the window.
+    func testWindowChromeResolvesTransientContentLayoutRectAfterGlassInsertion() throws {
+        guard #available(macOS 26.0, *) else { throw XCTSkip("NSGlassEffectView unavailable") }
+        let window = makeChromeTestWindow()
+        let root = NSView(frame: NSRect(origin: .zero, size: window.frame.size))
+        root.autoresizingMask = [.width, .height]
+        window.contentView = root
+        WindowChrome.configureTitlebar(of: window)
+        let hosted = NSView(frame: .zero)
+        root.addSubview(hosted)
+
+        var observedHostedFrames: [NSRect] = []
+        let observation = window.observe(\.contentLayoutRect, options: [.new]) { window, _ in
+            MainActor.assumeIsolated {
+                hosted.frame = WindowChrome.hostedContentFrame(in: root, of: window)
+                observedHostedFrames.append(hosted.frame)
+            }
+        }
+        defer { observation.invalidate() }
+
+        let glass = NSGlassEffectView(frame: root.bounds)
+        glass.autoresizingMask = [.width, .height]
+        root.addSubview(glass, positioned: .below, relativeTo: hosted)
+
+        XCTAssertFalse(observedHostedFrames.isEmpty, "glass insertion is expected to emit a contentLayoutRect change")
+        let windowBounds = NSRect(origin: .zero, size: window.frame.size)
+        for frame in observedHostedFrames {
+            XCTAssertTrue(windowBounds.contains(frame), "hosted frame \(frame) escaped window \(windowBounds)")
+        }
+        assertBackdropCoversTitlebar(window: window, backdrop: glass, hosted: hosted)
+    }
+
+    func testMainWindowGlassBackdropExtendsUnderTitlebar() throws {
+        guard #available(macOS 26.0, *) else { throw XCTSkip("NSGlassEffectView unavailable") }
+        try withTemporaryPtermProfile { _ in
+            let delegate = AppDelegate()
+            let window = makeChromeTestWindow()
+            delegate.installWindowShellForTesting(window: window)
+            let views = delegate.debugWindowShellViewsForTesting()
+            let glass = try XCTUnwrap(views.glass as? NSGlassEffectView,
+                                      "integrated view must install the glass backdrop")
+            XCTAssertFalse(glass.isHidden)
+            XCTAssertFalse(window.isOpaque)
+            XCTAssertEqual(window.appearance?.name, .darkAqua)
+            assertBackdropCoversTitlebar(window: window, backdrop: glass, hosted: views.hosted)
+            XCTAssertEqual(views.root.convert(views.root.bounds, to: nil),
+                           NSRect(origin: .zero, size: window.frame.size))
+        }
+    }
+
+    func testMainWindowHostedContentFollowsWindowResize() throws {
+        guard #available(macOS 26.0, *) else { throw XCTSkip("NSGlassEffectView unavailable") }
+        try withTemporaryPtermProfile { _ in
+            let delegate = AppDelegate()
+            let window = makeChromeTestWindow()
+            delegate.installWindowShellForTesting(window: window)
+            window.setFrame(NSRect(x: 50, y: 50, width: 1111, height: 733), display: false)
+            let views = delegate.debugWindowShellViewsForTesting()
+            let glass = try XCTUnwrap(views.glass)
+            assertBackdropCoversTitlebar(window: window, backdrop: glass, hosted: views.hosted)
+        }
+    }
+
+    func testAboutWindowGlassBackdropExtendsUnderTitlebar() throws {
+        guard #available(macOS 26.0, *) else { throw XCTSkip("NSGlassEffectView unavailable") }
+        let controller = AboutWindowController()
+        let window = try XCTUnwrap(controller.window)
+        let glass = try XCTUnwrap(findSubview(in: window.contentView) { $0 is NSGlassEffectView })
+        let hosted = try XCTUnwrap(window.contentView?.subviews.first { !($0 is NSGlassEffectView) })
+        assertBackdropCoversTitlebar(window: window, backdrop: glass, hosted: hosted)
+        XCTAssertEqual(WindowChrome.resolvedContentLayoutRect(of: window).size, AboutWindowController.hostedContentSize)
+    }
+
     func testAboutWindowControllerShowsApplicationMetadata() {
         let controller = AboutWindowController()
         let labels = allSubviews(in: controller.window?.contentView).compactMap { $0 as? NSTextField }.map(\.stringValue)

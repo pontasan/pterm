@@ -582,7 +582,7 @@ final class TextModelTests: XCTestCase {
         grid.setCell(Cell(codepoint: 65, attributes: .default, width: 1, isWideContinuation: false), at: 0, col: 0)
         grid.setCell(Cell(codepoint: 66, attributes: .default, width: 1, isWideContinuation: false), at: 1, col: 0)
         grid.debugCorruptReadableStateForTesting(
-            physicalSparseCompactDefaultPrefixCounts: [0, 0],
+            physicalSparsePrefixCounts: [0, 0],
             rowEncodingHintStatesCount: 2
         )
 
@@ -891,6 +891,149 @@ final class TextModelTests: XCTestCase {
         XCTAssertEqual(buffer.rowCount, 0)
         XCTAssertEqual(buffer.totalEvictedRows, 8,
                        "clear must keep `evicted + rowCount` stable so live grid rows keep their global address")
+    }
+
+    /// A sparse row prefix only means "columns past the prefix are blank"; it
+    /// must never be taken as proof that the prefix is compact-default. Wide
+    /// cells written through the sparse fast paths have to keep the row out of
+    /// the compact-default scrollback format, which stores codepoints only and
+    /// would turn every continuation cell into a visible U+0000 cell.
+    func testTerminalGridSparseWideRowsAreNeverHintedAsCompactDefault() {
+        func assertNotCompactDefault(_ grid: TerminalGrid, _ label: String) {
+            if case .compactDefault = grid.rowEncodingHint(0).kind {
+                XCTFail("\(label): row with wide cells must not be hinted as compact-default")
+            }
+        }
+        var wide: [UInt32] = [0x3042, 0x3044, 0x3046]
+        var ascii: [UInt32] = [0x61, 0x62]
+        let asciiBytes: [UInt8] = [0x61, 0x62]
+
+        // Wide cells on a blank row (sparse fast path).
+        var grid = TerminalGrid(rows: 2, cols: 12)
+        grid.writeDoubleWidthDefaultCells(&wide, count: 3, atRow: 0, startCol: 0)
+        assertNotCompactDefault(grid, "wide on blank row")
+
+        // Wide prefix extended by single-width codepoints.
+        grid = TerminalGrid(rows: 2, cols: 12)
+        grid.writeDoubleWidthDefaultCells(&wide, count: 1, atRow: 0, startCol: 0)
+        grid.writeSingleWidthDefaultCells(&ascii, count: 2, atRow: 0, startCol: 2)
+        assertNotCompactDefault(grid, "wide then single-width codepoints")
+
+        // Wide prefix extended by ASCII bytes.
+        grid = TerminalGrid(rows: 2, cols: 12)
+        grid.writeDoubleWidthDefaultCells(&wide, count: 1, atRow: 0, startCol: 0)
+        asciiBytes.withUnsafeBufferPointer {
+            grid.writeSingleWidthDefaultASCIIBytes($0.baseAddress!, count: 2, atRow: 0, startCol: 2)
+        }
+        assertNotCompactDefault(grid, "wide then ASCII bytes")
+
+        // Wide prefix extended by a repeated ASCII byte.
+        grid = TerminalGrid(rows: 2, cols: 12)
+        grid.writeDoubleWidthDefaultCells(&wide, count: 1, atRow: 0, startCol: 0)
+        grid.writeRepeatedSingleWidthDefaultASCIIByte(0x2D, count: 4, atRow: 0, startCol: 2)
+        assertNotCompactDefault(grid, "wide then repeated ASCII")
+
+        // ASCII prefix extended by wide cells.
+        grid = TerminalGrid(rows: 2, cols: 12)
+        asciiBytes.withUnsafeBufferPointer {
+            grid.writeSingleWidthDefaultASCIIBytes($0.baseAddress!, count: 2, atRow: 0, startCol: 0)
+        }
+        grid.writeDoubleWidthDefaultCells(&wide, count: 2, atRow: 0, startCol: 2)
+        assertNotCompactDefault(grid, "ASCII then wide")
+
+        // A full row of wide cells.
+        grid = TerminalGrid(rows: 2, cols: 6)
+        grid.writeFullRowDoubleWidthDefaultCellsAtRowStart(&wide, atRow: 0)
+        assertNotCompactDefault(grid, "full wide row")
+
+        // Pure ASCII sparse rows still take the compact-default format.
+        grid = TerminalGrid(rows: 2, cols: 12)
+        asciiBytes.withUnsafeBufferPointer {
+            grid.writeSingleWidthDefaultASCIIBytes($0.baseAddress!, count: 2, atRow: 0, startCol: 0)
+        }
+        grid.writeRepeatedSingleWidthDefaultASCIIByte(0x2D, count: 3, atRow: 0, startCol: 2)
+        guard case .compactDefault(let serializedCount) = grid.rowEncodingHint(0).kind else {
+            return XCTFail("ASCII-only sparse row should stay compact-default")
+        }
+        XCTAssertEqual(serializedCount, 5)
+    }
+
+    /// Rows that straddle the end of the ring's data buffer come back as two
+    /// segments; `getRow` must join them for every row format.
+    func testScrollbackBufferDecodesRowsThatWrapAroundTheRingEnd() throws {
+        let colored = CellAttributes(foreground: .indexed(2), background: .default, bold: true, italic: false,
+                                     underline: false, strikethrough: false, inverse: false, hidden: false,
+                                     dim: false, blink: false)
+        func row(_ index: Int) -> [Cell] {
+            let text = "row\(index)-" + String(repeating: "z", count: index % 23)
+            return text.unicodeScalars.enumerated().map { column, scalar in
+                // Cycle compact-default, uniform and full rows.
+                let attributes: CellAttributes = switch index % 3 {
+                case 0: .default
+                case 1: colored
+                default: column % 2 == 0 ? colored : .default
+                }
+                return Cell(codepoint: scalar.value, attributes: attributes, width: 1, isWideContinuation: false)
+            }
+        }
+        let buffer = ScrollbackBuffer(initialCapacity: 4096, maxCapacity: 4096)
+        var appended: [[Cell]] = []
+        for index in 0..<600 {
+            let cells = row(index)
+            appended.append(cells)
+            buffer.appendRow(ArraySlice(cells), isWrapped: false)
+            buffer.flushPendingRows()
+        }
+        XCTAssertGreaterThan(buffer.totalEvictedRows, 0, "fixture must cycle through the ring")
+
+        for index in 0..<buffer.rowCount {
+            let expected = appended[buffer.totalEvictedRows + index]
+            let decoded = try XCTUnwrap(buffer.getRow(at: index))
+            XCTAssertEqual(decoded.map(\.codepoint), expected.map(\.codepoint), "row \(index)")
+            XCTAssertEqual(decoded.map(\.attributes), expected.map(\.attributes), "row \(index)")
+        }
+    }
+
+    /// Full rows carry no format tag, so every row format must stay decodable
+    /// without ambiguity: a full row whose first codepoint's low byte equals a
+    /// compact tag (U+2502 "│" -> 0x02, U+2504 -> 0x04) must not decode as a
+    /// compact row, and an untrimmed uniform row whose length is a multiple of
+    /// the full-cell size (9, 21, 33... cells) must not decode as a full row.
+    func testScrollbackBufferRowFormatsNeverDecodeAsAnotherFormat() throws {
+        let red = CellAttributes(foreground: .indexed(1), background: .default, bold: false, italic: false,
+                                 underline: false, strikethrough: false, inverse: false, hidden: false,
+                                 dim: false, blink: false)
+        let blue = CellAttributes(foreground: .rgb(10, 20, 250), background: .indexed(4), bold: true, italic: false,
+                                  underline: true, strikethrough: false, inverse: false, hidden: false,
+                                  dim: false, blink: false)
+        func cell(_ codepoint: UInt32, _ attributes: CellAttributes) -> Cell {
+            Cell(codepoint: codepoint, attributes: attributes, width: 1, isWideContinuation: false)
+        }
+        var rows: [(label: String, cells: [Cell])] = []
+        for leading: UInt32 in [0x2501, 0x2502, 0x2503, 0x2504] {
+            // Mixed attributes force the untagged full format.
+            rows.append(("full row led by U+\(String(leading, radix: 16))",
+                         [cell(leading, red)] + (0..<11).map { cell(0x61 + UInt32($0), $0 % 2 == 0 ? blue : red) }))
+        }
+        for count in [9, 21, 33, 8, 10] {
+            // Uniform non-default attributes with no trailing blanks: untrimmed uniform format.
+            rows.append(("uniform row of \(count) cells", (0..<count).map { cell(0x41 + UInt32($0 % 26), blue) }))
+        }
+
+        for flushIntoRingBuffer in [false, true] {
+            let buffer = ScrollbackBuffer(initialCapacity: 64 * 1024, maxCapacity: 64 * 1024)
+            for row in rows { buffer.appendRow(ArraySlice(row.cells), isWrapped: false) }
+            if flushIntoRingBuffer { buffer.flushPendingRows() }
+            for (index, row) in rows.enumerated() {
+                let decoded = try XCTUnwrap(buffer.getRow(at: index), row.label)
+                XCTAssertEqual(decoded.count, row.cells.count, "\(row.label), flushed=\(flushIntoRingBuffer)")
+                for (column, (actual, expected)) in zip(decoded, row.cells).enumerated() {
+                    XCTAssertEqual(actual.codepoint, expected.codepoint, "\(row.label) col \(column)")
+                    XCTAssertEqual(actual.attributes, expected.attributes, "\(row.label) col \(column)")
+                    XCTAssertEqual(actual.width, expected.width, "\(row.label) col \(column)")
+                }
+            }
+        }
     }
 
     func testScrollbackBufferRoundTripsCellsAndWrapFlags() throws {

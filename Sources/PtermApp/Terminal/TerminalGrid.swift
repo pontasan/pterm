@@ -75,11 +75,15 @@ final class TerminalGrid {
     /// fresh empty rows without touching `cols` cells on every line feed.
     /// Writers materialize the row lazily before mutating individual cells.
     private var physicalBlankRows: [Bool]
-    /// Short default-attribute ASCII rows can stay sparse while they are only
-    /// built as a contiguous prefix from column 0. This avoids materializing an
+    /// Rows built as a contiguous default-attribute prefix from column 0 can
+    /// stay sparse: columns at or past the prefix count are logically blank
+    /// and their storage is left unmaterialized. This avoids touching an
     /// entire viewport-width row for workloads like `seq` that mostly write a
     /// handful of digits and immediately line-feed.
-    private var physicalSparseCompactDefaultPrefixCounts: [Int]
+    ///
+    /// The prefix may hold wide cells, so it says nothing about how the row
+    /// serializes; `rowEncodingHintStates` alone carries that.
+    private var physicalSparsePrefixCounts: [Int]
 
     /// Snapshot of per-row wrap flags for local transforms and tests.
     var lineWrapped: [Bool] {
@@ -112,7 +116,7 @@ final class TerminalGrid {
         self.nonSingleWidthLineCount = 0
         self.physicalMayContainProtectedCells = allocateStorage ? Array(repeating: false, count: rows) : []
         self.physicalBlankRows = allocateStorage ? Array(repeating: true, count: rows) : []
-        self.physicalSparseCompactDefaultPrefixCounts = allocateStorage ? Array(repeating: 0, count: rows) : []
+        self.physicalSparsePrefixCounts = allocateStorage ? Array(repeating: 0, count: rows) : []
     }
 
     // MARK: - Cell Access
@@ -127,7 +131,7 @@ final class TerminalGrid {
         if isPhysicalRowBlank(physicalRow) {
             return .empty
         }
-        let sparsePrefixCount = physicalSparseCompactDefaultPrefixCounts[physicalRow]
+        let sparsePrefixCount = physicalSparsePrefixCounts[physicalRow]
         if sparsePrefixCount > 0, col >= sparsePrefixCount {
             return .empty
         }
@@ -205,7 +209,7 @@ final class TerminalGrid {
     ) {
         guard count > 0 else { return }
         let physicalRow = physicalRow(for: row)
-        let priorSparsePrefixCount = physicalSparseCompactDefaultPrefixCounts[physicalRow]
+        let priorSparsePrefixCount = physicalSparsePrefixCounts[physicalRow]
         let canUseSparseFastPath = startCol == 0 && isPhysicalRowBlank(physicalRow)
         let canExtendSparseFastPath = priorSparsePrefixCount > 0 && startCol == priorSparsePrefixCount
 
@@ -213,8 +217,12 @@ final class TerminalGrid {
             let offset = physicalRow * cols + startCol
             initializeSingleWidthDefaultCells(at: offset, codepoints: codepoints, count: count)
             physicalBlankRows[physicalRow] = false
-            physicalSparseCompactDefaultPrefixCounts[physicalRow] = startCol + count
-            rowEncodingHintStates[physicalRow] = .compactDefault(serializedCount: startCol + count)
+            physicalSparsePrefixCounts[physicalRow] = startCol + count
+            appendCompactDefaultCellsToSparseRowHint(
+                physicalRow: physicalRow,
+                rowWasBlank: canUseSparseFastPath,
+                endColumn: startCol + count
+            )
             return
         }
 
@@ -226,7 +234,7 @@ final class TerminalGrid {
             return
         }
         physicalBlankRows[physicalRow] = false
-        physicalSparseCompactDefaultPrefixCounts[physicalRow] = 0
+        physicalSparsePrefixCounts[physicalRow] = 0
         let priorSerializedCount: Int
         switch rowEncodingHintStates[physicalRow] {
         case .blankDefault:
@@ -290,7 +298,7 @@ final class TerminalGrid {
     ) {
         guard count > 0 else { return }
         let physicalRow = physicalRow(for: row)
-        let priorSparsePrefixCount = physicalSparseCompactDefaultPrefixCounts[physicalRow]
+        let priorSparsePrefixCount = physicalSparsePrefixCounts[physicalRow]
         let canUseSparseFastPath = startCol == 0 && isPhysicalRowBlank(physicalRow)
         let canExtendSparseFastPath = priorSparsePrefixCount > 0 && startCol == priorSparsePrefixCount
 
@@ -298,8 +306,12 @@ final class TerminalGrid {
             let offset = physicalRow * cols + startCol
             initializeDefaultASCIIBytes(at: offset, bytes: bytes, count: count)
             physicalBlankRows[physicalRow] = false
-            physicalSparseCompactDefaultPrefixCounts[physicalRow] = startCol + count
-            rowEncodingHintStates[physicalRow] = .compactDefault(serializedCount: startCol + count)
+            physicalSparsePrefixCounts[physicalRow] = startCol + count
+            appendCompactDefaultCellsToSparseRowHint(
+                physicalRow: physicalRow,
+                rowWasBlank: canUseSparseFastPath,
+                endColumn: startCol + count
+            )
             return
         }
 
@@ -377,7 +389,7 @@ final class TerminalGrid {
     ) {
         guard count > 0 else { return }
         let physicalRow = physicalRow(for: row)
-        let priorSparsePrefixCount = physicalSparseCompactDefaultPrefixCounts[physicalRow]
+        let priorSparsePrefixCount = physicalSparsePrefixCounts[physicalRow]
         let canUseSparseFastPath = startCol == 0 && isPhysicalRowBlank(physicalRow)
         let canExtendSparseFastPath = priorSparsePrefixCount > 0 && startCol == priorSparsePrefixCount
         let cell = Self.defaultASCIIByteCells[Int(byte)]
@@ -386,8 +398,12 @@ final class TerminalGrid {
             let offset = physicalRow * cols + startCol
             fillCells(cell, count: count, at: offset)
             physicalBlankRows[physicalRow] = false
-            physicalSparseCompactDefaultPrefixCounts[physicalRow] = startCol + count
-            rowEncodingHintStates[physicalRow] = .compactDefault(serializedCount: startCol + count)
+            physicalSparsePrefixCounts[physicalRow] = startCol + count
+            appendCompactDefaultCellsToSparseRowHint(
+                physicalRow: physicalRow,
+                rowWasBlank: canUseSparseFastPath,
+                endColumn: startCol + count
+            )
             return
         }
 
@@ -437,7 +453,7 @@ final class TerminalGrid {
         let physicalRow = physicalRow(for: row)
         let writtenCellCount = count * 2
         let rowWasBlank = physicalBlankRows[physicalRow]
-        let priorSparsePrefixCount = physicalSparseCompactDefaultPrefixCounts[physicalRow]
+        let priorSparsePrefixCount = physicalSparsePrefixCounts[physicalRow]
         let canUseSparseFastPath = startCol == 0 && rowWasBlank
         let canExtendSparseFastPath = priorSparsePrefixCount > 0 && startCol == priorSparsePrefixCount
         if !(canUseSparseFastPath || canExtendSparseFastPath) {
@@ -450,9 +466,9 @@ final class TerminalGrid {
         }
         physicalBlankRows[physicalRow] = false
         if canUseSparseFastPath || canExtendSparseFastPath {
-            physicalSparseCompactDefaultPrefixCounts[physicalRow] = startCol + writtenCellCount
+            physicalSparsePrefixCounts[physicalRow] = startCol + writtenCellCount
         } else {
-            physicalSparseCompactDefaultPrefixCounts[physicalRow] = 0
+            physicalSparsePrefixCounts[physicalRow] = 0
         }
         rowEncodingHintStates[physicalRow] = .dirty
     }
@@ -476,7 +492,7 @@ final class TerminalGrid {
             Self.writeDoubleWidthDefaultCells(into: destination, from: codepoints, count: fullRowCount)
         }
         physicalBlankRows[physicalRow] = false
-        physicalSparseCompactDefaultPrefixCounts[physicalRow] = cols
+        physicalSparsePrefixCounts[physicalRow] = cols
         rowEncodingHintStates[physicalRow] = .dirty
     }
 
@@ -566,7 +582,7 @@ final class TerminalGrid {
         nonSingleWidthLineCount = 0
         physicalMayContainProtectedCells = Array(repeating: false, count: rows)
         physicalBlankRows = Array(repeating: true, count: rows)
-        physicalSparseCompactDefaultPrefixCounts = Array(repeating: 0, count: rows)
+        physicalSparsePrefixCounts = Array(repeating: 0, count: rows)
         debugAssertInternalInvariants()
     }
 
@@ -838,7 +854,7 @@ final class TerminalGrid {
                 !cell.isWideContinuation
             }
         }
-        self.physicalSparseCompactDefaultPrefixCounts = Array(repeating: 0, count: newRows)
+        self.physicalSparsePrefixCounts = Array(repeating: 0, count: newRows)
         self.scrollTop = 0
         self.scrollBottom = newRows - 1
 
@@ -931,7 +947,7 @@ final class TerminalGrid {
                 !cell.isWideContinuation
             }
         }
-        physicalSparseCompactDefaultPrefixCounts = Array(repeating: 0, count: newRows)
+        physicalSparsePrefixCounts = Array(repeating: 0, count: newRows)
         self.scrollTop = 0
         self.scrollBottom = newRows - 1
 
@@ -1037,7 +1053,7 @@ final class TerminalGrid {
             return ArraySlice(emptyRowTemplate)
         }
         let start = physicalRow * dimensions.cols
-        let sparsePrefixCount = physicalSparseCompactDefaultPrefixCounts[physicalRow]
+        let sparsePrefixCount = physicalSparsePrefixCounts[physicalRow]
         if sparsePrefixCount > 0 {
             let end = min(start + sparsePrefixCount, cells.count)
             return cells[start..<end]
@@ -1183,7 +1199,7 @@ final class TerminalGrid {
         copy.nonSingleWidthLineCount = nonSingleWidthLineCount
         copy.physicalMayContainProtectedCells = physicalMayContainProtectedCells
         copy.physicalBlankRows = physicalBlankRows
-        copy.physicalSparseCompactDefaultPrefixCounts = physicalSparseCompactDefaultPrefixCounts
+        copy.physicalSparsePrefixCounts = physicalSparsePrefixCounts
         copy.scrollTop = scrollTop
         copy.scrollBottom = scrollBottom
         copy.tracksPreciseRowEncodingHints = tracksPreciseRowEncodingHints
@@ -1207,7 +1223,7 @@ final class TerminalGrid {
         readableRows = min(readableRows, physicalLineAttributes.count)
         readableRows = min(readableRows, physicalMayContainProtectedCells.count)
         readableRows = min(readableRows, physicalBlankRows.count)
-        readableRows = min(readableRows, physicalSparseCompactDefaultPrefixCounts.count)
+        readableRows = min(readableRows, physicalSparsePrefixCounts.count)
         if hasRowPermutation {
             readableRows = min(readableRows, rowOrder.count)
         }
@@ -1234,7 +1250,7 @@ final class TerminalGrid {
         physicalLineAttributes: [TerminalLineAttribute]? = nil,
         physicalMayContainProtectedCells: [Bool]? = nil,
         physicalBlankRows: [Bool]? = nil,
-        physicalSparseCompactDefaultPrefixCounts: [Int]? = nil,
+        physicalSparsePrefixCounts: [Int]? = nil,
         rowEncodingHintStatesCount: Int? = nil
     ) {
         if let rowOrder {
@@ -1258,8 +1274,8 @@ final class TerminalGrid {
         if let physicalBlankRows {
             self.physicalBlankRows = physicalBlankRows
         }
-        if let physicalSparseCompactDefaultPrefixCounts {
-            self.physicalSparseCompactDefaultPrefixCounts = physicalSparseCompactDefaultPrefixCounts
+        if let physicalSparsePrefixCounts {
+            self.physicalSparsePrefixCounts = physicalSparsePrefixCounts
         }
         if let rowEncodingHintStatesCount {
             self.rowEncodingHintStates = Array(repeating: .dirty, count: rowEncodingHintStatesCount)
@@ -1299,8 +1315,8 @@ final class TerminalGrid {
         if physicalBlankRows.count != rows {
             issues.append("physicalBlankRows.count (\(physicalBlankRows.count)) != rows (\(rows))")
         }
-        if physicalSparseCompactDefaultPrefixCounts.count != rows {
-            issues.append("physicalSparseCompactDefaultPrefixCounts.count (\(physicalSparseCompactDefaultPrefixCounts.count)) != rows (\(rows))")
+        if physicalSparsePrefixCounts.count != rows {
+            issues.append("physicalSparsePrefixCounts.count (\(physicalSparsePrefixCounts.count)) != rows (\(rows))")
         }
         if scrollTop < 0 || scrollTop >= rows, rows > 0 {
             issues.append("scrollTop (\(scrollTop)) is out of bounds for rows (\(rows))")
@@ -1334,9 +1350,9 @@ final class TerminalGrid {
         } else if !rowOrder.isEmpty || rowOrderHead != 0 {
             issues.append("rowOrder state should be empty/reset when permutation is inactive")
         }
-        for (physicalRow, sparsePrefixCount) in physicalSparseCompactDefaultPrefixCounts.enumerated() {
+        for (physicalRow, sparsePrefixCount) in physicalSparsePrefixCounts.enumerated() {
             if sparsePrefixCount < 0 || sparsePrefixCount > cols {
-                issues.append("physicalSparseCompactDefaultPrefixCounts[\(physicalRow)] = \(sparsePrefixCount) is outside 0...\(cols)")
+                issues.append("physicalSparsePrefixCounts[\(physicalRow)] = \(sparsePrefixCount) is outside 0...\(cols)")
                 break
             }
         }
@@ -1367,13 +1383,36 @@ final class TerminalGrid {
     private func markRowEncodingHintDirty(_ logicalRow: Int) {
         let physicalRow = physicalRow(for: logicalRow)
         physicalBlankRows[physicalRow] = false
-        physicalSparseCompactDefaultPrefixCounts[physicalRow] = 0
+        physicalSparsePrefixCounts[physicalRow] = 0
         rowEncodingHintStates[physicalRow] = .dirty
+    }
+
+    /// Updates the hint after compact-default cells were appended to a sparse
+    /// row prefix. A blank row becomes compact-default; an extended prefix keeps
+    /// its prior state, because it may already hold wide cells (dirty).
+    @inline(__always)
+    private func appendCompactDefaultCellsToSparseRowHint(
+        physicalRow: Int,
+        rowWasBlank: Bool,
+        endColumn: Int
+    ) {
+        if rowWasBlank {
+            rowEncodingHintStates[physicalRow] = .compactDefault(serializedCount: endColumn)
+            return
+        }
+        switch rowEncodingHintStates[physicalRow] {
+        case .blankDefault:
+            rowEncodingHintStates[physicalRow] = .compactDefault(serializedCount: endColumn)
+        case .compactDefault(let serializedCount):
+            rowEncodingHintStates[physicalRow] = .compactDefault(serializedCount: max(serializedCount, endColumn))
+        case .dirty:
+            break
+        }
     }
 
     private func setRowEncodingHintBlank(_ logicalRow: Int) {
         let physicalRow = physicalRow(for: logicalRow)
-        physicalSparseCompactDefaultPrefixCounts[physicalRow] = 0
+        physicalSparsePrefixCounts[physicalRow] = 0
         rowEncodingHintStates[physicalRow] = .blankDefault
     }
 
@@ -1391,7 +1430,7 @@ final class TerminalGrid {
 
         let physicalRow = physicalRow(for: row)
         physicalBlankRows[physicalRow] = false
-        physicalSparseCompactDefaultPrefixCounts[physicalRow] = 0
+        physicalSparsePrefixCounts[physicalRow] = 0
         let priorSerializedCount: Int
         switch rowEncodingHintStates[physicalRow] {
         case .blankDefault:
@@ -1425,7 +1464,7 @@ final class TerminalGrid {
     ) {
         let physicalRow = physicalRow(for: row)
         physicalBlankRows[physicalRow] = false
-        physicalSparseCompactDefaultPrefixCounts[physicalRow] = 0
+        physicalSparsePrefixCounts[physicalRow] = 0
         let priorSerializedCount: Int
         switch rowEncodingHintStates[physicalRow] {
         case .blankDefault:
@@ -1471,18 +1510,14 @@ final class TerminalGrid {
         if isPhysicalRowBlank(physicalRow) {
             return ScrollbackBuffer.RowEncodingHint(kind: .compactDefault(serializedCount: 0))
         }
-        let sparsePrefixCount = physicalSparseCompactDefaultPrefixCounts[physicalRow]
-        if sparsePrefixCount > 0 {
-            return ScrollbackBuffer.RowEncodingHint(kind: .compactDefault(serializedCount: sparsePrefixCount))
-        }
+        // Only the sparse prefix is materialized; the rest of the row is blank.
+        let sparsePrefixCount = physicalSparsePrefixCounts[physicalRow]
         let start = physicalRow * cols
-        let end = start + cols
+        let end = start + (sparsePrefixCount > 0 ? sparsePrefixCount : cols)
         let rowSlice = cells[start..<end]
         var serializedCount = rowSlice.count
-        for cell in rowSlice {
-            if cell.attributes != .default || cell.width != 1 || cell.isWideContinuation {
-                return .unknown
-            }
+        for cell in rowSlice where !ScrollbackBuffer.isCompactDefaultCell(cell) {
+            return .unknown
         }
         while serializedCount > 0 {
             let cell = rowSlice[rowSlice.index(rowSlice.startIndex, offsetBy: serializedCount - 1)]
@@ -1792,7 +1827,7 @@ final class TerminalGrid {
     @inline(__always)
     private func setPhysicalRowBlank(_ physicalRow: Int) {
         physicalBlankRows[physicalRow] = true
-        physicalSparseCompactDefaultPrefixCounts[physicalRow] = 0
+        physicalSparsePrefixCounts[physicalRow] = 0
     }
 
     @inline(__always)
@@ -1815,14 +1850,14 @@ final class TerminalGrid {
 
     @inline(__always)
     private func materializePhysicalRowIfNeeded(_ physicalRow: Int) {
-        let sparsePrefixCount = physicalSparseCompactDefaultPrefixCounts[physicalRow]
+        let sparsePrefixCount = physicalSparsePrefixCounts[physicalRow]
         if sparsePrefixCount > 0 {
             let offset = physicalRow * cols + sparsePrefixCount
             let remainingCount = cols - sparsePrefixCount
             if remainingCount > 0 {
                 fillCells(.empty, count: remainingCount, at: offset)
             }
-            physicalSparseCompactDefaultPrefixCounts[physicalRow] = 0
+            physicalSparsePrefixCounts[physicalRow] = 0
             return
         }
         guard physicalBlankRows[physicalRow] else { return }

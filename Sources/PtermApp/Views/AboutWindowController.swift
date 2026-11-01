@@ -1,6 +1,8 @@
 import AppKit
 
 final class AboutWindowController: NSWindowController, NSWindowDelegate {
+    /// Size of the content area below the titlebar.
+    static let hostedContentSize = NSSize(width: 420, height: 280)
     private let rootContentView = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 280))
     private let hostedContentView = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 280))
     private var backgroundGlassView: NSView?
@@ -8,7 +10,7 @@ final class AboutWindowController: NSWindowController, NSWindowDelegate {
     init(bundle: Bundle = .main) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 420, height: 280),
-            styleMask: [.titled, .closable, .miniaturizable],
+            styleMask: WindowChrome.requiredStyleMask.union([.closable, .miniaturizable]),
             backing: .buffered,
             defer: false
         )
@@ -25,6 +27,10 @@ final class AboutWindowController: NSWindowController, NSWindowDelegate {
         hostedContentView.wantsLayer = true
         rootContentView.addSubview(hostedContentView)
         window.contentView = rootContentView
+        WindowChrome.configureTitlebar(of: window)
+        window.setContentSize(WindowChrome.windowFrameSize(forHostedContentSize: Self.hostedContentSize, of: window))
+        window.center()
+        hostedContentView.frame = WindowChrome.hostedContentFrame(in: rootContentView, of: window)
         window.delegate = self
 
         installGlassBackgroundIfNeeded()
