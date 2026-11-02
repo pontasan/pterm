@@ -195,6 +195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var perControllerPastedImages: [UUID: [URL]] = [:]
     private var clipboardCleanupService: ClipboardCleanupService?
     private var mcpServer: MCPServer?
+    private var switchBridge: SwitchBridge?
     private var aiRoomMCPServer: MCPServer?
     private lazy var aiRoomMCPToolProvider = AIRoomMCPToolProvider(appDelegate: self)
     private let aiRoomResponseCoordinator = AIRoomMCPResponseCoordinator()
@@ -895,6 +896,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Setup menu
         setupMenu()
         configureMCPServer()
+        startSwitchBridge()
     }
 
     private func performDirectLaunchIfRequested() {
@@ -4264,6 +4266,8 @@ extension AppDelegate: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         removeBackShortcutMonitor()
         stopConfigWatcher()
+        switchBridge?.stop()
+        switchBridge = nil
         stopMCPServer()
         stopAIRoomMCPServer()
         metricsMonitor?.stop()
@@ -5092,6 +5096,68 @@ extension AppDelegate: MCPToolProvider {
             ],
             "available_tools": toolDefinitions().map(\.name)
         ]
+    }
+
+    // MARK: - Switch Bridge
+
+    /// An unsigned or ad-hoc build has no team to check a peer against, so it offers nothing.
+    private func startSwitchBridge() {
+        guard let verifier = SwitchBridgePeerVerifier() else { return }
+        let bridge = SwitchBridge(
+            socketURL: PtermDirectories.base.appendingPathComponent("switch.sock"),
+            isAllowed: { verifier.isAllowed(connection: $0) },
+            respond: { [weak self] request in
+                DispatchQueue.main.sync {
+                    SwitchBridgeProtocol.reply(
+                        to: request,
+                        list: { self?.switchBridgeList() },
+                        show: { self?.switchBridgeShow($0) })
+                }
+            })
+        do {
+            try bridge.start()
+            switchBridge = bridge
+        } catch {
+            NSLog("pterm Switch bridge did not start: \(error)")
+        }
+    }
+
+    /// Terminals in the order the overview shows their workspaces.
+    private func switchBridgeList() -> (windowNumber: Int, terminals: [SwitchBridgeProtocol.Terminal])? {
+        guard let window else { return nil }
+        let displayed: [UUID]
+        switch viewMode {
+        case .integrated: displayed = []
+        case .focused(let controller): displayed = [controller.id]
+        case .split(let controllers): displayed = controllers.map(\.id)
+        }
+        let snapshots = manager.terminals.map { (controller: $0, workspace: $0.sessionSnapshot.workspaceName) }
+        let names = deduplicatedWorkspaceNamesPreservingOrder(workspaceNames + snapshots.map(\.workspace))
+        let terminals = names.flatMap { name in
+            snapshots.filter { $0.workspace == name }.map { entry in
+                SwitchBridgeProtocol.Terminal(
+                    id: entry.controller.id,
+                    title: entry.controller.title,
+                    workspace: name,
+                    isDisplayed: !window.isMiniaturized && displayed.contains(entry.controller.id))
+            }
+        }
+        return (window.windowNumber, terminals)
+    }
+
+    /// Nil when any of them is gone, so a stale choice changes nothing.
+    private func switchBridgeShow(_ ids: [UUID]) -> Int? {
+        guard let window else { return nil }
+        let controllers = ids.compactMap { id in manager.terminals.first { $0.id == id } }
+        guard controllers.count == ids.count, let first = controllers.first else { return nil }
+        splitOriginControllers = nil
+        splitOriginAncestorControllers = nil
+        if controllers.count == 1 {
+            switchToFocused(first)
+        } else {
+            switchToSplit(controllers)
+        }
+        return window.windowNumber
     }
 
     private func mcpWorkspacePayloads() -> [[String: Any]] {
