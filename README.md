@@ -81,6 +81,10 @@ See all running terminals at a glance in the overview grid. Click to focus, Shif
 - **Split view** — Shift-click to select multiple terminals and work side by side
 - **Auto-cleanup** — terminals disappear on exit. Close button to stop a process and remove it
 
+### Jump to Any Terminal with Switch
+
+[Switch](https://github.com/pontasan/switch) is a macOS menu bar window switcher that lists every app's windows by name and takes you to the right one in a click. It natively supports pterm: pick a terminal from the menu bar to focus it, or Shift-click several to open them in split view. It also knows VS Code windows by workspace name, so your editors and terminals are all one click away.
+
 ## Bounded Memory — Stay Stable Under Heavy Output
 
 pterm caps scrollback automatically — run `tail -F` for hours and memory stays flat. No bloat, no slowdown, no OOM surprises.
