@@ -67,6 +67,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     var terminalController: TerminalController? {
         willSet {
             guard terminalController !== newValue else { return }
+            stopFollowingAppScrolledText()
             teardownController()
         }
         didSet {
@@ -194,14 +195,37 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     /// Current text selection (nil = no selection)
     private(set) var selection: TerminalSelection? {
-        didSet {
+        get {
+            reconcileSelectionWithAppScroll()
+            return selectionStorage
+        }
+        set {
+            selectionStorage = newValue
+            updateAppScrollFollowing()
             requestDisplayUpdate()
         }
     }
+    private var selectionStorage: TerminalSelection?
     private struct ShiftClickSelectionAnchor {
         var position: GridPosition
     }
-    private var pendingShiftClickSelectionAnchor: ShiftClickSelectionAnchor?
+    private var pendingShiftClickSelectionAnchor: ShiftClickSelectionAnchor? {
+        didSet { updateAppScrollFollowing() }
+    }
+    private var applicationHoldsDragSelection = false
+    /// What a drag made the application select. The application paints it, and pterm only keeps
+    /// it attached to the text, so that copying does not have to go through the application.
+    private var applicationSelection: TerminalSelection? {
+        didSet { updateAppScrollFollowing() }
+    }
+    /// Where a double or triple click reached the application.
+    private var applicationMultiClickPosition: GridPosition?
+    /// The screen before the first click of a double or triple click reached the application.
+    private var applicationClickBackgrounds: TerminalController.ScreenBackgrounds?
+    /// How the application has been seen to paint its selection.
+    private var applicationHighlightLooks = Set<TerminalController.CellLook>()
+    /// Generation and shift already applied to the selection while an application scrolls.
+    private var appScrollFollowing: (generation: UInt64, appliedShift: Int, joinCount: Int)?
 
     /// Click count tracker for double/triple click detection
     private var clickCount: Int = 0
@@ -351,6 +375,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     func debugSetSelectionForTesting(_ sel: TerminalSelection?) {
+        reconcileSelectionWithAppScroll()
         pendingShiftClickSelectionAnchor = nil
         selection = sel
     }
@@ -399,7 +424,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         renderer.debugRenderToTextureForTesting(
             snapshot: snapshot,
             texture: texture,
-            selection: selection,
+            selection: selection(alignedWith: snapshot),
             transientTextOverlays: transientTextOverlays,
             suppressCursorBlink: suppressCursorBlink
         )
@@ -1502,6 +1527,7 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     override func mouseDown(with event: NSEvent) {
         hideImagePreview()
+        reconcileSelectionWithAppScroll()
 
         if event.modifierFlags.contains(.command) {
             if handleDetectedLinkClick(event) {
@@ -1529,27 +1555,21 @@ final class TerminalView: MTKView, NSTextInputClient {
 
         if event.modifierFlags.contains(.shift),
            var sel = selectionForShiftClickExtension() {
+            dismissApplicationDragSelection(at: pos)
+            applicationSelection = nil
+            applicationMultiClickPosition = nil
             sel.active = globalPos
             sel.mode = selectionMode(for: event)
-            sel.isDragging = false
-            if sel.isEmpty {
-                pendingShiftClickSelectionAnchor = ShiftClickSelectionAnchor(position: sel.anchor)
-                selection = nil
-            } else {
-                pendingShiftClickSelectionAnchor = nil
-                selection = sel
-            }
+            // Dragging on from a Shift press keeps moving the same end, as in text editors.
+            sel.isDragging = true
+            // Set the selection first: clearing the only anchor would stop following the text.
+            selection = sel
+            pendingShiftClickSelectionAnchor = nil
             return
         }
-
-        if sendMouseEventIfNeeded(event, phase: .down, buttonOverride: 0) {
-            pendingShiftClickSelectionAnchor = ShiftClickSelectionAnchor(position: globalPos)
-            return
-        }
-
-        let now = event.timestamp
 
         // Detect multi-click (double/triple)
+        let now = event.timestamp
         if let lastPos = lastClickPosition,
            lastPos == pos,
            now - lastClickTime < Self.multiClickInterval {
@@ -1559,6 +1579,19 @@ final class TerminalView: MTKView, NSTextInputClient {
         }
         lastClickTime = now
         lastClickPosition = pos
+
+        learnApplicationHighlight()
+        let backgroundsBeforeClick = clickCount == 1 && controller.applicationOwnsScrolling ? controller.screenBackgrounds() : nil
+        if sendMouseEventIfNeeded(event, phase: .down, buttonOverride: 0) {
+            if let backgroundsBeforeClick { applicationClickBackgrounds = backgroundsBeforeClick }
+            applicationHoldsDragSelection = false
+            applicationSelection = nil
+            // A plain click drops the selection and becomes the next Shift+click anchor.
+            pendingShiftClickSelectionAnchor = ShiftClickSelectionAnchor(position: globalPos)
+            applicationMultiClickPosition = clickCount >= 2 ? globalPos : nil
+            selection = nil
+            return
+        }
 
         if clickCount == 2 {
             // Double-click: word selection
@@ -1571,10 +1604,10 @@ final class TerminalView: MTKView, NSTextInputClient {
 
         if clickCount >= 3 {
             // Triple-click: line selection
-            controller.withModel { model in
-                pendingShiftClickSelectionAnchor = nil
-                selection = TerminalSelection.lineSelection(row: globalRow, cols: model.cols)
-            }
+            // Setting the selection may take the controller's write lock.
+            let cols = controller.withModel { $0.cols }
+            pendingShiftClickSelectionAnchor = nil
+            selection = TerminalSelection.lineSelection(row: globalRow, cols: cols)
             clickCount = 3 // cap
             return
         }
@@ -1737,6 +1770,7 @@ final class TerminalView: MTKView, NSTextInputClient {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        reconcileSelectionWithAppScroll()
         if var sel = selection, sel.isDragging,
            let controller = terminalController {
             autoScrollSelectionIfNeeded(for: event)
@@ -1750,8 +1784,37 @@ final class TerminalView: MTKView, NSTextInputClient {
         }
 
         if sendMouseEventIfNeeded(event, phase: .dragged) {
+            applicationHoldsDragSelection = true
+            updateApplicationSelection(endingAt: event)
             return
         }
+    }
+
+    /// The application selects from the press to the mouse, in its own text.
+    private func updateApplicationSelection(endingAt event: NSEvent) {
+        guard let anchor = pendingShiftClickSelectionAnchor?.position,
+              let controller = terminalController,
+              let position = clampedGridPosition(from: event) else { return }
+        applicationMultiClickPosition = nil
+        applicationSelection = TerminalSelection(
+            anchor: anchor,
+            active: GridPosition(row: controller.viewportRowToGlobalRow(position.row), col: position.col),
+            mode: .normal
+        )
+    }
+
+    /// A drag that went to the application may have left its own highlight. pterm takes over
+    /// the selection from here, so remove that highlight the way the user would, with a
+    /// click, or shrinking the selection would leave the old extent painted.
+    private func dismissApplicationDragSelection(at position: GridPosition) {
+        guard applicationHoldsDragSelection, let controller = terminalController else { return }
+        applicationHoldsDragSelection = false
+        guard let state = controller.withModel({ model -> MouseReportingState? in
+            guard model.mouseReporting != .none else { return nil }
+            return MouseReportingState(mode: model.mouseReporting, protocolMode: model.mouseProtocol)
+        }) else { return }
+        sendMouseReport(button: 0, position: position, phase: .press, protocolMode: state.protocolMode, to: controller)
+        sendMouseReport(button: 0, position: position, phase: .release, protocolMode: state.protocolMode, to: controller)
     }
 
     override func rightMouseDragged(with event: NSEvent) {
@@ -1774,6 +1837,19 @@ final class TerminalView: MTKView, NSTextInputClient {
         let margin = renderer.glyphAtlas.cellHeight
         guard margin > 0 else { return }
 
+        if controller.applicationOwnsScrolling {
+            let distance = location.y < 0 ? -location.y : location.y - bounds.height
+            guard distance > 0, let position = clampedGridPosition(from: event),
+                  let state = controller.withModel({ model -> MouseReportingState? in
+                      guard model.mouseReporting != .none else { return nil }
+                      return MouseReportingState(mode: model.mouseReporting, protocolMode: model.mouseProtocol)
+                  }) else { return }
+            let button = location.y < 0 ? MouseReportEncoder.wheelDownButton : MouseReportEncoder.wheelUpButton
+            sendWheelReports(button: button, count: max(1, Int(ceil(distance / margin))), position: position,
+                             protocolMode: state.protocolMode, to: controller)
+            return
+        }
+
         if location.y < 0 {
             let lines = max(1, Int(ceil(abs(location.y) / margin)))
             if controller.scrollDown(lines: lines) {
@@ -1789,29 +1865,31 @@ final class TerminalView: MTKView, NSTextInputClient {
 
     override func mouseUp(with event: NSEvent) {
         defer { pressedMouseButton = nil }
-        if var sel = selection {
-            if sel.isDragging {
-                if let pos = gridPosition(from: event),
-                   let controller = terminalController {
-                    let globalRow = controller.viewportRowToGlobalRow(pos.row)
-                    sel.active = GridPosition(row: globalRow, col: pos.col)
-                }
-                sel.mode = selectionMode(for: event)
-                sel.isDragging = false
+        reconcileSelectionWithAppScroll()
+        if var sel = selection, sel.isDragging {
+            if let pos = gridPosition(from: event),
+               let controller = terminalController {
+                let globalRow = controller.viewportRowToGlobalRow(pos.row)
+                sel.active = GridPosition(row: globalRow, col: pos.col)
+            }
+            sel.mode = selectionMode(for: event)
+            sel.isDragging = false
 
-                // If the selection is empty (click without drag), clear it
-                if sel.isEmpty {
-                    pendingShiftClickSelectionAnchor = ShiftClickSelectionAnchor(position: sel.anchor)
-                    selection = nil
-                } else {
-                    pendingShiftClickSelectionAnchor = nil
-                    selection = sel
-                }
+            // If the selection is empty (click without drag), clear it
+            if sel.isEmpty {
+                pendingShiftClickSelectionAnchor = ShiftClickSelectionAnchor(position: sel.anchor)
+                selection = nil
+            } else {
+                pendingShiftClickSelectionAnchor = nil
+                selection = sel
             }
             return
         }
 
         if sendMouseEventIfNeeded(event, phase: .up) {
+            if applicationHoldsDragSelection {
+                updateApplicationSelection(endingAt: event)
+            }
             return
         }
     }
@@ -1941,11 +2019,9 @@ final class TerminalView: MTKView, NSTextInputClient {
                     )
                     mouseReportMomentumScrollAccumulator = result.accumulator
                     guard result.lines != 0 else { return true }
-                    let button = result.lines > 0 ? 64 : 65
-                    for _ in 0..<abs(result.lines) {
-                        sendMouseReport(button: button, position: position, phase: .wheel,
-                            protocolMode: state.protocolMode, to: controller)
-                    }
+                    let button = result.lines > 0 ? MouseReportEncoder.wheelUpButton : MouseReportEncoder.wheelDownButton
+                    sendWheelReports(button: button, count: abs(result.lines), position: position,
+                                     protocolMode: state.protocolMode, to: controller)
                     return true
                 }
 
@@ -1968,11 +2044,9 @@ final class TerminalView: MTKView, NSTextInputClient {
                 mouseReportDirectScrollAccumulator = result.accumulator
                 guard result.lines != 0 else { return true }
 
-                let button = result.lines > 0 ? 64 : 65
-                for _ in 0..<abs(result.lines) {
-                    sendMouseReport(button: button, position: position, phase: .wheel,
-                            protocolMode: state.protocolMode, to: controller)
-                }
+                let button = result.lines > 0 ? MouseReportEncoder.wheelUpButton : MouseReportEncoder.wheelDownButton
+                sendWheelReports(button: button, count: abs(result.lines), position: position,
+                                 protocolMode: state.protocolMode, to: controller)
                 return true
             }
 
@@ -1980,9 +2054,9 @@ final class TerminalView: MTKView, NSTextInputClient {
             mouseReportMomentumScrollAccumulator = 0
             mouseReportDirectScrollGestureActive = false
             guard event.scrollingDeltaY != 0 else { return true }
-            let button = event.scrollingDeltaY > 0 ? 64 : 65
-            sendMouseReport(button: button, position: position, phase: .wheel,
-                            protocolMode: state.protocolMode, to: controller)
+            let button = event.scrollingDeltaY > 0 ? MouseReportEncoder.wheelUpButton : MouseReportEncoder.wheelDownButton
+            sendWheelReports(button: button, count: 1, position: position,
+                             protocolMode: state.protocolMode, to: controller)
             return true
         }
     }
@@ -2028,6 +2102,20 @@ final class TerminalView: MTKView, NSTextInputClient {
         }
     }
 
+    private func sendWheelReports(button: Int,
+                                  count: Int,
+                                  position: GridPosition,
+                                  protocolMode: TerminalModel.MouseProtocol,
+                                  to controller: TerminalController) {
+        learnApplicationHighlight()
+        guard let report = MouseReportEncoder.encode(button: button,
+                                                     column: position.col,
+                                                     row: position.row,
+                                                     phase: .wheel,
+                                                     protocolMode: protocolMode) else { return }
+        controller.sendApplicationWheel(report: report, button: button, count: count)
+    }
+
     private func sendMouseReport(button: Int,
                                  position: GridPosition,
                                  phase: MouseReportEncoder.Phase,
@@ -2041,12 +2129,91 @@ final class TerminalView: MTKView, NSTextInputClient {
         controller.sendInput(report)
     }
 
+    // MARK: - Selection Attached to Application-Scrolled Text
+
+    private func updateAppScrollFollowing() {
+        guard let controller = terminalController else { return }
+        let needsFollowing = selectionStorage != nil || pendingShiftClickSelectionAnchor != nil
+            || applicationSelection != nil
+        if needsFollowing, appScrollFollowing == nil, controller.applicationOwnsScrolling {
+            let state = controller.beginAppScrollSelectionTracking()
+            appScrollFollowing = (state.generation, state.globalShift, state.joinCount)
+        } else if !needsFollowing, appScrollFollowing != nil {
+            stopFollowingAppScrolledText()
+        }
+    }
+
+    private func stopFollowingAppScrolledText() {
+        guard appScrollFollowing != nil else { return }
+        appScrollFollowing = nil
+        terminalController?.endAppScrollSelectionTracking()
+    }
+
+    /// Moves the selection by whatever the application has scrolled since the last call.
+    private func reconcileSelectionWithAppScroll() {
+        guard let following = appScrollFollowing, let controller = terminalController else { return }
+        let state = controller.appScrollSelectionState()
+        guard state.generation == following.generation else {
+            // The text cannot be located anymore, so there is nothing left to select.
+            appScrollFollowing = nil
+            selectionStorage = nil
+            pendingShiftClickSelectionAnchor = nil
+            applicationSelection = nil
+            applicationMultiClickPosition = nil
+            return
+        }
+        appScrollFollowing = (following.generation, state.globalShift, state.joinCount)
+        guard state.globalShift != following.appliedShift || state.joinCount != following.joinCount else {
+            if var moved = selectionStorage, moved.paintableViewportRows != state.movingBand {
+                moved.paintableViewportRows = state.movingBand
+                selectionStorage = moved
+            }
+            return
+        }
+        func moved(_ position: GridPosition) -> GridPosition {
+            GridPosition(row: controller.appScrollGlobalRow(ofRow: position.row,
+                                                            atShift: following.appliedShift,
+                                                            joinCount: following.joinCount,
+                                                            in: state),
+                         col: position.col)
+        }
+        func moved(_ selection: TerminalSelection) -> TerminalSelection {
+            var result = selection
+            result.anchor = moved(selection.anchor)
+            result.active = moved(selection.active)
+            return result
+        }
+        if let anchor = pendingShiftClickSelectionAnchor {
+            pendingShiftClickSelectionAnchor = ShiftClickSelectionAnchor(position: moved(anchor.position))
+        }
+        applicationSelection = applicationSelection.map(moved)
+        applicationMultiClickPosition = applicationMultiClickPosition.map(moved)
+        if let before = applicationClickBackgrounds {
+            applicationClickBackgrounds?.firstGlobalRow = moved(GridPosition(row: before.firstGlobalRow, col: 0)).row
+        }
+        if let current = selectionStorage {
+            var result = moved(current)
+            result.paintableViewportRows = state.movingBand
+            selectionStorage = result
+        }
+    }
+
+    /// The selection aligned with the frame in `snapshot`, which may be older than the
+    /// shift already applied to the selection.
+    func selection(alignedWith snapshot: TerminalController.RenderSnapshot) -> TerminalSelection? {
+        guard let current = selection else { return nil }
+        guard let following = appScrollFollowing else { return current }
+        return current.offsetRows(by: snapshot.appScrollSelectionShift - following.appliedShift)
+    }
+
     // MARK: - Selection API
 
     /// Clear the current selection.
     func clearSelection() {
         selectAllActive = false
         pendingShiftClickSelectionAnchor = nil
+        applicationSelection = nil
+        applicationMultiClickPosition = nil
         selection = nil
     }
 
@@ -2156,8 +2323,42 @@ final class TerminalView: MTKView, NSTextInputClient {
         if selectAllActive {
             return controller.allText()
         }
-        guard let sel = selection, !sel.isEmpty else { return nil }
-        return controller.selectedText(for: sel)
+        if let sel = selection, !sel.isEmpty {
+            return controller.selectedText(for: sel)
+        }
+        return selectionHeldByApplication().map {
+            controller.applicationSelectedText(for: $0, paintedWith: applicationHighlightLooks)
+        }
+    }
+
+    /// What the application shows as selected. pterm has no selection of its own then, yet
+    /// copying must not reach the application: it takes that key for an interrupt.
+    private func selectionHeldByApplication() -> TerminalSelection? {
+        guard let controller = terminalController else { return nil }
+        learnApplicationHighlight()
+        if let dragged = applicationSelection, !dragged.isEmpty,
+           controller.applicationHighlights(dragged, paintedWith: applicationHighlightLooks) {
+            return dragged
+        }
+        if let position = applicationMultiClickPosition, let before = applicationClickBackgrounds {
+            return controller.applicationHighlightSelection(atGlobalRow: position.row, since: before,
+                                                            paintedWith: applicationHighlightLooks)
+        }
+        return nil
+    }
+
+    /// Notes how the application painted the current selection while the screen before it is
+    /// still comparable, including before the press that replaces it: a new selection inside
+    /// the old one changes nothing, and could not tell by itself that it is highlighted.
+    private func learnApplicationHighlight() {
+        guard let controller = terminalController else { return }
+        reconcileSelectionWithAppScroll()
+        guard let before = applicationClickBackgrounds,
+              let current = applicationSelection ?? applicationMultiClickPosition.flatMap({
+                  controller.applicationHighlightSelection(atGlobalRow: $0.row, since: before,
+                                                           paintedWith: applicationHighlightLooks)
+              }) else { return }
+        applicationHighlightLooks.formUnion(controller.applicationHighlightLooks(in: current, since: before))
     }
 
     func cutMarkedText() -> String? {
@@ -3097,7 +3298,7 @@ extension TerminalView: MTKViewDelegate {
         }
         renderer.render(
             snapshot: snapshot,
-            selection: selection,
+            selection: selection(alignedWith: snapshot),
             searchHighlight: highlight,
             linkUnderline: linkUL,
             borderConfig: border,

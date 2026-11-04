@@ -1476,7 +1476,7 @@ final class MetalRenderer {
             let rowHasMatches = !rowMatches.isEmpty
             var currentMatchIndex = 0
             let selectedColumnRange: ClosedRange<Int>? = {
-                guard hasSelection, let vpSel = viewportSelection else { return nil }
+                guard hasSelection, let vpSel = viewportSelection, vpSel.isPaintable(viewportRow: row) else { return nil }
                 let start = vpSel.start
                 let end = vpSel.end
                 switch vpSel.mode {
@@ -1549,15 +1549,14 @@ final class MetalRenderer {
                     }
                 }
 
-                if cell.attributes.inverse != isSelected {
-                    // Inverse XOR selected: swap fg/bg
+                if cell.attributes.inverse {
                     fgColor = resolveBackgroundColorAsForeground(cell.attributes.background)
                     bgColor = resolveForegroundColorAsBackground(cell.attributes.foreground)
-                    if isSelected { bgColor.a = 0.1 }
                 } else {
                     fgColor = resolveForegroundColor(for: cell)
                     bgColor = resolveBackgroundColor(cell.attributes.background)
                 }
+                if isSelected { bgColor = Self.selectionBackgroundColor }
 
                 // Apply search match highlight
                 if searchMatchType == 2 {
@@ -1977,7 +1976,7 @@ final class MetalRenderer {
             let rowHasMatches = !rowMatches.isEmpty
             var currentMatchIndex = 0
             let selectedColumnRange: ClosedRange<Int>? = {
-                guard hasSelection, let vpSel = viewportSelection else { return nil }
+                guard hasSelection, let vpSel = viewportSelection, vpSel.isPaintable(viewportRow: row) else { return nil }
                 let start = vpSel.start
                 let end = vpSel.end
                 switch vpSel.mode {
@@ -2112,15 +2111,14 @@ final class MetalRenderer {
                     }
                 }
 
-                let effectiveInverse = (cell.attributes.inverse != isSelected) != snapshot.reverseVideo
-                if effectiveInverse {
+                if cell.attributes.inverse != snapshot.reverseVideo {
                     fgColor = resolveBackgroundColorAsForeground(cell.attributes.background)
                     bgColor = resolveForegroundColorAsBackground(cell.attributes.foreground)
-                    if isSelected { bgColor.a = 0.1 }
                 } else {
                     fgColor = resolveForegroundColor(for: cell)
                     bgColor = resolveBackgroundColor(cell.attributes.background)
                 }
+                if isSelected { bgColor = Self.selectionBackgroundColor }
 
                 if searchMatchType == 2 {
                     bgColor = (0.90, 0.60, 0.10, 1.0)
@@ -2818,6 +2816,15 @@ final class MetalRenderer {
             return (resolved.r, resolved.g, resolved.b, 1.0)
         }
     }
+
+    /// Selected text keeps its own colors on this background, as in text editors. It is
+    /// the rgb(38, 79, 120) that VS Code and Claude Code paint, so a selection made by
+    /// pterm cannot be told apart from one an application made.
+    /// It goes through the same color conversion as a color an application writes.
+    static let selectionBackgroundColor: (r: Float, g: Float, b: Float, a: Float) = {
+        let resolved = TerminalColor.rgb(38, 79, 120).resolve(isForeground: false)
+        return (resolved.r, resolved.g, resolved.b, 1.0)
+    }()
 
     private func resolveBackgroundColorAsForeground(_ color: TerminalColor) -> (r: Float, g: Float, b: Float) {
         let background = resolveBackgroundColor(color)

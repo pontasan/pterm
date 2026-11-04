@@ -141,6 +141,7 @@ final class TerminalController {
         let hasInlineImages: Bool
         let inlineImagePlacements: [TerminalInlineImagePlacement]
         let visibleRows: [RenderRowSnapshot]
+        var appScrollSelectionShift: Int = 0
     }
 
     /// Terminal model (grid + cursor + state)
@@ -238,6 +239,25 @@ final class TerminalController {
     private var inlineImageReachabilityReconcileScheduled = false
     private var lastKnownInlineImageReachabilityWasNonEmpty = false
     private var terminalRenderingSuppressed = false
+    var debugInputObserverForTesting: ((Data) -> Void)?
+    private var appScrollSelectionTracker: AppScrollSelectionTracker?
+    private var appScrollSelectionGeneration: UInt64 = 0
+    private var appScrollTrackedAlternateScreen = false
+    private var appScrollCursorWasVisible = true
+    private var appScrollUpdateWasSuppressed = false
+    private var appScrollSettleToken: UInt64 = 0
+    private var appScrollWheelPacer = AppScrollWheelPacer()
+    private var appScrollWheelReport: Data?
+    private var appScrollWheelSent: (shift: Int, uptime: TimeInterval, token: UInt64)?
+    private var appScrollWheelToken: UInt64 = 0
+    private var appScrollWheelScrollingUp: (isUp: Bool, uptime: TimeInterval)?
+    private var appScrollWheelToSend: Data?
+    /// When the oldest step the application has not answered yet was sent.
+    private var appScrollWheelOldestUnanswered: TimeInterval?
+    private var appScrollOutputPace = AppScrollOutputPace()
+    /// How long after a wheel step a repaint is at least attributed to it, for applications
+    /// not measured yet. Slower ones get what their measured response time asks for.
+    private static let appScrollWheelMinimumAttributionInterval: TimeInterval = 0.5
     private var pendingRenderingSuppressedChanges: [Bool] = []
     private var renderContentVersion: UInt64 = 0
     private var cachedRenderSnapshot: RenderSnapshot?
@@ -782,6 +802,7 @@ final class TerminalController {
                 outputActivitySuppressedUntilUptime = 0
             }
         }
+        debugInputObserverForTesting?(data)
         auditLogger?.recordInput(data)
         hookManager?.dispatchRawInput(data, terminalID: id)
         pty.write(data)
@@ -1044,6 +1065,7 @@ final class TerminalController {
         var startedRenderingSuppressed = false
         var shouldScheduleScrollbackCompaction = true
         var deferredKittyImageJobs: [TerminalModel.DeferredKittyImagePayloadJob] = []
+        var wheelToSend: Data?
         let ptr = data.baseAddress!
         let count = data.count
 
@@ -1165,6 +1187,10 @@ final class TerminalController {
 
             flushPendingParserScrollOutBatch()
             flushPendingSemanticScrolledRowAgainstCurrentGridLocked()
+            if appScrollSelectionTracker != nil {
+                followAppScrollFrameLocked(output: data)
+                wheelToSend = takeAppScrollWheelToSendLocked()
+            }
             renderingSuppressed = terminalRenderingSuppressed
             renderingSuppressedChanges = pendingRenderingSuppressedChanges
             pendingRenderingSuppressedChanges.removeAll(keepingCapacity: true)
@@ -1174,6 +1200,10 @@ final class TerminalController {
                         cachedRenderSnapshotVersion = 0
                     }
                 }
+        }
+
+        if let wheelToSend {
+            sendInput(wheelToSend)
         }
 
         if !deferredKittyImageJobs.isEmpty {
@@ -1641,6 +1671,10 @@ final class TerminalController {
                     scrollback.reflow(oldCols: oldCols, newCols: cols)
                 }
                 model.resize(newRows: rows, newCols: cols)
+                // Reflow changes what every tracked row means.
+                if appScrollSelectionTracker != nil {
+                    dropAppScrollSelectionLocked()
+                }
                 // After resize, snap to the latest content so the user sees
                 // the current terminal output, not stale scrollback.
                 scrollOffset = 0
@@ -1748,6 +1782,490 @@ final class TerminalController {
         if changed {
             scheduleMainCallbacks(needsDisplay: true)
         }
+    }
+
+    // MARK: - Selection Attached to Application-Scrolled Text
+
+    struct AppScrollSelectionState: Equatable {
+        let generation: UInt64
+        let globalShift: Int
+        let movingBand: Range<Int>?
+        let joinCount: Int
+    }
+
+    /// True when the application, not pterm's scrollback, decides what the screen shows.
+    var applicationOwnsScrolling: Bool {
+        lock.withReadLock { model.isAlternateScreen || model.mouseReporting != .none }
+    }
+
+    /// Starts following text for a selection. Selection rows are global rows at this moment.
+    func beginAppScrollSelectionTracking() -> AppScrollSelectionState {
+        lock.withWriteLock {
+            let rows = model.rows
+            let frame = (0..<rows).map { AppScrollRowHash.hash(cells: model.grid.rowCells($0)) }
+            let rowBytes = max(model.cols, 1) * MemoryLayout<Cell>.stride
+            appScrollSelectionTracker = AppScrollSelectionTracker(
+                frame: frame,
+                baseGlobalRow: scrollback.totalEvictedRows + scrollback.rowCount,
+                maximumCapturedRows: max(rows, scrollback.maximumCapacityBytes / rowBytes),
+                row: capturedRowLocked
+            )
+            appScrollTrackedAlternateScreen = model.isAlternateScreen
+            appScrollCursorWasVisible = model.cursor.visible
+            appScrollUpdateWasSuppressed = terminalRenderingSuppressed
+            appScrollSelectionGeneration &+= 1
+            appScrollWheelPacer = AppScrollWheelPacer()
+            appScrollWheelSent = nil
+            appScrollWheelScrollingUp = nil
+            appScrollWheelOldestUnanswered = nil
+            appScrollOutputPace = AppScrollOutputPace()
+            return appScrollSelectionStateLocked()
+        }
+    }
+
+    func endAppScrollSelectionTracking() {
+        let wheel = lock.withWriteLock { () -> Data? in
+            dropAppScrollSelectionLocked()
+            return takeAppScrollWheelToSendLocked()
+        }
+        if let wheel { sendInput(wheel) }
+    }
+
+    /// Sends wheel notches to the application. While a selection follows its text, they go in
+    /// steps that keep consecutive frames overlapping.
+    func sendApplicationWheel(report: Data, button: Int, count: Int) {
+        let wheel = lock.withWriteLock { () -> Data? in
+            guard appScrollSelectionTracker != nil else {
+                return Self.repeated(report, count: count)
+            }
+            appScrollWheelReport = report
+            appScrollWheelScrollingUp = (button == MouseReportEncoder.wheelUpButton, ProcessInfo.processInfo.systemUptime)
+            prepareAppScrollWheelLocked(notches: appScrollWheelPacer.add(button: button, count: count))
+            return takeAppScrollWheelToSendLocked()
+        }
+        if let wheel { sendInput(wheel) }
+    }
+
+    private static func repeated(_ report: Data, count: Int) -> Data {
+        var data = Data(capacity: report.count * count)
+        for _ in 0..<count { data.append(report) }
+        return data
+    }
+
+    private func takeAppScrollWheelToSendLocked() -> Data? {
+        defer { appScrollWheelToSend = nil }
+        return appScrollWheelToSend
+    }
+
+    private func prepareAppScrollWheelLocked(notches: Int) {
+        guard notches > 0, let report = appScrollWheelReport else { return }
+        appScrollOutputPace.noteRepaintBoundary()
+        appScrollWheelToSend = (appScrollWheelToSend ?? Data()) + Self.repeated(report, count: notches)
+        appScrollWheelToken &+= 1
+        let token = appScrollWheelToken
+        let now = ProcessInfo.processInfo.systemUptime
+        appScrollWheelSent = (appScrollSelectionTracker?.globalShift ?? 0, now, token)
+        appScrollWheelOldestUnanswered = appScrollWheelOldestUnanswered ?? now
+        if let direction = appScrollWheelScrollingUp {
+            appScrollWheelScrollingUp = (direction.isUp, now)
+        }
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + appScrollWheelPacer.responseTimeout) { [weak self] in
+            guard let self else { return }
+            let wheel = self.lock.withWriteLock { () -> Data? in
+                guard token == self.appScrollWheelToken, self.appScrollSelectionTracker != nil else { return nil }
+                self.prepareAppScrollWheelLocked(notches: self.appScrollWheelPacer.responseTimedOut())
+                return self.takeAppScrollWheelToSendLocked()
+            }
+            if let wheel { self.sendInput(wheel) }
+        }
+    }
+
+    /// One wheel event can take an application several repaints, so the next step waits until
+    /// the output pauses. Going on after the first one would stack the steps into one jump.
+    private func appScrollFrameSettledLocked(tracker: AppScrollSelectionTracker) {
+        guard appScrollWheelPacer.isAwaitingRepaint, let sent = appScrollWheelSent,
+              tracker.globalShift != sent.shift else { return }
+        appScrollWheelToken &+= 1
+        let token = appScrollWheelToken
+        // Steps sent after a timeout have not been answered either, so the time an application
+        // takes is measured from the oldest one. From the latest it would look far too short.
+        let latency = ProcessInfo.processInfo.systemUptime - (appScrollWheelOldestUnanswered ?? sent.uptime)
+        appScrollWheelOldestUnanswered = nil
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + appScrollOutputPace.settlePause) { [weak self] in
+            guard let self else { return }
+            let wheel = self.lock.withWriteLock { () -> Data? in
+                guard token == self.appScrollWheelToken, let tracker = self.appScrollSelectionTracker else { return nil }
+                self.prepareAppScrollWheelLocked(notches: self.appScrollWheelPacer.repaintSettled(
+                    rowsMoved: abs(tracker.globalShift - sent.shift),
+                    movingRows: tracker.movingBand?.count ?? self.model.rows,
+                    latency: latency
+                ))
+                return self.takeAppScrollWheelToSendLocked()
+            }
+            if let wheel { self.sendInput(wheel) }
+        }
+    }
+
+    /// Where a row last known at `shift` and `joinCount` is in `state`.
+    func appScrollGlobalRow(ofRow row: Int, atShift shift: Int, joinCount: Int, in state: AppScrollSelectionState) -> Int {
+        lock.withReadLock {
+            appScrollSelectionTracker?.globalRow(ofRow: row, atShift: shift, joinCount: joinCount,
+                                                 toShift: state.globalShift, toJoinCount: state.joinCount) ?? row
+        }
+    }
+
+    func appScrollSelectionState() -> AppScrollSelectionState {
+        lock.withReadLock { appScrollSelectionStateLocked() }
+    }
+
+    private func appScrollSelectionStateLocked() -> AppScrollSelectionState {
+        AppScrollSelectionState(
+            generation: appScrollSelectionGeneration,
+            globalShift: appScrollSelectionTracker?.globalShift ?? 0,
+            movingBand: appScrollSelectionTracker?.movingBand,
+            joinCount: appScrollSelectionTracker?.joinCount ?? 0
+        )
+    }
+
+    private func capturedRowLocked(_ gridRow: Int) -> AppScrollSelectionTracker.CapturedRow {
+        AppScrollSelectionTracker.CapturedRow(
+            cells: Array(model.grid.rowCells(gridRow)),
+            isWrapped: model.grid.isWrapped(gridRow)
+        )
+    }
+
+    /// Called after each read. A repaint is known to be finished where the application
+    /// shows the cursor again after hiding it. Applications that never hide it are settled
+    /// by a pause in their output instead: the reads of one repaint arrive back to back.
+    private func followAppScrollFrameLocked(output: UnsafeBufferPointer<UInt8>) {
+        guard var tracker = appScrollSelectionTracker else { return }
+        appScrollOutputPace.noteRead(atUptime: ProcessInfo.processInfo.systemUptime)
+        // Moving between the primary and alternate screens swaps the whole text.
+        guard model.isAlternateScreen == appScrollTrackedAlternateScreen else {
+            dropAppScrollSelectionLocked()
+            return
+        }
+        let cursorVisible = model.cursor.visible
+        // One read can hold a whole repaint, hiding and showing the cursor within it.
+        let repaintFinished = cursorVisible && (!appScrollCursorWasVisible || Self.contains(Self.showCursorSequence, in: output))
+        appScrollCursorWasVisible = cursorVisible
+        let updateEnded = (appScrollUpdateWasSuppressed && !terminalRenderingSuppressed)
+            || Self.contains(Self.endSynchronizedUpdateSequence, in: output)
+        appScrollUpdateWasSuppressed = terminalRenderingSuppressed
+        if repaintFinished || updateEnded {
+            appScrollOutputPace.noteRepaintBoundary()
+        }
+        // A hidden cursor or a synchronized update marks a repaint in progress.
+        guard cursorVisible, !terminalRenderingSuppressed else {
+            scheduleAppScrollSettleLocked()
+            return
+        }
+        let frame = appScrollFrameLocked()
+        let base = scrollback.totalEvictedRows + scrollback.rowCount
+        tracker.follow(frame: frame, baseGlobalRow: base, activeRow: repaintFinished ? nil : model.cursor.row)
+        appScrollSelectionTracker = tracker
+        if repaintFinished {
+            settleAppScrollFrameLocked()
+        } else {
+            scheduleAppScrollSettleLocked()
+        }
+    }
+
+    private static let showCursorSequence = Array("\u{1B}[?25h".utf8)
+    private static let endSynchronizedUpdateSequence = Array("\u{1B}[?2026l".utf8)
+
+    private static func contains(_ sequence: [UInt8], in output: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard let base = output.baseAddress else { return false }
+        return memmem(base, output.count, sequence, sequence.count) != nil
+    }
+
+    private func appScrollFrameLocked() -> [UInt64] {
+        (0..<model.rows).map { AppScrollRowHash.hash(cells: model.grid.rowCells($0)) }
+    }
+
+    private func settleAppScrollFrameLocked() {
+        guard var tracker = appScrollSelectionTracker else { return }
+        let frame = appScrollFrameLocked()
+        let base = scrollback.totalEvictedRows + scrollback.rowCount
+        tracker.follow(frame: frame, baseGlobalRow: base, activeRow: nil)
+        var scrollingUp: Bool?
+        if let wheel = appScrollWheelScrollingUp,
+           ProcessInfo.processInfo.systemUptime - wheel.uptime <= max(Self.appScrollWheelMinimumAttributionInterval, appScrollWheelPacer.responseTimeout) {
+            scrollingUp = wheel.isUp
+        }
+        guard tracker.settle(frame: frame, baseGlobalRow: base, scrollingUp: scrollingUp, row: capturedRowLocked) else {
+            dropAppScrollSelectionLocked()
+            return
+        }
+        appScrollSelectionTracker = tracker
+        appScrollFrameSettledLocked(tracker: tracker)
+    }
+
+    /// Notches still queued go out at once: the scrolling continues without a selection.
+    private func dropAppScrollSelectionLocked() {
+        appScrollSelectionTracker = nil
+        appScrollSelectionGeneration &+= 1
+        appScrollWheelToken &+= 1
+        if let report = appScrollWheelReport {
+            let remaining = appScrollWheelPacer.takeAll()
+            if remaining > 0 {
+                appScrollWheelToSend = (appScrollWheelToSend ?? Data()) + Self.repeated(report, count: remaining)
+            }
+        }
+    }
+
+    private func scheduleAppScrollSettleLocked() {
+        appScrollSettleToken &+= 1
+        let token = appScrollSettleToken
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + appScrollOutputPace.settlePause) { [weak self] in
+            guard let self else { return }
+            var wheel: Data?
+            let settled = self.lock.withWriteLock { () -> Bool in
+                guard token == self.appScrollSettleToken, self.appScrollSelectionTracker != nil else { return false }
+                self.settleAppScrollFrameLocked()
+                wheel = self.takeAppScrollWheelToSendLocked()
+                return true
+            }
+            if let wheel { self.sendInput(wheel) }
+            if settled {
+                self.renderSnapshotCacheLock.withLock { self.cachedRenderSnapshotVersion = 0 }
+                self.scheduleMainCallbacks(needsDisplay: true)
+            }
+        }
+    }
+
+    /// True if an application's own selection highlight still shows on `selection`. Rows off
+    /// the screen cannot be checked, so only visible rows can disprove it.
+    func applicationHighlights(_ selection: TerminalSelection, paintedWith looks: Set<CellLook>) -> Bool {
+        lock.withReadLock {
+            let base = scrollback.totalEvictedRows + scrollback.rowCount
+            guard selection.start.row - base < model.rows, selection.end.row - base >= 0 else { return true }
+            let rows = max(selection.start.row - base, 0)...min(selection.end.row - base, model.rows - 1)
+            for gridRow in rows {
+                let first = gridRow == selection.start.row - base ? selection.start.col : 0
+                let last = gridRow == selection.end.row - base ? selection.end.col : model.cols - 1
+                guard first <= last else { continue }
+                for col in first...min(last, model.cols - 1)
+                where looks.contains(CellLook(model.grid.cell(at: gridRow, col: col).attributes)) {
+                    return true
+                }
+            }
+            return false
+        }
+    }
+
+    /// How a cell is painted behind its text, which is what a selection highlight changes.
+    struct CellLook: Hashable {
+        let background: TerminalColor
+        let inverse: Bool
+
+        init(_ attributes: CellAttributes) {
+            background = attributes.background
+            inverse = attributes.inverse
+        }
+
+        var isPlain: Bool { background == .default && !inverse }
+    }
+
+    /// What the screen looks like before a click, to tell what the click highlighted.
+    struct ScreenBackgrounds {
+        fileprivate let cols: Int
+        fileprivate let cells: [(look: CellLook, codepoint: UInt32)]
+        var firstGlobalRow: Int
+
+        /// A highlight paints over text and leaves it alone. Anything else that changes a
+        /// background, such as an overlay or new output, brings text of its own.
+        fileprivate func wasHighlighted(_ cell: Cell, gridRow: Int, col: Int) -> Bool {
+            let index = gridRow * cols + col
+            guard cells.indices.contains(index) else { return false }
+            let look = CellLook(cell.attributes)
+            return !look.isPlain && look != cells[index].look
+                && Self.text(cell.codepoint) == Self.text(cells[index].codepoint)
+        }
+
+        /// A cell that was never written and a space read the same.
+        private static func text(_ codepoint: UInt32) -> UInt32 {
+            codepoint == 0 ? 0x20 : codepoint
+        }
+    }
+
+    func screenBackgrounds() -> ScreenBackgrounds {
+        lock.withReadLock {
+            var cells: [(look: CellLook, codepoint: UInt32)] = []
+            cells.reserveCapacity(model.rows * model.cols)
+            for row in 0..<model.rows {
+                for col in 0..<model.cols {
+                    let cell = model.grid.cell(at: row, col: col)
+                    cells.append((CellLook(cell.attributes), cell.codepoint))
+                }
+            }
+            return ScreenBackgrounds(cols: model.cols, cells: cells,
+                                     firstGlobalRow: scrollback.totalEvictedRows + scrollback.rowCount)
+        }
+    }
+
+    /// How an application painted the highlight on `selection` since `before`. Applications choose
+    /// their own highlight, and also color cells for other reasons, such as a logo or a diff,
+    /// so a background says nothing until a selection is seen to have put it there.
+    func applicationHighlightLooks(in selection: TerminalSelection, since before: ScreenBackgrounds) -> Set<CellLook> {
+        lock.withReadLock {
+            let base = scrollback.totalEvictedRows + scrollback.rowCount
+            let offset = base - before.firstGlobalRow
+            guard selection.start.row - base < model.rows, selection.end.row - base >= 0 else { return [] }
+            var looks = Set<CellLook>()
+            for gridRow in max(selection.start.row - base, 0)...min(selection.end.row - base, model.rows - 1) {
+                let first = gridRow == selection.start.row - base ? selection.start.col : 0
+                let last = min(gridRow == selection.end.row - base ? selection.end.col : model.cols - 1, model.cols - 1)
+                guard first <= last else { continue }
+                for col in first...last {
+                    let cell = model.grid.cell(at: gridRow, col: col)
+                    if before.wasHighlighted(cell, gridRow: gridRow + offset, col: col) {
+                        looks.insert(CellLook(cell.attributes))
+                    }
+                }
+            }
+            return looks
+        }
+    }
+
+    /// What an application highlighted around a row since `before`. How a double or triple click
+    /// expands is the application's choice, so the cells it repainted say what it selected.
+    /// Their color alone would not: a line of a colored block looks like its neighbors. A cell
+    /// painted with a highlight seen earlier counts too, as it may have been selected already.
+    func applicationHighlightSelection(atGlobalRow globalRow: Int,
+                                       since before: ScreenBackgrounds,
+                                       paintedWith looks: Set<CellLook>) -> TerminalSelection? {
+        lock.withReadLock {
+            let base = scrollback.totalEvictedRows + scrollback.rowCount
+            let offset = base - before.firstGlobalRow
+            func changedColumns(_ row: Int) -> [Int] {
+                (0..<model.cols).filter { col in
+                    let cell = model.grid.cell(at: row, col: col)
+                    return looks.contains(CellLook(cell.attributes))
+                        || before.wasHighlighted(cell, gridRow: row + offset, col: col)
+                }
+            }
+            let gridRow = globalRow - base
+            guard (0..<model.rows).contains(gridRow), !changedColumns(gridRow).isEmpty else { return nil }
+            var top = gridRow
+            while top > 0, !changedColumns(top - 1).isEmpty { top -= 1 }
+            var bottom = gridRow
+            while bottom < model.rows - 1, !changedColumns(bottom + 1).isEmpty { bottom += 1 }
+            guard let firstCol = changedColumns(top).first, let lastCol = changedColumns(bottom).last else { return nil }
+            return TerminalSelection(anchor: GridPosition(row: base + top, col: firstCol),
+                                     active: GridPosition(row: base + bottom, col: lastCol),
+                                     mode: .normal)
+        }
+    }
+
+    /// The text of an application's selection. Where its rows are in sight, only the cells it
+    /// highlighted count: applications leave out what is not meant to be copied, such as the
+    /// line numbers of a code listing, and the highlight is what says so.
+    func applicationSelectedText(for selection: TerminalSelection, paintedWith looks: Set<CellLook>) -> String {
+        lock.withReadLock {
+            let base = scrollback.totalEvictedRows + scrollback.rowCount
+            let cols = model.cols
+            let start = selection.start
+            let end = selection.end
+            var result = ""
+            for globalRow in start.row...end.row {
+                let gridRow = globalRow - base
+                let row: AppScrollSelectionTracker.CapturedRow?
+                if (0..<model.rows).contains(gridRow) {
+                    let visible = capturedRowLocked(gridRow)
+                    row = appScrollSelectionTracker?.capturedRow(atGlobalRow: globalRow, ifCovers: visible, gridRow: gridRow) ?? visible
+                } else {
+                    row = appScrollSelectionTracker?.capturedRow(atGlobalRow: globalRow)
+                }
+                guard let row else { continue }
+                let first = globalRow == start.row ? start.col : 0
+                let last = globalRow == end.row ? end.col : cols - 1
+                guard first <= last else { continue }
+                let cells = Array(row.cells[min(first, row.cells.count)..<min(last + 1, row.cells.count)])
+                let highlighted = cells.filter { looks.contains(CellLook($0.attributes)) }
+                let rowCells = highlighted.isEmpty ? cells : highlighted
+                Self.appendCells(in: rowCells, from: 0, through: max(rowCells.count - 1, 0), to: &result)
+                if globalRow < end.row {
+                    Self.trimTrailingSpaces(from: &result)
+                    let next = globalRow + 1 - base
+                    let nextIsWrapped = (0..<model.rows).contains(next)
+                        ? model.grid.isWrapped(next)
+                        : appScrollSelectionTracker?.capturedRow(atGlobalRow: globalRow + 1)?.isWrapped ?? false
+                    if !nextIsWrapped { result.append("\n") }
+                }
+            }
+            return result
+        }
+    }
+
+    func debugAppScrollSettlePauseForTesting() -> TimeInterval {
+        lock.withReadLock { appScrollOutputPace.settlePause }
+    }
+
+    /// Settles what is on the screen now, without waiting for the output to pause.
+    func debugSettleAppScrollFrameForTesting() {
+        lock.withWriteLock { settleAppScrollFrameLocked() }
+    }
+
+    private func extractTextLocked(selection: TerminalSelection,
+                                   tracker: AppScrollSelectionTracker) -> String {
+        guard !selection.isEmpty, let band = tracker.movingBand else { return "" }
+        let cols = model.cols
+        let baseGlobalRow = scrollback.totalEvictedRows + scrollback.rowCount
+        // Visible rows of the moving band are always read from the screen, the only copy
+        // that cannot be stale. The rest comes from what was stored on the way past.
+        func capturedRow(atGlobalRow globalRow: Int) -> AppScrollSelectionTracker.CapturedRow? {
+            let gridRow = globalRow - baseGlobalRow
+            guard band.contains(gridRow) else { return tracker.capturedRow(atGlobalRow: globalRow) }
+            return tracker.capturedRow(atGlobalRow: globalRow, ifCovers: capturedRowLocked(gridRow), gridRow: gridRow)
+        }
+        // Rows beyond the scrolled text are fixed rows, which are not part of the selection.
+        let visible = (baseGlobalRow + band.lowerBound)...(baseGlobalRow + band.upperBound - 1)
+        let extent = tracker.scrolledTextGlobalRowExtent ?? visible
+        let start = selection.start
+        let end = selection.end
+        let firstRow = max(start.row, min(extent.lowerBound, visible.lowerBound))
+        let lastRow = min(end.row, max(extent.upperBound, visible.upperBound))
+        guard firstRow <= lastRow else { return "" }
+
+        var result = ""
+        var rowIndex = firstRow
+        while rowIndex <= lastRow {
+            guard let row = capturedRow(atGlobalRow: rowIndex) else {
+                var missing = 0
+                while rowIndex <= lastRow, capturedRow(atGlobalRow: rowIndex) == nil {
+                    missing += 1
+                    rowIndex += 1
+                }
+                if tracker.isUndisplayed(globalRow: rowIndex - 1) {
+                    result.append("[pterm: rows passed by a fast scroll were never displayed]")
+                } else {
+                    result.append("[pterm: \(missing) rows are no longer held]")
+                }
+                if rowIndex <= lastRow { result.append("\n") }
+                continue
+            }
+            let columnStart: Int
+            let columnEnd: Int
+            switch selection.mode {
+            case .normal:
+                columnStart = rowIndex == start.row ? start.col : 0
+                columnEnd = rowIndex == end.row ? end.col : max(cols - 1, 0)
+            case .rectangular:
+                columnStart = start.col
+                columnEnd = min(end.col, cols - 1)
+            }
+            Self.appendCells(in: row.cells, from: columnStart, through: columnEnd, to: &result)
+            if rowIndex < lastRow {
+                Self.trimTrailingSpaces(from: &result)
+                let nextIsWrapped = capturedRow(atGlobalRow: rowIndex + 1)?.isWrapped ?? false
+                if selection.mode == .rectangular || !nextIsWrapped {
+                    result.append("\n")
+                }
+            }
+            rowIndex += 1
+        }
+        return result
     }
 
     // MARK: - Selection Coordinate Conversion
@@ -1983,7 +2501,8 @@ final class TerminalController {
             ownerID: id,
             hasInlineImages: hasInlineImages,
             inlineImagePlacements: inlineImagePlacements,
-            visibleRows: renderRows
+            visibleRows: renderRows,
+            appScrollSelectionShift: appScrollSelectionTracker?.globalShift ?? 0
         )
     }
 
@@ -2010,6 +2529,10 @@ final class TerminalController {
 
     func selectedText(for selection: TerminalSelection) -> String {
         lock.withReadLock {
+            // Once the text has moved, the rows may be anywhere, also back where they began.
+            if let tracker = appScrollSelectionTracker, tracker.movingBand != nil {
+                return extractTextLocked(selection: selection, tracker: tracker)
+            }
             let dimensions = visibleGridDimensionsLocked()
             let scrollbackCount = scrollback.rowCount
             let evicted = scrollback.totalEvictedRows

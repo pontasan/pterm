@@ -11,6 +11,8 @@ import Foundation
 /// - UTF-8 (1005) coordinates use the same value encoded as a UTF-8 scalar.
 /// - SGR (1006) uses decimal parameters and `M` / `m` for press / release.
 enum MouseReportEncoder {
+    static let wheelUpButton = 64
+    static let wheelDownButton = 65
     enum Phase: Equatable {
         case press
         case release

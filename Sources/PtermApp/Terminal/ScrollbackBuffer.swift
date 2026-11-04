@@ -115,6 +115,8 @@ final class ScrollbackBuffer {
     }
 
     /// Total allocated capacity in bytes
+    var maximumCapacityBytes: Int { maxCapacityBytes }
+
     var capacity: Int {
         guard let rb = ringBuffer else { return 0 }
         return ring_buffer_capacity(rb)

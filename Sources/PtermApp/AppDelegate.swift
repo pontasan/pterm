@@ -255,6 +255,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Focused terminal view (single terminal occupying the window)
     private var terminalView: TerminalView?
+    /// The clipboard of copy, cut, paste and OSC 52. Replaceable so that verification never
+    /// touches the clipboard of the person using the machine.
+    var terminalPasteboard: NSPasteboard = .general
     private var searchBarView: SearchBarView?
     /// The terminal view that was active when search started.
     /// Kept stable during search so switching focus to the search field
@@ -2178,7 +2181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard controller != nil, let sourceView else { return }
 
         if let text = sourceView.selectedText() {
-            let pasteboard = NSPasteboard.general
+            let pasteboard = terminalPasteboard
             pasteboard.clearContents()
             pasteboard.setString(text, forType: .string)
         } else {
@@ -2206,7 +2209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard let controller else { return }
 
-        let pasteboard = NSPasteboard.general
+        let pasteboard = terminalPasteboard
 
         // Determine whether the clipboard's primary content is plain text
         // or file/image data.  When the user copies text (Cmd+C on text),
@@ -2315,9 +2318,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func configureController(_ controller: TerminalController) {
-        controller.model.onClipboardWrite = { text in
+        controller.model.onClipboardWrite = { [weak self] text in
             DispatchQueue.main.async {
-                let pasteboard = NSPasteboard.general
+                guard let pasteboard = self?.terminalPasteboard else { return }
                 pasteboard.clearContents()
                 pasteboard.setString(text, forType: .string)
             }
@@ -2325,10 +2328,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.model.onClipboardRead = { [weak self] in
             guard let self, self.config.security.osc52ClipboardRead else { return nil }
             if Thread.isMainThread {
-                return NSPasteboard.general.string(forType: .string)
+                return self.terminalPasteboard.string(forType: .string)
             }
             return DispatchQueue.main.sync {
-                NSPasteboard.general.string(forType: .string)
+                self.terminalPasteboard.string(forType: .string)
             }
         }
         controller.model.mouseReportingPolicy = { [weak self] _, isAlternateScreen in
@@ -3223,7 +3226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let activeTerminalInputView,
            window?.firstResponder === activeTerminalInputView,
            let text = activeTerminalInputView.cutMarkedText() {
-            let pasteboard = NSPasteboard.general
+            let pasteboard = terminalPasteboard
             pasteboard.clearContents()
             pasteboard.setString(text, forType: .string)
             return

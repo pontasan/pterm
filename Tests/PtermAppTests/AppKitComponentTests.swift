@@ -5357,13 +5357,839 @@ final class AppKitComponentTests: XCTestCase {
         let text = view.selectedText()
         XCTAssertNotNil(text)
         XCTAssertTrue(text!.hasPrefix("Hello"))
-        let pasteboard = NSPasteboard.general
+        // A private pasteboard: the clipboard of the machine belongs to whoever is using it.
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("pterm.test.\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
         pasteboard.clearContents()
         pasteboard.setString(text!, forType: .string)
 
         // Selection must still be present after copy.
         XCTAssertNotNil(view.selection)
         XCTAssertFalse(view.selection!.isEmpty)
+    }
+
+    // MARK: - Selection attached to application-scrolled text
+
+    /// A full-screen application with mouse tracking: five scrolling rows above a fixed footer.
+    private struct AppScrollHarness {
+        let controller: TerminalController
+        let view: TerminalView
+        let window: NSWindow
+        let renderer: MetalRenderer
+
+        func redraw(firstLine: Int, sync: Bool = false) {
+            var output = sync ? "\u{1B}[?2026h" : ""
+            for row in 0..<5 {
+                output += "\u{1B}[\(row + 1);1H\u{1B}[2K" + String(format: "L%02d", firstLine + row)
+            }
+            output += "\u{1B}[6;1H\u{1B}[2KFOOTER"
+            output += sync ? "\u{1B}[?2026l" : ""
+            controller.debugProcessPTYOutputForTesting(Data(output.utf8))
+            controller.debugSettleAppScrollFrameForTesting()
+        }
+
+        func point(row: Int, col: Int) -> NSPoint {
+            NSPoint(
+                x: renderer.gridPadding + CGFloat(col) * renderer.glyphAtlas.cellWidth + renderer.glyphAtlas.cellWidth * 0.5,
+                y: view.bounds.height - renderer.gridPadding - CGFloat(row) * renderer.glyphAtlas.cellHeight - renderer.glyphAtlas.cellHeight * 0.5
+            )
+        }
+    }
+
+    private func makeAppScrollHarness(renderer: MetalRenderer) -> AppScrollHarness {
+        let controller = TerminalController(
+            rows: 6, cols: 20,
+            termEnv: "xterm-256color", textEncoding: .utf8,
+            scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 1024 * 1024,
+            fontName: "Menlo", fontSize: 13
+        )
+        controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?1049h\u{1B}[?1000h\u{1B}[?1006h".utf8))
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 160), renderer: renderer)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(view)
+        view.terminalController = controller
+        let harness = AppScrollHarness(controller: controller, view: view, window: window, renderer: renderer)
+        harness.redraw(firstLine: 0)
+        return harness
+    }
+
+    private func click(_ h: AppScrollHarness, row: Int, col: Int, modifiers: NSEvent.ModifierFlags = []) throws {
+        let p = h.point(row: row, col: col)
+        h.view.mouseDown(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: p, in: h.view, window: h.window, modifiers: modifiers)))
+        h.view.mouseUp(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseUp, point: p, in: h.view, window: h.window, modifiers: modifiers)))
+    }
+
+    /// Fraction of the cell-sized band of `row` that is painted with the selection blue.
+    private func selectionBlueCoverage(_ h: AppScrollHarness, row: Int) throws -> Double {
+        let scale = 2
+        let width = Int(h.view.bounds.width) * scale
+        let height = Int(h.view.bounds.height) * scale
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: h.renderer, width: width, height: height))
+        h.view.debugRenderFrameToTextureForTesting(texture)
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        texture.getBytes(&pixels, bytesPerRow: width * 4,
+                         from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
+        let cellHeight = Double(h.renderer.glyphAtlas.cellHeight) * Double(scale)
+        let top = Double(h.renderer.gridPadding) * Double(scale) + Double(row) * cellHeight
+        // The middle of the row's last columns, which hold only the cell background.
+        let y = Int(top + cellHeight / 2)
+        let cellWidth = Double(h.renderer.glyphAtlas.cellWidth) * Double(scale)
+        let left = Double(h.renderer.gridPadding) * Double(scale)
+        let xStart = Int(left + cellWidth * 16)
+        let xEnd = Int(left + cellWidth * 20)
+        var blue = 0
+        for x in xStart..<xEnd {
+            let offset = (y * width + x) * 4
+            // bgra8
+            if Int(pixels[offset]) > Int(pixels[offset + 2]) + 30 { blue += 1 }
+        }
+        return Double(blue) / Double(xEnd - xStart)
+    }
+
+    func testSelectionFollowsTextWhenApplicationScrollsAndKeepsItsTextOffscreen() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        try click(h, row: 2, col: 2, modifiers: [.shift])
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02")
+        let before = try XCTUnwrap(h.view.selection)
+        h.redraw(firstLine: 1)
+        XCTAssertEqual(try XCTUnwrap(h.view.selection).start.row, before.start.row - 1)
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02")
+        // Scrolled completely above the screen, in steps like wheel notches.
+        for first in 2...9 { h.redraw(firstLine: first) }
+        XCTAssertEqual(try XCTUnwrap(h.view.selection).end.row, before.end.row - 9)
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02", "Selected text must survive leaving the screen.")
+        // And back on screen at the rows the text is drawn at.
+        for first in stride(from: 8, through: 0, by: -1) { h.redraw(firstLine: first) }
+        let back = try XCTUnwrap(h.view.selection)
+        XCTAssertEqual(back.start.row, before.start.row)
+        XCTAssertEqual(back.end.row, before.end.row)
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02")
+    }
+
+    func testShiftClickGrowsAndShrinksSelectionAcrossApplicationScroll() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        for first in 1...4 { h.redraw(firstLine: first) }
+        // Row 3 now shows L07. Everything from the anchor L01 to there is selected.
+        try click(h, row: 3, col: 2, modifiers: [.shift])
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02\nL03\nL04\nL05\nL06\nL07")
+        // Shrink.
+        try click(h, row: 1, col: 2, modifiers: [.shift])
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02\nL03\nL04\nL05")
+        // Grow again after scrolling further.
+        h.redraw(firstLine: 5)
+        try click(h, row: 4, col: 2, modifiers: [.shift])
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02\nL03\nL04\nL05\nL06\nL07\nL08\nL09")
+        // Across the anchor: the anchor stays and the selection flips above it.
+        for first in stride(from: 4, through: 0, by: -1) { h.redraw(firstLine: first) }
+        try click(h, row: 0, col: 0, modifiers: [.shift])
+        XCTAssertEqual(h.view.selectedText(), "L00\nL")
+    }
+
+    func testPlainClickClearsShiftClickSelectionWhileApplicationTracksMouse() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        try click(h, row: 2, col: 2, modifiers: [.shift])
+        XCTAssertNotNil(h.view.selection)
+        try click(h, row: 3, col: 1)
+        XCTAssertNil(h.view.selection, "A plain click must drop the selection.")
+        // The click is the anchor of the next Shift+click.
+        try click(h, row: 4, col: 2, modifiers: [.shift])
+        XCTAssertEqual(h.view.selectedText(), "03\nL04")
+    }
+
+    func testShiftDragMovesTheSelectionEndWhileApplicationTracksMouse() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 0, col: 0)
+        let down = h.point(row: 1, col: 2)
+        let drag = h.point(row: 3, col: 2)
+        h.view.mouseDown(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: down, in: h.view, window: h.window, modifiers: [.shift])))
+        h.view.mouseDragged(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDragged, point: drag, in: h.view, window: h.window, modifiers: [.shift])))
+        h.view.mouseUp(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseUp, point: drag, in: h.view, window: h.window, modifiers: [.shift])))
+        XCTAssertEqual(h.view.selectedText(), "L00\nL01\nL02\nL03")
+    }
+
+    func testSelectionIsDroppedWhenItsTextCanNoLongerBeLocated() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        try click(h, row: 2, col: 2, modifiers: [.shift])
+        h.redraw(firstLine: 500)
+        XCTAssertNil(h.view.selection, "No shared text with the previous frame: gray text over other text is a lie.")
+
+        let h2 = makeAppScrollHarness(renderer: renderer)
+        try click(h2, row: 1, col: 0)
+        try click(h2, row: 2, col: 2, modifiers: [.shift])
+        h2.controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?1049l".utf8))
+        XCTAssertNil(h2.view.selection, "Leaving the alternate screen removes the selected text.")
+    }
+
+    func testSelectionSurvivesInPlaceEditsAndResizeDropsTracking() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        try click(h, row: 2, col: 2, modifiers: [.shift])
+        let before = try XCTUnwrap(h.view.selection)
+        h.controller.debugProcessPTYOutputForTesting(Data("\u{1B}[6;1H\u{1B}[2KWORKING".utf8))
+        h.controller.debugSettleAppScrollFrameForTesting()
+        XCTAssertEqual(try XCTUnwrap(h.view.selection).start.row, before.start.row)
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02")
+        h.controller.resize(rows: 8, cols: 20)
+        h.redraw(firstLine: 1)
+        XCTAssertNil(h.view.selection, "Reflow invalidates what the rows meant, and must not crash the tracker.")
+    }
+
+    func testSynchronizedUpdateIsMeasuredOnlyWhenComplete() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        try click(h, row: 2, col: 2, modifiers: [.shift])
+        let before = try XCTUnwrap(h.view.selection)
+        h.controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?2026h\u{1B}[1;1H\u{1B}[2KL01".utf8))
+        XCTAssertEqual(try XCTUnwrap(h.view.selection).start.row, before.start.row)
+        h.controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?2026l".utf8))
+        h.redraw(firstLine: 1, sync: true)
+        XCTAssertEqual(try XCTUnwrap(h.view.selection).start.row, before.start.row - 1)
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02")
+    }
+
+    func testRenderedSelectionIsBlueMovesWithTextAndSkipsFixedFooter() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        // To the footer row, which is fixed.
+        try click(h, row: 5, col: 19, modifiers: [.shift])
+        XCTAssertGreaterThan(try selectionBlueCoverage(h, row: 2), 0.9, "The selection must be painted blue.")
+        XCTAssertLessThan(try selectionBlueCoverage(h, row: 0), 0.1)
+
+        h.redraw(firstLine: 1)
+        XCTAssertGreaterThan(try selectionBlueCoverage(h, row: 0), 0.9, "L01 moved to row 0 and the paint must follow.")
+        XCTAssertLessThan(try selectionBlueCoverage(h, row: 5), 0.1, "The fixed footer must not be painted.")
+    }
+
+    func testPlainShellSelectionIsPaintedTheSameBlue() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        h.controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?1000l\u{1B}[?1006l\u{1B}[?1049l".utf8))
+        h.controller.debugProcessPTYOutputForTesting(Data("ONE\r\nTWO\r\n".utf8))
+        let start = h.point(row: 0, col: 0)
+        let end = h.point(row: 2, col: 2)
+        h.view.mouseDown(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: start, in: h.view, window: h.window)))
+        h.view.mouseDragged(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDragged, point: end, in: h.view, window: h.window)))
+        h.view.mouseUp(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseUp, point: end, in: h.view, window: h.window)))
+        XCTAssertGreaterThan(try selectionBlueCoverage(h, row: 1), 0.9)
+    }
+
+    /// Waits for what the controller does on its own clock: settling and pacing.
+    private func spinMainRunLoop(_ seconds: TimeInterval) {
+        RunLoop.main.run(until: Date().addingTimeInterval(seconds))
+    }
+
+    private func wheelEvent(_ h: AppScrollHarness, lines: Int) throws -> NSEvent {
+        let cellHeight = h.renderer.glyphAtlas.cellHeight
+        return try XCTUnwrap(makeScrollWheelEvent(deltaY: Int32(CGFloat(lines) * cellHeight), point: h.point(row: 2, col: 2),
+                                                  in: h.view, window: h.window, precise: true, phase: .changed))
+    }
+
+    private func wheelNotches(in data: Data) -> Int {
+        String(decoding: data, as: UTF8.self).components(separatedBy: "\u{1B}[<").count - 1
+    }
+
+    /// The defect behind a selection vanishing in a fast scroll: a fling reached the application
+    /// at once, it repainted one far away screen, and no text was left to align on.
+    func testFlingReachesTheApplicationInStepsWhileASelectionFollowsItsText() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        try click(h, row: 2, col: 2, modifiers: [.shift])
+        let before = try XCTUnwrap(h.view.selection).start.row
+        var delivered = 0
+        h.controller.debugInputObserverForTesting = { delivered += self.wheelNotches(in: $0) }
+
+        h.view.scrollWheel(with: try wheelEvent(h, lines: -40))
+        XCTAssertEqual(delivered, 1, "Only one step is outstanding.")
+
+        var firstLine = 0
+        var answered = 0
+        let deadline = Date().addingTimeInterval(5)
+        var step = 0
+        while Date() < deadline, step < 3 {
+            // The application answers every step it received by moving as far as it was told.
+            if delivered > answered {
+                firstLine += delivered - answered
+                answered = delivered
+                h.redraw(firstLine: firstLine)
+                step += 1
+                XCTAssertEqual(try XCTUnwrap(h.view.selection).start.row, before - firstLine)
+                spinMainRunLoop(0.05)
+            } else {
+                spinMainRunLoop(0.01)
+            }
+        }
+        XCTAssertGreaterThan(delivered, 1, "A repaint releases the next step.")
+        XCTAssertLessThan(delivered, 40, "Three repaints do not carry a whole fling.")
+    }
+
+    func testWheelGoesStraightToTheApplicationWithoutASelection() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        var delivered = 0
+        h.controller.debugInputObserverForTesting = { delivered += self.wheelNotches(in: $0) }
+        h.view.scrollWheel(with: try wheelEvent(h, lines: -7))
+        XCTAssertEqual(delivered, 7, "Pacing is only for following a selection.")
+    }
+
+    func testClearingTheSelectionReleasesTheQueuedWheel() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        try click(h, row: 2, col: 2, modifiers: [.shift])
+        var delivered = 0
+        h.controller.debugInputObserverForTesting = { delivered += self.wheelNotches(in: $0) }
+        h.view.scrollWheel(with: try wheelEvent(h, lines: -6))
+        XCTAssertEqual(delivered, 1)
+        h.view.clearSelection()
+        XCTAssertEqual(delivered, 6, "The scrolling the user asked for is not lost.")
+    }
+
+    func testApplicationThatIgnoresTheWheelStillGetsTheRest() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        try click(h, row: 2, col: 2, modifiers: [.shift])
+        var delivered = 0
+        h.controller.debugInputObserverForTesting = { delivered += self.wheelNotches(in: $0) }
+        h.view.scrollWheel(with: try wheelEvent(h, lines: -3))
+        XCTAssertEqual(delivered, 1)
+        let deadline = Date().addingTimeInterval(5)
+        while delivered < 3, Date() < deadline { spinMainRunLoop(0.01) }
+        XCTAssertEqual(delivered, 3)
+    }
+
+    func testSelectionSurvivesAScrollPastEverythingSeenAndComesBack() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        try click(h, row: 2, col: 2, modifiers: [.shift])
+        let before = try XCTUnwrap(h.view.selection).start.row
+        h.view.scrollWheel(with: try wheelEvent(h, lines: -1))
+        h.redraw(firstLine: 500)
+        let during = try XCTUnwrap(h.view.selection, "Scrolled out of sight is not gone.")
+        XCTAssertEqual(try selectionBlueCoverage(h, row: 1), 0, accuracy: 0.01, "Other text must not look selected.")
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02")
+        XCTAssertNotEqual(during.start.row, before)
+        h.view.scrollWheel(with: try wheelEvent(h, lines: 1))
+        h.redraw(firstLine: 0)
+        XCTAssertEqual(try XCTUnwrap(h.view.selection).start.row, before, "The text found its place again.")
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02")
+    }
+
+    func testCopyWorksWhenTheShiftIsBackAtZeroWhileTheSelectedRowsAreOffTheScreen() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        h.redraw(firstLine: 4)
+        // Following starts at this click, at another position of the text.
+        try click(h, row: 3, col: 0)
+        h.redraw(firstLine: 2)
+        h.redraw(firstLine: 0)
+        try click(h, row: 1, col: 0)
+        try click(h, row: 2, col: 2, modifiers: [.shift])
+        h.redraw(firstLine: 2)
+        h.redraw(firstLine: 4)
+        XCTAssertEqual(h.controller.appScrollSelectionState().globalShift, 0)
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02")
+    }
+
+    /// Repaints a tenth of a second apart, marked the ways applications mark them, say nothing
+    /// about the link. Without any mark the gap could be inside a repaint, and has to count.
+    func testOnlyUnmarkedGapsLengthenTheSettlePause() throws {
+        let renderer = try makeRendererOrSkip()
+        let pause = { (repaint: String) throws -> TimeInterval in
+            let h = self.makeAppScrollHarness(renderer: renderer)
+            try self.click(h, row: 1, col: 0)
+            for _ in 0..<4 {
+                h.controller.debugProcessPTYOutputForTesting(Data(repaint.utf8))
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            return h.controller.debugAppScrollSettlePauseForTesting()
+        }
+        XCTAssertEqual(try pause("\u{1B}[?25lx\u{1B}[?25h"), 1.0 / 60.0, accuracy: 0.0001, "Cursor hidden and shown")
+        XCTAssertEqual(try pause("\u{1B}[?2026hx\u{1B}[?2026l"), 1.0 / 60.0, accuracy: 0.0001, "Synchronized update")
+        XCTAssertGreaterThan(try pause("x"), 0.1, "No mark")
+    }
+
+    func testRowsMoveToTheStateThatWasReadEvenWhenOutputHasMovedOn() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        h.redraw(firstLine: 2)
+        let state = h.controller.appScrollSelectionState()
+        h.redraw(firstLine: 4)
+        XCTAssertEqual(h.controller.appScrollGlobalRow(ofRow: 100, atShift: 0, joinCount: 0, in: state), 100 + state.globalShift)
+    }
+
+    /// Paints a drag selection the way Claude Code does: a background on the cells.
+    private func paintApplicationHighlight(_ h: AppScrollHarness, row: Int, columns: Range<Int>, text: String) {
+        let background = "\u{1B}[48;2;38;79;120m"
+        let start = "\u{1B}[\(row + 1);\(columns.lowerBound + 1)H"
+        h.controller.debugProcessPTYOutputForTesting(Data((start + background + text + "\u{1B}[0m").utf8))
+    }
+
+    private func drag(_ h: AppScrollHarness, from: (row: Int, col: Int), to: (row: Int, col: Int)) throws {
+        // Button-event tracking is what reports the motion of a drag, as Claude Code enables.
+        h.controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?1002h".utf8))
+        h.view.mouseDown(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: h.point(row: from.row, col: from.col), in: h.view, window: h.window)))
+        let end = h.point(row: to.row, col: to.col)
+        h.view.mouseDragged(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDragged, point: end, in: h.view, window: h.window)))
+        h.view.mouseUp(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseUp, point: end, in: h.view, window: h.window)))
+    }
+
+    /// The defect behind copying removing the highlight: pterm had no selection of its own, so
+    /// Cmd+C went to the application as an interrupt, which it answers by clearing its selection.
+    func testCopyingWhatTheApplicationSelectedDoesNotReachTheApplication() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try drag(h, from: (1, 0), to: (2, 2))
+        paintApplicationHighlight(h, row: 1, columns: 0..<3, text: "L01")
+        paintApplicationHighlight(h, row: 2, columns: 0..<3, text: "L02")
+        var sent = Data()
+        h.controller.debugInputObserverForTesting = { sent.append($0) }
+        XCTAssertNil(h.view.selection, "The application paints this selection, not pterm.")
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02", "AppDelegate.copy takes this instead of sending an interrupt.")
+        XCTAssertTrue(sent.isEmpty)
+    }
+
+    func testCopyingWhatTheApplicationSelectedLeavesOutWhatItDidNotHighlight() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        // Like a code listing: line numbers on the left that the application does not select.
+        h.controller.debugProcessPTYOutputForTesting(Data("\u{1B}[2;1H\u{1B}[2K 1 code\u{1B}[3;1H\u{1B}[2K 2 more".utf8))
+        h.controller.debugSettleAppScrollFrameForTesting()
+        try drag(h, from: (1, 0), to: (2, 19))
+        paintApplicationHighlight(h, row: 1, columns: 3..<7, text: "code")
+        paintApplicationHighlight(h, row: 2, columns: 3..<7, text: "more")
+        XCTAssertEqual(h.view.selectedText(), "code\nmore")
+    }
+
+    /// Found with a real application: a logo keeps its own background, and it is not selected.
+    func testCopyingLeavesOutCellsWithABackgroundOfTheirOwn() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        let own = "\u{1B}[48;2;0;0;0m"
+        h.controller.debugProcessPTYOutputForTesting(Data("\u{1B}[2;1H\u{1B}[2K\(own)##\u{1B}[0m text".utf8))
+        h.controller.debugSettleAppScrollFrameForTesting()
+        try drag(h, from: (1, 0), to: (1, 19))
+        paintApplicationHighlight(h, row: 1, columns: 3..<7, text: "text")
+        XCTAssertEqual(h.view.selectedText(), "text")
+    }
+
+    func testADragOverColoredCellsThatTheApplicationDidNotHighlightSelectsNothing() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        h.controller.debugProcessPTYOutputForTesting(Data("\u{1B}[2;1H\u{1B}[2K\u{1B}[48;2;20;60;20mdiff\u{1B}[0m".utf8))
+        h.controller.debugSettleAppScrollFrameForTesting()
+        try drag(h, from: (1, 0), to: (1, 3))
+        XCTAssertNil(h.view.selectedText(), "Cmd+C has to stay an interrupt here.")
+    }
+
+    func testAnOverlayAppearingOverASelectionIsNotTakenForItsHighlight() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try drag(h, from: (1, 0), to: (2, 19))
+        paintApplicationHighlight(h, row: 1, columns: 0..<3, text: "L01")
+        paintApplicationHighlight(h, row: 2, columns: 0..<3, text: "L02")
+        h.controller.debugProcessPTYOutputForTesting(Data("\u{1B}[3;10H\u{1B}[48;2;55;55;55mJump\u{1B}[0m".utf8))
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02")
+    }
+
+    func testANewSelectionInsideTheOldOneIsStillHighlighted() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try drag(h, from: (1, 0), to: (2, 2))
+        paintApplicationHighlight(h, row: 1, columns: 0..<3, text: "L01")
+        paintApplicationHighlight(h, row: 2, columns: 0..<3, text: "L02")
+        // The press clears nothing yet and the highlight stays where the new drag lands.
+        try drag(h, from: (1, 0), to: (1, 2))
+        XCTAssertEqual(h.view.selectedText(), "L01")
+    }
+
+    func testADoubleClickAfterAnotherSelectionLeavesOutWhatThatOneLost() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        h.controller.debugProcessPTYOutputForTesting(Data("\u{1B}[2;1H\u{1B}[2Kaa bbb cc".utf8))
+        h.controller.debugSettleAppScrollFrameForTesting()
+        try drag(h, from: (1, 0), to: (1, 8))
+        paintApplicationHighlight(h, row: 1, columns: 0..<9, text: "aa bbb cc")
+        try click(h, row: 1, col: 4)
+        h.controller.debugProcessPTYOutputForTesting(Data("\u{1B}[2;1H\u{1B}[2Kaa bbb cc".utf8))
+        try click(h, row: 1, col: 4)
+        paintApplicationHighlight(h, row: 1, columns: 3..<6, text: "bbb")
+        XCTAssertEqual(h.view.selectedText(), "bbb")
+    }
+
+    func testApplicationSelectionFollowsScrollForCopy() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try drag(h, from: (1, 0), to: (2, 2))
+        h.redraw(firstLine: 1)
+        paintApplicationHighlight(h, row: 0, columns: 0..<3, text: "L01")
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02")
+        h.redraw(firstLine: 3)
+        h.redraw(firstLine: 5)
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02", "Off the screen it cannot be disproved.")
+    }
+
+    func testCopyStillInterruptsWhenTheApplicationShowsNoSelection() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try drag(h, from: (1, 0), to: (2, 2))
+        XCTAssertNil(h.view.selectedText(), "A drag the application did not highlight selected nothing.")
+
+        let cleared = makeAppScrollHarness(renderer: renderer)
+        try drag(cleared, from: (1, 0), to: (2, 2))
+        paintApplicationHighlight(cleared, row: 1, columns: 0..<3, text: "L01")
+        XCTAssertNotNil(cleared.view.selectedText())
+        cleared.redraw(firstLine: 0)
+        XCTAssertNil(cleared.view.selectedText(), "The application removed its highlight by itself.")
+
+        let clicked = makeAppScrollHarness(renderer: renderer)
+        try drag(clicked, from: (1, 0), to: (2, 2))
+        paintApplicationHighlight(clicked, row: 1, columns: 0..<3, text: "L01")
+        try click(clicked, row: 3, col: 0)
+        XCTAssertNil(clicked.view.selectedText(), "A plain click ends the selection.")
+    }
+
+    func testCopyingADoubleClickTakesWhatTheApplicationHighlighted() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        h.controller.debugProcessPTYOutputForTesting(Data("\u{1B}[2;1H\u{1B}[2Kaa bbb cc".utf8))
+        h.controller.debugSettleAppScrollFrameForTesting()
+        try click(h, row: 1, col: 4)
+        XCTAssertNil(h.view.selectedText(), "One click selects nothing.")
+        try click(h, row: 1, col: 4)
+        XCTAssertNil(h.view.selectedText(), "No highlight yet.")
+        paintApplicationHighlight(h, row: 1, columns: 3..<6, text: "bbb")
+        XCTAssertEqual(h.view.selectedText(), "bbb")
+        try click(h, row: 3, col: 0)
+        XCTAssertNil(h.view.selectedText())
+    }
+
+    func testCopyingATripleClickInAColoredBlockTakesOnlyTheHighlightedLine() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        // A block of lines that already carry a background, like a diff in a transcript.
+        let block = "\u{1B}[48;2;20;60;20m"
+        h.controller.debugProcessPTYOutputForTesting(Data((block + "\u{1B}[1;1H\u{1B}[2KAAA\u{1B}[2;1H\u{1B}[2KBBB\u{1B}[3;1H\u{1B}[2KCCC\u{1B}[0m").utf8))
+        h.controller.debugSettleAppScrollFrameForTesting()
+        for _ in 0..<3 { try click(h, row: 1, col: 1) }
+        paintApplicationHighlight(h, row: 1, columns: 0..<3, text: "BBB")
+        XCTAssertEqual(h.view.selectedText(), "BBB", "The neighbors look alike but did not change.")
+    }
+
+    /// Replays a recording of real output: chunks as [u32 length][bytes], one per read, with
+    /// empty chunks between phases. The recording may hold private text, so it is never
+    /// committed. Set PTERM_TEST_APP_SCROLL_RECORDING to a file, and
+    /// PTERM_TEST_APP_SCROLL_RECORDING_SIZE to "rows,cols", to run this against a real application.
+    func testSelectionFollowsTextThroughRecordedApplicationOutput() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let path = environment["PTERM_TEST_APP_SCROLL_RECORDING"],
+              let size = environment["PTERM_TEST_APP_SCROLL_RECORDING_SIZE"] else {
+            throw XCTSkip("No recording provided")
+        }
+        let dimensions = size.split(separator: ",").compactMap { Int($0) }
+        let rowCount = dimensions[0]
+        let colCount = dimensions[1]
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        var phases: [Data] = [Data()]
+        var offset = 0
+        while offset + 4 <= data.count {
+            let length = data[offset..<(offset + 4)].enumerated().reduce(0) { $0 | (Int($1.element) << (8 * $1.offset)) }
+            offset += 4
+            if length == 0 {
+                phases.append(Data())
+            } else {
+                phases[phases.count - 1].append(data[offset..<(offset + length)])
+                offset += length
+            }
+        }
+        let repaintStart = Data("\u{1B}[?25l".utf8)
+        var repaints: [Data] = []
+        for phase in phases.dropFirst() where !phase.isEmpty {
+            var start = phase.startIndex
+            while let next = phase.range(of: repaintStart, in: (start + 1)..<phase.endIndex) {
+                repaints.append(phase[start..<next.lowerBound])
+                start = next.lowerBound
+            }
+            repaints.append(phase[start..<phase.endIndex])
+        }
+
+        let renderer = try makeRendererOrSkip()
+        var totalChecks = 0
+        var totalOffscreen = 0
+        var failures: [String] = []
+
+        for readSize in [17, 256, 1024, 4096, Int.max] {
+            for selectionPlace in [(0.1, 0), (0.5, 0), (0.8, 0), (0.3, 6)] {
+                let controller = TerminalController(rows: rowCount, cols: colCount, termEnv: "xterm-256color", textEncoding: .utf8,
+                                                    scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4 * 1024 * 1024,
+                                                    fontName: "Menlo", fontSize: 13)
+                let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 2000, height: 1200), renderer: renderer)
+                let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 2100, height: 1300),
+                                      styleMask: [.titled], backing: .buffered, defer: false)
+                window.contentView = NSView(frame: window.frame)
+                window.contentView?.addSubview(view)
+                view.terminalController = controller
+                // A view of another size would reflow the application's frames.
+                controller.resize(rows: rowCount, cols: colCount)
+                controller.debugProcessPTYOutputForTesting(phases[0])
+
+                func screenRows() -> [String] {
+                    controller.withModel { model in
+                        (0..<model.rows).map { row in
+                            (0..<model.cols).map { model.grid.cell(at: row, col: $0) }
+                                .filter { !$0.isWideContinuation }
+                                .map { $0.renderedString() }.joined()
+                                .replacingOccurrences(of: " ", with: "")
+                        }
+                    }
+                }
+                let base = controller.viewportRowToGlobalRow(0)
+                // The moving rows are found from a first repaint, before selecting anything.
+                let first = screenRows()
+                let usable = first.indices.filter { row in
+                    !first[row].isEmpty && first.filter { $0 == first[row] }.count == 1 && row < rowCount - 10
+                }
+                let startRow = usable[Int(Double(usable.count) * selectionPlace.0)]
+                let endRow = selectionPlace.1 == 0 ? startRow : usable.first { $0 >= startRow + selectionPlace.1 } ?? startRow
+                let startText = first[startRow]
+                let endText = first[endRow]
+                let selectedText = first[startRow...endRow].joined()
+                view.debugSetSelectionForTesting(TerminalSelection(
+                    anchor: GridPosition(row: base + startRow, col: 0),
+                    active: GridPosition(row: base + endRow, col: colCount - 1),
+                    mode: .normal
+                ))
+                let label = "read \(readSize) place \(selectionPlace)"
+
+                for (index, repaint) in repaints.enumerated() {
+                    var position = repaint.startIndex
+                    while position < repaint.endIndex {
+                        let stop = readSize >= repaint.endIndex - position ? repaint.endIndex : position + readSize
+                        controller.debugProcessPTYOutputForTesting(Data(repaint[position..<stop]))
+                        position = stop
+                    }
+                    guard let selection = view.selection else {
+                        failures.append("\(label): selection dropped at repaint \(index)")
+                        break
+                    }
+                    let rows = screenRows()
+                    let expectedStart = selection.start.row - base
+                    let expectedEnd = selection.end.row - base
+                    totalChecks += 1
+                    // The last moving row can carry a hint drawn over the middle of its text.
+                    func row(holding text: String) -> Int? {
+                        rows.firstIndex(of: text) ?? rows.firstIndex { candidate in
+                            guard let hint = candidate.range(of: "Jumptobottom") else { return false }
+                            let before = candidate[..<hint.lowerBound]
+                            return !before.isEmpty && text.hasPrefix(before)
+                        }
+                    }
+                    if let actual = row(holding: startText) {
+                        if actual != expectedStart { failures.append("\(label) repaint \(index): start painted at \(expectedStart), text at \(actual)") }
+                    } else if rows.indices.contains(expectedStart), selection.isPaintable(viewportRow: expectedStart) {
+                        failures.append("\(label) repaint \(index): start painted at \(expectedStart), text is off screen")
+                    }
+                    if let actual = row(holding: endText) {
+                        if actual != expectedEnd { failures.append("\(label) repaint \(index): end painted at \(expectedEnd), text at \(actual)") }
+                    } else {
+                        totalOffscreen += 1
+                        if rows.indices.contains(expectedEnd), selection.isPaintable(viewportRow: expectedEnd) {
+                            failures.append("\(label) repaint \(index): end painted at \(expectedEnd), text is off screen")
+                        }
+                    }
+                    let copied = (view.selectedText() ?? "")
+                        .replacingOccurrences(of: " ", with: "")
+                        .replacingOccurrences(of: "\n", with: "")
+                    if copied != selectedText {
+                        failures.append("\(label) repaint \(index): copied \(copied.prefix(30)), expected \(selectedText.prefix(30))")
+                    }
+                }
+            }
+        }
+        let byReadSize = Dictionary(grouping: failures) { $0.components(separatedBy: " repaint")[0] }.mapValues(\.count)
+        print("RECORDING checks=\(totalChecks) offscreen=\(totalOffscreen) failures=\(failures.count) \(byReadSize)")
+        XCTAssertGreaterThan(totalChecks, 100)
+        XCTAssertGreaterThan(totalOffscreen, 0, "The recording must scroll the selection off the screen.")
+        XCTAssertTrue(failures.isEmpty, "\(failures.prefix(12))")
+    }
+
+    /// An answer streaming in while text is selected: lines arrive at the bottom and push
+    /// the selection up, a status line keeps changing, and the input box stays.
+    func testSelectionFollowsTextWhileApplicationStreamsOutput() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        func repaint(lastLine: Int, status: Int) {
+            var output = "\u{1B}[?25l\u{1B}[H"
+            for row in 0..<4 {
+                output += "\u{1B}[K" + String(format: "L%02d", lastLine - 3 + row) + "\r\u{1B}[1B"
+            }
+            output += "\u{1B}[KWorking \(status)\r\u{1B}[1B\u{1B}[KINPUT\u{1B}[6;3H\u{1B}[?25h"
+            let bytes = Array(output.utf8)
+            for start in stride(from: 0, to: bytes.count, by: 16) {
+                h.controller.debugProcessPTYOutputForTesting(Data(bytes[start..<min(start + 16, bytes.count)]))
+            }
+        }
+        repaint(lastLine: 3, status: 0)
+        try click(h, row: 1, col: 0)
+        try click(h, row: 2, col: 2, modifiers: [.shift])
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02")
+        let before = try XCTUnwrap(h.view.selection).start.row
+        var status = 1
+        for lastLine in 4...12 {
+            // The status line changes on its own between the lines.
+            repaint(lastLine: lastLine - 1, status: status)
+            status += 1
+            repaint(lastLine: lastLine, status: status)
+            status += 1
+            XCTAssertEqual(try XCTUnwrap(h.view.selection).start.row, before - (lastLine - 3), "line \(lastLine)")
+            XCTAssertEqual(h.view.selectedText(), "L01\nL02", "line \(lastLine)")
+        }
+    }
+
+    /// An application that neither hides the cursor nor uses synchronized updates.
+    func testRepaintOfAnApplicationThatKeepsItsCursorVisibleSettlesOnAPause() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        try click(h, row: 2, col: 2, modifiers: [.shift])
+        for first in 1...6 {
+            var output = ""
+            for row in 0..<5 {
+                output += "\u{1B}[\(row + 1);1H\u{1B}[2K" + String(format: "L%02d", first + row)
+            }
+            h.controller.debugProcessPTYOutputForTesting(Data(output.utf8))
+            // Long enough for the pause to be noticed, on a real clock.
+            let settled = expectation(description: "settled")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { settled.fulfill() }
+            wait(for: [settled], timeout: 5.0)
+        }
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02", "Rows that left the screen were stored without a test hook.")
+    }
+
+    /// The same shape as real full-screen applications: no synchronized updates, every row
+    /// erased and redrawn on every repaint, and each repaint cut into small reads at any byte.
+    func testSelectionFollowsTextWhenEachRepaintArrivesInSmallReads() throws {
+        let renderer = try makeRendererOrSkip()
+        for readSize in [1, 7, 64, 1024] {
+            let h = makeAppScrollHarness(renderer: renderer)
+
+            func repaint(firstLine: Int) {
+                var output = "\u{1B}[?25l\u{1B}[H"
+                for row in 0..<5 {
+                    output += "\u{1B}[K" + String(format: "L%02d 日本語", firstLine + row) + "\r\u{1B}[1B"
+                }
+                output += "\u{1B}[KFOOTER\u{1B}[?25h"
+                let bytes = Array(output.utf8)
+                for start in stride(from: 0, to: bytes.count, by: readSize) {
+                    h.controller.debugProcessPTYOutputForTesting(Data(bytes[start..<min(start + readSize, bytes.count)]))
+                }
+            }
+            repaint(firstLine: 0)
+            try click(h, row: 1, col: 0)
+            try click(h, row: 2, col: 2, modifiers: [.shift])
+            let before = try XCTUnwrap(h.view.selection).start.row
+            for first in [1, 2, 3, 4, 5, 6, 7, 8, 7, 6, 5, 4, 3, 2, 1, 0, 2, 4, 2, 0] {
+                repaint(firstLine: first)
+                XCTAssertEqual(try XCTUnwrap(h.view.selection, "read size \(readSize)").start.row, before - first,
+                               "read size \(readSize), first line \(first)")
+            }
+            // Col 2 of the last row ends the selection at the end of its label.
+            XCTAssertEqual(h.view.selectedText()?.replacingOccurrences(of: " 日本語", with: ""), "L01\nL02",
+                           "read size \(readSize)")
+        }
+    }
+
+    func testSelectionPaintsExactlyTheColorApplicationsPaintTheirSelection() throws {
+        let renderer = try makeRendererWithPipelinesOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        // Row 3 holds the color Claude Code writes for its own selection.
+        h.controller.debugProcessPTYOutputForTesting(Data(("\u{1B}[4;1H\u{1B}[48;2;38;79;120m" + String(repeating: " ", count: 20) + "\u{1B}[0m").utf8))
+        try click(h, row: 1, col: 0)
+        try click(h, row: 2, col: 19, modifiers: [.shift])
+        let selected = try cellBackgroundPixel(h, row: 1)
+        let application = try cellBackgroundPixel(h, row: 3)
+        XCTAssertEqual(selected, application, "pterm's selection and an application's selection must look the same.")
+    }
+
+    func testShiftClickRemovesTheHighlightOfADragThatWentToTheApplication() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        // Like Claude Code, this application asks for drag reports.
+        h.controller.debugProcessPTYOutputForTesting(Data("\u{1B}[?1002h".utf8))
+        var sent = Data()
+        h.controller.debugInputObserverForTesting = { sent.append($0) }
+        let start = h.point(row: 1, col: 0)
+        let end = h.point(row: 2, col: 2)
+        h.view.mouseDown(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: start, in: h.view, window: h.window)))
+        h.view.mouseDragged(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDragged, point: end, in: h.view, window: h.window)))
+        h.view.mouseUp(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseUp, point: end, in: h.view, window: h.window)))
+        XCTAssertNil(h.view.selection, "A drag belongs to the application.")
+        sent.removeAll()
+        try click(h, row: 3, col: 2, modifiers: [.shift])
+        XCTAssertEqual(String(decoding: sent, as: UTF8.self), "\u{1B}[<0;3;4M\u{1B}[<0;3;4m",
+                       "The application is told about one click, which removes its highlight.")
+        XCTAssertEqual(h.view.selectedText(), "L01\nL02\nL03", "The selection starts where the drag started.")
+        sent.removeAll()
+        try click(h, row: 2, col: 2, modifiers: [.shift])
+        XCTAssertTrue(sent.isEmpty, "Later Shift+clicks are pterm's alone.")
+    }
+
+    func testClickReleaseReachesTheApplicationAfterASelectionExisted() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        try click(h, row: 2, col: 2, modifiers: [.shift])
+        var sent = Data()
+        h.controller.debugInputObserverForTesting = { sent.append($0) }
+        try click(h, row: 3, col: 1)
+        XCTAssertEqual(String(decoding: sent, as: UTF8.self), "\u{1B}[<0;2;4M\u{1B}[<0;2;4m")
+    }
+
+    func testDragPastTheEdgeAsksTheApplicationToScroll() throws {
+        let renderer = try makeRendererOrSkip()
+        let h = makeAppScrollHarness(renderer: renderer)
+        try click(h, row: 1, col: 0)
+        let down = h.point(row: 2, col: 2)
+        h.view.mouseDown(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDown, point: down, in: h.view, window: h.window, modifiers: [.shift])))
+        var sent = Data()
+        h.controller.debugInputObserverForTesting = { sent.append($0) }
+        let below = NSPoint(x: down.x, y: -1)
+        h.view.mouseDragged(with: try XCTUnwrap(makeMouseEvent(type: .leftMouseDragged, point: below, in: h.view, window: h.window, modifiers: [.shift])))
+        XCTAssertTrue(String(decoding: sent, as: UTF8.self).hasPrefix("\u{1B}[<65;"), "Wheel down reaches the application.")
+    }
+
+    private func cellBackgroundPixel(_ h: AppScrollHarness, row: Int) throws -> [UInt8] {
+        let scale = 2
+        let width = Int(h.view.bounds.width) * scale
+        let height = Int(h.view.bounds.height) * scale
+        let texture = try XCTUnwrap(makeSharedRenderTexture(renderer: h.renderer, width: width, height: height))
+        h.view.debugRenderFrameToTextureForTesting(texture)
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        texture.getBytes(&pixels, bytesPerRow: width * 4,
+                         from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
+        let cellHeight = Double(h.renderer.glyphAtlas.cellHeight) * Double(scale)
+        let cellWidth = Double(h.renderer.glyphAtlas.cellWidth) * Double(scale)
+        let left = Double(h.renderer.gridPadding) * Double(scale)
+        let top = Double(h.renderer.gridPadding) * Double(scale) + Double(row) * cellHeight
+        let offset = (Int(top + cellHeight / 2) * width + Int(left + cellWidth * 18.5)) * 4
+        return Array(pixels[offset..<(offset + 4)])
     }
 
     func testTerminalViewShiftClickExtendsPendingSelectionAnchorAfterScroll() throws {
@@ -5639,7 +6465,7 @@ final class AppKitComponentTests: XCTestCase {
 
     // MARK: - Selection background translucency
 
-    func testSelectionBackgroundAlphaIsTranslucent() throws {
+    func testSelectionBackgroundMatchesTheColorApplicationsWrite() throws {
         let renderer = try makeRendererWithPipelinesOrSkip()
         let controller = TerminalController(
             rows: 4, cols: 20,
@@ -5647,17 +6473,13 @@ final class AppKitComponentTests: XCTestCase {
             scrollbackInitialCapacity: 4096, scrollbackMaxCapacity: 4096,
             fontName: "Menlo", fontSize: 13
         )
-        controller.withModel { model in
-            for (i, char) in "ABCDE".unicodeScalars.enumerated() {
-                model.grid.setCell(
-                    Cell(codepoint: char.value, attributes: .default, width: 1, isWideContinuation: false),
-                    at: 0, col: i
-                )
-            }
-        }
+        // Row 0 is selected. Row 2 is painted by an application in its selection color.
+        controller.debugProcessPTYOutputForTesting(
+            Data("ABCDE\u{1B}[3;1H\u{1B}[48;2;38;79;120mFGHIJ\u{1B}[0m".utf8)
+        )
         let selection = TerminalSelection(
             anchor: GridPosition(row: 0, col: 0),
-            active: GridPosition(row: 0, col: 5),
+            active: GridPosition(row: 0, col: 4),
             mode: .normal
         )
         let vd = controller.withViewport { model, scrollback, scrollOffset in
@@ -5669,20 +6491,17 @@ final class AppKitComponentTests: XCTestCase {
             )
         }
         // Background vertices encode 12 floats per vertex (pos2 + tex2 + fg4 + bg4).
-        // bgColor alpha is at offset 11 of each vertex.  Selection bg should be < 1.0.
         let floatsPerVertex = 12
-        let bgVertices = vd.bgVertices
-        XCTAssertFalse(bgVertices.isEmpty)
-        var foundTranslucent = false
-        for i in stride(from: 0, to: bgVertices.count, by: floatsPerVertex) {
-            let bgAlpha = bgVertices[i + 11]
-            if bgAlpha > 0.001 && bgAlpha < 0.99 {
-                foundTranslucent = true
-                XCTAssertEqual(bgAlpha, 0.1, accuracy: 0.02,
-                               "Selected cell bg alpha should be ~0.1")
-            }
+        let bg = vd.bgVertices
+        var colors: Set<[Float]> = []
+        var vertexCount = 0
+        for i in stride(from: 0, to: bg.count, by: floatsPerVertex) where bg[i + 11] > 0.001 {
+            colors.insert(Array(bg[(i + 8)...(i + 11)]))
+            vertexCount += 1
         }
-        XCTAssertTrue(foundTranslucent, "Expected at least one translucent bg vertex from selection")
+        XCTAssertGreaterThanOrEqual(vertexCount, 60, "Five selected cells and five application cells were expected.")
+        XCTAssertEqual(colors.count, 1, "Selected cells and the application's cells must have one color: \(colors)")
+        XCTAssertEqual(colors.first?.last, 1.0, "The selection is opaque, like the application's.")
     }
 
     // MARK: - Cursor width for wide characters
@@ -12349,6 +13168,9 @@ final class AppKitComponentTests: XCTestCase {
         ) else {
             return nil
         }
+        // A synthesized event takes on the keys held on the real keyboard, which must not
+        // reach a test: Option keeps the wheel from the application.
+        event.flags = []
         event.location = window.convertPoint(toScreen: view.convert(point, to: nil))
         if !phase.isEmpty {
             event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Self.cgScrollPhaseValue(for: phase))

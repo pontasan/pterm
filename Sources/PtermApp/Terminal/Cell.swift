@@ -495,7 +495,7 @@ struct CellAttributes: Equatable {
 
 /// Terminal color representation.
 /// Supports default, indexed (0-255), and TrueColor (24-bit RGB).
-enum TerminalColor: Equatable {
+enum TerminalColor: Hashable {
     case `default`
     case indexed(UInt8)          // 0-255 color index
     case rgb(UInt8, UInt8, UInt8) // 24-bit TrueColor

@@ -268,7 +268,6 @@ final class SplitRenderView: MTKView {
         renderedSnapshots.reserveCapacity(cellRefs.count)
         for ref in cellRefs {
             guard let terminalView = ref.terminalView else { continue }
-            let selection = terminalView.selection
             let border = borderConfigProvider?(terminalView)
             // Freeze each cell's visible terminal state before the expensive
             // shared render pass so PTY writers are not blocked by vertex work.
@@ -276,7 +275,7 @@ final class SplitRenderView: MTKView {
             renderedSnapshots.append((cellRect: ref.frame, snapshot: snapshot))
             renderer.renderSplitCell(
                 snapshot: snapshot,
-                selection: selection,
+                selection: terminalView.selection(alignedWith: snapshot),
                 borderConfig: border,
                 transientTextOverlays: [],
                 suppressCursorBlink: false,
@@ -431,7 +430,6 @@ extension SplitRenderView: MTKViewDelegate {
 
         for ref in cellRefs {
             // Read live state from TerminalView each frame
-            let selection = ref.terminalView?.selection
             let border = ref.terminalView.flatMap { borderConfigProvider?($0) }
             let headerOverlay = headerOverlayConfigProvider?(ref.controller)
             let transientTextOverlays = ref.terminalView?.activeTransientTextOverlaysForRendering() ?? []
@@ -453,7 +451,7 @@ extension SplitRenderView: MTKViewDelegate {
             let snapshot = ref.controller.captureRenderSnapshot()
             renderer.renderSplitCell(
                 snapshot: snapshot,
-                selection: selection,
+                selection: ref.terminalView?.selection(alignedWith: snapshot),
                 borderConfig: border,
                 headerOverlayConfig: headerOverlay,
                 transientTextOverlays: transientTextOverlays,

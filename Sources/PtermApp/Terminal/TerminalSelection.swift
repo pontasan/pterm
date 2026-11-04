@@ -30,6 +30,10 @@ struct TerminalSelection {
     /// Whether the selection is currently active (user is dragging)
     var isDragging: Bool = false
 
+    /// Viewport rows the selection may be painted on. Rows outside it are fixed by the
+    /// application (headers, input boxes) and do not scroll with the selected text.
+    var paintableViewportRows: Range<Int>?
+
     init(anchor: GridPosition, active: GridPosition, mode: SelectionMode) {
         self.anchor = anchor
         self.active = active
@@ -62,6 +66,10 @@ struct TerminalSelection {
             return GridPosition(row: max(anchor.row, active.row),
                               col: max(anchor.col, active.col))
         }
+    }
+
+    func isPaintable(viewportRow: Int) -> Bool {
+        paintableViewportRows?.contains(viewportRow) ?? true
     }
 
     /// Check if a cell at (row, col) is within the selection.
