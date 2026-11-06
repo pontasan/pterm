@@ -55,8 +55,6 @@ final class GlyphAtlas {
     private var resolvedBMPFontCache: ContiguousArray<CTFont?> = ContiguousArray(repeating: nil, count: 0x10000)
     private var resolvedBMPGlyphCache: ContiguousArray<CGGlyph> = ContiguousArray(repeating: 0, count: 0x10000)
     private var resolvedBMPFontKnown: ContiguousArray<Bool> = ContiguousArray(repeating: false, count: 0x10000)
-    private var resolvedBMPPageFallbackFonts: ContiguousArray<CTFont?> = ContiguousArray(repeating: nil, count: 0x100)
-    private var resolvedBMPPageFallbackKnown: ContiguousArray<Bool> = ContiguousArray(repeating: false, count: 0x100)
     private var fallbackFonts: [CTFont] = []
     private var accessGeneration: UInt64 = 0
     private(set) var atlasRevision: UInt64 = 0
@@ -110,6 +108,25 @@ final class GlyphAtlas {
 
     var debugHasCommandQueue: Bool {
         commandQueue != nil
+    }
+
+    /// PostScript name of the font a BMP codepoint was drawn with, or nil when it has not been
+    /// drawn yet or has no glyph. Reads the cache only, so it never changes what gets resolved.
+    func debugResolvedFontName(for codepoint: UInt32) -> String? {
+        guard codepoint <= 0xFFFF, resolvedBMPFontKnown[Int(codepoint)],
+              let font = resolvedBMPFontCache[Int(codepoint)] else {
+            return nil
+        }
+        return CTFontCopyPostScriptName(font) as String
+    }
+
+    /// PostScript name of the font a BMP codepoint resolves to, resolving it through the same
+    /// cache rendering uses but without rasterizing it. Nil when no font has a glyph.
+    func debugFontNameResolvingIfNeeded(for codepoint: UInt32) -> String? {
+        guard codepoint <= 0xFFFF, let resolved = resolvedBMPFontAndGlyph(for: codepoint) else {
+            return nil
+        }
+        return CTFontCopyPostScriptName(resolved.font) as String
     }
 
     struct GlyphInfo {
@@ -310,7 +327,7 @@ final class GlyphAtlas {
 
     private func recentCodepointAccessSet(limit: UInt64) -> Set<UInt32> {
         guard recentCodepointAccessCount > 0 else { return [] }
-        let tailCount = min(Int(limit), recentCodepointAccessCount)
+        let tailCount = min(Int(clamping: limit), recentCodepointAccessCount)
         guard tailCount > 0 else { return [] }
         var retained = Set<UInt32>()
         retained.reserveCapacity(tailCount)
@@ -324,7 +341,7 @@ final class GlyphAtlas {
 
     private func recentClusterAccessSet(limit: UInt64) -> Set<Cell.GraphemeCacheKey> {
         guard recentClusterAccessCount > 0 else { return [] }
-        let tailCount = min(Int(limit), recentClusterAccessCount)
+        let tailCount = min(Int(clamping: limit), recentClusterAccessCount)
         guard tailCount > 0 else { return [] }
         var retained = Set<Cell.GraphemeCacheKey>()
         retained.reserveCapacity(tailCount)
@@ -338,7 +355,7 @@ final class GlyphAtlas {
 
     private func recentColorClusterAccessSet(limit: UInt64) -> Set<Cell.GraphemeCacheKey> {
         guard recentColorClusterAccessCount > 0 else { return [] }
-        let tailCount = min(Int(limit), recentColorClusterAccessCount)
+        let tailCount = min(Int(clamping: limit), recentColorClusterAccessCount)
         guard tailCount > 0 else { return [] }
         var retained = Set<Cell.GraphemeCacheKey>()
         retained.reserveCapacity(tailCount)
@@ -506,70 +523,36 @@ final class GlyphAtlas {
             return (font, glyph)
         }
 
-        let character = UniChar(codepoint)
-        var characters = [character]
+        let resolved = resolveBMPFontAndGlyph(for: codepoint)
+        resolvedBMPFontKnown[index] = true
+        resolvedBMPFontCache[index] = resolved?.font
+        resolvedBMPGlyphCache[index] = resolved?.glyph ?? 0
+        return resolved
+    }
+
+    /// Resolves one codepoint on its own, always in the same order: the terminal font, then the
+    /// fallback cascade, then the system's choice for that character. The answer is never reused
+    /// for other codepoints. The system answers a character no font covers with its last-resort
+    /// font, which claims a glyph for every character, so sharing that answer with neighbouring
+    /// codepoints would draw all of them as missing-glyph boxes.
+    private func resolveBMPFontAndGlyph(for codepoint: UInt32) -> (font: CTFont, glyph: CGGlyph)? {
+        var character = UniChar(codepoint)
         var glyph: CGGlyph = 0
-        if CTFontGetGlyphsForCharacters(ctFont, &characters, &glyph, 1), glyph != 0 {
-            resolvedBMPFontCache[index] = ctFont
-            resolvedBMPGlyphCache[index] = glyph
-            resolvedBMPFontKnown[index] = true
+        if CTFontGetGlyphsForCharacters(ctFont, &character, &glyph, 1), glyph != 0 {
             return (ctFont, glyph)
         }
-
-        guard let scalar = Unicode.Scalar(codepoint) else {
-            resolvedBMPFontKnown[index] = true
-            resolvedBMPFontCache[index] = nil
-            return nil
-        }
-        let pageIndex = index >> 8
-        let fallbackFont: CTFont
-        if resolvedBMPPageFallbackKnown[pageIndex],
-           let cachedPageFallback = resolvedBMPPageFallbackFonts[pageIndex] {
-            fallbackFont = cachedPageFallback
-        } else {
-            var resolvedPageFallback: CTFont?
-            for candidateFont in fallbackFonts {
-                glyph = 0
-                if CTFontGetGlyphsForCharacters(candidateFont, &characters, &glyph, 1), glyph != 0 {
-                    resolvedPageFallback = candidateFont
-                    break
-                }
-            }
-            if let resolvedPageFallback {
-                fallbackFont = resolvedPageFallback
-            } else {
-                let string = String(Character(scalar)) as CFString
-                fallbackFont = CTFontCreateForString(ctFont, string, CFRangeMake(0, 1))
-            }
-            resolvedBMPPageFallbackFonts[pageIndex] = fallbackFont
-            resolvedBMPPageFallbackKnown[pageIndex] = true
-        }
-
-        glyph = 0
-        if CTFontGetGlyphsForCharacters(fallbackFont, &characters, &glyph, 1), glyph != 0 {
-            resolvedBMPFontCache[index] = fallbackFont
-            resolvedBMPGlyphCache[index] = glyph
-            resolvedBMPFontKnown[index] = true
-            return (fallbackFont, glyph)
-        }
-
-        let string = String(Character(scalar)) as CFString
-        let preciseFallbackFont = CTFontCreateForString(ctFont, string, CFRangeMake(0, 1))
-        if preciseFallbackFont !== fallbackFont {
+        for candidateFont in fallbackFonts {
             glyph = 0
-            if CTFontGetGlyphsForCharacters(preciseFallbackFont, &characters, &glyph, 1), glyph != 0 {
-                resolvedBMPPageFallbackFonts[pageIndex] = preciseFallbackFont
-                resolvedBMPPageFallbackKnown[pageIndex] = true
-                resolvedBMPFontCache[index] = preciseFallbackFont
-                resolvedBMPGlyphCache[index] = glyph
-                resolvedBMPFontKnown[index] = true
-                return (preciseFallbackFont, glyph)
+            if CTFontGetGlyphsForCharacters(candidateFont, &character, &glyph, 1), glyph != 0 {
+                return (candidateFont, glyph)
             }
         }
-
-        resolvedBMPFontKnown[index] = true
-        resolvedBMPFontCache[index] = nil
-        resolvedBMPGlyphCache[index] = 0
+        guard let scalar = Unicode.Scalar(codepoint) else { return nil }
+        let systemFont = CTFontCreateForString(ctFont, String(Character(scalar)) as CFString, CFRangeMake(0, 1))
+        glyph = 0
+        if CTFontGetGlyphsForCharacters(systemFont, &character, &glyph, 1), glyph != 0 {
+            return (systemFont, glyph)
+        }
         return nil
     }
 
@@ -855,8 +838,6 @@ final class GlyphAtlas {
         resolvedBMPFontCache = ContiguousArray(repeating: nil, count: 0x10000)
         resolvedBMPGlyphCache = ContiguousArray(repeating: 0, count: 0x10000)
         resolvedBMPFontKnown = ContiguousArray(repeating: false, count: 0x10000)
-        resolvedBMPPageFallbackFonts = ContiguousArray(repeating: nil, count: 0x100)
-        resolvedBMPPageFallbackKnown = ContiguousArray(repeating: false, count: 0x100)
         fallbackFonts.removeAll(keepingCapacity: true)
         recentCodepointAccesses = GlyphAtlas.makeRecentCodepointAccessRing()
         recentCodepointAccessCount = 0
@@ -966,8 +947,6 @@ final class GlyphAtlas {
         resolvedBMPFontCache = ContiguousArray(repeating: nil, count: 0x10000)
         resolvedBMPGlyphCache = ContiguousArray(repeating: 0, count: 0x10000)
         resolvedBMPFontKnown = ContiguousArray(repeating: false, count: 0x10000)
-        resolvedBMPPageFallbackFonts = ContiguousArray(repeating: nil, count: 0x100)
-        resolvedBMPPageFallbackKnown = ContiguousArray(repeating: false, count: 0x100)
         rebuildFallbackFontCascade()
         recentCodepointAccesses = GlyphAtlas.makeRecentCodepointAccessRing()
         recentCodepointAccessCount = 0

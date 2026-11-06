@@ -2419,6 +2419,141 @@ final class AppKitComponentTests: XCTestCase {
         XCTAssertEqual(atlas.texturePixelSize?.height, 64)
     }
 
+    private func makeFallbackTestAtlas(renderer: MetalRenderer, initialAtlasDimension: Int = 512) -> GlyphAtlas {
+        GlyphAtlas(
+            device: renderer.device,
+            fontSize: 13,
+            scaleFactor: 2.0,
+            initialAtlasDimension: initialAtlasDimension,
+            maxAtlasDimension: 2048,
+            prerasterizeASCII: false
+        )
+    }
+
+    /// Every BMP codepoint that can be a Unicode scalar.
+    private static let bmpScalarCodepoints: [UInt32] = (UInt32(0)...UInt32(0xFFFF)).filter { Unicode.Scalar($0) != nil }
+
+    /// The coverage bytes the atlas holds for a glyph, which is exactly what the GPU samples.
+    private func atlasCoverage(_ atlas: GlyphAtlas, _ codepoint: UInt32, file: StaticString = #filePath, line: UInt = #line) -> [UInt8]? {
+        guard let info = atlas.glyphInfo(for: codepoint) else {
+            XCTFail(String(format: "U+%04X has no glyph", codepoint), file: file, line: line)
+            return nil
+        }
+        guard let texture = atlas.texture else {
+            XCTFail("The atlas has no texture", file: file, line: line)
+            return nil
+        }
+        let x = Int((info.textureX * Float(texture.width)).rounded())
+        let y = Int((info.textureY * Float(texture.height)).rounded())
+        let width = Int((info.textureW * Float(texture.width)).rounded())
+        let height = Int((info.textureH * Float(texture.height)).rounded())
+        guard width > 0, height > 0 else { return [] }
+        var bytes = [UInt8](repeating: 0, count: width * height)
+        texture.getBytes(&bytes, bytesPerRow: width, from: MTLRegionMake2D(x, y, width, height), mipmapLevel: 0)
+        return bytes
+    }
+
+    /// For each 256-codepoint block, a codepoint the system can only answer with its last-resort
+    /// font, and codepoints of the same block that another font draws. Core Text is asked
+    /// directly, never the atlas under test, so a resolution bug cannot hide cases from the test.
+    /// The cases follow whatever fonts and Unicode version the machine has, for every script
+    /// rather than a hand-picked one.
+    private struct FallbackBlockCase {
+        let lastResortCodepoint: UInt32
+        let fallbackCodepoints: [UInt32]
+    }
+
+    private func fallbackBlockCases(renderer: MetalRenderer) -> [FallbackBlockCase] {
+        let scout = makeFallbackTestAtlas(renderer: renderer)
+        let terminalFont = CTFontCreateWithName(scout.fontName as CFString, scout.fontSize, nil)
+        func hasGlyph(_ font: CTFont, _ codepoint: UInt32) -> Bool {
+            var character = UniChar(codepoint)
+            var glyph: CGGlyph = 0
+            return CTFontGetGlyphsForCharacters(font, &character, &glyph, 1) && glyph != 0
+        }
+        var lastResort: [Int: UInt32] = [:]
+        var drawnByOtherFonts: [Int: [UInt32]] = [:]
+        for codepoint in Self.bmpScalarCodepoints where !hasGlyph(terminalFont, codepoint) {
+            let text = String(Character(Unicode.Scalar(codepoint)!)) as CFString
+            let systemFont = CTFontCreateForString(terminalFont, text, CFRangeMake(0, 1))
+            guard hasGlyph(systemFont, codepoint) else { continue }
+            let block = Int(codepoint >> 8)
+            if CTFontCopyPostScriptName(systemFont) as String == "LastResort" {
+                if lastResort[block] == nil { lastResort[block] = codepoint }
+            } else {
+                drawnByOtherFonts[block, default: []].append(codepoint)
+            }
+        }
+        return lastResort.keys.sorted().compactMap { block in
+            let trigger = lastResort[block]!
+            guard let drawn = drawnByOtherFonts[block] else { return nil }
+            // Codepoints after the trigger are the ones a shared per-block answer would break,
+            // whichever order glyphs are added or re-added in.
+            let after = drawn.filter { $0 > trigger }
+            guard let firstAfter = after.first, let lastAfter = after.last else { return nil }
+            let picks = Set([drawn[0], firstAfter, after[after.count / 2], lastAfter]).sorted()
+            return FallbackBlockCase(lastResortCodepoint: trigger, fallbackCodepoints: picks)
+        }
+    }
+
+    func testFontResolutionDoesNotDependOnWhatWasResolvedBefore() throws {
+        let renderer = try makeRendererOrSkip()
+        let ascending = makeFallbackTestAtlas(renderer: renderer)
+        let descending = makeFallbackTestAtlas(renderer: renderer)
+        let forward = Self.bmpScalarCodepoints.map { ascending.debugFontNameResolvingIfNeeded(for: $0) }
+        let backward = Array(Self.bmpScalarCodepoints.reversed().map { descending.debugFontNameResolvingIfNeeded(for: $0) }.reversed())
+
+        XCTAssertGreaterThan(forward.filter { $0 == "LastResort" }.count, 0,
+                             "The system must answer some codepoints with its last-resort font, or this test proves nothing")
+        let differences = zip(Self.bmpScalarCodepoints, zip(forward, backward)).filter { $0.1.0 != $0.1.1 }
+        XCTAssertEqual(differences.count, 0, differences.prefix(12).map {
+            String(format: "U+%04X: %@ vs %@", $0.0, $0.1.0 ?? "none", $0.1.1 ?? "none")
+        }.joined(separator: ", "))
+    }
+
+    func testALastResortCodepointDoesNotChangeHowItsBlockIsDrawnInAnyScript() throws {
+        let renderer = try makeRendererOrSkip()
+        let cases = fallbackBlockCases(renderer: renderer)
+        XCTAssertGreaterThan(cases.count, 0)
+        XCTAssertTrue(cases.contains { $0.lastResortCodepoint >> 8 == 0x30 }, "The reported kana case must be covered")
+
+        let reference = makeFallbackTestAtlas(renderer: renderer)
+        let atlas = makeFallbackTestAtlas(renderer: renderer)
+        for blockCase in cases {
+            _ = atlas.glyphInfo(for: blockCase.lastResortCodepoint)
+            for codepoint in blockCase.fallbackCodepoints {
+                let label = String(format: "U+%04X after U+%04X", codepoint, blockCase.lastResortCodepoint)
+                XCTAssertEqual(atlasCoverage(atlas, codepoint), atlasCoverage(reference, codepoint), "\(label) is drawn differently")
+                XCTAssertEqual(atlas.debugResolvedFontName(for: codepoint), reference.debugResolvedFontName(for: codepoint), label)
+            }
+        }
+    }
+
+    func testRebuildingTheAtlasKeepsEveryScriptDrawnWithItsOwnFont() throws {
+        let renderer = try makeRendererOrSkip()
+        let cases = fallbackBlockCases(renderer: renderer)
+        XCTAssertGreaterThan(cases.count, 0)
+        let reference = makeFallbackTestAtlas(renderer: renderer)
+
+        // Growing and compacting re-add every glyph in codepoint order, so after a rebuild the
+        // last-resort codepoint of a block is resolved again among the others of that block.
+        let atlas = makeFallbackTestAtlas(renderer: renderer, initialAtlasDimension: 32)
+        for blockCase in cases {
+            _ = atlas.glyphInfo(for: blockCase.lastResortCodepoint)
+            blockCase.fallbackCodepoints.forEach { _ = atlas.glyphInfo(for: $0) }
+        }
+        XCTAssertGreaterThan(atlas.atlasDimension, 32, "The atlas must have been rebuilt by growing")
+        XCTAssertTrue(atlas.compactRetainingRecentlyUsedGlyphs(maximumInactiveGenerations: UInt64.max))
+
+        for blockCase in cases {
+            for codepoint in blockCase.fallbackCodepoints {
+                let label = String(format: "U+%04X after a rebuild", codepoint)
+                XCTAssertEqual(atlasCoverage(atlas, codepoint), atlasCoverage(reference, codepoint), "\(label) is drawn differently")
+                XCTAssertEqual(atlas.debugResolvedFontName(for: codepoint), reference.debugResolvedFontName(for: codepoint), label)
+            }
+        }
+    }
+
     func testGlyphAtlasDefersCommandQueueAllocationUntilSynchronizationIsNeeded() throws {
         let renderer = try makeRendererOrSkip()
         let atlas = GlyphAtlas(
