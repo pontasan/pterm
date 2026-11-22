@@ -1746,6 +1746,35 @@ final class TerminalController {
         return changed
     }
 
+    /// Where the viewport sits in the history, read in one piece.
+    struct ScrollPosition: Equatable {
+        let scrollOffset: Int
+        let scrollbackRowCount: Int
+        let viewRows: Int
+    }
+
+    /// Move the viewport by whole lines, towards older rows for a positive count, and report
+    /// where it ended. The move is measured from the rows on screen now, so output that
+    /// arrived since the last frame cannot displace it.
+    func scroll(byLines lines: Int) -> (position: ScrollPosition, changed: Bool) {
+        let result = lock.withWriteLock { () -> (position: ScrollPosition, changed: Bool) in
+            let scrollbackRowCount = scrollback.rowCount
+            let (sum, overflow) = scrollOffset.addingReportingOverflow(lines)
+            let unclamped = overflow ? (lines > 0 ? Int.max : 0) : sum
+            let newOffset = max(0, min(scrollbackRowCount, unclamped))
+            let changed = newOffset != scrollOffset
+            scrollOffset = newOffset
+            return (ScrollPosition(scrollOffset: newOffset,
+                                   scrollbackRowCount: scrollbackRowCount,
+                                   viewRows: model.rows),
+                    changed)
+        }
+        if result.changed {
+            scheduleMainCallbacks(needsDisplay: true)
+        }
+        return result
+    }
+
     /// Set the scroll offset to an absolute value (used by NSScroller drag).
     func setScrollOffset(_ offset: Int) {
         let changed = lock.withWriteLock {

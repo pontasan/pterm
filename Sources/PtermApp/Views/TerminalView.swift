@@ -15,6 +15,7 @@ final class TerminalView: MTKView, NSTextInputClient {
         let viewRows: Int
         let scrollOffset: Int
         let cellHeight: CGFloat
+        let wheelScrollSerial: UInt64
     }
 
     private enum PreviewPolicy {
@@ -236,6 +237,8 @@ final class TerminalView: MTKView, NSTextInputClient {
     /// Accumulated scroll delta for smooth (trackpad) scrolling.
     /// We accumulate fractional lines until a full line is reached.
     private var scrollAccumulator: CGFloat = 0
+    /// Counts the wheel events that moved the view, to tell a frame captured before one.
+    private var wheelScrollSerial: UInt64 = 0
     private var mouseReportDirectScrollAccumulator: CGFloat = 0
     private var mouseReportMomentumScrollAccumulator: CGFloat = 0
     private var mouseReportDirectScrollGestureActive = false
@@ -1125,6 +1128,10 @@ final class TerminalView: MTKView, NSTextInputClient {
             self.scrollerSyncScheduled = false
             guard let state = self.pendingScrollSyncState else { return }
             self.pendingScrollSyncState = nil
+            // A frame reports what it drew a turn after it was captured. If the wheel has
+            // scrolled since, that report is history: the wheel already showed its own
+            // position and asked for the frame that will report next.
+            guard state.wheelScrollSerial == self.wheelScrollSerial else { return }
             (self.enclosingScrollView as? TerminalScrollView)?.syncScroller(
                 scrollbackRowCount: state.scrollbackRowCount,
                 viewRows: state.viewRows,
@@ -1913,41 +1920,65 @@ final class TerminalView: MTKView, NSTextInputClient {
         if sendMouseEventIfNeeded(event, phase: .scroll) {
             return
         }
-        // When inside a TerminalScrollView, forward to NSScrollView
-        // so it handles scrolling natively (shows overlay scroller, momentum, etc.).
-        // The scrollViewDidScroll notification translates clip position → scrollOffset.
-        if enclosingScrollView is TerminalScrollView {
-            super.scrollWheel(with: event)
-            return
-        }
-
-        // Direct handling when not inside a scroll view (standalone mode)
+        // The wheel moves the terminal's own scroll position, line by line, straight from the
+        // event. The view never moves inside its scroll view, so handing the event to
+        // NSScrollView would only start AppKit's gesture tracking of a clip view that has
+        // nothing to scroll, and leave the position to be guessed back from where that clip
+        // view ended up. The scroll view shows the result; it does not decide it.
         guard let controller = terminalController,
               let renderer = renderer else { return }
 
         let cellH = renderer.glyphAtlas.cellHeight
         guard cellH > 0 else { return }
 
-        if event.hasPreciseScrollingDeltas {
-            scrollAccumulator += event.scrollingDeltaY
-
-            let lines = Int(scrollAccumulator / cellH)
-            if lines != 0 {
-                scrollAccumulator -= CGFloat(lines) * cellH
-                if lines > 0 {
-                    controller.scrollUp(lines: lines)
-                } else {
-                    controller.scrollDown(lines: -lines)
-                }
-            }
-        } else {
-            let lines = 3
-            if event.scrollingDeltaY > 0 {
-                controller.scrollUp(lines: lines)
-            } else if event.scrollingDeltaY < 0 {
-                controller.scrollDown(lines: lines)
-            }
+        if event.phase.contains(.began) {
+            scrollAccumulator = 0
         }
+        let step = Self.wheelScrollLines(
+            delta: event.scrollingDeltaY,
+            precise: event.hasPreciseScrollingDeltas,
+            cellHeight: cellH,
+            accumulator: scrollAccumulator
+        )
+        scrollAccumulator = step.accumulator
+        guard step.lines != 0 else { return }
+
+        let result = controller.scroll(byLines: step.lines)
+        guard result.changed else { return }
+        wheelScrollSerial &+= 1
+        (enclosingScrollView as? TerminalScrollView)?.showWheelScroll(to: result.position, cellHeight: cellH)
+        requestInteractiveDisplayUpdate()
+    }
+
+    /// Whole lines a wheel event scrolls, and what is left over for the next event.
+    ///
+    /// A trackpad reports points, which add up until they fill a line. A wheel mouse reports
+    /// notches already scaled by the system's acceleration, and every notch moves at least a line.
+    static func wheelScrollLines(
+        delta: CGFloat,
+        precise: Bool,
+        cellHeight: CGFloat,
+        accumulator: CGFloat
+    ) -> (accumulator: CGFloat, lines: Int) {
+        guard delta != 0 else { return (accumulator, 0) }
+        guard precise else {
+            return (0, Int(delta.rounded(.awayFromZero)))
+        }
+        return accumulatedMouseWheelSteps(delta: delta, cellHeight: cellHeight, accumulator: accumulator)
+    }
+
+    /// Redraw on the next display refresh. What the user moves with their own hand is not
+    /// paced like output: it has to follow the fingers at the rate the display can show.
+    private func requestInteractiveDisplayUpdate() {
+        idleBufferReleaseTimer?.invalidate()
+        idleBufferReleaseTimer = nil
+        if renderingSuppressed,
+           let splitContainer = enclosingScrollView?.superview as? SplitTerminalContainerView {
+            splitContainer.requestRender()
+            return
+        }
+        cancelDeferredDisplayUpdate()
+        setNeedsDisplay(bounds)
     }
 
     private enum MousePhase {
@@ -3311,7 +3342,8 @@ extension TerminalView: MTKViewDelegate {
             scrollbackRowCount: snapshot.scrollbackRowCount,
             viewRows: snapshot.rows,
             scrollOffset: snapshot.scrollOffset,
-            cellHeight: renderer.glyphAtlas.cellHeight
+            cellHeight: renderer.glyphAtlas.cellHeight,
+            wheelScrollSerial: wheelScrollSerial
         )
         scheduleScrollerSyncIfNeeded()
         if !searchMatches.isEmpty {
@@ -3588,6 +3620,14 @@ final class TerminalScrollView: NSScrollView {
     /// Guard against feedback loops during programmatic scroller updates.
     private var isSyncing = false
     private var lastScrollSyncSignature: ScrollSyncSignature?
+    /// Clip view position last seen, to tell a scroll from a mere resize.
+    private var lastObservedClipOriginY: CGFloat = 0
+    /// Half a point: closer than that, the clip view already shows the position.
+    private static let clipPositionTolerance: CGFloat = 0.5
+
+    private var isUserDraggingScroller: Bool {
+        (verticalScroller as? TerminalScroller)?.isTrackingMouse ?? false
+    }
 
     init(frame: NSRect, renderer: MetalRenderer) {
         super.init(frame: frame)
@@ -3596,6 +3636,7 @@ final class TerminalScrollView: NSScrollView {
         self.hasVerticalScroller = true
         self.hasHorizontalScroller = false
         self.autohidesScrollers = true
+        self.verticalScroller = TerminalScroller()
         self.scrollerStyle = .overlay
         self.verticalScroller?.knobStyle = .light
         self.drawsBackground = false
@@ -3714,14 +3755,12 @@ final class TerminalScrollView: NSScrollView {
 
     // MARK: - Scroller Sync
 
-    /// Sync the native scroller position with the terminal's virtual scroll state.
-    /// Called every frame from TerminalView's draw(in:).
+    /// Show the terminal's scroll position on the native scroller.
     ///
-    /// Handles two directions:
-    /// 1. Programmatic → UI: when scrollOffset changes (auto-scroll on output,
-    ///    keyboard scrollToBottom), update the clip view position.
-    /// 2. Document height: when scrollback grows, update document view height
-    ///    so the scroller knob proportion reflects total content.
+    /// The terminal's scroll offset is the only truth. The document view is sized to the whole
+    /// history and the clip view is placed where that offset falls in it, so the knob has the
+    /// right size and position; nothing is read back from the clip view except while the user
+    /// holds the scroller itself.
     ///
     /// CRITICAL: All reads from TerminalController happen first (under lock),
     /// then the lock is released BEFORE any UI mutation. This prevents deadlocks
@@ -3731,61 +3770,11 @@ final class TerminalScrollView: NSScrollView {
         guard let controller = terminalView.terminalController,
               let renderer = terminalView.renderer else { return }
 
-        let cellH = renderer.glyphAtlas.cellHeight
-        guard cellH > 0 else { return }
-
-        // Step 1: Read scroll state under lock — NO UI mutation here.
         let (sbCount, viewRows, scrollOffset) = controller.withViewport { model, scrollback, offset in
             (scrollback.rowCount, model.rows, offset)
         }
-        // Lock is now released.
-
-        let totalRows = sbCount + viewRows
-        let viewportHeight = self.bounds.height
-        let documentHeight = max(viewportHeight, CGFloat(totalRows) * cellH)
-        let signature = ScrollSyncSignature(
-            scrollbackRowCount: sbCount,
-            viewRows: viewRows,
-            scrollOffset: scrollOffset,
-            viewportSize: bounds.size,
-            cellHeight: cellH
-        )
-        let targetFrame = NSRect(origin: contentView.bounds.origin, size: contentView.bounds.size)
-        if lastScrollSyncSignature == signature, terminalView.frame == targetFrame {
-            return
-        }
-
-        // Step 2: All UI mutations under isSyncing to block re-entrant notifications.
-        isSyncing = true
-        defer { isSyncing = false }
-
-        let docView = self.documentView!
-        if abs(docView.frame.height - documentHeight) > 1 {
-            docView.frame = NSRect(x: 0, y: 0, width: self.bounds.width, height: documentHeight)
-            self.reflectScrolledClipView(self.contentView)
-        }
-
-        // Map scrollOffset to clipView position.
-        // scrollOffset 0 = bottom → clipView origin.y = maxY
-        // scrollOffset == sbCount = top → clipView origin.y = 0
-        let maxY = documentHeight - viewportHeight
-        let targetY: CGFloat
-        if sbCount > 0 {
-            targetY = maxY * CGFloat(sbCount - scrollOffset) / CGFloat(sbCount)
-        } else {
-            targetY = maxY
-        }
-
-        // Use cellH tolerance to avoid fighting with NSScrollView's native
-        // scroll positioning (which differs by sub-line pixel amounts).
-        let currentY = self.contentView.bounds.origin.y
-        if abs(currentY - targetY) > cellH {
-            self.contentView.setBoundsOrigin(NSPoint(x: 0, y: targetY))
-            self.reflectScrolledClipView(self.contentView)
-        }
-
-        pinTerminalViewToViewport()
-        lastScrollSyncSignature = signature
+        syncScroller(scrollbackRowCount: sbCount, viewRows: viewRows, scrollOffset: scrollOffset,
+                     cellHeight: renderer.glyphAtlas.cellHeight)
     }
 
     func syncScroller(snapshot: TerminalController.RenderSnapshot, cellHeight: CGFloat) {
@@ -3795,6 +3784,14 @@ final class TerminalScrollView: NSScrollView {
             scrollOffset: snapshot.scrollOffset,
             cellHeight: cellHeight
         )
+    }
+
+    /// Show where the wheel just scrolled to, and bring the overlay scroller into view the
+    /// way a native scroll would.
+    func showWheelScroll(to position: TerminalController.ScrollPosition, cellHeight: CGFloat) {
+        syncScroller(scrollbackRowCount: position.scrollbackRowCount, viewRows: position.viewRows,
+                     scrollOffset: position.scrollOffset, cellHeight: cellHeight)
+        flashScrollers()
     }
 
     func syncScroller(scrollbackRowCount sbCount: Int, viewRows: Int, scrollOffset: Int, cellHeight: CGFloat) {
@@ -3815,6 +3812,7 @@ final class TerminalScrollView: NSScrollView {
             return
         }
 
+        // All UI mutations under isSyncing to block re-entrant notifications.
         isSyncing = true
         defer { isSyncing = false }
 
@@ -3824,41 +3822,76 @@ final class TerminalScrollView: NSScrollView {
             self.reflectScrolledClipView(self.contentView)
         }
 
-        let maxY = documentHeight - viewportHeight
-        let targetY: CGFloat
-        if sbCount > 0 {
-            targetY = maxY * CGFloat(sbCount - scrollOffset) / CGFloat(sbCount)
-        } else {
-            targetY = maxY
-        }
-
-        let currentY = self.contentView.bounds.origin.y
-        if abs(currentY - targetY) > cellHeight {
-            self.contentView.setBoundsOrigin(NSPoint(x: 0, y: targetY))
-            self.reflectScrolledClipView(self.contentView)
+        // While the user holds the scroller, the knob is theirs: the clip view says where they
+        // want to be, and moving it under their hand would fight the drag.
+        if !isUserDraggingScroller {
+            let targetY = Self.clipOriginY(
+                scrollOffset: scrollOffset,
+                scrollbackRowCount: sbCount,
+                documentHeight: documentHeight,
+                viewportHeight: viewportHeight
+            )
+            if abs(self.contentView.bounds.origin.y - targetY) > Self.clipPositionTolerance {
+                self.contentView.setBoundsOrigin(NSPoint(x: 0, y: targetY))
+                self.reflectScrolledClipView(self.contentView)
+            }
         }
 
         pinTerminalViewToViewport()
+        lastObservedClipOriginY = contentView.bounds.origin.y
         lastScrollSyncSignature = signature
     }
 
-    /// Handle user-initiated scrolling (scroll wheel, trackpad, knob drag).
-    /// NSScrollView moves the clip view natively; we translate that position
-    /// back to a scrollOffset for the terminal's virtual scrollback.
+    /// Clip view position that shows `scrollOffset`: the bottom of the document for the
+    /// newest output, the top for the oldest row.
+    static func clipOriginY(
+        scrollOffset: Int,
+        scrollbackRowCount: Int,
+        documentHeight: CGFloat,
+        viewportHeight: CGFloat
+    ) -> CGFloat {
+        let maxY = max(0, documentHeight - viewportHeight)
+        guard scrollbackRowCount > 0 else { return maxY }
+        let clamped = max(0, min(scrollbackRowCount, scrollOffset))
+        return maxY * CGFloat(scrollbackRowCount - clamped) / CGFloat(scrollbackRowCount)
+    }
+
+    /// Scroll offset the scroller asks for when the clip view sits at `clipOriginY`.
+    static func scrollOffset(
+        clipOriginY: CGFloat,
+        scrollbackRowCount: Int,
+        documentHeight: CGFloat,
+        viewportHeight: CGFloat
+    ) -> Int? {
+        let maxY = documentHeight - viewportHeight
+        guard maxY > 0, scrollbackRowCount > 0 else { return nil }
+        let fraction = max(0, min(1, clipOriginY / maxY))  // 0 = top, 1 = bottom
+        return scrollbackRowCount - Int((fraction * CGFloat(scrollbackRowCount)).rounded())
+    }
+
+    /// The user moved the scroller: knob drag or a click in its track. The wheel does not come
+    /// through here; it moves the terminal directly.
     @objc private func scrollViewDidScroll(_ notification: Notification) {
         guard !isSyncing else { return }
         guard let controller = terminalView.terminalController else { return }
 
+        // The clip view also reports when only its size changed. That is not a scroll.
+        let currentY = contentView.bounds.origin.y
+        guard currentY != lastObservedClipOriginY else {
+            pinTerminalViewToViewport()
+            return
+        }
+        lastObservedClipOriginY = currentY
+
         let viewportHeight = bounds.height
         let documentHeight = documentView?.frame.height ?? viewportHeight
-        let maxY = documentHeight - viewportHeight
-        guard maxY > 0 else { return }
-
-        let currentY = contentView.bounds.origin.y
-        let fraction = currentY / maxY  // 0 = top, 1 = bottom
-
         let sbCount = controller.withViewport { _, scrollback, _ in scrollback.rowCount }
-        let newOffset = sbCount - Int(fraction * CGFloat(sbCount))
+        guard let newOffset = Self.scrollOffset(
+            clipOriginY: currentY,
+            scrollbackRowCount: sbCount,
+            documentHeight: documentHeight,
+            viewportHeight: viewportHeight
+        ) else { return }
         controller.setScrollOffset(newOffset)
         lastScrollSyncSignature = nil
 
@@ -3867,6 +3900,11 @@ final class TerminalScrollView: NSScrollView {
            let splitContainer = terminalView.enclosingScrollView?.superview as? SplitTerminalContainerView {
             splitContainer.requestRender()
         }
+    }
+
+    /// A wheel event that lands on the scroller or another overlay still scrolls the terminal.
+    override func scrollWheel(with event: NSEvent) {
+        terminalView.scrollWheel(with: event)
     }
 
     // MARK: - First Responder
@@ -3878,6 +3916,19 @@ final class TerminalScrollView: NSScrollView {
 
     @objc private func backButtonPressed(_ sender: Any?) {
         terminalView.onBackToIntegrated?()
+    }
+}
+
+/// Scroller that tells when the user has hold of it.
+final class TerminalScroller: NSScroller {
+    private(set) var isTrackingMouse = false
+
+    override class var isCompatibleWithOverlayScrollers: Bool { self == TerminalScroller.self }
+
+    override func mouseDown(with event: NSEvent) {
+        isTrackingMouse = true
+        defer { isTrackingMouse = false }
+        super.mouseDown(with: event)
     }
 }
 
